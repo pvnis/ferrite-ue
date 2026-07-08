@@ -53,3 +53,7 @@ path = "src/bin/prach_cmp.rs"
 [[bin]]
 name = "prach-tx"
 path = "src/bin/prach_tx.rs"
+
+[[bin]]
+name = "rar-rx"
+path = "src/bin/rar_rx.rs"
