@@ -14,7 +14,7 @@
 
 use crate::prach_tables::{ROOT_L139, ROOT_L839};
 use num_complex::Complex32;
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 
 /// PRACH preamble sequence length `L_RA` (§6.3.3.1): 839 for the long formats
 /// (0/1/2/3), 139 for the short formats (A1-A3, B1-B4, C0, C2).
@@ -121,6 +121,73 @@ pub fn prach_preamble_seq(
     (0..l_ra).map(|n| x_u[(n + c_v) % l_ra]).collect()
 }
 
+/// Unnormalized DFT: `X[k] = Σ_n x[n]·exp(-j2π·k·n/N)`.
+fn dft(x: &[Complex32]) -> Vec<Complex32> {
+    let n = x.len();
+    (0..n)
+        .map(|k| {
+            (0..n)
+                .map(|m| x[m] * Complex32::from_polar(1.0, -TAU * (k * m % n) as f32 / n as f32))
+                .sum()
+        })
+        .collect()
+}
+
+/// Inverse DFT (1/N normalized): `x[n] = (1/N)·Σ_k X[k]·exp(+j2π·k·n/N)`.
+fn idft(x: &[Complex32]) -> Vec<Complex32> {
+    let n = x.len();
+    let scale = 1.0 / n as f32;
+    (0..n)
+        .map(|m| {
+            let s: Complex32 = (0..n)
+                .map(|k| x[k] * Complex32::from_polar(1.0, TAU * (k * m % n) as f32 / n as f32))
+                .sum();
+            s * scale
+        })
+        .collect()
+}
+
+/// Time/frequency parameters of one PRACH occasion for the base sample rate
+/// (§6.3.3.2, §5.3.2). All lengths in samples of that rate.
+#[derive(Clone, Copy, Debug)]
+pub struct PrachOccasion {
+    /// IFFT size = base_rate / PRACH_SCS (e.g. 512 for 30 kHz at 15.36 Msps).
+    pub fft_size: usize,
+    /// PRACH grid size = N_RB_ul_grid · K · 12 (subcarriers, DC-centred).
+    pub grid_size: usize,
+    /// First occupied subcarrier in the grid: `K·12·(rb_offset + nof_rb_ra·i) + k_bar`.
+    pub k_start: usize,
+    /// Cyclic-prefix length in samples.
+    pub cp_samples: usize,
+    /// PRACH OFDM symbols per occasion (1 for C0, 12 for B4, …).
+    pub nof_symbols: usize,
+}
+
+/// Frequency-domain mapping: subcarrier `k_start + k` (0-centred grid of
+/// `grid_size`) → IFFT bin, `(k_start + k − grid_size/2) mod fft_size`.
+pub fn prach_bin(occ: &PrachOccasion, k: usize) -> usize {
+    (occ.k_start + k + occ.fft_size - occ.grid_size / 2) % occ.fft_size
+}
+
+/// Generate the time-domain PRACH occasion for a sequence-domain preamble
+/// `x_{u,v}` (§5.3.2): place `y_{u,v} = DFT(x_{u,v})` on the mapped subcarriers,
+/// IFFT to time, prepend the cyclic prefix, and repeat the symbol `nof_symbols`
+/// times. Returns `cp_samples + nof_symbols·fft_size` samples.
+pub fn prach_occasion_waveform(x_uv: &[Complex32], occ: &PrachOccasion) -> Vec<Complex32> {
+    let y = dft(x_uv);
+    let mut grid = vec![Complex32::new(0.0, 0.0); occ.fft_size];
+    for (k, &yk) in y.iter().enumerate() {
+        grid[prach_bin(occ, k)] = yk;
+    }
+    let sym = idft(&grid);
+    let mut out = Vec::with_capacity(occ.cp_samples + occ.nof_symbols * occ.fft_size);
+    out.extend_from_slice(&sym[occ.fft_size - occ.cp_samples..]); // cyclic prefix
+    for _ in 0..occ.nof_symbols {
+        out.extend_from_slice(&sym);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +249,43 @@ mod tests {
         assert_eq!(prach_ncs_unrestricted(PrachScs::Khz1_25, 0), Some(0));
         assert_eq!(prach_ncs_unrestricted(PrachScs::Khz1_25, 8), Some(46));
         assert_eq!(prach_ncs_unrestricted(PrachScs::Short, 15), Some(69));
+    }
+
+    /// Generate the cell's format-C0 occasion (30 kHz, 15.36 Msps), demodulate,
+    /// and recover the preamble: the sequence-domain correlation against the
+    /// root ZC must peak sharply at the transmitted cyclic shift.
+    #[test]
+    fn c0_waveform_round_trip() {
+        let occ = PrachOccasion { fft_size: 512, grid_size: 24 * 12, k_start: 62, cp_samples: 310, nof_symbols: 1 };
+        // cell config: root sequence index 1, N_CS = 0, preamble 0 → u = ROOT[1].
+        let seq_len = PrachSeqLen::Short;
+        let x = prach_preamble_seq(1, 0, 0, seq_len); // N_CS=0
+        let wf = prach_occasion_waveform(&x, &occ);
+        assert_eq!(wf.len(), occ.cp_samples + occ.fft_size);
+
+        // Demodulate: drop CP, DFT the symbol, pull the 139 subcarriers → y_rx.
+        let sym = &wf[occ.cp_samples..occ.cp_samples + occ.fft_size];
+        let g = dft(sym);
+        let y_rx: Vec<Complex32> = (0..seq_len.l_ra()).map(|k| g[prach_bin(&occ, k)]).collect();
+        let x_rx = idft(&y_rx); // back to the sequence domain
+
+        // Correlate with the root ZC (u = ROOT_L139[1] = 138) over cyclic shifts.
+        let u = prach_root(1, seq_len);
+        let root = zadoff_chu(u, seq_len.l_ra());
+        let l = seq_len.l_ra();
+        let (mut peak, mut peak_tau, mut second) = (0f32, 0usize, 0f32);
+        for tau in 0..l {
+            let c: Complex32 = (0..l).map(|n| x_rx[n] * root[(n + tau) % l].conj()).sum();
+            let m = c.norm();
+            if m > peak {
+                second = peak;
+                peak = m;
+                peak_tau = tau;
+            } else if m > second {
+                second = m;
+            }
+        }
+        assert_eq!(peak_tau, 0, "correlation peak at wrong shift");
+        assert!(peak > 20.0 * second, "correlation not a sharp delta: peak {peak}, 2nd {second}");
     }
 }
