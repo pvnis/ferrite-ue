@@ -49,3 +49,7 @@ path = "src/bin/pdsch_chan.rs"
 [[bin]]
 name = "prach-cmp"
 path = "src/bin/prach_cmp.rs"
+
+[[bin]]
+name = "prach-tx"
+path = "src/bin/prach_tx.rs"

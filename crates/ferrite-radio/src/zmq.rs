@@ -134,6 +134,37 @@ impl ZmqSink {
             Err(e) => Err(zerr(e)),
         }
     }
+
+    /// Answer at most one pending request, filling the reply block via `fill`
+    /// (passed the running uplink sample counter and a zero-initialised block).
+    /// Advances the counter by the block length. Returns `true` if served.
+    ///
+    /// Because the gNB requests uplink and transmits downlink in lockstep, the
+    /// counter tracks the gNB's receive sample index, letting the caller place a
+    /// PRACH occasion at a downlink-derived sample position.
+    pub fn serve_with(&mut self, counter: &mut u64, fill: impl Fn(u64, &mut [Complex32])) -> Result<bool> {
+        match self.socket.recv_msg(0) {
+            Ok(_) => {
+                let mut block = vec![Complex32::default(); self.block_len];
+                fill(*counter, &mut block);
+                let mut bytes = Vec::with_capacity(self.block_len * 8);
+                for s in &block {
+                    bytes.extend_from_slice(&s.re.to_le_bytes());
+                    bytes.extend_from_slice(&s.im.to_le_bytes());
+                }
+                self.socket.send(&bytes[..], 0).map_err(zerr)?;
+                *counter += self.block_len as u64;
+                Ok(true)
+            }
+            Err(::zmq::Error::EAGAIN) => Ok(false),
+            Err(e) => Err(zerr(e)),
+        }
+    }
+
+    /// Uplink block length (samples per served request).
+    pub fn block_len(&self) -> usize {
+        self.block_len
+    }
 }
 
 #[cfg(test)]
