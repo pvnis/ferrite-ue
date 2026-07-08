@@ -6,6 +6,7 @@
 pub mod bch;
 pub mod crc;
 pub mod dci;
+pub mod dlsch;
 pub mod ldpc;
 pub mod ldpc_tables;
 pub mod polar;

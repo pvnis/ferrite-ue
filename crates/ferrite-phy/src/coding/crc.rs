@@ -23,6 +23,12 @@ pub const CRC24A: Crc = Crc {
     width: 24,
 };
 
+/// CRC24B (§5.1): `D^24+D^23+D^6+D^5+D+1`, used for LDPC code-block CRC.
+pub const CRC24B: Crc = Crc {
+    poly: 0x0080_0063,
+    width: 24,
+};
+
 /// CRC16 (§5.1).
 pub const CRC16: Crc = Crc {
     poly: 0x0000_1021,
