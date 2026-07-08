@@ -6,6 +6,8 @@
 pub mod bch;
 pub mod crc;
 pub mod dci;
+pub mod ldpc;
+pub mod ldpc_tables;
 pub mod polar;
 pub mod ratematch;
 pub mod tables;
