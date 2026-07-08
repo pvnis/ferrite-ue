@@ -37,3 +37,11 @@ path = "src/bin/pdsch_fwd.rs"
 [[bin]]
 name = "pdsch-sys"
 path = "src/bin/pdsch_sys.rs"
+
+[[bin]]
+name = "pdsch-cmp"
+path = "src/bin/pdsch_cmp.rs"
+
+[[bin]]
+name = "pdsch-chan"
+path = "src/bin/pdsch_chan.rs"

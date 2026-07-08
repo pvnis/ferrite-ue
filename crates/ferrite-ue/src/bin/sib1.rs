@@ -125,6 +125,7 @@ fn main() {
                 n_sym: l_sym,
                 dmrs_symbols: dmrs_symbols.clone(),
                 qm: qm as usize,
+                n_bwp: 0, // non-interleaved (DMRS confirms contiguous PRBs)
             };
             println!(
                 "SFN {} slot {slot}: SIB1 DCI  RB {rb_start}+{n_rb}  sym {s_sym}+{l_sym}  MCS {mcs} (Qm {qm}, R {:.3})",
@@ -225,13 +226,13 @@ fn main() {
                             [a, b]
                         })
                         .collect();
-                    let (tb, conv) = ferrite_phy::coding::dlsch::dlsch_decode_single_dbg(&llrs, tbs, r, qm as usize, 0, 60);
+                    let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llrs, tbs, r, qm as usize, 0, 60);
                     if conv {
-                        println!("  order={order} transform={name}: LDPC CONVERGED, crc={}", tb.is_some());
+                        let hex: String = bits.chunks(8).take(12).map(|c| format!("{:02x}", c.iter().fold(0u8, |a, &b| a << 1 | b))).collect();
+                        println!("  order={order} transform={name}: CONVERGED crc={crc} TB[0..12]={hex}");
                     }
-                    if let Some(tb) = tb {
-                        println!("  -> decoded with order={order} transform={name}");
-                        decoded = Some(tb);
+                    if crc {
+                        decoded = Some(bits);
                         break 'outer;
                     }
                 }

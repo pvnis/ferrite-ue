@@ -28,6 +28,57 @@ pub struct PdschAlloc {
     pub dmrs_symbols: Vec<usize>,
     /// Modulation order (2 = QPSK).
     pub qm: usize,
+    /// CORESET#0 size in RBs for interleaved VRB→PRB mapping (§7.3.1.6). `0`
+    /// means non-interleaved (PRB = VRB). SIB1 in CORESET0 is interleaved (L=2).
+    pub n_bwp: usize,
+}
+
+impl PdschAlloc {
+    /// Physical (CORESET0-relative) PRB carrying local VRB `v` (`0..n_rb`).
+    /// Applies the interleaved VRB→PRB bundle mapping (§7.3.1.6) when
+    /// `n_bwp != 0`, otherwise identity.
+    pub fn prb_of(&self, v: usize) -> usize {
+        if self.n_bwp == 0 {
+            self.rb_start + v
+        } else {
+            coreset0_vrb_to_prb(self.n_bwp)[self.rb_start + v]
+        }
+    }
+}
+
+/// Interleaved VRB→PRB mapping for CORESET0 (§7.3.1.6, bundle size `L = 2`),
+/// coreset_start-relative. Returns `prb[vrb]` for `vrb ∈ 0..n_bwp`. Mirrors
+/// OCUDU's `vrb_to_prb_mapper_get_interleaved_prb`.
+pub fn coreset0_vrb_to_prb(n_bwp: usize) -> Vec<usize> {
+    let l = 2usize;
+    let nof_bundles = n_bwp.div_ceil(l);
+    let (first, other) = (l, l);
+    let last = if n_bwp % l > 0 { n_bwp % l } else { l };
+    let r = 2usize;
+    let c = nof_bundles / r;
+    let mut prb = vec![0usize; n_bwp];
+    for (i, p) in prb.iter_mut().take(first).enumerate() {
+        *p = i; // first bundle
+    }
+    let last_prb_start = (nof_bundles - 2) * other + first;
+    for i in 0..last {
+        prb[n_bwp - last + i] = last_prb_start + i; // last bundle
+    }
+    for cc in 0..c {
+        for rr in 0..r {
+            let j = cc * r + rr;
+            if j == 0 || j > nof_bundles - 2 {
+                continue;
+            }
+            let f_j = rr * c + cc;
+            let vrb_start = (j - 1) * other + first;
+            let prb_start = (f_j - 1) * other + first;
+            for i in 0..other {
+                prb[vrb_start + i] = prb_start + i;
+            }
+        }
+    }
+    prb
 }
 
 /// PDSCH DM-RS sequence values `r(0..len)` for one OFDM symbol (§7.4.1.1.1),
@@ -107,22 +158,25 @@ pub fn extract_pdsch(
     time_first: bool,
 ) -> PdschLlrs {
     let n_rb = alloc.n_rb;
-    let sc0 = 12 * alloc.rb_start as i32; // first PDSCH subcarrier, CORESET0-relative
+    // Physical (CORESET0-relative) PRB for each local VRB (interleaved for SIB1).
+    let prb: Vec<usize> = (0..n_rb).map(|v| alloc.prb_of(v)).collect();
+    let ref_len = dmrs_base + 6 * (alloc.n_bwp.max(alloc.rb_start + n_rb) + 1);
 
     // Per-(DM-RS symbol, RB) channel estimate (a per-symbol phase rotation, e.g.
-    // from residual CFO, means we must NOT average across symbols).
+    // from residual CFO, means we must NOT average across symbols). DM-RS is
+    // PRB-domain: sequence indexed by the physical PRB.
     let dmrs_syms = &alloc.dmrs_symbols;
     let mut h = vec![vec![Complex32::new(0.0, 0.0); n_rb]; dmrs_syms.len()];
     let mut per_sym_corr = vec![Complex32::new(0.0, 0.0); dmrs_syms.len()];
     let mut corr_pow = 0f32;
     for (si, &l) in dmrs_syms.iter().enumerate() {
-        let full_ref = pdsch_dmrs(cell_id, slot, l as u32, dmrs_base + 6 * (alloc.rb_start + n_rb));
+        let full_ref = pdsch_dmrs(cell_id, slot, l as u32, ref_len);
         for rb in 0..n_rb {
             let mut acc = Complex32::new(0.0, 0.0);
             for j in 0..6 {
-                let k = sc0 + (12 * rb + 2 * j) as i32;
+                let k = (12 * prb[rb] + 2 * j) as i32;
                 let rx = grids[l][sc_to_bin(k)];
-                let est = rx * full_ref[dmrs_base + 6 * (alloc.rb_start + rb) + j].conj();
+                let est = rx * full_ref[dmrs_base + 6 * prb[rb] + j].conj();
                 acc += est;
                 corr_pow += rx.norm_sqr();
             }
@@ -201,7 +255,9 @@ pub fn extract_pdsch(
         // (l, k') — symbol-outer, subcarrier-inner.
         for &l in &data_syms {
             for kp in 0..(12 * n_rb) {
-                let z = grids[l][sc_to_bin(sc0 + kp as i32)] * chan(l, kp / 12).conj();
+                let rb = kp / 12;
+                let k = (12 * prb[rb] + kp % 12) as i32;
+                let z = grids[l][sc_to_bin(k)] * chan(l, rb).conj();
                 push_re(z, &mut data);
             }
         }
@@ -209,7 +265,7 @@ pub fn extract_pdsch(
         // (k', l) — subcarrier-outer, symbol-inner (§7.3.1.5).
         for kp in 0..(12 * n_rb) {
             let rb = kp / 12;
-            let k = sc0 + kp as i32;
+            let k = (12 * prb[rb] + kp % 12) as i32;
             for &l in &data_syms {
                 let z = grids[l][sc_to_bin(k)] * chan(l, rb).conj();
                 push_re(z, &mut data);
@@ -240,16 +296,19 @@ pub fn capture_data_res(
     dmrs_base: usize,
 ) -> Vec<(usize, usize, usize, f32, f32)> {
     let n_rb = alloc.n_rb;
-    let sc0 = 12 * alloc.rb_start as i32;
     let dmrs_syms = &alloc.dmrs_symbols;
+    // Physical (CORESET0-relative) PRB for each local VRB (interleaved for SIB1).
+    let prb: Vec<usize> = (0..n_rb).map(|v| alloc.prb_of(v)).collect();
+    let ref_len = dmrs_base + 6 * (alloc.n_bwp.max(alloc.rb_start + n_rb) + 1);
     let mut h = vec![vec![Complex32::new(0.0, 0.0); n_rb]; dmrs_syms.len()];
     for (si, &l) in dmrs_syms.iter().enumerate() {
-        let full_ref = pdsch_dmrs(cell_id, slot, l as u32, dmrs_base + 6 * (alloc.rb_start + n_rb));
+        let full_ref = pdsch_dmrs(cell_id, slot, l as u32, ref_len);
         for rb in 0..n_rb {
             let mut acc = Complex32::new(0.0, 0.0);
             for j in 0..6 {
-                let k = sc0 + (12 * rb + 2 * j) as i32;
-                acc += grids[l][sc_to_bin(k)] * full_ref[dmrs_base + 6 * (alloc.rb_start + rb) + j].conj();
+                // DM-RS is PRB-domain: sequence indexed by the physical PRB.
+                let k = (12 * prb[rb] + 2 * j) as i32;
+                acc += grids[l][sc_to_bin(k)] * full_ref[dmrs_base + 6 * prb[rb] + j].conj();
             }
             h[si][rb] = acc / 6.0;
         }
@@ -288,9 +347,11 @@ pub fn capture_data_res(
         }
         for kp in 0..(12 * n_rb) {
             let rb = kp / 12;
+            let sc = kp % 12;
+            let k = (12 * prb[rb] + sc) as i32; // (interleaved) physical PRB
             let chan = h_avg[rb] * Complex32::from_polar(1.0, slope * l as f32);
-            let z = grids[l][sc_to_bin(sc0 + kp as i32)] * chan.conj();
-            out.push((rb, kp % 12, l, z.re, z.im));
+            let z = grids[l][sc_to_bin(k)] * chan.conj();
+            out.push((rb, sc, l, z.re, z.im));
         }
     }
     out

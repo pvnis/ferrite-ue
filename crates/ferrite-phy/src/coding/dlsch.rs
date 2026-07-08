@@ -9,9 +9,18 @@
 //! ```
 //! SIB1 is a single code block (`B ≤ 3840`), BG2, RV0.
 
-use crate::coding::crc::{CRC24A, CRC24B};
+use crate::coding::crc::{Crc, CRC16, CRC24A, CRC24B};
 use crate::coding::ldpc::{BaseGraph, LdpcGraph};
 use crate::coding::ldpc_tables::LIFTING_SETS;
+
+/// Transport-block CRC for DL-SCH (§7.2.1): CRC24A if `A > 3824`, else CRC16.
+pub fn tb_crc(a: usize) -> Crc {
+    if a > 3824 {
+        CRC24A
+    } else {
+        CRC16
+    }
+}
 
 /// Base-graph selection (§7.2.2) from payload size `a` (bits) and code rate `r`.
 pub fn select_base_graph(a: usize, r: f64) -> BaseGraph {
@@ -44,7 +53,7 @@ pub struct SegParams {
 /// Compute segmentation parameters (§5.2.2) for `a` payload bits at rate `r`.
 pub fn seg_params(a: usize, r: f64) -> SegParams {
     let bg = select_base_graph(a, r);
-    let b = a + 24; // TB CRC24A
+    let b = a + tb_crc(a).width(); // TB CRC (§7.2.1): 24A if A>3824 else 16
     let k_cb = match bg {
         BaseGraph::Bg1 => 8448,
         BaseGraph::Bg2 => 3840,
@@ -183,8 +192,8 @@ fn de_rate_match_cb(f: &[f32], filler: &[bool], ncb: usize, k0: usize, qm: usize
 pub fn dlsch_encode_single(tb: &[u8], e_len: usize, r: f64, qm: usize, rv: u8) -> Vec<u8> {
     let p = seg_params(tb.len(), r);
     assert_eq!(p.c, 1, "single-CB helper");
-    // b = tb || CRC24A
-    let b = CRC24A.attach(tb);
+    // b = tb || TB-CRC (CRC16 for A<=3824, else CRC24A)
+    let b = tb_crc(tb.len()).attach(tb);
     // code block c: b then filler (NULL modeled as 0 here; excluded via mask)
     let mut cb = vec![0u8; p.k];
     cb[..b.len()].copy_from_slice(&b);
@@ -220,7 +229,7 @@ pub fn dlsch_decode_single(
     if p.c != 1 {
         return None; // multi-CB not needed for SIB1
     }
-    let b_len = tbs + 24;
+    let b_len = tbs + tb_crc(tbs).width();
     let g = LdpcGraph::new(p.bg, p.zc as u16)?;
     let ncb = g.n() - 2 * p.zc; // N = 50·Zc / 66·Zc
 
@@ -239,7 +248,7 @@ pub fn dlsch_decode_single(
     let (info, _) = g.decode(&full, max_iter, 0.75);
     // info is K = Kb·Zc systematic bits; the block is b (tbs+24) then filler.
     let b = &info[..b_len];
-    if !CRC24A.check(b) {
+    if !tb_crc(tbs).check(b) {
         return None;
     }
     Some(b[..tbs].to_vec())
@@ -259,7 +268,7 @@ pub fn dlsch_decode_single_dbg(
     if p.c != 1 {
         return (None, false);
     }
-    let b_len = tbs + 24;
+    let b_len = tbs + tb_crc(tbs).width();
     let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
         return (None, false);
     };
@@ -275,8 +284,36 @@ pub fn dlsch_decode_single_dbg(
     full[2 * p.zc..].copy_from_slice(&cb_llr);
     let (info, converged) = g.decode(&full, max_iter, 0.75);
     let b = &info[..b_len];
-    let tb = if CRC24A.check(b) { Some(b[..tbs].to_vec()) } else { None };
+    let tb = if tb_crc(tbs).check(b) { Some(b[..tbs].to_vec()) } else { None };
     (tb, converged)
+}
+
+/// Like [`dlsch_decode_single_dbg`] but also returns the raw decoded transport
+/// block bits (systematic, ignoring CRC) for interface debugging.
+pub fn dlsch_decode_single_bits(
+    f: &[f32],
+    tbs: usize,
+    r: f64,
+    qm: usize,
+    rv: u8,
+    max_iter: usize,
+) -> (Vec<u8>, bool, bool) {
+    let p = seg_params(tbs, r);
+    let b_len = tbs + tb_crc(tbs).width();
+    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    let ncb = g.n() - 2 * p.zc;
+    let mut filler = vec![false; ncb];
+    let fstart = b_len.saturating_sub(2 * p.zc);
+    for fi in fstart..(p.k - 2 * p.zc) {
+        filler[fi] = true;
+    }
+    let k0 = k0_of(rv, p.bg, ncb, p.zc);
+    let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
+    let mut full = vec![0f32; g.n()];
+    full[2 * p.zc..].copy_from_slice(&cb_llr);
+    let (info, converged) = g.decode(&full, max_iter, 0.75);
+    let b = &info[..b_len];
+    (b[..tbs].to_vec(), converged, tb_crc(tbs).check(b))
 }
 
 /// Verify a multi-CB block's per-CB CRC24B (helper for future multi-CB support).
@@ -292,7 +329,7 @@ pub fn de_rate_match_full(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> (
     let p = seg_params(tbs, r);
     let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
     let ncb = g.n() - 2 * p.zc;
-    let b_len = tbs + 24;
+    let b_len = tbs + tb_crc(tbs).width();
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
     for fi in fstart..(p.k - 2 * p.zc) {
@@ -336,13 +373,13 @@ mod tests {
 
     #[test]
     fn segmentation_for_sib1_sized_block() {
-        // ~776-bit SIB1 payload → single CB, BG2.
+        // ~776-bit SIB1 payload → single CB, BG2. A ≤ 3824 ⇒ TB CRC16.
         let p = seg_params(776, 0.19);
         assert_eq!(p.bg, BaseGraph::Bg2);
         assert_eq!(p.c, 1);
         assert_eq!(p.l, 0);
         assert_eq!(p.k, 10 * p.zc);
-        assert_eq!(p.filler, p.k - (776 + 24));
+        assert_eq!(p.filler, p.k - (776 + 16));
     }
 
     #[test]
