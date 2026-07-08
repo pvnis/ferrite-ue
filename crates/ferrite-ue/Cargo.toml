@@ -1,0 +1,23 @@
+[package]
+name = "ferrite-ue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-phy.workspace = true
+ferrite-radio = { workspace = true, features = ["zmq"] }
+num-complex.workspace = true
+
+[[bin]]
+name = "ssb-scan"
+path = "src/bin/ssb_scan.rs"
+
+[[bin]]
+name = "sync-track"
+path = "src/bin/sync_track.rs"
+
+[[bin]]
+name = "sib1-dci"
+path = "src/bin/sib1_dci.rs"

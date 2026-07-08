@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrite-common",
+    "crates/ferrite-phy",
+    "crates/ferrite-radio",
+    "crates/ferrite-ue",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Ferrite contributors"]
+
+[workspace.dependencies]
+num-complex = "0.4"
+rustfft = "6"
+thiserror = "2"
+
+ferrite-common = { path = "crates/ferrite-common" }
+ferrite-phy = { path = "crates/ferrite-phy" }
+ferrite-radio = { path = "crates/ferrite-radio" }
+ferrite-ue = { path = "crates/ferrite-ue" }
+
+# Optimize dependencies even in debug builds; the DSP inner loops are unusably
+# slow otherwise.
+[profile.dev.package."*"]
+opt-level = 3

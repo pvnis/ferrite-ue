@@ -1,0 +1,7 @@
+/target
+# Cargo.lock is tracked: this workspace ships binaries (ferrite-ue).
+*.iq
+*.cfile
+*.bin
+*.f32
+*.rec

@@ -1,0 +1,13 @@
+[package]
+name = "ferrite-phy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+num-complex.workspace = true
+rustfft.workspace = true
+
+[dev-dependencies]
+ferrite-radio.workspace = true

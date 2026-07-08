@@ -1,0 +1,18 @@
+[package]
+name = "ferrite-radio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+num-complex.workspace = true
+zmq = { version = "0.10", optional = true }
+
+[features]
+default = []
+# SoapySDR backend (LiteX-M2SDR, BladeRF, …). Requires libSoapySDR + libclang.
+soapy = []
+# ZMQ IQ-transport backend, for a gNB exposing baseband over ZeroMQ
+# (srsRAN/OCUDU-compatible REQ/REP protocol).
+zmq = ["dep:zmq"]
