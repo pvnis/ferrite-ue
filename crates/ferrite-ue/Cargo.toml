@@ -45,3 +45,7 @@ path = "src/bin/pdsch_cmp.rs"
 [[bin]]
 name = "pdsch-chan"
 path = "src/bin/pdsch_chan.rs"
+
+[[bin]]
+name = "prach-cmp"
+path = "src/bin/prach_cmp.rs"

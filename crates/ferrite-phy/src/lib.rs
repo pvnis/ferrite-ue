@@ -11,6 +11,8 @@ pub mod ofdm;
 pub mod pdcch;
 pub mod pdsch;
 pub mod pdsch_params;
+pub mod prach;
+pub mod prach_tables;
 pub mod sequence;
 pub mod sync;
 
