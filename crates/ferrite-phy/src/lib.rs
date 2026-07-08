@@ -9,6 +9,7 @@ pub mod coding;
 pub mod numerology;
 pub mod ofdm;
 pub mod pdcch;
+pub mod pdsch;
 pub mod pdsch_params;
 pub mod sequence;
 pub mod sync;

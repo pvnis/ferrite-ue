@@ -245,9 +245,64 @@ pub fn dlsch_decode_single(
     Some(b[..tbs].to_vec())
 }
 
+/// Like [`dlsch_decode_single`] but also reports whether the LDPC decoder
+/// converged to a valid codeword (independent of the CRC) — for diagnostics.
+pub fn dlsch_decode_single_dbg(
+    f: &[f32],
+    tbs: usize,
+    r: f64,
+    qm: usize,
+    rv: u8,
+    max_iter: usize,
+) -> (Option<Vec<u8>>, bool) {
+    let p = seg_params(tbs, r);
+    if p.c != 1 {
+        return (None, false);
+    }
+    let b_len = tbs + 24;
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return (None, false);
+    };
+    let ncb = g.n() - 2 * p.zc;
+    let mut filler = vec![false; ncb];
+    let fstart = b_len.saturating_sub(2 * p.zc);
+    for fi in fstart..(p.k - 2 * p.zc) {
+        filler[fi] = true;
+    }
+    let k0 = k0_of(rv, p.bg, ncb, p.zc);
+    let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
+    let mut full = vec![0f32; g.n()];
+    full[2 * p.zc..].copy_from_slice(&cb_llr);
+    let (info, converged) = g.decode(&full, max_iter, 0.75);
+    let b = &info[..b_len];
+    let tb = if CRC24A.check(b) { Some(b[..tbs].to_vec()) } else { None };
+    (tb, converged)
+}
+
 /// Verify a multi-CB block's per-CB CRC24B (helper for future multi-CB support).
 pub fn check_cb_crc(cb: &[u8]) -> bool {
     CRC24B.check(cb)
+}
+
+/// De-rate-match `E` soft bits to the full LDPC codeword LLRs (length
+/// `N_base·Zc`, first `2·Zc` punctured = 0), *without* LDPC decoding. The
+/// systematic bits are then the info bits directly: `codeword[0..K]` = the
+/// transport block + CRC + filler. For interface debugging.
+pub fn de_rate_match_full(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> (Vec<f32>, usize) {
+    let p = seg_params(tbs, r);
+    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    let ncb = g.n() - 2 * p.zc;
+    let b_len = tbs + 24;
+    let mut filler = vec![false; ncb];
+    let fstart = b_len.saturating_sub(2 * p.zc);
+    for fi in fstart..(p.k - 2 * p.zc) {
+        filler[fi] = true;
+    }
+    let k0 = k0_of(rv, p.bg, ncb, p.zc);
+    let cb = de_rate_match_cb(f, &filler, ncb, k0, qm);
+    let mut full = vec![0f32; g.n()];
+    full[2 * p.zc..].copy_from_slice(&cb);
+    (full, p.zc)
 }
 
 #[cfg(test)]
@@ -326,6 +381,44 @@ mod tests {
             .collect();
 
         let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 40).expect("CRC failed");
+        assert_eq!(dec, tb);
+    }
+
+    /// SIB1 regime: E < Ncb (the transmitted bits are a *prefix* of the
+    /// circular buffer, so most of the mother code is untransmitted). tbs=808 →
+    /// Zc=88, N=50·Zc=4400, E=2160.
+    #[test]
+    fn dlsch_roundtrip_e_less_than_ncb() {
+        let mut rng = Rng(0xD15C_0808);
+        let (tbs, qm, e_len, r) = (808usize, 2usize, 2160usize, 0.370);
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
+        assert_eq!(f_bits.len(), e_len);
+        let sigma = 0.6f32;
+        let llr: Vec<f32> = f_bits
+            .iter()
+            .map(|&b| {
+                let s = 1.0 - 2.0 * b as f32;
+                let x = s + rng.normal() * sigma;
+                2.0 * x / (sigma * sigma)
+            })
+            .collect();
+        let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 60).expect("CRC failed (E<Ncb)");
+        assert_eq!(dec, tb);
+    }
+
+    /// Same E<Ncb regime but noiseless with *uniform* LLR magnitudes (what a
+    /// clean ZMQ channel produces: EVM ≈ 0). Exercises the decoder where every
+    /// transmitted bit has identical reliability and ~half the mother code is
+    /// erased.
+    #[test]
+    fn dlsch_roundtrip_uniform_llr_e_less_than_ncb() {
+        let mut rng = Rng(0xD15C_1808);
+        let (tbs, qm, e_len, r) = (808usize, 2usize, 2160usize, 0.370);
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
+        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 10.0 } else { -10.0 }).collect();
+        let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 80).expect("CRC failed (uniform)");
         assert_eq!(dec, tb);
     }
 

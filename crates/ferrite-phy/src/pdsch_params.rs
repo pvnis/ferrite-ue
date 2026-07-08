@@ -46,11 +46,11 @@ pub fn mcs_params(i_mcs: u8) -> (u8, f64) {
     (qm, r1024 as f64 / 1024.0)
 }
 
-/// Number of DM-RS resource elements per PRB for the SIB1 PDSCH: DM-RS config
-/// type 1 with one CDM group without data, on each of `n_dmrs_symbols` symbols
-/// (6 subcarriers per symbol).
+/// DM-RS overhead REs per PRB for the SIB1 PDSCH (TBS purposes). DCI format 1_0
+/// assumes 2 DM-RS CDM groups without data, so the whole DM-RS symbol (12
+/// subcarriers) counts as overhead on each of `n_dmrs_symbols` symbols.
 pub fn ndmrs_per_prb(n_dmrs_symbols: usize) -> usize {
-    6 * n_dmrs_symbols
+    12 * n_dmrs_symbols
 }
 
 /// Transport block size (§5.1.3.2) for a PDSCH allocation. `n_re_per_prb` is the

@@ -21,3 +21,19 @@ path = "src/bin/sync_track.rs"
 [[bin]]
 name = "sib1-dci"
 path = "src/bin/sib1_dci.rs"
+
+[[bin]]
+name = "sib1"
+path = "src/bin/sib1.rs"
+
+[[bin]]
+name = "pdsch-dbg"
+path = "src/bin/pdsch_dbg.rs"
+
+[[bin]]
+name = "pdsch-fwd"
+path = "src/bin/pdsch_fwd.rs"
+
+[[bin]]
+name = "pdsch-sys"
+path = "src/bin/pdsch_sys.rs"

@@ -1,0 +1,80 @@
+# OCUDU gNB config for Ferrite UE bring-up over ZMQ.
+#
+# Copy of ocudu-pavo configs/gnb_zmq_tdd_n78_10mhz.yml, retuned so it coexists
+# with other gNBs on this host:
+#   - ZMQ IQ transport on tcp ports 2100 (DL/tx) / 2101 (UL/rx)   [default is 2000/2001]
+#   - NGAP/GTP bind_addr 127.0.0.20                                [default is 127.0.0.2]
+#   - unique gnb_id 333
+# Points at the shared qcore (AMF at 127.0.0.1, PLMN 00101, TAC 7).
+#
+# Run:   /home/dmd/ocudu-pavo/build/apps/gnb/gnb -c /home/dmd/ferrite/test/gnb_zmq_ferrite.yml
+# Ferrite: cargo run --release -p ferrite-ue --bin ssb-scan -- \
+#            --tx tcp://127.0.0.1:2100 --rx tcp://127.0.0.1:2101 --srate 15.36e6
+
+gnb_id: 333
+
+cu_cp:
+  inactivity_timer: 7200
+  amf:
+    # For SIB1-only bring-up without the core, set `no_core: true` (the cell
+    # then broadcasts SSB/SIB1 without NGAP). For UE attach, leave it pointed at
+    # the shared qcore AMF below and make sure qcore is running.
+    no_core: true            # SIB1 bring-up without core; comment out for attach
+    addr: 127.0.0.1          # shared qcore AMF
+    bind_addr: 127.0.0.20    # unique local bind (NGAP + GTP-U 127.0.0.20:2152)
+    supported_tracking_areas:
+      -
+        tac: 7               # must match qcore (TAC 7)
+        plmn_list:
+          -
+            plmn: "00101"
+            tai_slice_support_list:
+              -
+                sst: 1
+                sd: 0
+
+ru_sdr:
+ device_driver: zmq
+ device_args: tx_port=tcp://127.0.0.1:2100,rx_port=tcp://127.0.0.1:2101,base_srate=15.36e6
+ srate: 15.36
+ tx_gain: 75
+ rx_gain: 75
+
+cell_cfg:
+ dl_arfcn: 626000
+ band: 78
+ channel_bandwidth_MHz: 10
+ common_scs: 30
+ plmn: "00101"
+ tac: 7                       # must match qcore (TAC 7)
+ slicing:
+ - sst: 1
+   sd: 0
+ pci: 1
+ tdd_ul_dl_cfg:
+  dl_ul_tx_period: 10
+  nof_dl_slots: 6
+  nof_dl_symbols: 8
+  nof_ul_slots: 3
+  nof_ul_symbols: 0
+ nof_antennas_ul: 1
+ nof_antennas_dl: 1
+ pdsch:
+  mcs_table: qam256
+ pusch:
+  mcs_table: qam64
+ # NOTE: leave PUCCH at default so the gNB auto-reduces PUCCH resources for the narrow TDD BWP
+ # (the auto-reduction only applies when the user PUCCH config is left default; see
+ #  du_high_config_translators.cpp ~line 835).
+ prach:
+  prach_config_index: 159
+
+log:
+ filename: /tmp/ferrite_gnb_zmq.log
+ all_level: info
+ lib_level: info
+ broadcast_enabled: true
+ hex_max_size: 1024
+
+metrics:
+ autostart_stdout_metrics: 0
