@@ -19,7 +19,7 @@ cu_cp:
     # For SIB1-only bring-up without the core, set `no_core: true` (the cell
     # then broadcasts SSB/SIB1 without NGAP). For UE attach, leave it pointed at
     # the shared qcore AMF below and make sure qcore is running.
-    no_core: true            # SIB1 bring-up without core; comment out for attach
+    # no_core: true          # SIB1-only bring-up; commented → connect to qcore
     addr: 127.0.0.1          # shared qcore AMF
     bind_addr: 127.0.0.20    # unique local bind (NGAP + GTP-U 127.0.0.20:2152)
     supported_tracking_areas:
