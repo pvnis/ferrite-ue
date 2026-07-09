@@ -16,7 +16,7 @@ fn qpsk(b0: u8, b1: u8) -> Complex32 {
 
 fn main() {
     let (cell, tc, slot) = (1u16, 0x4601u16, 17u32);
-    let (rb_start, n_rb, carrier_rb, crb_off) = (4usize, 3usize, 24usize, 2usize);
+    let (rb_start, n_rb, carrier_rb, crb_off) = (4usize, 3usize, 24usize, 0usize);
     let dmrs = [2usize, 7, 11];
 
     let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
@@ -30,11 +30,11 @@ fn main() {
     let dmset: std::collections::HashSet<usize> = dmrs.iter().copied().collect();
     let data_syms: Vec<usize> = (0..14).filter(|l| !dmset.contains(l)).collect();
 
-    // Data — §6.3.1.6 order (k' outer, l inner).
+    // Data — §6.3.1.6 order: increasing k first (inner), then l (outer).
     let mut di = 0;
-    for kp in 0..(12 * n_rb) {
-        let crb_sc = 12 * (crb_off + rb_start + kp / 12) + kp % 12;
-        for &l in &data_syms {
+    for &l in &data_syms {
+        for kp in 0..(12 * n_rb) {
+            let crb_sc = 12 * (crb_off + rb_start + kp / 12) + kp % 12;
             let v = data[di];
             di += 1;
             println!("{crb_sc} {l} {:.6} {:.6}", v.re, v.im);

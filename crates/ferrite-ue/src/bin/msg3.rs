@@ -107,6 +107,7 @@ fn main() {
 
     // Pending Msg3 injection (ul position, samples), shared via the serve closure.
     // Uplink fill = periodic PRACH (base + offset) + any pending one-shot burst.
+    let injected = std::cell::Cell::new(0i64); // diagnostic: pend samples actually written
     let serve = |ul: &mut ZmqSink, counter: &mut u64, base: i64, pend: &Option<(i64, Vec<Complex32>)>| {
         loop {
             let ok = ul.serve_with(counter, |c, block| {
@@ -126,6 +127,7 @@ fn main() {
                         let abs = pos + i as i64;
                         if abs >= c && abs < c + bl {
                             block[(abs - c) as usize] = s;
+                            injected.set(injected.get() + 1);
                         }
                     }
                 }
@@ -172,6 +174,17 @@ fn main() {
     let mut pend: Option<(i64, Vec<Complex32>)> = None;
     let mut slot_buf = vec![Complex32::default(); slot_len as usize];
     let mut slot_idx = 0u32; // 0..20 within the frame
+    // Msg3 launch timing: pos0 (below) lands ~1900 samples late (occ_off models the
+    // PRACH RO ~3.5 symbols late + per-run ZMQ startup skew), and the gNB's decode
+    // window is NARROW (< a CP). So cycle a per-attempt `toff` correction over a fine
+    // grid until the Msg3 lands in the window (crc=OK in the gNB log). Not yet
+    // auto-locked to Msg4 — sweep step must be ≤ ~50 samples or it steps over.
+    let toff_lo: i64 = arg("--toff-lo", "-2800").parse().unwrap();
+    let toff_hi: i64 = arg("--toff-hi", "-600").parse().unwrap();
+    let toff_step: i64 = arg("--toff-step", "25").parse().unwrap();
+    let toffs: Vec<i64> = (toff_lo..=toff_hi).step_by(toff_step.max(1) as usize).collect();
+    println!("toff sweep {toff_lo}..{toff_hi} step {toff_step} ({} pts)", toffs.len());
+    let mut attempt = 0usize;
 
     loop {
         let slot_start_ul = ul_counter as i64;
@@ -219,16 +232,21 @@ fn main() {
                                 println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] (offset {offset})", m_rb0 + m_nrb);
                                 sweep = 0; // freeze the aligned offset
                                 let _ = grant;
-                                let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 2 };
+                                // carrier RB0 = point A (CRB0), so the DM-RS gold sequence
+                                // is referenced directly to the carrier RB (crb_offset 0).
+                                let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 0 };
                                 let tb3 = msg3_tb();
                                 let ulsch = dlsch_encode_single(&tb3, pusch_e_len(&m_alloc), 0.117, 2, 0);
                                 let msg3_slot = slot_idx as i64 + msg3_delay;
-                                let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, (msg3_slot % 20) as u32, (msg3_slot % 2) as usize, tc);
-                                // Optionally frequency-shift the uplink by k·df (the DL SSB
-                                // offset) to test whether the UL grid is carrier- vs SSB-centred.
+                                let dmrs_slot = msg3_slot % 20;
+                                // §5.4 phase compensation at the carrier centre (center_hz):
+                                // the gNB's OFDM demod removes it, so an uncompensated UL
+                                // decorrelates the DM-RS across symbols. Critical for decode.
+                                let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, dmrs_slot as u32, (msg3_slot % 2) as usize, tc, center_hz, fs);
                                 let pos0 = slot_start_ul + msg3_delay * slot_len + offset - ta as i64 * 4;
+                                let toff = toffs[attempt % toffs.len()];
                                 let mut wave = if fshift != 0.0 {
-                                    freq_shift(&wave0, fshift * df, fs, pos0 as usize)
+                                    freq_shift(&wave0, fshift * df, fs, (pos0 + toff) as usize)
                                 } else {
                                     wave0
                                 };
@@ -242,8 +260,9 @@ fn main() {
                                 // PRACH), advanced by the timing advance (N_TA = TA·4 samples).
                                 // Cycle a coarse timing offset to probe alignment (the frozen
                                 // PRACH offset can sit anywhere in the wide detection window).
-                                println!("  → Msg3 at ul {pos0} (slot {msg3_slot})");
-                                let pos = pos0;
+                                attempt += 1;
+                                println!("  → Msg3 TC-RNTI={tc:#06x} toff={toff} at ul {} (slot {msg3_slot})", pos0 + toff);
+                                let pos = pos0 + toff;
                                 pend = Some((pos, wave));
                             }
                             break;
@@ -266,7 +285,9 @@ fn main() {
         // Drop the pending Msg3 once its window has passed.
         if let Some((pos, wave)) = &pend {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
-                println!("  Msg3 transmitted (window passed); watch gNB for PUSCH crc=OK");
+                println!("  Msg3 window passed: injected {}/{} samples (ul_counter {} vs pos {})",
+                    injected.get(), wave.len(), ul_counter, pos);
+                injected.set(0);
                 pend = None;
             }
         }

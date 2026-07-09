@@ -38,6 +38,12 @@ fn qpsk(b0: u8, b1: u8) -> Complex32 {
 /// Modulate one PUSCH slot (14 OFDM symbols) carrying `ulsch` rate-matched bits.
 /// Returns the CP-OFDM time-domain samples for the slot. `slot_in_frame` drives
 /// the DM-RS sequence, `slot_in_subframe` (0/1 at μ=1) the cyclic-prefix pattern.
+///
+/// `center_freq_hz` applies the TS 38.211 §5.4 per-symbol phase compensation
+/// (multiply symbol l by `exp(-j2π·f_c·t_start,l)`, `t_start` from the subframe
+/// start): the gNB's OFDM demodulator removes this using the carrier centre
+/// frequency, so an uncompensated uplink decodes at a garbage SINR. Pass 0.0 to
+/// disable (e.g. for the self-consistent round-trip test). `fs` is the sample rate.
 pub fn pusch_modulate_slot(
     ofdm: &Ofdm,
     ulsch: &[u8],
@@ -46,6 +52,8 @@ pub fn pusch_modulate_slot(
     slot_in_frame: u32,
     slot_in_subframe: usize,
     tc_rnti: u16,
+    center_freq_hz: f64,
+    fs: f64,
 ) -> Vec<Complex32> {
     let n = ofdm.fft_size();
     let center = alloc.carrier_rb * 6; // DC subcarrier index of the UL carrier
@@ -60,11 +68,12 @@ pub fn pusch_modulate_slot(
     let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs_set.contains(l)).collect();
 
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
-    // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs), then l.
+    // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l.
+    // i.e. fill a whole OFDM symbol across subcarriers before moving to the next.
     let mut di = 0;
-    for kp in 0..(12 * alloc.n_rb) {
-        let sc = 12 * alloc.rb_start + kp;
-        for &l in &data_syms {
+    for &l in &data_syms {
+        for kp in 0..(12 * alloc.n_rb) {
+            let sc = 12 * alloc.rb_start + kp;
             if di < data.len() {
                 grids[l][bin(sc)] = data[di];
                 di += 1;
@@ -84,9 +93,21 @@ pub fn pusch_modulate_slot(
     }
 
     let mut out = Vec::with_capacity(14 * (n + 40));
+    // Sample offset from the subframe start to this slot's first symbol.
+    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, 1) + n).sum();
     for (l, grid) in grids.iter().enumerate() {
         let cp = ofdm.cp_len(slot_in_subframe * 14 + l, 1);
-        out.extend(ofdm.modulate_symbol(grid, cp));
+        let sym = ofdm.modulate_symbol(grid, cp);
+        if center_freq_hz != 0.0 {
+            // §5.4 phase compensation: t_start = start of the useful part.
+            let t_start = (sub_off + cp) as f64 / fs;
+            let phase = -2.0 * std::f64::consts::PI * center_freq_hz * t_start;
+            let coeff = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            out.extend(sym.iter().map(|s| s * coeff));
+        } else {
+            out.extend(sym);
+        }
+        sub_off += cp + n;
     }
     out
 }
@@ -119,7 +140,7 @@ mod tests {
         let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
         let ulsch = dlsch_encode_single(&tb, e, r, 2, 0);
 
-        let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, tc_rnti);
+        let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, tc_rnti, 0.0, 15.36e6);
 
         // Demodulate: extract the data REs (skip DM-RS symbols), form soft bits.
         let center = alloc.carrier_rb as i32 * 6;
@@ -133,12 +154,12 @@ mod tests {
             off += cp + 512;
         }
         let mut llr: Vec<f32> = Vec::new();
-        for kp in 0..(12 * alloc.n_rb) {
-            let sc = 12 * alloc.rb_start + kp;
-            for l in 0..14 {
-                if dmrs.contains(&l) {
-                    continue;
-                }
+        for l in 0..14 {
+            if dmrs.contains(&l) {
+                continue;
+            }
+            for kp in 0..(12 * alloc.n_rb) {
+                let sc = 12 * alloc.rb_start + kp;
                 let z = grids[l][bin(sc)];
                 llr.push(z.re);
                 llr.push(z.im);
