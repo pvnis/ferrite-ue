@@ -92,18 +92,19 @@ fn alpha_index(n_id: u16, n_slot: u32, symbol: usize, m0: usize) -> usize {
 }
 
 /// BPSK/QPSK modulation of the HARQ-ACK bits (TS 38.211 §5.1). 1 bit → BPSK.
+/// An empty slice is a positive Scheduling Request (no UCI): d(0) = 1.
 fn modulate_ack(bits: &[u8]) -> Complex32 {
     match bits.len() {
+        0 => Complex32::new(1.0, 0.0), // positive SR: sequence sent unmodulated
         1 => {
             let b = bits[0];
             let v = (1 - 2 * b as i32) as f32 * FRAC_1_SQRT_2;
             Complex32::new(v, v)
         }
-        2 => {
+        _ => {
             let (b0, b1) = (bits[0], bits[1]);
             Complex32::new((1 - 2 * b0 as i32) as f32 * FRAC_1_SQRT_2, (1 - 2 * b1 as i32) as f32 * FRAC_1_SQRT_2)
         }
-        _ => Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2),
     }
 }
 

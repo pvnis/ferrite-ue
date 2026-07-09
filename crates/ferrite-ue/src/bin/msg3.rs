@@ -198,8 +198,7 @@ fn main() {
     let serve = |ul: &mut ZmqSink,
                  counter: &mut u64,
                  base: i64,
-                 pend: &Option<(i64, Vec<Complex32>)>,
-                 pend_pucch: &Option<(i64, Vec<Complex32>)>| {
+                 bursts: &[&Option<(i64, Vec<Complex32>)>]| {
         loop {
             let ok = ul.serve_with(counter, |c, block| {
                 let (c, bl) = (c as i64, block.len() as i64);
@@ -213,7 +212,7 @@ fn main() {
                         }
                     }
                 }
-                for burst in [pend, pend_pucch] {
+                for burst in bursts.iter().copied() {
                     if let Some((pos, wave)) = burst {
                         for (i, &s) in wave.iter().enumerate() {
                             let abs = pos + i as i64;
@@ -235,7 +234,7 @@ fn main() {
     while cap.len() < cap_len {
         fill_dl(&mut dl, &mut blk);
         cap.extend_from_slice(&blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
     }
     let (df, _r, shifted) = gscn_scan(&cap, fs, center_hz, &searcher).expect("no SSB");
     let acq = sync.acquire(&shifted).expect("acquire");
@@ -251,12 +250,12 @@ fn main() {
     let mut to_skip = acq.skip_to_frame;
     while to_skip >= block_len {
         fill_dl(&mut dl, &mut blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
         to_skip -= block_len;
     }
     if to_skip > 0 {
         fill_dl(&mut dl, &mut blk[..to_skip]);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
     }
 
     let blocks_per_slot = slot_len as usize / block_len; // 4
@@ -297,10 +296,20 @@ fn main() {
     // used to advance UL timing; `pend_pucch` is the pending PUCCH F1 burst.
     let mut last_ta: i64 = 5;
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
+    let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
     };
+    // SR PUCCH resource (from the RRCSetup dedicated config): F1, PRB 0 (no hop),
+    // cs 6, occ 3, symb[0,14), monitored at slot 7. A positive SR = tx this (d=1).
+    let sr_cfg = ferrite_phy::pucch::PucchF1 {
+        prb1: 0, prb2: 0, start_symbol: 0, nof_symbols: 14,
+        init_cyclic_shift: 6, occ_index: 3, n_id: acq.cell_id, carrier_rb,
+    };
+    // Once contention resolution is won, drive the connected UE: send an SR to
+    // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
+    let mut connected: Option<u16> = None;
 
     loop {
         let slot_start_ul = ul_counter as i64;
@@ -309,7 +318,7 @@ fn main() {
         for b in 0..blocks_per_slot {
             fill_dl(&mut dl, &mut blk);
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
-            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &pend, &pend_pucch);
+            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &[&pend, &pend_pucch, &pend_sr]);
         }
 
         // Decode this slot's RA search space.
@@ -344,7 +353,7 @@ fn main() {
                             // Accept only a RAR that belongs to the CURRENT offset
                             // (dwell has settled) so its TA precisely corrects Msg3.
                             let settled = sweep == 0 || frames_at_offset >= 3;
-                            if settled && pend.is_none() {
+                            if settled && pend.is_none() && connected.is_none() {
                                 println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] (offset {offset})", m_rb0 + m_nrb);
                                 sweep = 0; // freeze the aligned offset
                                 last_ta = ta as i64;
@@ -425,11 +434,27 @@ fn main() {
                                 println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
                                 pend_pucch = Some((pos, pw));
                             }
+                            if connected.is_none() {
+                                connected = Some(tcx);
+                                println!("  ⇒ CONNECTED as C-RNTI {tcx:#06x} — will SR for Msg5 grant");
+                            }
                             break;
                         }
                     }
                 }
             }
+        }
+
+        // Once connected, send a Scheduling Request each frame at slot 7 to get a
+        // UL grant for Msg5 (until the grant arrives / this is superseded).
+        if connected.is_some() && slot_idx == 0 && pend_sr.is_none() {
+            let sr_slot = 7i64;
+            let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
+            let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+            for s in &mut sw { *s *= amp / pk; }
+            let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
+                + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+            pend_sr = Some((pos, sw));
         }
 
         slot_idx = (slot_idx + 1) % 20;
@@ -451,10 +476,15 @@ fn main() {
                 pend = None;
             }
         }
-        // Drop the pending PUCCH once its window has passed.
+        // Drop the pending PUCCH / SR once their windows have passed.
         if let Some((pos, wave)) = &pend_pucch {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_pucch = None;
+            }
+        }
+        if let Some((pos, wave)) = &pend_sr {
+            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+                pend_sr = None;
             }
         }
     }
