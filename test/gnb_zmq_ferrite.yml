@@ -60,9 +60,15 @@ cell_cfg:
  nof_antennas_ul: 1
  nof_antennas_dl: 1
  pdsch:
-  mcs_table: qam256
+  # Cap DL/UL to QPSK on the qam64 table: the lossless ZMQ channel reports
+  # infinite SINR so link adaptation would otherwise pick 64/256-QAM, which the
+  # Ferrite UE's QPSK-tested modem can't yet produce/consume. MCS ≤ 9 = QPSK, and
+  # matches the UE's qam64 mcs_params so brute-forced DL decode + UL grants align.
+  mcs_table: qam64
+  max_ue_mcs: 9
  pusch:
   mcs_table: qam64
+  max_ue_mcs: 9
  # NOTE: leave PUCCH at default so the gNB auto-reduces PUCCH resources for the narrow TDD BWP
  # (the auto-reduction only applies when the user PUCCH config is left default; see
  #  du_high_config_translators.cpp ~line 835).

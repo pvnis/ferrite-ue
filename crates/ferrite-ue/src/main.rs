@@ -210,36 +210,42 @@ fn try_decode_msg4(
     None
 }
 
-/// Decode a connected-mode DL PDSCH for `crnti` (SRB1: AuthenticationRequest
-/// etc.). The gNB uses CORESET1/USS but a fixed allocation (rb[0,10), MCS2, 1
-/// CDM group), so decode the PDSCH directly. Returns the raw MAC TB on success.
+/// Decode a connected-mode DL PDSCH for `crnti` at RB `[rb_start, rb_start+n_rb)`
+/// (SRB1: AuthenticationRequest / SecurityModeCommand / …). The frequency comes
+/// from the DCI 1_1 assignment; the MCS is brute-forced (LDPC+CRC rejects wrong
+/// guesses), covering the gNB's varying allocations. 1 CDM group, 12 symbols.
+/// Returns the raw MAC TB on success.
 fn try_decode_dl_srb1(
     grids: &[Vec<Complex32>],
     sc_to_bin: impl Fn(i32) -> usize + Copy,
     cell_id: u16,
     slot_idx: u32,
     crnti: u16,
+    rb_start: usize,
     n_rb: usize,
 ) -> Option<Vec<u8>> {
-    let (qm, r) = (2usize, 193.0 / 1024.0); // MCS2, QPSK
     let n_re = n_rb * ((12 - 3) * 12 + 3 * 6); // 1 CDM group: DM-RS symbols carry data on odd SCs
-    let tbs = tbs_from_nre(n_re, r, qm);
-    let alloc = PdschAlloc { rb_start: 0, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: 1 };
-    [true, false].into_iter().find_map(|time_first| {
-        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
-        let mut llr = px.llrs.clone();
-        descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
-        let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
-        if !crc {
-            return None;
+    for mcs in [2u8, 0, 1, 3, 4, 5, 6, 7, 8, 9] {
+        let (qm, r) = mcs_params(mcs);
+        let (qm, r) = (qm as usize, r);
+        let tbs = tbs_from_nre(n_re, r, qm);
+        let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: 1 };
+        let hit = [true, false].into_iter().find_map(|time_first| {
+            let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+            let mut llr = px.llrs.clone();
+            descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
+            let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+            if !crc {
+                return None;
+            }
+            let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+            if tb.iter().all(|&b| b == 0) { None } else { Some(tb) }
+        });
+        if hit.is_some() {
+            return hit;
         }
-        let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-        if tb.iter().all(|&b| b == 0) {
-            None
-        } else {
-            Some(tb)
-        }
-    })
+    }
+    None
 }
 
 fn main() {
@@ -584,18 +590,32 @@ fn run(cfg: Config) {
         }
 
         // Connected DL: decode the SRB1 PDSCH at DL slots and drive the NAS
-        // registration state machine (AuthReq → SMC → RegistrationAccept). The gNB
-        // uses CORESET1/USS/DCI-1_1 but a fixed PDSCH allocation (rb[0,10/11), MCS2,
-        // 1 CDM group), so decode the PDSCH directly.
+        // registration state machine (AuthReq → SMC → RegistrationAccept). The DL
+        // allocation is variable, so read it from the DCI 1_1 assignment in the
+        // CORESET1 USS (frequency = FDRA bits[1..10]); fall back to the fixed
+        // rb[0,10/11) (the AuthReq) if no DCI decodes. MCS is brute-forced.
         if connected.is_some() && !reg_done && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
+                let crnti = connected.unwrap();
+                let mut allocs: Vec<(usize, usize)> = uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
+                    .into_iter()
+                    .filter_map(|cand| {
+                        let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
+                        pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
+                        dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1).map(|b| {
+                            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                            riv_decode(riv, carrier_rb)
+                        })
+                    })
+                    .collect();
+                allocs.push((0, 10));
+                allocs.push((0, 11));
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
-                    for nrb in [10usize, 11] {
-                        let probe = PdschAlloc { rb_start: 0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 };
+                    for (rb0, nrb) in allocs {
+                        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
-                            let crnti = connected.unwrap();
-                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, nrb) {
+                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb) {
                                 let Some(nas) = parse_srb1_dl_nas(&tb) else { break };
                                 // Strip the NAS security header (SMC/RegAccept are
                                 // integrity protected); dispatch on the message type.
