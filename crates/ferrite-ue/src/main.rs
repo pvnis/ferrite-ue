@@ -22,7 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
-use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -243,7 +243,17 @@ fn try_decode_dl_srb1(
                     return None;
                 }
                 let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-                if tb.iter().all(|&b| b == 0) { None } else { Some(tb) }
+                // A wrong (mcs, cdm) guess can still pass the 24-bit CRC on a
+                // retransmission; require the TB to unstack to a plausible DL-DCCH
+                // RRC PDU (known c1 type; a dlInformationTransfer must carry a 0x7e
+                // NAS) so the brute-force keeps trying until the real decode.
+                let rrc = parse_srb1_dl_rrc(&tb)?;
+                let ok = match dl_dcch_type(&rrc) {
+                    Some(5) => parse_dl_dcch_nas(&rrc).is_some_and(|n| n.first() == Some(&0x7e)),
+                    Some(0 | 2 | 4) => true,
+                    _ => false,
+                };
+                if ok { Some(tb) } else { None }
             });
             if hit.is_some() {
                 return hit;
@@ -465,7 +475,11 @@ fn run(cfg: Config) {
         // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
         const DCI_0_1_SIZE: usize = 36;
         if let Some(crnti) = connected {
-            if pend_msg5.is_none() && (!ul_queue.is_empty() || pending_status.is_some()) {
+            // Decode a UL grant every slot (not only when we have data): a grant the
+            // UE leaves empty is decoded as noise (crc=KO) and enough consecutive KOs
+            // trip the gNB's "MAC max KOs" radio-link failure. So always fill a
+            // decoded grant with a valid MAC PDU (reporting an empty buffer when idle).
+            if pend_msg5.is_none() {
                 let c0 = Candidate { agg_level: 4, cces: (0..4).collect() };
                 let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
@@ -507,6 +521,10 @@ fn run(cfg: Config) {
                             // retransmitting and delivers the next one.
                             pending_status = None;
                             (rlc_status_mac_pdu(ack, tbs_bytes), format!("RLC STATUS ack={ack}"))
+                        } else if ul_queue.is_empty() {
+                            // Idle grant: a valid, decodable PDU that reports an empty
+                            // buffer so the gNB stops granting (and no crc=KO).
+                            (mac_short_bsr(0, tbs_bytes), String::new())
                         } else if ul_queue.front().unwrap().len() + 10 > tbs_bytes {
                             let need = ul_queue.front().unwrap().len() + 10;
                             (mac_short_bsr(need, tbs_bytes), format!("Short BSR (need {need}B)"))
@@ -523,7 +541,9 @@ fn run(cfg: Config) {
                         let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                         for s in &mut m5 { *s *= amp / pk; }
                         let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                        println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
+                        if !kind.is_empty() {
+                            println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
+                        }
                         pend_msg5 = Some((pos, m5));
                     }
                 }
