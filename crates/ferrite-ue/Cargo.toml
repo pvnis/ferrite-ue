@@ -3,6 +3,9 @@ name = "ferrite-ue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# The UE entry point is src/main.rs (binary `ferrite-ue`); the src/bin/* targets
+# are milestone-specific test/debug harnesses.
+default-run = "ferrite-ue"
 
 [dependencies]
 ferrite-common.workspace = true
@@ -61,10 +64,6 @@ path = "src/bin/prach_tx.rs"
 [[bin]]
 name = "rar-rx"
 path = "src/bin/rar_rx.rs"
-
-[[bin]]
-name = "msg3"
-path = "src/bin/msg3.rs"
 
 [[bin]]
 name = "msg3-grid"

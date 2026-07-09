@@ -1,10 +1,13 @@
-//! Msg3 (PUSCH) transmit. Runs the random-access procedure: PRACH → RAR → Msg3.
-//! Sweeps the PRACH offset until a RAR is decoded, then freezes the offset,
-//! builds the Msg3 PUSCH from the RAR's grant/TC-RNTI, and injects it into the
-//! uplink at the granted slot (RAR slot + msg3_delay). Decodes slot-by-slot so
-//! the RAR is known before the Msg3 slot's uplink is served.
+//! Ferrite UE — the entry point. Drives the whole attach procedure over the
+//! ZMQ radio link to the OCUDU gNB: cell search → PRACH → RAR → Msg3 → Msg4
+//! (contention resolution) → PUCCH/SR → RRCSetupComplete + NAS RegistrationRequest
+//! → 5G-AKA (AuthenticationRequest/Response). Runs a locked read-DL/serve-UL loop
+//! and decodes slot-by-slot so each downlink message is known before the uplink
+//! it schedules is served.
 //!
-//! Usage: msg3 [--tx …:2100] [--rx …:2101] [--center-mhz 3390.0] [--sweep 384]
+//! Run:   ferrite-ue [--tx tcp://…:2100] [--rx tcp://…:2101] [--center-mhz 3390.0]
+//!                   [--imsi …] [--ki …] [--opc …] …  (see `Config` for all flags)
+//! The gNB (radio/PHY config) and qcore (5G core) must be up first.
 
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
@@ -31,6 +34,56 @@ fn hexn<const N: usize>(s: &str) -> [u8; N] {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
     }
     out
+}
+
+/// All run-time configuration, parsed once from the command line. Every field
+/// has a working default for the local OCUDU/qcore test setup.
+struct Config {
+    /// ZMQ endpoint for the downlink (gNB TX → UE) and uplink (UE → gNB RX).
+    tx: String,
+    rx: String,
+    /// Sample rate (Hz) and carrier centre frequency (Hz).
+    fs: f64,
+    center_hz: f64,
+    /// PRACH preamble index and UL TX peak amplitude.
+    preamble: usize,
+    amp: f32,
+    /// PRACH offset sweep step; Msg3 slot delay; optional UL frequency shift.
+    sweep0: i64,
+    msg3_delay: i64,
+    fshift: f64,
+    /// Msg3 timing-offset (`toff`) search window: lo..=hi step.
+    toff_lo: i64,
+    toff_hi: i64,
+    toff_step: i64,
+    /// Subscriber identity + 5G-AKA (Milenage) credentials and serving-network name.
+    imsi: String,
+    ki: [u8; 16],
+    opc: [u8; 16],
+    snn: String,
+}
+
+impl Config {
+    fn from_args() -> Self {
+        Config {
+            tx: arg("--tx", "tcp://127.0.0.1:2100"),
+            rx: arg("--rx", "tcp://127.0.0.1:2101"),
+            fs: arg("--srate", "15.36e6").parse().unwrap(),
+            center_hz: arg("--center-mhz", "3390.0").parse::<f64>().unwrap() * 1e6,
+            preamble: arg("--preamble", "0").parse().unwrap(),
+            amp: arg("--amp", "0.5").parse().unwrap(),
+            sweep0: arg("--sweep", "384").parse().unwrap(),
+            msg3_delay: arg("--msg3-delay", "7").parse().unwrap(),
+            fshift: arg("--fshift", "0").parse().unwrap(),
+            toff_lo: arg("--toff-lo", "-2800").parse().unwrap(),
+            toff_hi: arg("--toff-hi", "-600").parse().unwrap(),
+            toff_step: arg("--toff-step", "25").parse().unwrap(),
+            imsi: arg("--imsi", "001010167891203"),
+            ki: hexn(&arg("--ki", "5122250214c33e723a5dd523fc145fc0")),
+            opc: hexn(&arg("--opc", "981d464c7c52eb6e5036234984ad0bcf")),
+            snn: arg("--snn", "5G:mnc001.mcc001.3gppnetwork.org"),
+        }
+    }
 }
 
 fn arg(name: &str, default: &str) -> String {
@@ -190,15 +243,14 @@ fn try_decode_dl_srb1(
 }
 
 fn main() {
-    let tx = arg("--tx", "tcp://127.0.0.1:2100");
-    let rx = arg("--rx", "tcp://127.0.0.1:2101");
-    let fs: f64 = arg("--srate", "15.36e6").parse().unwrap();
-    let center_hz: f64 = arg("--center-mhz", "3390.0").parse::<f64>().unwrap() * 1e6;
-    let preamble: usize = arg("--preamble", "0").parse().unwrap();
-    let amp: f32 = arg("--amp", "0.5").parse().unwrap();
-    let sweep0: i64 = arg("--sweep", "384").parse().unwrap();
-    let msg3_delay: i64 = arg("--msg3-delay", "7").parse().unwrap();
-    let fshift: f64 = arg("--fshift", "0").parse().unwrap();
+    run(Config::from_args());
+}
+
+fn run(cfg: Config) {
+    let Config {
+        tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
+        toff_lo, toff_hi, toff_step, imsi, ki, opc, snn,
+    } = cfg;
 
     let fft = (fs / 30_000.0).round() as usize;
     let searcher = CellSearcher::new(fft, 1);
@@ -315,9 +367,6 @@ fn main() {
     // window is NARROW (< a CP). So cycle a per-attempt `toff` correction over a fine
     // grid until the Msg3 lands in the window (crc=OK in the gNB log). Not yet
     // auto-locked to Msg4 — sweep step must be ≤ ~50 samples or it steps over.
-    let toff_lo: i64 = arg("--toff-lo", "-2800").parse().unwrap();
-    let toff_hi: i64 = arg("--toff-hi", "-600").parse().unwrap();
-    let toff_step: i64 = arg("--toff-step", "25").parse().unwrap();
     let toffs: Vec<i64> = (toff_lo..=toff_hi).step_by(toff_step.max(1) as usize).collect();
     println!("toff sweep {toff_lo}..{toff_hi} step {toff_step} ({} pts)", toffs.len());
     let mut attempt = 0usize;
@@ -362,12 +411,7 @@ fn main() {
     let mut srb1_sn: u16 = 0;
     let mut auth_done = false;
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
-    let imsi = arg("--imsi", "001010167891203");
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
-    // 5G-AKA credentials (TS 35.206 Milenage) and serving-network name.
-    let ki: [u8; 16] = hexn(&arg("--ki", "5122250214c33e723a5dd523fc145fc0"));
-    let opc: [u8; 16] = hexn(&arg("--opc", "981d464c7c52eb6e5036234984ad0bcf"));
-    let snn = arg("--snn", "5G:mnc001.mcc001.3gppnetwork.org");
 
     loop {
         let slot_start_ul = ul_counter as i64;
