@@ -11,7 +11,7 @@
 
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
-use ferrite_phy::pdcch::{equalize_candidate, Candidate, Coreset0};
+use ferrite_phy::pdcch::{equalize_candidate, equalize_candidate_c1, uss_candidates, Candidate, Coreset0};
 use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, pdsch_scramble_c_init, PdschAlloc};
 use ferrite_phy::pdsch_params::mcs_params;
 use ferrite_phy::prach::{prach_ncs_unrestricted, prach_occasion_waveform, prach_preamble_seq, PrachOccasion, PrachScs, PrachSeqLen};
@@ -22,7 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{milenage, res_star};
 use ferrite_ue::nas::{auth_response, parse_auth_request, registration_request};
-use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, parse_srb1_dl_nas, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::rrc::{mac_short_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_srb1_dl_nas, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -437,37 +437,71 @@ fn run(cfg: Config) {
             cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
             off += cp + fft;
         }
-        // Connected: decode the C-RNTI DCI 0_0 UL grant (AL4 CCE0, CORESET0) and
-        // send the next queued SRB1 RRC PDU on the granted PUSCH, k2 slots later.
+        // Connected: decode the C-RNTI UL grant and send the next queued SRB1 RRC
+        // PDU on the granted PUSCH, k2 slots later. The gNB grants the FIRST UL
+        // (RRCSetupComplete) via a CORESET0 fallback DCI 0_0 (AL4 CCE0), then moves
+        // to the UE-specific search space (CORESET1, DCI 0_1) for everything after.
+        // DCI 0_0 (37b) and 0_1 (36b) share their leading fields — id(1) freq-RIV
+        // (9,N=24) time(4) hop(1) mcs(5) ndi(1) — so one parser handles both; only
+        // the payload size and the search space differ. CORESET1 spans the whole
+        // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
+        const DCI_0_1_SIZE: usize = 36;
         if let Some(crnti) = connected {
             if pend_msg5.is_none() && !ul_queue.is_empty() {
-                let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
-                let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &cand);
+                let c0 = Candidate { agg_level: 4, cces: (0..4).collect() };
+                let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
-                if let Some(bits) = dci_decode(&m, crnti, a_len) {
-                    // DCI 0_0 (UL grant): id(1) freq(9,N=24) time(4) hop(1) mcs(5) ndi(1)...
+                let dci = dci_decode(&m, crnti, a_len).or_else(|| {
+                    // CORESET1 UE-specific search space: DCI 0_1 (non-interleaved,
+                    // AL2×4 + AL4×2 candidates). n_ID/n_RNTI for scrambling = cell_id/0.
+                    uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
+                        .into_iter()
+                        .find_map(|cand| {
+                            let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
+                            pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
+                            dci_decode(&mm, crnti, DCI_0_1_SIZE)
+                        })
+                });
+                if let Some(bits) = dci {
+                    // UL grant. Both formats share id(1) + FDRA(9, type-1 RIV/N=24)
+                    // at bits[1..10]; after that DCI 0_0 has time(4)+hop(1) then MCS,
+                    // while DCI 0_1 (this config) has only a 3-bit time field and no
+                    // hop flag, so its MCS/NDI sit 2 bits earlier. Verified live vs the
+                    // gNB's scheduled grant (MCS/RV/HARQ aligned).
                     if bits[0] == 0 {
+                        let mcs_lo = if bits.len() == DCI_0_1_SIZE { 13 } else { 15 };
                         let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
-                        let mcs = bits[15..20].iter().fold(0u8, |a, &b| a << 1 | b);
-                        let ndi = bits[20];
+                        let mcs = bits[mcs_lo..mcs_lo + 5].iter().fold(0u8, |a, &b| a << 1 | b);
+                        let ndi = bits[mcs_lo + 5];
                         let (qm, r) = mcs_params(mcs);
                         let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
                         let n_data_sym = 14 - 3;
                         let e = g_nrb * 12 * n_data_sym * qm as usize;
                         let tbs = tbs_from_nre(g_nrb * 12 * n_data_sym, r, qm as usize);
-                        let rrc = ul_queue.pop_front().unwrap();
-                        let mac = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs / 8);
+                        let tbs_bytes = tbs / 8;
+                        // The queued RRC PDU framed for SRB1 costs MAC(2)+RLC(2)+PDCP(2)
+                        // +MAC-I(4) = 10 bytes of overhead. If it doesn't fit the grant
+                        // (the gNB grants a minimal TB after an SR and waits for a BSR),
+                        // send a Short BSR to solicit a larger grant instead.
+                        let need = ul_queue.front().unwrap().len() + 10;
+                        let (mac, kind) = if need > tbs_bytes {
+                            (mac_short_bsr(need, tbs_bytes), format!("Short BSR (need {need}B)"))
+                        } else {
+                            let rrc = ul_queue.pop_front().unwrap();
+                            let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes);
+                            let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
+                            srb1_sn += 1;
+                            (m, k)
+                        };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
                         let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
                         let mut m5 = pusch_modulate_slot(&ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize, crnti, center_hz, fs);
                         let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                         for s in &mut m5 { *s *= amp / pk; }
                         let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                        let kind = if srb1_sn == 0 { "RRCSetupComplete" } else { "UL-DCCH(NAS)" };
-                        println!("  → SRB1 {kind} (SN {srb1_sn}): grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb, tbs / 8);
+                        println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
                         pend_msg5 = Some((pos, m5));
-                        srb1_sn += 1;
                     }
                 }
             }

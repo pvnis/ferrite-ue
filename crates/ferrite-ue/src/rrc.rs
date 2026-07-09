@@ -268,6 +268,31 @@ pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize) -> Vec<u
     mac
 }
 
+/// UL-SCH LCID for a Short BSR MAC CE (TS 38.321 Table 6.2.1-2).
+pub const LCID_SHORT_BSR: u8 = 61;
+
+/// Build a UL-SCH MAC PDU carrying a Short BSR MAC CE (TS 38.321 §6.1.3.1) that
+/// reports `buf_bytes` pending on logical-channel group 0, padded to `tbs`
+/// bytes. Sent in a minimal grant to solicit a larger one when the queued SRB1
+/// PDU doesn't fit. The 5-bit buffer-size index is the smallest level whose
+/// upper bound ≥ `buf_bytes` (Table 6.1.3.1-1).
+pub fn mac_short_bsr(buf_bytes: usize, tbs: usize) -> Vec<u8> {
+    const LEVELS: [usize; 32] = [
+        0, 10, 14, 20, 28, 38, 53, 74, 102, 142, 198, 276, 384, 528, 726, 1010,
+        1420, 1983, 2765, 3839, 5446, 7594, 10570, 14099, 19468, 26971, 38326,
+        49759, 65726, 86677, 114069, usize::MAX,
+    ];
+    let idx = LEVELS.iter().position(|&l| l >= buf_bytes).unwrap_or(31) as u8;
+    let mut mac = Vec::with_capacity(tbs);
+    mac.push(LCID_SHORT_BSR); // R/R/LCID (fixed-size CE, no L field)
+    mac.push(idx & 0x1f); // LCG-ID (bits 7..5) = 0 | buffer-size index (bits 4..0)
+    if mac.len() < tbs {
+        mac.push(LCID_PADDING);
+        mac.resize(tbs, 0);
+    }
+    mac
+}
+
 /// Build the Msg3 MAC PDU: one CCCH48 subPDU carrying `ccch_sdu` (the 6-byte
 /// RRCSetupRequest) followed by padding, sized to `tbs` bytes.
 pub fn msg3_mac_pdu(ccch_sdu: &[u8; 6], tbs: usize) -> Vec<u8> {
