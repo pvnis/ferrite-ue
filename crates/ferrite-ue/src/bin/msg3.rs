@@ -192,7 +192,14 @@ fn main() {
     // Pending Msg3 injection (ul position, samples), shared via the serve closure.
     // Uplink fill = periodic PRACH (base + offset) + any pending one-shot burst.
     let injected = std::cell::Cell::new(0i64); // diagnostic: pend samples actually written
-    let serve = |ul: &mut ZmqSink, counter: &mut u64, base: i64, pend: &Option<(i64, Vec<Complex32>)>| {
+    // Uplink fill = periodic PRACH (base + offset) + Msg3 burst (`pend`) + PUCCH
+    // HARQ-ACK burst (`pend_pucch`). Msg3 (PRB 4-6) and PUCCH (PRB 0/23) never
+    // overlap in frequency, so both can be present in the same UL slot.
+    let serve = |ul: &mut ZmqSink,
+                 counter: &mut u64,
+                 base: i64,
+                 pend: &Option<(i64, Vec<Complex32>)>,
+                 pend_pucch: &Option<(i64, Vec<Complex32>)>| {
         loop {
             let ok = ul.serve_with(counter, |c, block| {
                 let (c, bl) = (c as i64, block.len() as i64);
@@ -206,12 +213,14 @@ fn main() {
                         }
                     }
                 }
-                if let Some((pos, wave)) = pend {
-                    for (i, &s) in wave.iter().enumerate() {
-                        let abs = pos + i as i64;
-                        if abs >= c && abs < c + bl {
-                            block[(abs - c) as usize] = s;
-                            injected.set(injected.get() + 1);
+                for burst in [pend, pend_pucch] {
+                    if let Some((pos, wave)) = burst {
+                        for (i, &s) in wave.iter().enumerate() {
+                            let abs = pos + i as i64;
+                            if abs >= c && abs < c + bl {
+                                block[(abs - c) as usize] = s;
+                                injected.set(injected.get() + 1);
+                            }
                         }
                     }
                 }
@@ -226,7 +235,7 @@ fn main() {
     while cap.len() < cap_len {
         fill_dl(&mut dl, &mut blk);
         cap.extend_from_slice(&blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
     }
     let (df, _r, shifted) = gscn_scan(&cap, fs, center_hz, &searcher).expect("no SSB");
     let acq = sync.acquire(&shifted).expect("acquire");
@@ -242,12 +251,12 @@ fn main() {
     let mut to_skip = acq.skip_to_frame;
     while to_skip >= block_len {
         fill_dl(&mut dl, &mut blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
         to_skip -= block_len;
     }
     if to_skip > 0 {
         fill_dl(&mut dl, &mut blk[..to_skip]);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &None, &None);
     }
 
     let blocks_per_slot = slot_len as usize / block_len; // 4
@@ -284,6 +293,14 @@ fn main() {
     let mut recent_tc: std::collections::VecDeque<(u16, i64)> = std::collections::VecDeque::new();
     let mut locked_toff: Option<i64> = None;
     let mut msg4_wins = 0u32;
+    // PUCCH HARQ-ACK for Msg4 (contention resolution). `last_ta` is the RAR TA
+    // used to advance UL timing; `pend_pucch` is the pending PUCCH F1 burst.
+    let mut last_ta: i64 = 5;
+    let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
+    let pucch_cfg = ferrite_phy::pucch::PucchF1 {
+        prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
+        init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
+    };
 
     loop {
         let slot_start_ul = ul_counter as i64;
@@ -292,7 +309,7 @@ fn main() {
         for b in 0..blocks_per_slot {
             fill_dl(&mut dl, &mut blk);
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
-            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &pend);
+            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &pend, &pend_pucch);
         }
 
         // Decode this slot's RA search space.
@@ -330,6 +347,7 @@ fn main() {
                             if settled && pend.is_none() {
                                 println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] (offset {offset})", m_rb0 + m_nrb);
                                 sweep = 0; // freeze the aligned offset
+                                last_ta = ta as i64;
                                 let _ = grant;
                                 // carrier RB0 = point A (CRB0), so the DM-RS gold sequence
                                 // is referenced directly to the carrier RB (crb_offset 0).
@@ -394,6 +412,19 @@ fn main() {
                                 sweep = 0;
                                 println!("  ⇒ toff LOCKED at {toffx} (Msg3 now reliable); Msg4 wins={msg4_wins}");
                             }
+                            // HARQ-ACK the Msg4 on PUCCH F1 at the next UL slot
+                            // (7 for a DL slot ≤5, else 17). Same UL timing as Msg3.
+                            if pend_pucch.is_none() {
+                                let pucch_slot = if slot_idx < 10 { 7 } else { 17 };
+                                let mut pw = ferrite_phy::pucch::pucch_f1_modulate_slot(
+                                    &ofdm, &pucch_cfg, &[1], pucch_slot as u32, center_hz, fs);
+                                let pk = pw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                                for s in &mut pw { *s *= amp / pk; }
+                                let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
+                                    + offset + toffx - last_ta * 4;
+                                println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
+                                pend_pucch = Some((pos, pw));
+                            }
                             break;
                         }
                     }
@@ -418,6 +449,12 @@ fn main() {
                     injected.get(), wave.len(), ul_counter, pos);
                 injected.set(0);
                 pend = None;
+            }
+        }
+        // Drop the pending PUCCH once its window has passed.
+        if let Some((pos, wave)) = &pend_pucch {
+            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+                pend_pucch = None;
             }
         }
     }
