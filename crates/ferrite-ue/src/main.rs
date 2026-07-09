@@ -22,7 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
-use ferrite_ue::rrc::{mac_short_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_srb1_dl_nas, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -224,25 +224,30 @@ fn try_decode_dl_srb1(
     rb_start: usize,
     n_rb: usize,
 ) -> Option<Vec<u8>> {
-    let n_re = n_rb * ((12 - 3) * 12 + 3 * 6); // 1 CDM group: DM-RS symbols carry data on odd SCs
-    for mcs in [2u8, 0, 1, 3, 4, 5, 6, 7, 8, 9] {
-        let (qm, r) = mcs_params(mcs);
-        let (qm, r) = (qm as usize, r);
-        let tbs = tbs_from_nre(n_re, r, qm);
-        let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: 1 };
-        let hit = [true, false].into_iter().find_map(|time_first| {
-            let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
-            let mut llr = px.llrs.clone();
-            descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
-            let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
-            if !crc {
-                return None;
+    // Brute-force the modulation/coding and the DM-RS CDM-group count (1 group ⇒
+    // data on the odd SCs of DM-RS symbols; 2 groups ⇒ none), since both vary
+    // across the connected-mode DL. n_re follows the CDM-group choice.
+    for cdm in [1usize, 2] {
+        let n_re = n_rb * ((12 - 3) * 12 + if cdm == 1 { 3 * 6 } else { 0 });
+        for mcs in [2u8, 0, 1, 3, 4, 5, 6, 7, 8, 9] {
+            let (qm, r) = mcs_params(mcs);
+            let (qm, r) = (qm as usize, r);
+            let tbs = tbs_from_nre(n_re, r, qm);
+            let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: cdm };
+            let hit = [true, false].into_iter().find_map(|time_first| {
+                let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+                let mut llr = px.llrs.clone();
+                descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
+                let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+                if !crc {
+                    return None;
+                }
+                let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+                if tb.iter().all(|&b| b == 0) { None } else { Some(tb) }
+            });
+            if hit.is_some() {
+                return hit;
             }
-            let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-            if tb.iter().all(|&b| b == 0) { None } else { Some(tb) }
-        });
-        if hit.is_some() {
-            return hit;
         }
     }
     None
@@ -421,6 +426,8 @@ fn run(cfg: Config) {
     let mut reg_done = false; // RegistrationComplete queued
     let mut nas_ul_count: u32 = 0; // NAS COUNT for uplink integrity protection
     let mut k_nasint: Option<[u8; 16]> = None; // 128-NIA2 key, derived after AKA
+    let mut dl_rlc_next: u16 = 0; // next expected DL RLC SN (for RLC STATUS ACK)
+    let mut pending_status: Option<u16> = None; // ACK_SN to report so the gNB DL advances
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -458,7 +465,7 @@ fn run(cfg: Config) {
         // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
         const DCI_0_1_SIZE: usize = 36;
         if let Some(crnti) = connected {
-            if pend_msg5.is_none() && !ul_queue.is_empty() {
+            if pend_msg5.is_none() && (!ul_queue.is_empty() || pending_status.is_some()) {
                 let c0 = Candidate { agg_level: 4, cces: (0..4).collect() };
                 let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
@@ -495,8 +502,13 @@ fn run(cfg: Config) {
                         // +MAC-I(4) = 10 bytes of overhead. If it doesn't fit the grant
                         // (the gNB grants a minimal TB after an SR and waits for a BSR),
                         // send a Short BSR to solicit a larger grant instead.
-                        let need = ul_queue.front().unwrap().len() + 10;
-                        let (mac, kind) = if need > tbs_bytes {
+                        let (mac, kind) = if let Some(ack) = pending_status {
+                            // Acknowledge received DL RLC SDUs so the gNB stops
+                            // retransmitting and delivers the next one.
+                            pending_status = None;
+                            (rlc_status_mac_pdu(ack, tbs_bytes), format!("RLC STATUS ack={ack}"))
+                        } else if ul_queue.front().unwrap().len() + 10 > tbs_bytes {
+                            let need = ul_queue.front().unwrap().len() + 10;
                             (mac_short_bsr(need, tbs_bytes), format!("Short BSR (need {need}B)"))
                         } else {
                             let rrc = ul_queue.pop_front().unwrap();
@@ -616,12 +628,24 @@ fn run(cfg: Config) {
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
                             if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb) {
-                                let Some(nas) = parse_srb1_dl_nas(&tb) else { break };
-                                // Strip the NAS security header (SMC/RegAccept are
-                                // integrity protected); dispatch on the message type.
+                                let Some((rlc_sn, rrc)) = parse_srb1_dl_rrc_sn(&tb) else { break };
+                                // On a NEW DL RLC SDU, arm an RLC STATUS ACK so the
+                                // gNB advances (don't re-arm on retransmissions, which
+                                // would starve our own UL data).
+                                if rlc_sn >= dl_rlc_next {
+                                    dl_rlc_next = rlc_sn + 1;
+                                    pending_status = Some(dl_rlc_next);
+                                }
+                                let dtype = dl_dcch_type(&rrc);
+                                println!("★ DL RRC (slot {slot_idx} rlcSN {rlc_sn}): c1={dtype:?} {}",
+                                    rrc.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                // securityModeCommand (4) and rrcReconfiguration (0) are
+                                // handled in the AS-security milestone; for now dispatch the
+                                // NAS carried in dlInformationTransfer (5).
+                                let Some(nas) = parse_dl_dcch_nas(&rrc).filter(|_| dtype == Some(5)) else { break };
                                 let (sht, dl_mac, dl_seq, inner) = strip_security_header(&nas);
                                 let mtype = nas_msg_type(inner);
-                                println!("★ DL NAS (slot {slot_idx}): sht={sht} type={:02x?} {}",
+                                println!("   NAS sht={sht} type={:02x?} {}",
                                     mtype, inner.iter().map(|b| format!("{b:02x}")).collect::<String>());
                                 match mtype {
                                     // AuthenticationRequest → run 5G-AKA, derive the NAS
@@ -733,7 +757,7 @@ fn run(cfg: Config) {
         // Send a Scheduling Request each frame at slot 7 whenever an SRB1 PDU is
         // queued (RRCSetupComplete, then the AuthenticationResponse) to solicit
         // a UL grant. Stops once the queue drains so we don't over-request.
-        if connected.is_some() && !ul_queue.is_empty() && slot_idx == 0 && pend_sr.is_none() {
+        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some()) && slot_idx == 0 && pend_sr.is_none() {
             let sr_slot = 7i64;
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);

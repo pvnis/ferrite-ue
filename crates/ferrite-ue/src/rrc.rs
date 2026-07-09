@@ -177,25 +177,45 @@ pub fn parse_dl_dcch_nas(rrc: &[u8]) -> Option<Vec<u8>> {
 /// SDU), the PDCP Data PDU header (2 octets, 12-bit SN) and trailing MAC-I
 /// (4 octets), then decodes the DL-DCCH dlInformationTransfer RRC PDU.
 pub fn parse_srb1_dl_nas(mac_pdu: &[u8]) -> Option<Vec<u8>> {
-    // A DL-SCH PDU can carry several LCID-1 subPDUs: an RLC AM STATUS PDU
-    // (ACKing our uplink, D/C=0) alongside the RLC AM DATA PDU with the SDU.
-    // Scan every DCCH subPDU and decode the first DATA PDU that yields a NAS.
+    parse_dl_dcch_nas(&parse_srb1_dl_rrc(mac_pdu)?)
+}
+
+/// Unstack a DL-SCH SRB1 MAC PDU → the raw RRC PDU (a DL-DCCH message). Peels the
+/// MAC subheader (DCCH = LCID 1), the RLC AM Data PDU header (2 octets, 12-bit
+/// SN — skipping any RLC STATUS PDU), and the PDCP header (2 octets) + trailing
+/// MAC-I (4 octets). The payload is plaintext RRC (NEA0); a non-null AS cipher
+/// would require deciphering the PDCP payload first. Also returns the RLC SN.
+pub fn parse_srb1_dl_rrc_sn(mac_pdu: &[u8]) -> Option<(u16, Vec<u8>)> {
     for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
         let rlc = &s.payload;
         // RLC AM DATA PDU: D/C must be 1 (skip STATUS); 12-bit SN ⇒ 2-octet header.
         if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
             continue;
         }
+        let rlc_sn = (((rlc[0] & 0x0f) as u16) << 8) | rlc[1] as u16;
         let pdcp = &rlc[2..];
         // PDCP Data PDU (SRB): 2-octet header (12-bit SN) + RRC + 4-octet MAC-I.
         if pdcp.len() < 2 + 4 {
             continue;
         }
-        if let Some(nas) = parse_dl_dcch_nas(&pdcp[2..pdcp.len() - 4]) {
-            return Some(nas);
-        }
+        return Some((rlc_sn, pdcp[2..pdcp.len() - 4].to_vec()));
     }
     None
+}
+
+/// As `parse_srb1_dl_rrc_sn` but returning only the RRC PDU.
+pub fn parse_srb1_dl_rrc(mac_pdu: &[u8]) -> Option<Vec<u8>> {
+    parse_srb1_dl_rrc_sn(mac_pdu).map(|(_, rrc)| rrc)
+}
+
+/// The DL-DCCH c1 message index (TS 38.331): 0=rrcReconfiguration, 2=rrcRelease,
+/// 4=securityModeCommand, 5=dlInformationTransfer, … Returns None if not a c1.
+pub fn dl_dcch_type(rrc: &[u8]) -> Option<u8> {
+    let b = *rrc.first()?;
+    if b & 0x80 != 0 {
+        return None; // not the c1 CHOICE
+    }
+    Some((b >> 3) & 0x0f)
 }
 
 /// Encode `UL-DCCH-Message { c1: rrcSetupComplete }` carrying `nas` as the
@@ -270,6 +290,28 @@ pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize) -> Vec<u
 
 /// UL-SCH LCID for a Short BSR MAC CE (TS 38.321 Table 6.2.1-2).
 pub const LCID_SHORT_BSR: u8 = 61;
+
+/// Build a UL-SCH MAC PDU carrying an RLC AM STATUS PDU (TS 38.322 §6.2.3.2,
+/// 12-bit SN) that acknowledges all DL RLC SDUs below `ack_sn` (D/C=0, CPT=0,
+/// E1=0 — no NACKs), on SRB1 (LCID 1), padded to `tbs` bytes. Sending these lets
+/// the gNB's DL RLC AM window advance so it stops retransmitting and delivers the
+/// next SDU (else it loops on the first unacknowledged PDU).
+pub fn rlc_status_mac_pdu(ack_sn: u16, tbs: usize) -> Vec<u8> {
+    let status = [
+        ((ack_sn >> 8) & 0x0f) as u8, // D/C=0, CPT=000, ACK_SN[11:8]
+        (ack_sn & 0xff) as u8,        // ACK_SN[7:0]
+        0x00,                         // E1=0, padding
+    ];
+    let mut mac = Vec::with_capacity(tbs);
+    mac.push(0x01); // R/F=0, LCID=1 (DCCH), 8-bit L
+    mac.push(status.len() as u8);
+    mac.extend_from_slice(&status);
+    if mac.len() < tbs {
+        mac.push(LCID_PADDING);
+        mac.resize(tbs, 0);
+    }
+    mac
+}
 
 /// Build a UL-SCH MAC PDU carrying a Short BSR MAC CE (TS 38.321 §6.1.3.1) that
 /// reports `buf_bytes` pending on logical-channel group 0, padded to `tbs`
