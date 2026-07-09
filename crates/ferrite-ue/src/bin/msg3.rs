@@ -17,6 +17,7 @@ use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
+use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, rrc_setup_request, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 
@@ -56,9 +57,92 @@ fn parse_rar(tb: &[u8], rapid: u8) -> Option<(u16, u32, u16)> {
 
 /// Build the 11-byte Msg3 MAC PDU: CCCH subheader + 6-byte RRCSetupRequest +
 /// padding. Content is arbitrary for the gNB CRC/contention-resolution echo.
-fn msg3_tb() -> Vec<u8> {
-    let bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
+fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect()
+}
+
+/// PDSCH transport block size (bits) for a single layer, TS 38.214 §5.1.3.2.
+/// `n_re` = data REs, `r` = target code rate (fraction), `qm` = modulation order.
+fn tbs_from_nre(n_re: usize, r: f64, qm: usize) -> usize {
+    // Table 5.1.3.2-1 (N_info <= 3824).
+    const TBL: &[usize] = &[
+        24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 208, 224,
+        240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 408, 432, 456, 480, 504, 528, 552, 576, 608, 640, 672, 704,
+        736, 768, 808, 848, 888, 928, 984, 1032, 1064, 1128, 1160, 1192, 1224, 1256, 1288, 1320, 1352, 1416, 1480, 1544,
+        1608, 1672, 1736, 1800, 1864, 1928, 2024, 2088, 2152, 2216, 2280, 2408, 2472, 2536, 2600, 2664, 2728, 2792,
+        2856, 2976, 3104, 3240, 3368, 3496, 3624, 3752, 3824,
+    ];
+    let n_info = (n_re as f64 * r * qm as f64).floor() as usize;
+    if n_info <= 3824 {
+        let n = (((n_info as f64).log2().floor() as i64) - 6).max(3) as u32;
+        let n_info_p = (24).max((1 << n) * (n_info / (1 << n)));
+        *TBL.iter().find(|&&t| t >= n_info_p).unwrap_or(&3824)
+    } else {
+        // Larger blocks (not needed for Msg4, kept for completeness).
+        let n = ((n_info - 24) as f64).log2().floor() as u32 - 5;
+        let step = 1 << n;
+        let n_info_p = step * ((n_info - 24 + step / 2) / step);
+        let c = if r <= 0.25 { (n_info_p + 24).div_ceil(3816) } else if n_info_p > 8424 { (n_info_p + 24).div_ceil(8424) } else { 1 };
+        c * (8 * ((n_info_p + 24).div_ceil(8 * c))) - 24
+    }
+}
+
+/// Decode the Msg4 PDSCH (RRCSetup + Contention Resolution) and check the
+/// ConRes CE against our Msg3 CCCH SDU. `dci` are the decoded DCI 1_0 bits.
+/// Try to decode a Msg4 PDSCH for `tc` in the current slot and, if the ConRes CE
+/// matches our Msg3 CCCH, report the win and the RRCSetup. Returns true on match.
+#[allow(clippy::too_many_arguments)]
+fn try_decode_msg4(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(i32) -> usize + Copy,
+    cell_id: u16,
+    slot_idx: u32,
+    tc: u16,
+    ccch_sdu: &[u8; 6],
+) -> Option<Vec<u8>> {
+    // Msg4 allocation (fallback DCI 1_0 defaults): PRB[0,21), symbols[2,14),
+    // QPSK MCS7 (Qm2, R=526/1024), 2 CDM groups, non-interleaved VRB-to-PRB.
+    let (rb0, nrb, qm, r) = (0usize, 21usize, 2usize, 526.0 / 1024.0);
+    let n_re = nrb * 12 * (12 - 3);
+    let tbs = tbs_from_nre(n_re, r, qm);
+    let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0 };
+    // CORESET0 RB0 = CRB0 here (base 0, confirmed by the SIB1 sanity). Data RE
+    // mapping order is l,k' (time_first) for these common PDSCHs; try both.
+    let dbg = std::env::var("MSG4DBG").is_ok();
+    let tb = [true, false].into_iter().find_map(|time_first| {
+        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, tc, cell_id, time_first);
+        let mut llr = px.llrs.clone();
+        descramble_llrs(&mut llr, pdsch_scramble_c_init(tc, cell_id));
+        let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+        if dbg {
+            eprintln!("  [msg4] tc={tc:#06x} slot {slot_idx} tf={time_first} dmrs={:.2} conv={conv} crc={crc}", px.dmrs_metric);
+        }
+        if !crc {
+            return None;
+        }
+        let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+        if tb.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(tb)
+        }
+    })?;
+    let subs = parse_dl_mac_pdu(&tb);
+    println!("  · Msg4 PDSCH crc=OK (non-zero!) tc={tc:#06x} slot {slot_idx} lcids={:?} head={}",
+        subs.iter().map(|s| s.lcid).collect::<Vec<_>>(),
+        tb.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>());
+    if subs.iter().any(|s| s.lcid == LCID_DL_CON_RES && s.payload.as_slice() == &ccch_sdu[..]) {
+        println!("✦✦ Msg4 CONTENTION RESOLUTION WON (TC-RNTI={tc:#06x}, slot {slot_idx})");
+        for s in &subs {
+            if s.lcid == LCID_DL_CON_RES {
+                println!("   ConRes CE = {} (== our Msg3 CCCH)", s.payload.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            } else if s.lcid == 0 {
+                println!("   DL-CCCH RRCSetup ({} bytes): {}", s.payload.len(), s.payload.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            }
+        }
+        return Some(tb);
+    }
+    None
 }
 
 fn main() {
@@ -186,6 +270,21 @@ fn main() {
     println!("toff sweep {toff_lo}..{toff_hi} step {toff_step} ({} pts)", toffs.len());
     let mut attempt = 0usize;
 
+    // Msg3 payload: a real RRCSetupRequest (fixed random ue-Identity so the Msg4
+    // Contention Resolution Identity CE, which echoes the first 48 bits of this
+    // CCCH SDU, can be matched). LCID52 CCCH48 + 6-byte SDU + padding to TBS 11.
+    let ue_random: u64 = 0x00c0_ffee_42 & ((1 << 39) - 1);
+    let ccch_sdu = rrc_setup_request(ue_random, CAUSE_MO_SIGNALLING);
+    println!("Msg3 RRCSetupRequest ue-Identity={ue_random:#012x} ccch={}", ccch_sdu.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
+    // Msg4 (contention resolution) is DCI 1_0 scrambled by the TC-RNTI in the RA
+    // search space, AL2 CCE 0..1. Track recently-sent TC-RNTIs and probe for it.
+    // Track (TC-RNTI, toff) for recently-sent Msg3s; when a Msg4 confirms one
+    // succeeded, lock that toff so every subsequent Msg3 lands in the window.
+    let mut recent_tc: std::collections::VecDeque<(u16, i64)> = std::collections::VecDeque::new();
+    let mut locked_toff: Option<i64> = None;
+    let mut msg4_wins = 0u32;
+
     loop {
         let slot_start_ul = ul_counter as i64;
         // Read one slot of DL, serving UL (PRACH + pending Msg3) in lockstep.
@@ -235,7 +334,7 @@ fn main() {
                                 // carrier RB0 = point A (CRB0), so the DM-RS gold sequence
                                 // is referenced directly to the carrier RB (crb_offset 0).
                                 let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 0 };
-                                let tb3 = msg3_tb();
+                                let tb3 = bytes_to_bits(&msg3_mac_pdu(&ccch_sdu, 11));
                                 let ulsch = dlsch_encode_single(&tb3, pusch_e_len(&m_alloc), 0.117, 2, 0);
                                 let msg3_slot = slot_idx as i64 + msg3_delay;
                                 let dmrs_slot = msg3_slot % 20;
@@ -244,7 +343,7 @@ fn main() {
                                 // decorrelates the DM-RS across symbols. Critical for decode.
                                 let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, dmrs_slot as u32, (msg3_slot % 2) as usize, tc, center_hz, fs);
                                 let pos0 = slot_start_ul + msg3_delay * slot_len + offset - ta as i64 * 4;
-                                let toff = toffs[attempt % toffs.len()];
+                                let toff = locked_toff.unwrap_or_else(|| toffs[attempt % toffs.len()]);
                                 let mut wave = if fshift != 0.0 {
                                     freq_shift(&wave0, fshift * df, fs, (pos0 + toff) as usize)
                                 } else {
@@ -261,9 +360,39 @@ fn main() {
                                 // Cycle a coarse timing offset to probe alignment (the frozen
                                 // PRACH offset can sit anywhere in the wide detection window).
                                 attempt += 1;
-                                println!("  → Msg3 TC-RNTI={tc:#06x} toff={toff} at ul {} (slot {msg3_slot})", pos0 + toff);
                                 let pos = pos0 + toff;
                                 pend = Some((pos, wave));
+                                recent_tc.push_back((tc, toff));
+                                while recent_tc.len() > 24 {
+                                    recent_tc.pop_front();
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Msg4 (contention resolution): decode the TC-RNTI PDSCH directly at DL
+        // slots for any recently-sent TC-RNTI (LDPC+CRC is more robust than the
+        // blind AL2 PDCCH decode). ConRes CE match ⇒ that Msg3 won → attach on.
+        // Msg4 lands at DL slots ≡ {1,5} (mod 10) for this TDD pattern. The DM-RS
+        // is cell-specific (tc-independent), so measure the 21-RB PDSCH DM-RS once;
+        // only if a real PDSCH is present do we run the per-TC LDPC decode.
+        if matches!(slot_idx % 10, 1 | 5) && !recent_tc.is_empty() {
+            if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                let probe = PdschAlloc { rb_start: 0, n_rb: 21, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0 };
+                let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
+                if metric > 0.9 {
+                    let cands: Vec<(u16, i64)> = recent_tc.iter().rev().copied().collect();
+                    for (tcx, toffx) in cands {
+                        if try_decode_msg4(&grids, sc_to_bin, acq.cell_id, slot_idx, tcx, &ccch_sdu).is_some() {
+                            msg4_wins += 1;
+                            if locked_toff != Some(toffx) {
+                                locked_toff = Some(toffx);
+                                sweep = 0;
+                                println!("  ⇒ toff LOCKED at {toffx} (Msg3 now reliable); Msg4 wins={msg4_wins}");
                             }
                             break;
                         }
