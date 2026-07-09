@@ -223,13 +223,14 @@ fn try_decode_dl_srb1(
     crnti: u16,
     rb_start: usize,
     n_rb: usize,
+    mcs: u8,
 ) -> Option<Vec<u8>> {
-    // Brute-force the modulation/coding and the DM-RS CDM-group count (1 group ⇒
-    // data on the odd SCs of DM-RS symbols; 2 groups ⇒ none), since both vary
-    // across the connected-mode DL. n_re follows the CDM-group choice.
+    // The MCS comes from the DCI 1_1 assignment; only the DM-RS CDM-group count
+    // (1 group ⇒ data on the odd SCs of DM-RS symbols; 2 groups ⇒ none) is tried
+    // both ways. n_re follows the CDM-group choice.
     for cdm in [1usize, 2] {
         let n_re = n_rb * ((12 - 3) * 12 + if cdm == 1 { 3 * 6 } else { 0 });
-        for mcs in [2u8, 0, 1, 3, 4, 5, 6, 7, 8, 9] {
+        {
             let (qm, r) = mcs_params(mcs);
             let (qm, r) = (qm as usize, r);
             let tbs = tbs_from_nre(n_re, r, qm);
@@ -411,8 +412,16 @@ fn run(cfg: Config) {
     let mut last_ta: i64 = 5;
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
     let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
+    let mut pend_ack: Option<(i64, Vec<Complex32>)> = None; // connected-mode DL HARQ-ACK
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
+        init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
+    };
+    // Connected-mode HARQ-ACK uses the DEDICATED PUCCH F1 resource: prb0, cs0,
+    // occ0, symb[0,14), NO intra-slot hop (prb2=prb1) — unlike the common Msg4
+    // resource above which hops to prb23.
+    let harq_cfg = ferrite_phy::pucch::PucchF1 {
+        prb1: 0, prb2: 0, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
     };
     // SR PUCCH resource (from the RRCSetup dedicated config): F1, PRB 0 (no hop),
@@ -453,7 +462,7 @@ fn run(cfg: Config) {
             // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
             // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
             let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
-            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5]);
+            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5, &pend_ack]);
         }
 
         // Decode this slot's RA search space.
@@ -629,25 +638,50 @@ fn run(cfg: Config) {
         if connected.is_some() && !reg_done && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
-                let mut allocs: Vec<(usize, usize)> = uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
+                // Decode DCI 1_1 in the CORESET1 USS → (rb_start, n_rb, MCS, k1, PRI).
+                // Layout (from the gNB dci_1_1_pack, this config): id[0] FDRA[1..10]
+                // time[10] MCS[11..16] NDI[16] RV[17..19] HARQ[19..23] DAI[23..25]
+                // TPC[25..27] PRI[27..30] k1[30..33] antenna[33..37] SRS[37..39] DMRS[39].
+                let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
+                let mut allocs: Vec<(usize, usize, u8, u8, u8)> = uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
                     .into_iter()
                     .filter_map(|cand| {
                         let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
                         pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
                         dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1).map(|b| {
                             let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                            riv_decode(riv, carrier_rb)
+                            let (rb0, nrb) = riv_decode(riv, carrier_rb);
+                            (rb0, nrb, bits5(&b, 11, 5), bits5(&b, 30, 3), bits5(&b, 27, 3))
                         })
                     })
                     .collect();
-                allocs.push((0, 10));
-                allocs.push((0, 11));
+                // Fallbacks (no DCI): the AuthReq's fixed rb[0,10/11) MCS2, no HARQ-ACK.
+                allocs.push((0, 10, 2, 0xff, 0));
+                allocs.push((0, 11, 2, 0xff, 0));
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
-                    for (rb0, nrb) in allocs {
-                        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 };
+                    for (rb0, nrb, mcs, k1, pri) in allocs {
+                        let (qm, _) = mcs_params(mcs);
+                        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
-                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb) {
+                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs) {
+                                // HARQ-ACK the PDSCH k1 slots later on the PUCCH F1
+                                // resource (this cell always uses cs0/occ0/prb0, = the
+                                // Msg4-ACK resource), so the gNB stops retransmitting.
+                                if k1 != 0xff && pend_ack.is_none() {
+                                    let _ = pri; // PRI selects the resource; only cs0/occ0 here
+                                    // The 3-bit k1 field indexes the dl-DataToUL-ACK list
+                                    // (from the gNB config): [4,5,6,7,8,9,11,12].
+                                    const K1_LIST: [i64; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                                    let k1a = K1_LIST[k1 as usize & 7];
+                                    let ack_slot = slot_idx as i64 + k1a;
+                                    let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(
+                                        &ofdm, &harq_cfg, &[1], (ack_slot % 20) as u32, center_hz, fs);
+                                    let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                                    for s in &mut aw { *s *= amp / pk; }
+                                    let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                                    pend_ack = Some((pos, aw));
+                                }
                                 let Some((rlc_sn, rrc)) = parse_srb1_dl_rrc_sn(&tb) else { break };
                                 // On a NEW DL RLC SDU, arm an RLC STATUS ACK so the
                                 // gNB advances (don't re-arm on retransmissions, which
@@ -815,6 +849,11 @@ fn run(cfg: Config) {
         if let Some((pos, wave)) = &pend_sr {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_sr = None;
+            }
+        }
+        if let Some((pos, wave)) = &pend_ack {
+            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+                pend_ack = None;
             }
         }
         if let Some((pos, wave)) = &pend_msg5 {
