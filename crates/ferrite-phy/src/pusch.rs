@@ -25,6 +25,10 @@ pub struct PuschAlloc {
     pub qm: usize,
     /// UL carrier size in RBs (for DC-centred subcarrier→bin mapping).
     pub carrier_rb: usize,
+    /// CRB of the carrier's RB 0 (= offsetToPointA in this SCS). The PUSCH DM-RS
+    /// sequence is referenced to CRB 0 / point A (§6.4.1.1.1.2), so the sequence
+    /// index is `6·(crb_offset + PRB) + j`, not `6·PRB + j`.
+    pub crb_offset: usize,
 }
 
 fn qpsk(b0: u8, b1: u8) -> Complex32 {
@@ -67,13 +71,14 @@ pub fn pusch_modulate_slot(
             }
         }
     }
-    // DM-RS (config type 1, CDM group 0: even subcarriers), PRB-domain sequence.
+    // DM-RS (config type 1, CDM group 0: even subcarriers). Sequence referenced
+    // to CRB 0 (point A): index by 6·(crb_offset + PRB) + j.
     for &l in &alloc.dmrs_symbols {
-        let refs = pdsch_dmrs(cell_id, slot_in_frame, l as u32, alloc.carrier_rb * 6);
+        let refs = pdsch_dmrs(cell_id, slot_in_frame, l as u32, 6 * (alloc.crb_offset + alloc.carrier_rb));
         for rb in 0..alloc.n_rb {
             for j in 0..6 {
                 let sc = 12 * (alloc.rb_start + rb) + 2 * j;
-                grids[l][bin(sc)] = refs[6 * (alloc.rb_start + rb) + j];
+                grids[l][bin(sc)] = refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j];
             }
         }
     }
@@ -104,7 +109,7 @@ mod tests {
     #[test]
     fn pusch_msg3_round_trip() {
         let ofdm = Ofdm::new(512);
-        let alloc = PuschAlloc { rb_start: 4, n_rb: 3, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24 };
+        let alloc = PuschAlloc { rb_start: 4, n_rb: 3, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
         let e = pusch_e_len(&alloc);
         assert_eq!(e, 792);
         let (cell_id, tc_rnti, r) = (1u16, 0x4601u16, 0.117);

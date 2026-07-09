@@ -70,6 +70,7 @@ fn main() {
     let amp: f32 = arg("--amp", "0.5").parse().unwrap();
     let sweep0: i64 = arg("--sweep", "384").parse().unwrap();
     let msg3_delay: i64 = arg("--msg3-delay", "7").parse().unwrap();
+    let fshift: f64 = arg("--fshift", "0").parse().unwrap();
 
     let fft = (fs / 30_000.0).round() as usize;
     let searcher = CellSearcher::new(fft, 1);
@@ -218,15 +219,31 @@ fn main() {
                                 println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] (offset {offset})", m_rb0 + m_nrb);
                                 sweep = 0; // freeze the aligned offset
                                 let _ = grant;
-                                let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb };
+                                let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 2 };
                                 let tb3 = msg3_tb();
                                 let ulsch = dlsch_encode_single(&tb3, pusch_e_len(&m_alloc), 0.117, 2, 0);
                                 let msg3_slot = slot_idx as i64 + msg3_delay;
-                                let wave = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, (msg3_slot % 20) as u32, (msg3_slot % 2) as usize, tc);
+                                let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, (msg3_slot % 20) as u32, (msg3_slot % 2) as usize, tc);
+                                // Optionally frequency-shift the uplink by k·df (the DL SSB
+                                // offset) to test whether the UL grid is carrier- vs SSB-centred.
+                                let pos0 = slot_start_ul + msg3_delay * slot_len + offset - ta as i64 * 4;
+                                let mut wave = if fshift != 0.0 {
+                                    freq_shift(&wave0, fshift * df, fs, pos0 as usize)
+                                } else {
+                                    wave0
+                                };
+                                // Scale to a peak amplitude of `amp` (like the PRACH) so the
+                                // signal is well above the receiver's nose floor.
+                                let wpk = wave.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                                for s in &mut wave {
+                                    *s *= amp / wpk;
+                                }
                                 // Uplink position of the Msg3 slot (same skew/offset as
                                 // PRACH), advanced by the timing advance (N_TA = TA·4 samples).
-                                let pos = slot_start_ul + msg3_delay * slot_len + offset - ta as i64 * 4;
-                                println!("  → scheduling Msg3 at ul {pos} (slot {}), {} samples", msg3_slot, wave.len());
+                                // Cycle a coarse timing offset to probe alignment (the frozen
+                                // PRACH offset can sit anywhere in the wide detection window).
+                                println!("  → Msg3 at ul {pos0} (slot {msg3_slot})");
+                                let pos = pos0;
                                 pend = Some((pos, wave));
                             }
                             break;
