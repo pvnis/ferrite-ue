@@ -149,12 +149,35 @@ pub fn algo_key(k_amf: &[u8; 32], algo_type: u8, algo_id: u8) -> [u8; 16] {
     out[16..32].try_into().unwrap()
 }
 
+/// 128-NIA2 integrity MAC (TS 33.501 Annex D.3.1.2 = TS 33.401 B.2.3): AES-CMAC
+/// over the bit string COUNT(32) || BEARER(5) || DIRECTION(1) || 0^26 || MESSAGE,
+/// i.e. octets COUNT(4) || (BEARER<<3 | DIR<<2) || 0x00 0x00 0x00 || MESSAGE.
+/// Returns the leading 32 bits (4 octets). `direction`: 0 uplink, 1 downlink.
+pub fn nia2_mac(k: &[u8; 16], count: u32, bearer: u8, direction: u8, message: &[u8]) -> [u8; 4] {
+    use cmac::Cmac;
+    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(k).unwrap();
+    mac.update(&count.to_be_bytes());
+    mac.update(&[(bearer << 3) | (direction << 2)]);
+    mac.update(&[0u8; 3]);
+    mac.update(message);
+    mac.finalize().into_bytes()[..4].try_into().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn hx(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// 128-EIA2/NIA2 Test Set 2 (TS 33.401 C.2 / 35.208).
+    #[test]
+    fn nia2_test_set_2() {
+        let ik: [u8; 16] = hx("d3c5d592327fb11c4035c6680af8c6d1").try_into().unwrap();
+        let msg = hx("484583d5afe082ae");
+        let mac = nia2_mac(&ik, 0x398a59b4, 0b11010, 1, &msg);
+        assert_eq!(mac, hx("b93787e6").as_slice());
     }
 
     /// TS 35.208 Test Set 1.

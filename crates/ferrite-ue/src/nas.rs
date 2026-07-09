@@ -117,6 +117,53 @@ pub fn auth_response(res_star: &[u8; 16]) -> Vec<u8> {
     m
 }
 
+/// Strip a 5GS NAS security header (TS 24.501 §9.1.1) if present. Returns
+/// `(security_header_type, mac, sequence_number, inner_plain_message)`; for a
+/// plain message (SHT nibble 0) returns `(0, [0;4], 0, whole message)`. A
+/// protected message is [EPD 0x7e | SHT | MAC(4) | SEQ | inner].
+pub fn strip_security_header(nas: &[u8]) -> (u8, [u8; 4], u8, &[u8]) {
+    if nas.len() >= 7 && nas[0] == 0x7e && (nas[1] & 0x0f) != 0 {
+        (nas[1] & 0x0f, nas[2..6].try_into().unwrap(), nas[6], &nas[7..])
+    } else {
+        (0, [0; 4], 0, nas)
+    }
+}
+
+/// The 5GMM message type of a plain NAS message (3rd octet: EPD, SHT=0, type).
+pub fn nas_msg_type(plain: &[u8]) -> Option<u8> {
+    plain.get(2).copied()
+}
+
+/// Wrap a plain 5GS NAS message in a security header (TS 24.501 §9.1.1) with a
+/// 128-NIA2 integrity MAC: [EPD 0x7e | SHT | MAC(4) | SEQ | inner]. The MAC is
+/// computed over SEQ||inner with the NAS COUNT and BEARER=1 (`direction`: 0
+/// uplink, 1 downlink). NEA0 ⇒ the inner message is not ciphered.
+pub fn nas_protect(sht: u8, k_nasint: &[u8; 16], count: u32, direction: u8, inner: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x7e, sht, 0, 0, 0, 0, (count & 0xff) as u8];
+    out.extend_from_slice(inner);
+    let mac = crate::milenage::nia2_mac(k_nasint, count, 1, direction, &out[6..]);
+    out[2..6].copy_from_slice(&mac);
+    out
+}
+
+/// Build a plain SecurityModeComplete (TS 24.501 §8.2.26), replaying the initial
+/// RegistrationRequest in a NAS message container (IEI 0x71) as required when the
+/// initial registration was sent without integrity protection.
+pub fn security_mode_complete(imsi: &str) -> Vec<u8> {
+    let mut m = vec![0x7e, 0x00, 0x5e]; // 5GMM, plain, Security mode complete
+    let rr = registration_request(imsi);
+    m.push(0x71); // NAS message container IEI
+    m.push((rr.len() >> 8) as u8);
+    m.push((rr.len() & 0xff) as u8);
+    m.extend_from_slice(&rr);
+    m
+}
+
+/// Build a plain RegistrationComplete (TS 24.501 §8.2.9): header only.
+pub fn registration_complete() -> Vec<u8> {
+    vec![0x7e, 0x00, 0x43]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

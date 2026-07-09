@@ -20,8 +20,8 @@ use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
-use ferrite_ue::milenage::{milenage, res_star};
-use ferrite_ue::nas::{auth_response, parse_auth_request, registration_request};
+use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
+use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
 use ferrite_ue::rrc::{mac_short_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_srb1_dl_nas, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
@@ -409,7 +409,12 @@ fn run(cfg: Config) {
     // SRB1 RLC/PDCP sequence number that increments per PDU.
     let mut ul_queue: VecDeque<Vec<u8>> = VecDeque::new();
     let mut srb1_sn: u16 = 0;
-    let mut auth_done = false;
+    // NAS registration state machine: each DL NAS message queues a UL reply.
+    let mut auth_done = false; // AuthenticationResponse queued
+    let mut smc_done = false; // SecurityModeComplete queued
+    let mut reg_done = false; // RegistrationComplete queued
+    let mut nas_ul_count: u32 = 0; // NAS COUNT for uplink integrity protection
+    let mut k_nasint: Option<[u8; 16]> = None; // 128-NIA2 key, derived after AKA
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -578,10 +583,11 @@ fn run(cfg: Config) {
             }
         }
 
-        // Connected DL: decode the SRB1 PDSCH (AuthenticationRequest etc.) at DL
-        // slots. The gNB uses CORESET1/USS/DCI-1_1, but a fixed PDSCH allocation
-        // (rb[0,10/11), MCS2, 1 CDM group), so decode the PDSCH directly.
-        if connected.is_some() && !auth_done && srb1_sn >= 1 {
+        // Connected DL: decode the SRB1 PDSCH at DL slots and drive the NAS
+        // registration state machine (AuthReq → SMC → RegistrationAccept). The gNB
+        // uses CORESET1/USS/DCI-1_1 but a fixed PDSCH allocation (rb[0,10/11), MCS2,
+        // 1 CDM group), so decode the PDSCH directly.
+        if connected.is_some() && !reg_done && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
                     for nrb in [10usize, 11] {
@@ -590,37 +596,66 @@ fn run(cfg: Config) {
                         if metric > 0.9 {
                             let crnti = connected.unwrap();
                             if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, nrb) {
-                                println!("★ DL SRB1 decoded (slot {slot_idx} nrb={nrb}, {}B): {}",
-                                    tb.len(), tb.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                                // Unstack MAC/RLC/PDCP → NAS; if it's the
-                                // AuthenticationRequest, run 5G-AKA and queue the response.
-                                // Only latch auth_done once we've actually seen the
-                                // AuthenticationRequest (earlier DL PDUs may be RLC
-                                // STATUS-only, carrying no NAS).
-                                if let Some(nas) = parse_srb1_dl_nas(&tb) {
-                                    println!("   NAS: {}", nas.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                                    if let Some(ar) = parse_auth_request(&nas) {
-                                        auth_done = true;
-                                        // AUTN = SQN⊕AK (6) || AMF (2) || MAC (8).
-                                        let amf: [u8; 2] = ar.autn[6..8].try_into().unwrap();
-                                        // First pass with SQN=0 recovers AK = f5(RAND); then
-                                        // SQN = (SQN⊕AK) ⊕ AK. Re-run to get MAC/RES over SQN.
-                                        let z = milenage(&ki, &opc, &ar.rand, &[0; 6], &amf);
-                                        let mut sqn = [0u8; 6];
-                                        for i in 0..6 { sqn[i] = ar.autn[i] ^ z.ak[i]; }
-                                        let m = milenage(&ki, &opc, &ar.rand, &sqn, &amf);
-                                        let mac_ok = m.mac_a == ar.autn[8..16];
-                                        let rs = res_star(&m.ck, &m.ik, &snn, &ar.rand, &m.res);
-                                        println!("   AKA: MAC={} SQN={} RES*={}",
-                                            if mac_ok { "OK" } else { "BAD" },
-                                            sqn.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                                            rs.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                                        if mac_ok {
-                                            let resp = rrc_ul_information_transfer(&auth_response(&rs));
-                                            ul_queue.push_back(resp);
-                                            println!("   ⇒ queued AuthenticationResponse for UL");
+                                let Some(nas) = parse_srb1_dl_nas(&tb) else { break };
+                                // Strip the NAS security header (SMC/RegAccept are
+                                // integrity protected); dispatch on the message type.
+                                let (sht, dl_mac, dl_seq, inner) = strip_security_header(&nas);
+                                let mtype = nas_msg_type(inner);
+                                println!("★ DL NAS (slot {slot_idx}): sht={sht} type={:02x?} {}",
+                                    mtype, inner.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                match mtype {
+                                    // AuthenticationRequest → run 5G-AKA, derive the NAS
+                                    // integrity key, queue the AuthenticationResponse.
+                                    Some(0x56) if !auth_done => {
+                                        if let Some(ar) = parse_auth_request(inner) {
+                                            auth_done = true;
+                                            let amf: [u8; 2] = ar.autn[6..8].try_into().unwrap();
+                                            let z = milenage(&ki, &opc, &ar.rand, &[0; 6], &amf);
+                                            let mut sqn = [0u8; 6];
+                                            for i in 0..6 { sqn[i] = ar.autn[i] ^ z.ak[i]; }
+                                            let sqn_xor_ak: [u8; 6] = ar.autn[0..6].try_into().unwrap();
+                                            let m = milenage(&ki, &opc, &ar.rand, &sqn, &amf);
+                                            let mac_ok = m.mac_a == ar.autn[8..16];
+                                            let rs = res_star(&m.ck, &m.ik, &snn, &ar.rand, &m.res);
+                                            // Derive K_AMF → K_NASint (TS 33.501): 128-NIA2.
+                                            let kausf = k_ausf(&m.ck, &m.ik, &snn, &sqn_xor_ak);
+                                            let kseaf = k_seaf(&kausf, &snn);
+                                            let kamf = k_amf(&kseaf, &imsi, &ar.abba);
+                                            k_nasint = Some(algo_key(&kamf, 2, 2));
+                                            println!("   AKA: MAC={} RES*={}", if mac_ok { "OK" } else { "BAD" },
+                                                rs.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                            if mac_ok {
+                                                ul_queue.push_back(rrc_ul_information_transfer(&auth_response(&rs)));
+                                                println!("   ⇒ queued AuthenticationResponse");
+                                            }
                                         }
                                     }
+                                    // SecurityModeCommand → verify its DL integrity MAC
+                                    // (validates K_NASint), send an integrity-protected
+                                    // SecurityModeComplete replaying the RegistrationRequest.
+                                    Some(0x5d) if auth_done && !smc_done => {
+                                        smc_done = true;
+                                        if let Some(ni) = &k_nasint {
+                                            let exp = ferrite_ue::milenage::nia2_mac(ni, dl_seq as u32, 1, 1, &nas[6..]);
+                                            println!("   SMC integrity MAC={}", if exp == dl_mac { "OK" } else { "BAD" });
+                                            let inner = security_mode_complete(&imsi);
+                                            let prot = nas_protect(0x04, ni, nas_ul_count, 0, &inner);
+                                            nas_ul_count += 1;
+                                            ul_queue.push_back(rrc_ul_information_transfer(&prot));
+                                            println!("   ⇒ queued SecurityModeComplete (count {})", nas_ul_count - 1);
+                                        }
+                                    }
+                                    // RegistrationAccept → send RegistrationComplete = attach done.
+                                    Some(0x42) if smc_done && !reg_done => {
+                                        reg_done = true;
+                                        if let Some(ni) = &k_nasint {
+                                            let prot = nas_protect(0x02, ni, nas_ul_count, 0, &registration_complete());
+                                            nas_ul_count += 1;
+                                            ul_queue.push_back(rrc_ul_information_transfer(&prot));
+                                            println!("   ⇒ queued RegistrationComplete — ATTACH COMPLETE");
+                                        }
+                                    }
+                                    _ => {}
                                 }
                                 break;
                             }
