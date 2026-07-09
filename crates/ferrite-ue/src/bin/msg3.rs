@@ -17,10 +17,21 @@ use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
-use ferrite_ue::nas::registration_request;
-use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, rrc_setup_complete, rrc_setup_request, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::milenage::{milenage, res_star};
+use ferrite_ue::nas::{auth_response, parse_auth_request, registration_request};
+use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, parse_srb1_dl_nas, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
+use std::collections::VecDeque;
+
+/// Parse a fixed-length hex string into a byte array.
+fn hexn<const N: usize>(s: &str) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+    }
+    out
+}
 
 fn arg(name: &str, default: &str) -> String {
     let a: Vec<String> = std::env::args().collect();
@@ -106,7 +117,7 @@ fn try_decode_msg4(
     let (rb0, nrb, qm, r) = (0usize, 21usize, 2usize, 526.0 / 1024.0);
     let n_re = nrb * 12 * (12 - 3);
     let tbs = tbs_from_nre(n_re, r, qm);
-    let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0 };
+    let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0 , nof_cdm_groups: 2};
     // CORESET0 RB0 = CRB0 here (base 0, confirmed by the SIB1 sanity). Data RE
     // mapping order is l,k' (time_first) for these common PDSCHs; try both.
     let dbg = std::env::var("MSG4DBG").is_ok();
@@ -144,6 +155,38 @@ fn try_decode_msg4(
         return Some(tb);
     }
     None
+}
+
+/// Decode a connected-mode DL PDSCH for `crnti` (SRB1: AuthenticationRequest
+/// etc.). The gNB uses CORESET1/USS but a fixed allocation (rb[0,10), MCS2, 1
+/// CDM group), so decode the PDSCH directly. Returns the raw MAC TB on success.
+fn try_decode_dl_srb1(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(i32) -> usize + Copy,
+    cell_id: u16,
+    slot_idx: u32,
+    crnti: u16,
+    n_rb: usize,
+) -> Option<Vec<u8>> {
+    let (qm, r) = (2usize, 193.0 / 1024.0); // MCS2, QPSK
+    let n_re = n_rb * ((12 - 3) * 12 + 3 * 6); // 1 CDM group: DM-RS symbols carry data on odd SCs
+    let tbs = tbs_from_nre(n_re, r, qm);
+    let alloc = PdschAlloc { rb_start: 0, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: 1 };
+    [true, false].into_iter().find_map(|time_first| {
+        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+        let mut llr = px.llrs.clone();
+        descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
+        let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+        if !crc {
+            return None;
+        }
+        let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+        if tb.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(tb)
+        }
+    })
 }
 
 fn main() {
@@ -312,10 +355,19 @@ fn main() {
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
     let mut pend_msg5: Option<(i64, Vec<Complex32>)> = None;
-    let mut msg5_done = false;
+    // Connected-mode UL: a queue of RRC PDUs to send on successive grants
+    // (RRCSetupComplete, then the AuthenticationResponse, …), with a shared
+    // SRB1 RLC/PDCP sequence number that increments per PDU.
+    let mut ul_queue: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut srb1_sn: u16 = 0;
+    let mut auth_done = false;
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let imsi = arg("--imsi", "001010167891203");
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
+    // 5G-AKA credentials (TS 35.206 Milenage) and serving-network name.
+    let ki: [u8; 16] = hexn(&arg("--ki", "5122250214c33e723a5dd523fc145fc0"));
+    let opc: [u8; 16] = hexn(&arg("--opc", "981d464c7c52eb6e5036234984ad0bcf"));
+    let snn = arg("--snn", "5G:mnc001.mcc001.3gppnetwork.org");
 
     loop {
         let slot_start_ul = ul_counter as i64;
@@ -324,7 +376,12 @@ fn main() {
         for b in 0..blocks_per_slot {
             fill_dl(&mut dl, &mut blk);
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
-            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &[&pend, &pend_pucch, &pend_sr, &pend_msg5]);
+            // Stop the periodic PRACH once connected: otherwise each frame's
+            // preamble spawns a fresh TC-RNTI at the gNB, and the accumulated RA
+            // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
+            // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
+            let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
+            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5]);
         }
 
         // Decode this slot's RA search space.
@@ -337,33 +394,37 @@ fn main() {
             off += cp + fft;
         }
         // Connected: decode the C-RNTI DCI 0_0 UL grant (AL4 CCE0, CORESET0) and
-        // send Msg5 (RRCSetupComplete + NAS) on the granted PUSCH, k2 slots later.
-        if let (Some(crnti), false) = (connected, msg5_done) {
-            let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
-            let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &cand);
-            pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
-            if let Some(bits) = dci_decode(&m, crnti, a_len) {
-                // DCI 0_0 (UL grant): id(1) freq(9,N=24) time(4) hop(1) mcs(5) ndi(1)...
-                if bits[0] == 0 {
-                    let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
-                    let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
-                    let mcs = bits[15..20].iter().fold(0u8, |a, &b| a << 1 | b);
-                    let ndi = bits[20];
-                    let (qm, r) = mcs_params(mcs);
-                    let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
-                    let n_data_sym = 14 - 3;
-                    let e = g_nrb * 12 * n_data_sym * qm as usize;
-                    let tbs = tbs_from_nre(g_nrb * 12 * n_data_sym, r, qm as usize);
-                    let mac = srb1_msg5_pdu(&rrc_sc, 0, 0, tbs / 8);
-                    let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
-                    let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
-                    let mut m5 = pusch_modulate_slot(&ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize, crnti, center_hz, fs);
-                    let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                    for s in &mut m5 { *s *= amp / pk; }
-                    let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                    println!("  → Msg5 RRCSetupComplete: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb, tbs / 8);
-                    pend_msg5 = Some((pos, m5));
-                    msg5_done = true;
+        // send the next queued SRB1 RRC PDU on the granted PUSCH, k2 slots later.
+        if let Some(crnti) = connected {
+            if pend_msg5.is_none() && !ul_queue.is_empty() {
+                let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
+                let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &cand);
+                pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
+                if let Some(bits) = dci_decode(&m, crnti, a_len) {
+                    // DCI 0_0 (UL grant): id(1) freq(9,N=24) time(4) hop(1) mcs(5) ndi(1)...
+                    if bits[0] == 0 {
+                        let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
+                        let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
+                        let mcs = bits[15..20].iter().fold(0u8, |a, &b| a << 1 | b);
+                        let ndi = bits[20];
+                        let (qm, r) = mcs_params(mcs);
+                        let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
+                        let n_data_sym = 14 - 3;
+                        let e = g_nrb * 12 * n_data_sym * qm as usize;
+                        let tbs = tbs_from_nre(g_nrb * 12 * n_data_sym, r, qm as usize);
+                        let rrc = ul_queue.pop_front().unwrap();
+                        let mac = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs / 8);
+                        let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
+                        let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
+                        let mut m5 = pusch_modulate_slot(&ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize, crnti, center_hz, fs);
+                        let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                        for s in &mut m5 { *s *= amp / pk; }
+                        let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                        let kind = if srb1_sn == 0 { "RRCSetupComplete" } else { "UL-DCCH(NAS)" };
+                        println!("  → SRB1 {kind} (SN {srb1_sn}): grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb, tbs / 8);
+                        pend_msg5 = Some((pos, m5));
+                        srb1_sn += 1;
+                    }
                 }
             }
         }
@@ -376,7 +437,7 @@ fn main() {
             let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
             let mcs = bits[riv_bits + 5..riv_bits + 10].iter().fold(0u8, |a, &b| a << 1 | b);
             let (qm, r) = mcs_params(mcs);
-            let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0 };
+            let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0 , nof_cdm_groups: 2};
             if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
                 for tf in [false, true] {
                     let px = extract_pdsch(&grids, sc_to_bin, &alloc, acq.cell_id, slot_idx, 0, ra_rnti, acq.cell_id, tf);
@@ -439,6 +500,58 @@ fn main() {
             }
         }
 
+        // Connected DL: decode the SRB1 PDSCH (AuthenticationRequest etc.) at DL
+        // slots. The gNB uses CORESET1/USS/DCI-1_1, but a fixed PDSCH allocation
+        // (rb[0,10/11), MCS2, 1 CDM group), so decode the PDSCH directly.
+        if connected.is_some() && !auth_done && srb1_sn >= 1 {
+            if matches!(slot_idx % 10, 0..=5) {
+                if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                    for nrb in [10usize, 11] {
+                        let probe = PdschAlloc { rb_start: 0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 };
+                        let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
+                        if metric > 0.9 {
+                            let crnti = connected.unwrap();
+                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, nrb) {
+                                println!("★ DL SRB1 decoded (slot {slot_idx} nrb={nrb}, {}B): {}",
+                                    tb.len(), tb.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                // Unstack MAC/RLC/PDCP → NAS; if it's the
+                                // AuthenticationRequest, run 5G-AKA and queue the response.
+                                // Only latch auth_done once we've actually seen the
+                                // AuthenticationRequest (earlier DL PDUs may be RLC
+                                // STATUS-only, carrying no NAS).
+                                if let Some(nas) = parse_srb1_dl_nas(&tb) {
+                                    println!("   NAS: {}", nas.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                    if let Some(ar) = parse_auth_request(&nas) {
+                                        auth_done = true;
+                                        // AUTN = SQN⊕AK (6) || AMF (2) || MAC (8).
+                                        let amf: [u8; 2] = ar.autn[6..8].try_into().unwrap();
+                                        // First pass with SQN=0 recovers AK = f5(RAND); then
+                                        // SQN = (SQN⊕AK) ⊕ AK. Re-run to get MAC/RES over SQN.
+                                        let z = milenage(&ki, &opc, &ar.rand, &[0; 6], &amf);
+                                        let mut sqn = [0u8; 6];
+                                        for i in 0..6 { sqn[i] = ar.autn[i] ^ z.ak[i]; }
+                                        let m = milenage(&ki, &opc, &ar.rand, &sqn, &amf);
+                                        let mac_ok = m.mac_a == ar.autn[8..16];
+                                        let rs = res_star(&m.ck, &m.ik, &snn, &ar.rand, &m.res);
+                                        println!("   AKA: MAC={} SQN={} RES*={}",
+                                            if mac_ok { "OK" } else { "BAD" },
+                                            sqn.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                                            rs.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                                        if mac_ok {
+                                            let resp = rrc_ul_information_transfer(&auth_response(&rs));
+                                            ul_queue.push_back(resp);
+                                            println!("   ⇒ queued AuthenticationResponse for UL");
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Msg4 (contention resolution): decode the TC-RNTI PDSCH directly at DL
         // slots for any recently-sent TC-RNTI (LDPC+CRC is more robust than the
         // blind AL2 PDCCH decode). ConRes CE match ⇒ that Msg3 won → attach on.
@@ -447,7 +560,7 @@ fn main() {
         // only if a real PDSCH is present do we run the per-TC LDPC decode.
         if matches!(slot_idx % 10, 1 | 5) && !recent_tc.is_empty() {
             if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
-                let probe = PdschAlloc { rb_start: 0, n_rb: 21, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0 };
+                let probe = PdschAlloc { rb_start: 0, n_rb: 21, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0 , nof_cdm_groups: 2};
                 let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                 if metric > 0.9 {
                     let cands: Vec<(u16, i64)> = recent_tc.iter().rev().copied().collect();
@@ -474,6 +587,7 @@ fn main() {
                             }
                             if connected.is_none() {
                                 connected = Some(tcx);
+                                ul_queue.push_back(rrc_sc.clone()); // Msg5 = first UL PDU
                                 println!("  ⇒ CONNECTED as C-RNTI {tcx:#06x} — will SR for Msg5 grant");
                             }
                             break;
@@ -483,9 +597,10 @@ fn main() {
             }
         }
 
-        // Once connected, send a Scheduling Request each frame at slot 7 to get a
-        // UL grant for Msg5 (until the grant arrives / this is superseded).
-        if connected.is_some() && slot_idx == 0 && pend_sr.is_none() {
+        // Send a Scheduling Request each frame at slot 7 whenever an SRB1 PDU is
+        // queued (RRCSetupComplete, then the AuthenticationResponse) to solicit
+        // a UL grant. Stops once the queue drains so we don't over-request.
+        if connected.is_some() && !ul_queue.is_empty() && slot_idx == 0 && pend_sr.is_none() {
             let sr_slot = 7i64;
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);

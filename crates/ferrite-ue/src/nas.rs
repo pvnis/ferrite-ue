@@ -63,6 +63,60 @@ pub fn registration_request(imsi: &str) -> Vec<u8> {
     m
 }
 
+/// Parsed 5GS AuthenticationRequest (TS 24.501 §8.2.1): RAND (IEI 0x21) and
+/// AUTN (IEI 0x20), plus ngKSI and ABBA.
+pub struct AuthRequest {
+    pub ngksi: u8,
+    pub abba: Vec<u8>,
+    pub rand: [u8; 16],
+    pub autn: [u8; 16],
+}
+
+/// Parse an AuthenticationRequest NAS message (header 7e 00 56).
+pub fn parse_auth_request(nas: &[u8]) -> Option<AuthRequest> {
+    if nas.len() < 4 || nas[0] != 0x7e || nas[2] != 0x56 {
+        return None;
+    }
+    let ngksi = nas[3] & 0x0f;
+    let abba_len = *nas.get(4)? as usize;
+    let mut i = 5 + abba_len;
+    let abba = nas.get(5..5 + abba_len)?.to_vec();
+    let mut rand = None;
+    let mut autn = None;
+    while i < nas.len() {
+        let iei = nas[i];
+        match iei {
+            0x21 => {
+                // RAND: type-3 IE, fixed 16 octets, no length.
+                rand = Some(nas.get(i + 1..i + 17)?.try_into().ok()?);
+                i += 17;
+            }
+            0x20 => {
+                // AUTN: type-4 IE, length + value.
+                let l = *nas.get(i + 1)? as usize;
+                autn = Some(nas.get(i + 2..i + 2 + l.min(16))?.try_into().ok()?);
+                i += 2 + l;
+            }
+            _ => {
+                // Other type-4 IEs (length-prefixed) — skip.
+                let l = *nas.get(i + 1)? as usize;
+                i += 2 + l;
+            }
+        }
+    }
+    Some(AuthRequest { ngksi, abba, rand: rand?, autn: autn? })
+}
+
+/// Build a 5GS AuthenticationResponse (TS 24.501 §8.2.2) carrying RES*
+/// (Authentication response parameter, IEI 0x2d, length 16).
+pub fn auth_response(res_star: &[u8; 16]) -> Vec<u8> {
+    let mut m = vec![0x7e, 0x00, 0x57]; // 5GMM, plain, Authentication response
+    m.push(0x2d); // IEI: Authentication response parameter
+    m.push(0x10); // length 16
+    m.extend_from_slice(res_star);
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

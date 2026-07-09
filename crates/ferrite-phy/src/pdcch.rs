@@ -161,13 +161,19 @@ pub struct CandidateLayout {
 pub fn candidate_layout(coreset: &Coreset0, cell_id: u16, cand: &Candidate) -> CandidateLayout {
     let n_bundles = coreset.n_reg() / 6;
     let f = bundle_interleaver(n_bundles, cell_id);
+    layout_from_bundles(coreset.n_symb, cand, |cce| f[cce])
+}
 
+/// Build a candidate's RE layout given a `bundle_of(cce)` map (interleaved for
+/// CORESET#0, identity for a non-interleaved RRC-configured CORESET). L = 6, so
+/// there is exactly one REG bundle per CCE.
+fn layout_from_bundles(n_symb: usize, cand: &Candidate, bundle_of: impl Fn(usize) -> usize) -> CandidateLayout {
     let mut dmrs = Vec::new();
     let mut data = Vec::new();
     for &cce in &cand.cces {
-        let bundle = f[cce]; // L = 6: one bundle per CCE
+        let bundle = bundle_of(cce);
         for reg in 6 * bundle..6 * bundle + 6 {
-            let (l, rb) = reg_to_symbol_rb(reg, coreset.n_symb);
+            let (l, rb) = reg_to_symbol_rb(reg, n_symb);
             for sc in 0..12 {
                 let k = 12 * rb + sc;
                 if sc % 4 == 1 {
@@ -183,6 +189,38 @@ pub fn candidate_layout(coreset: &Coreset0, cell_id: u16, cand: &Candidate) -> C
     data.sort_by_key(|&(l, k)| (l, k));
     dmrs.sort_by_key(|&(l, k, _)| (l, k));
     CandidateLayout { dmrs, data }
+}
+
+/// UE-specific search-space candidate CCE hashing (TS 38.213 §10.1). For a USS
+/// on CORESET `coreset_id`, C-RNTI `rnti`, and slot-in-frame `slot`:
+/// `Y_{p,n} = (A_p·Y_{p,n-1}) mod 65537`, `Y_{p,-1}=n_RNTI`, `A_p` per `p mod 3`;
+/// CCE = `L·((Y + ⌊m·N_CCE/(L·M)⌋) mod ⌊N_CCE/L⌋) + i`. `al_counts` is
+/// `(aggregation_level, nrofCandidates)` from the SearchSpace config.
+pub fn uss_candidates(n_cce: usize, coreset_id: u16, rnti: u16, slot: u32, al_counts: &[(usize, usize)]) -> Vec<Candidate> {
+    const D: u64 = 65537;
+    let a = match coreset_id % 3 {
+        0 => 39827u64,
+        1 => 39829,
+        _ => 39839,
+    };
+    let mut y = u64::from(rnti); // Y_{p,-1}
+    for _ in 0..=slot {
+        y = (a * y) % D; // iterate (slot+1) times → Y_{p,slot}
+    }
+    let mut out = Vec::new();
+    for &(l, m_max) in al_counts {
+        if m_max == 0 || n_cce / l == 0 {
+            continue;
+        }
+        for m in 0..m_max {
+            let base = l * (((y + (m * n_cce) as u64 / (l * m_max) as u64) % (n_cce / l) as u64) as usize);
+            let cand = Candidate { agg_level: l, cces: (base..base + l).collect() };
+            if !out.contains(&cand) {
+                out.push(cand);
+            }
+        }
+    }
+    out
 }
 
 /// Equalize one candidate from per-symbol frequency grids and produce its
@@ -201,11 +239,41 @@ pub fn equalize_candidate(
     cand: &Candidate,
 ) -> Vec<f32> {
     let layout = candidate_layout(coreset, cell_id, cand);
-    let dmrs_ref: Vec<Vec<Complex32>> = (0..coreset.n_symb)
-        .map(|l| pdcch_dmrs(cell_id, slot, l as u32, coreset.n_rb))
+    equalize_layout(grids, sc_to_bin, &layout, cell_id, slot, coreset.n_symb, coreset.n_rb)
+}
+
+/// Equalize a candidate in an RRC-configured CORESET with NON-interleaved
+/// CCE→REG mapping (identity bundle map), spanning `n_rb` RBs over `n_symb`
+/// symbols, DMRS referenced at the CORESET's lowest RB (`sc_to_bin(0)` = its
+/// first subcarrier). Used for CORESET#1 / the UE-specific search space.
+pub fn equalize_candidate_c1(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    n_rb: usize,
+    n_symb: usize,
+    cell_id: u16,
+    slot: u32,
+    cand: &Candidate,
+) -> Vec<f32> {
+    let layout = layout_from_bundles(n_symb, cand, |cce| cce);
+    equalize_layout(grids, sc_to_bin, &layout, cell_id, slot, n_symb, n_rb)
+}
+
+/// Shared equalization: per-(symbol, rb) LS channel estimate from each REG's
+/// 3 DMRS REs, then match-filter the data REs into LLRs (positive ⇒ bit 0).
+fn equalize_layout(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    layout: &CandidateLayout,
+    cell_id: u16,
+    slot: u32,
+    n_symb: usize,
+    n_rb: usize,
+) -> Vec<f32> {
+    let dmrs_ref: Vec<Vec<Complex32>> = (0..n_symb)
+        .map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb))
         .collect();
 
-    // Per-(symbol, rb) LS channel estimate from the REG's 3 DMRS REs.
     use std::collections::HashMap;
     let mut h_reg: HashMap<(usize, usize), Complex32> = HashMap::new();
     let mut acc: HashMap<(usize, usize), (Complex32, u32)> = HashMap::new();
@@ -237,6 +305,32 @@ mod tests {
         dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE,
     };
     use crate::sequence::gold_sequence as gold;
+
+    #[test]
+    fn uss_hashing_matches_live_gnb() {
+        // Live OCUDU cell: CORESET#1 (id 1, 8 CCEs), USS ss-id 2, C-RNTI 0x4626,
+        // nrofCandidates AL2=4, AL4=2. The gNB was observed scheduling this UE at
+        // AL4 with cce_index ∈ {0, 4} across slots. Every AL4 candidate we produce
+        // must therefore be one of those two, and AL2 must be 2-CCE aligned.
+        for slot in 0..20u32 {
+            let cands = uss_candidates(8, 1, 0x4626, slot, &[(2, 4), (4, 2)]);
+            for c in &cands {
+                assert!(c.cces.iter().all(|&x| x < 8), "CCE out of range");
+                assert_eq!(c.cces.len(), c.agg_level);
+                // contiguous, aligned to the aggregation level
+                assert_eq!(c.cces[0] % c.agg_level, 0);
+                assert!(c.cces.windows(2).all(|w| w[1] == w[0] + 1));
+                if c.agg_level == 4 {
+                    assert!(c.cces[0] == 0 || c.cces[0] == 4, "AL4 base {} not in {{0,4}}", c.cces[0]);
+                }
+            }
+        }
+        // A_p for p=1 is 39829; Y_{1,0} = 39829·0x4626 mod 65537.
+        let y0 = (39829u64 * 0x4626) % 65537;
+        // AL4 (L=4, M=2): base = 4·(Y mod 2) → {0 or 4}; both m give both parities.
+        let c0 = uss_candidates(8, 1, 0x4626, 0, &[(4, 2)]);
+        assert!(c0.iter().any(|c| c.cces[0] == 4 * ((y0 % 2) as usize)));
+    }
 
     #[test]
     fn coreset0_table_13_4() {

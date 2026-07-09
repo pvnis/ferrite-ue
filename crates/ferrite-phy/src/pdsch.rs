@@ -31,6 +31,9 @@ pub struct PdschAlloc {
     /// CORESET#0 size in RBs for interleaved VRB→PRB mapping (§7.3.1.6). `0`
     /// means non-interleaved (PRB = VRB). SIB1 in CORESET0 is interleaved (L=2).
     pub n_bwp: usize,
+    /// Number of DM-RS CDM groups without data (config type 1): 2 → DM-RS symbols
+    /// carry no data; 1 → the odd subcarriers of DM-RS symbols carry data too.
+    pub nof_cdm_groups: usize,
 }
 
 impl PdschAlloc {
@@ -237,9 +240,6 @@ pub fn extract_pdsch(
     // Data REs in §7.3.1.5 order: increasing k' (subcarrier over all RBs), then l.
     let syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym).collect();
     let dmrs_set: std::collections::HashSet<usize> = dmrs_syms.iter().copied().collect();
-    // DCI 1_0 uses 2 DM-RS CDM groups without data, so DM-RS symbols carry no
-    // PDSCH data on any subcarrier — data lives only on the non-DM-RS symbols.
-    let data_syms: Vec<usize> = syms.iter().copied().filter(|l| !dmrs_set.contains(l)).collect();
     let mut data: Vec<f32> = Vec::new();
     let mut evm_acc = 0f32;
     let mut evm_n = 0usize;
@@ -251,10 +251,22 @@ pub fn extract_pdsch(
         data.push(z.re);
         data.push(z.im);
     };
+    // With 2 CDM groups without data, DM-RS symbols carry no PDSCH data on any
+    // subcarrier. With 1 CDM group, the odd subcarriers of DM-RS symbols do carry
+    // data (config type 1 → DM-RS on even subcarriers only).
+    let is_data_re = |l: usize, k_in_rb: usize| -> bool {
+        if !dmrs_set.contains(&l) {
+            return true;
+        }
+        alloc.nof_cdm_groups == 1 && k_in_rb % 2 == 1
+    };
     if time_first {
         // (l, k') — symbol-outer, subcarrier-inner.
-        for &l in &data_syms {
+        for &l in &syms {
             for kp in 0..(12 * n_rb) {
+                if !is_data_re(l, kp % 12) {
+                    continue;
+                }
                 let rb = kp / 12;
                 let k = (12 * prb[rb] + kp % 12) as i32;
                 let z = grids[l][sc_to_bin(k)] * chan(l, rb).conj();
@@ -264,9 +276,12 @@ pub fn extract_pdsch(
     } else {
         // (k', l) — subcarrier-outer, symbol-inner (§7.3.1.5).
         for kp in 0..(12 * n_rb) {
-            let rb = kp / 12;
-            let k = (12 * prb[rb] + kp % 12) as i32;
-            for &l in &data_syms {
+            for &l in &syms {
+                if !is_data_re(l, kp % 12) {
+                    continue;
+                }
+                let rb = kp / 12;
+                let k = (12 * prb[rb] + kp % 12) as i32;
                 let z = grids[l][sc_to_bin(k)] * chan(l, rb).conj();
                 push_re(z, &mut data);
             }

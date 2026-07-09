@@ -99,6 +99,23 @@ pub fn rrc_setup_request(random_value_39: u64, establishment_cause: u8) -> [u8; 
 /// EstablishmentCause mo-Signalling (TS 38.331).
 pub const CAUSE_MO_SIGNALLING: u8 = 3;
 
+/// Encode `UL-DCCH-Message { c1: ulInformationTransfer }` carrying `nas`
+/// (TS 38.331). Used to send NAS uplink (AuthenticationResponse, etc.).
+/// Layout: [1: c1=0][4: c1 idx ulInformationTransfer=7][1: critExt=0]
+/// [3: optional bitmap = 100 (dedicatedNAS present)][NAS length + octets].
+pub fn rrc_ul_information_transfer(nas: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(0, 1); // c1
+    w.put(7, 4); // c1: ulInformationTransfer (index 7)
+    w.put(0, 1); // criticalExtensions: ulInformationTransfer
+    w.put(0b100, 3); // optional bitmap: dedicatedNAS present, lateExt/nonCrit absent
+    put_length(&mut w, nas.len());
+    for &b in nas {
+        w.put(b as u64, 8);
+    }
+    w.finish()
+}
+
 /// UPER length determinant for an unconstrained count `n` (TS X.691 §11.9).
 fn put_length(w: &mut BitWriter, n: usize) {
     if n < 128 {
@@ -108,6 +125,77 @@ fn put_length(w: &mut BitWriter, n: usize) {
         w.put(0b10, 2);
         w.put(n as u64, 14);
     }
+}
+
+/// Read a UPER length determinant (inverse of `put_length`).
+fn get_length(r: &mut BitReader) -> Option<usize> {
+    if r.get(1)? == 0 {
+        Some(r.get(7)? as usize) // short form: 0 | 7-bit
+    } else {
+        if r.get(1)? != 0 {
+            return None; // fragmented form not supported
+        }
+        Some(r.get(14)? as usize) // 10 | 14-bit
+    }
+}
+
+/// Decode a `DL-DCCH-Message { c1: dlInformationTransfer }` (TS 38.331) and
+/// return the carried `dedicatedNAS-Message` octets. Mirror of the UL encoder,
+/// but DLInformationTransfer has a 2-bit rrc-TransactionIdentifier before the
+/// criticalExtensions CHOICE. The NAS octets are UPER-packed (not byte aligned),
+/// so they must be bit-shifted out — a plain byte scan for 0x7e misses them.
+///
+/// Layout: [1: c1=0][4: c1 idx dlInformationTransfer=5][2: rrc-TransactionId]
+/// [1: critExt=dlInformationTransfer=0][3: optional bitmap {dedNAS,lateExt,
+/// nonCrit}][dedicatedNAS-Message: length + octets].
+pub fn parse_dl_dcch_nas(rrc: &[u8]) -> Option<Vec<u8>> {
+    let mut r = BitReader::new(rrc);
+    if r.get(1)? != 0 {
+        return None; // DL-DCCH-MessageType CHOICE: c1
+    }
+    if r.get(4)? != 5 {
+        return None; // c1 CHOICE: dlInformationTransfer (index 5)
+    }
+    let _tid = r.get(2)?; // rrc-TransactionIdentifier (0..3)
+    if r.get(1)? != 0 {
+        return None; // criticalExtensions CHOICE: dlInformationTransfer
+    }
+    let opt = r.get(3)?; // {dedicatedNAS-Message, lateNonCritExt, nonCritExt}
+    if opt & 0b100 == 0 {
+        return None; // dedicatedNAS-Message absent
+    }
+    let len = get_length(&mut r)?;
+    let mut nas = Vec::with_capacity(len);
+    for _ in 0..len {
+        nas.push(r.get(8)? as u8);
+    }
+    Some(nas)
+}
+
+/// Unstack a DL-SCH SRB1 MAC PDU → the carried NAS. Peels the MAC subheader
+/// (DCCH = LCID 1), the RLC AM Data PDU header (2 octets, 12-bit SN, complete
+/// SDU), the PDCP Data PDU header (2 octets, 12-bit SN) and trailing MAC-I
+/// (4 octets), then decodes the DL-DCCH dlInformationTransfer RRC PDU.
+pub fn parse_srb1_dl_nas(mac_pdu: &[u8]) -> Option<Vec<u8>> {
+    // A DL-SCH PDU can carry several LCID-1 subPDUs: an RLC AM STATUS PDU
+    // (ACKing our uplink, D/C=0) alongside the RLC AM DATA PDU with the SDU.
+    // Scan every DCCH subPDU and decode the first DATA PDU that yields a NAS.
+    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+        let rlc = &s.payload;
+        // RLC AM DATA PDU: D/C must be 1 (skip STATUS); 12-bit SN ⇒ 2-octet header.
+        if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
+            continue;
+        }
+        let pdcp = &rlc[2..];
+        // PDCP Data PDU (SRB): 2-octet header (12-bit SN) + RRC + 4-octet MAC-I.
+        if pdcp.len() < 2 + 4 {
+            continue;
+        }
+        if let Some(nas) = parse_dl_dcch_nas(&pdcp[2..pdcp.len() - 4]) {
+            return Some(nas);
+        }
+    }
+    None
 }
 
 /// Encode `UL-DCCH-Message { c1: rrcSetupComplete }` carrying `nas` as the

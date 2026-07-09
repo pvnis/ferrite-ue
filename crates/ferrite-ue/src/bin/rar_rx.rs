@@ -208,7 +208,7 @@ fn main() {
 
             let alloc = PdschAlloc {
                 rb_start, n_rb, sym_start: s_sym, n_sym: l_sym,
-                dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0,
+                dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 2
             };
             let Some(grids) = demod_slot(&ofdm, &fsh, base, slot as usize % 2, 1) else { continue };
             // TBS for the RAR (small): gNB logs tbs=9 bytes. Try both orderings.

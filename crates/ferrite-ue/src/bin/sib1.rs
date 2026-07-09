@@ -126,6 +126,7 @@ fn main() {
                 dmrs_symbols: dmrs_symbols.clone(),
                 qm: qm as usize,
                 n_bwp: 0, // non-interleaved (DMRS confirms contiguous PRBs)
+                nof_cdm_groups: 2,
             };
             println!(
                 "SFN {} slot {slot}: SIB1 DCI  RB {rb_start}+{n_rb}  sym {s_sym}+{l_sym}  MCS {mcs} (Qm {qm}, R {:.3})",
