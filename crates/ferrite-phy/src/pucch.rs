@@ -132,7 +132,7 @@ pub fn pucch_f1_modulate_slot(
     let n1 = if hopping { cfg.nof_symbols / 2 } else { cfg.nof_symbols };
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
 
-    let mut place_hop = |grids: &mut Vec<Vec<Complex32>>, hop_start: usize, hop_len: usize, prb: usize| {
+    let place_hop = |grids: &mut Vec<Vec<Complex32>>, hop_start: usize, hop_len: usize, prb: usize| {
         // Count DM-RS (even rel) and data (odd rel) symbols in the hop.
         let n_dmrs = hop_len.div_ceil(2);
         let n_data = hop_len / 2;

@@ -1,0 +1,89 @@
+//! Minimal 5GS NAS (TS 24.501) — just the RegistrationRequest the UE sends in
+//! RRCSetupComplete, with a SUCI (null protection scheme) built from the IMSI.
+//! Hand-rolled for exactly this message.
+
+/// Pack two decimal digits into a BCD octet (low nibble first): (d_lo, d_hi).
+fn bcd(lo: u8, hi: u8) -> u8 {
+    (hi << 4) | (lo & 0x0f)
+}
+
+/// Build the SUCI (5GS mobile identity, null scheme) from a 15-digit IMSI with a
+/// 2-digit MNC (TS 24.501 §9.11.3.4). Layout: identity-type octet, MCC/MNC (3),
+/// routing indicator (2), protection scheme (1), home-net key id (1), then the
+/// MSIN BCD (scheme output for the null scheme).
+pub fn suci_from_imsi(imsi: &str) -> Vec<u8> {
+    let d: Vec<u8> = imsi.bytes().map(|b| b - b'0').collect();
+    assert!(d.len() == 15, "expect a 15-digit IMSI (2-digit MNC)");
+    let (mcc, mnc, msin) = (&d[0..3], &d[3..5], &d[5..]);
+    let mut v = Vec::new();
+    // Identity type octet: SUPI format = IMSI (0), type of identity = SUCI (001).
+    v.push(0x01);
+    // MCC/MNC BCD (2-digit MNC → 3rd MNC digit = 0xf).
+    v.push(bcd(mcc[0], mcc[1]));
+    v.push(bcd(mcc[2], 0xf));
+    v.push(bcd(mnc[0], mnc[1]));
+    // Routing indicator: none configured → "0000" (per many cores) = 0x00 0x00.
+    v.push(0x00);
+    v.push(0x00);
+    // Protection scheme id = null (0), home network public key id = 0.
+    v.push(0x00);
+    v.push(0x00);
+    // Scheme output = MSIN in BCD (null scheme = cleartext).
+    for pair in msin.chunks(2) {
+        v.push(bcd(pair[0], *pair.get(1).unwrap_or(&0xf)));
+    }
+    v
+}
+
+/// Build a plain 5GS RegistrationRequest (TS 24.501 §8.2.6): initial
+/// registration with the SUCI, 5GMM capability, and UE security capability.
+pub fn registration_request(imsi: &str) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(0x7e); // Extended protocol discriminator: 5GS mobility management
+    m.push(0x00); // Security header type: plain NAS message
+    m.push(0x41); // Message type: Registration request
+    // 5GS registration type (½ octet) + ngKSI (½ octet): initial reg (0b001),
+    // FOR=0; ngKSI = no key available (0b111). Octet = ngKSI<<4 | regtype.
+    m.push(0x79); // 0111_1001: ngKSI=7, FOR=1, type=001 (initial)
+    // 5GS mobile identity (SUCI), type-6 IE: 2-octet length + value.
+    let suci = suci_from_imsi(imsi);
+    m.push((suci.len() >> 8) as u8);
+    m.push((suci.len() & 0xff) as u8);
+    m.extend_from_slice(&suci);
+    // 5GMM capability (IEI 0x10), length 1: S1 mode / handover bits (0x07 typical).
+    m.push(0x10);
+    m.push(0x01);
+    m.push(0x07);
+    // UE security capability (IEI 0x2e), length 2: 5G-EA0 + 128-5G-EA1/2 and
+    // 5G-IA0 + 128-5G-IA1/2 (bit7..: EA0,EA1,EA2 / IA0,IA1,IA2). 0xe0 0xe0.
+    m.push(0x2e);
+    m.push(0x02);
+    m.push(0xe0);
+    m.push(0xe0);
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suci_layout() {
+        // imsi 001010167891203 → MCC 001, MNC 01, MSIN 0167891203
+        let s = suci_from_imsi("001010167891203");
+        assert_eq!(s[0], 0x01); // IMSI / SUCI
+        assert_eq!(s[1], 0x00); // MCC digits 0,0
+        assert_eq!(s[2], 0xf1); // MNC filler f, MCC digit 1
+        assert_eq!(s[3], 0x10); // MNC digits 1,0
+        assert_eq!(s[6], 0x00); // protection scheme = null
+        assert_eq!(s[7], 0x00); // home net key id
+        // MSIN 0167891203 → 10,76,98,21,30
+        assert_eq!(&s[8..], &[0x10, 0x76, 0x98, 0x21, 0x30]);
+    }
+
+    #[test]
+    fn reg_request_header() {
+        let r = registration_request("001010167891203");
+        assert_eq!(&r[0..4], &[0x7e, 0x00, 0x41, 0x79]);
+    }
+}

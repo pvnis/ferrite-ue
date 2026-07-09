@@ -99,6 +99,39 @@ pub fn rrc_setup_request(random_value_39: u64, establishment_cause: u8) -> [u8; 
 /// EstablishmentCause mo-Signalling (TS 38.331).
 pub const CAUSE_MO_SIGNALLING: u8 = 3;
 
+/// UPER length determinant for an unconstrained count `n` (TS X.691 §11.9).
+fn put_length(w: &mut BitWriter, n: usize) {
+    if n < 128 {
+        w.put(n as u64, 8); // 0 | 7-bit
+    } else {
+        assert!(n < 16384, "length too large for the short form");
+        w.put(0b10, 2);
+        w.put(n as u64, 14);
+    }
+}
+
+/// Encode `UL-DCCH-Message { c1: rrcSetupComplete }` carrying `nas` as the
+/// dedicatedNAS-Message (TS 38.331). `selectedPLMN-Identity` = `plmn` (1..12).
+///
+/// UPER layout: [1: msg CHOICE c1=0][4: c1 index rrcSetupComplete=2]
+/// [2: rrc-TransactionIdentifier][1: critExt CHOICE rrcSetupComplete=0]
+/// [1: IEs ext marker=0][6: optional bitmap=0][4: selectedPLMN-1]
+/// [dedicatedNAS-Message: length + octets].
+pub fn rrc_setup_complete(transaction_id: u8, plmn: u8, nas: &[u8]) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(0, 1); // UL-DCCH-MessageType CHOICE: c1
+    w.put(2, 4); // c1 CHOICE: rrcSetupComplete (index 2 of 16)
+    w.put((transaction_id & 0x3) as u64, 2); // RRC-TransactionIdentifier (0..3)
+    w.put(0, 1); // criticalExtensions CHOICE: rrcSetupComplete
+    w.put(0, 6); // optional bitmap: registeredAMF/guami/s-NSSAI/ng-5G-S-TMSI/lateExt/nonCrit all absent
+    w.put((plmn - 1) as u64, 4); // selectedPLMN-Identity (1..12) → constrained 4 bits
+    put_length(&mut w, nas.len()); // dedicatedNAS-Message OCTET STRING length
+    for &b in nas {
+        w.put(b as u64, 8);
+    }
+    w.finish()
+}
+
 // ---------------------------------------------------------------------------
 // MAC (TS 38.321)
 // ---------------------------------------------------------------------------
@@ -110,6 +143,42 @@ pub const LCID_PADDING: u8 = 63;
 /// DL-SCH LCID values (TS 38.321 Table 6.2.1-1).
 pub const LCID_DL_CCCH: u8 = 0; // DL CCCH SDU (has length field)
 pub const LCID_DL_CON_RES: u8 = 62; // UE Contention Resolution Identity CE (6 bytes)
+
+/// Frame an RRC message for SRB1 into a UL-SCH MAC PDU (Msg5). Stacks:
+/// PDCP Data PDU (SRB, 12-bit SN + 4-octet MAC-I=0 since integrity is not yet
+/// active, TS 38.323) → RLC AM Data PDU (complete SDU, 12-bit SN, poll set,
+/// TS 38.322) → MAC subPDU (LCID 1 = DCCH/SRB1, 8/16-bit L) + padding to `tbs`.
+pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize) -> Vec<u8> {
+    // PDCP Data PDU for SRB: [RRRR|SN(4 MSB)][SN(8 LSB)] || data || MAC-I(4 = 0).
+    let mut pdcp = Vec::with_capacity(rrc.len() + 6);
+    pdcp.push(((pdcp_sn >> 8) & 0x0f) as u8);
+    pdcp.push((pdcp_sn & 0xff) as u8);
+    pdcp.extend_from_slice(rrc);
+    pdcp.extend_from_slice(&[0, 0, 0, 0]); // MAC-I (no integrity yet)
+
+    // RLC AM Data PDU (12-bit SN): [D/C=1|P=1|SI=00|SN(4 MSB)][SN(8 LSB)] || data.
+    let mut rlc = Vec::with_capacity(pdcp.len() + 2);
+    rlc.push(0xc0 | ((rlc_sn >> 8) & 0x0f) as u8); // D/C=1, P=1, SI=00
+    rlc.push((rlc_sn & 0xff) as u8);
+    rlc.extend_from_slice(&pdcp);
+
+    // MAC subPDU: subheader (LCID 1, with L field) + the RLC PDU.
+    let mut mac = Vec::with_capacity(tbs);
+    if rlc.len() < 256 {
+        mac.push(0x01); // R=0, F=0 (8-bit L), LCID=1
+        mac.push(rlc.len() as u8);
+    } else {
+        mac.push(0x41); // R=0, F=1 (16-bit L), LCID=1
+        mac.push((rlc.len() >> 8) as u8);
+        mac.push((rlc.len() & 0xff) as u8);
+    }
+    mac.extend_from_slice(&rlc);
+    if mac.len() < tbs {
+        mac.push(LCID_PADDING);
+        mac.resize(tbs, 0);
+    }
+    mac
+}
 
 /// Build the Msg3 MAC PDU: one CCCH48 subPDU carrying `ccch_sdu` (the 6-byte
 /// RRCSetupRequest) followed by padding, sized to `tbs` bytes.

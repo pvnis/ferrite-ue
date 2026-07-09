@@ -17,7 +17,8 @@ use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
-use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, rrc_setup_request, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::nas::registration_request;
+use ferrite_ue::rrc::{msg3_mac_pdu, parse_dl_mac_pdu, rrc_setup_complete, rrc_setup_request, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 
@@ -310,6 +311,11 @@ fn main() {
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
+    let mut pend_msg5: Option<(i64, Vec<Complex32>)> = None;
+    let mut msg5_done = false;
+    // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
+    let imsi = arg("--imsi", "001010167891203");
+    let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
     loop {
         let slot_start_ul = ul_counter as i64;
@@ -318,7 +324,7 @@ fn main() {
         for b in 0..blocks_per_slot {
             fill_dl(&mut dl, &mut blk);
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
-            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &[&pend, &pend_pucch, &pend_sr]);
+            serve(&mut ul, &mut ul_counter, align_ul + occ_off + offset, &[&pend, &pend_pucch, &pend_sr, &pend_msg5]);
         }
 
         // Decode this slot's RA search space.
@@ -330,6 +336,38 @@ fn main() {
             cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
             off += cp + fft;
         }
+        // Connected: decode the C-RNTI DCI 0_0 UL grant (AL4 CCE0, CORESET0) and
+        // send Msg5 (RRCSetupComplete + NAS) on the granted PUSCH, k2 slots later.
+        if let (Some(crnti), false) = (connected, msg5_done) {
+            let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
+            let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &cand);
+            pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
+            if let Some(bits) = dci_decode(&m, crnti, a_len) {
+                // DCI 0_0 (UL grant): id(1) freq(9,N=24) time(4) hop(1) mcs(5) ndi(1)...
+                if bits[0] == 0 {
+                    let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
+                    let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
+                    let mcs = bits[15..20].iter().fold(0u8, |a, &b| a << 1 | b);
+                    let ndi = bits[20];
+                    let (qm, r) = mcs_params(mcs);
+                    let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
+                    let n_data_sym = 14 - 3;
+                    let e = g_nrb * 12 * n_data_sym * qm as usize;
+                    let tbs = tbs_from_nre(g_nrb * 12 * n_data_sym, r, qm as usize);
+                    let mac = srb1_msg5_pdu(&rrc_sc, 0, 0, tbs / 8);
+                    let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
+                    let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
+                    let mut m5 = pusch_modulate_slot(&ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize, crnti, center_hz, fs);
+                    let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                    for s in &mut m5 { *s *= amp / pk; }
+                    let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                    println!("  → Msg5 RRCSetupComplete: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb, tbs / 8);
+                    pend_msg5 = Some((pos, m5));
+                    msg5_done = true;
+                }
+            }
+        }
+
         let mut llrs = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &ra_cand);
         pdcch_descramble_llr(&mut llrs, u32::from(acq.cell_id));
         if let Some(bits) = dci_decode(&llrs, ra_rnti, a_len) {
@@ -485,6 +523,11 @@ fn main() {
         if let Some((pos, wave)) = &pend_sr {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_sr = None;
+            }
+        }
+        if let Some((pos, wave)) = &pend_msg5 {
+            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+                pend_msg5 = None;
             }
         }
     }
