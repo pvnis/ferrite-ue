@@ -116,6 +116,40 @@ pub fn rrc_ul_information_transfer(nas: &[u8]) -> Vec<u8> {
     w.finish()
 }
 
+/// Encode `UL-DCCH-Message { c1: securityModeComplete }` (TS 38.331). Layout:
+/// [1: c1=0][4: c1 idx securityModeComplete=5][2: rrc-TransactionIdentifier]
+/// [1: critExt=securityModeComplete=0][2: IEs optional bitmap = 00 (lateExt,
+/// nonCrit absent)].
+pub fn rrc_security_mode_complete(transaction_id: u8) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(0, 1);
+    w.put(5, 4);
+    w.put((transaction_id & 3) as u64, 2);
+    w.put(0, 1);
+    w.put(0, 2);
+    w.finish()
+}
+
+/// Encode `UL-DCCH-Message { c1: rrcReconfigurationComplete }` (TS 38.331):
+/// c1 index 1, rrc-TransactionIdentifier, critExt=0, IEs optional bitmap 00.
+pub fn rrc_reconfiguration_complete(transaction_id: u8) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(0, 1);
+    w.put(1, 4);
+    w.put((transaction_id & 3) as u64, 2);
+    w.put(0, 1);
+    w.put(0, 2);
+    w.finish()
+}
+
+/// The 2-bit rrc-TransactionIdentifier of a DL-DCCH c1 message (it follows the
+/// 1-bit c1 CHOICE + 4-bit message index).
+pub fn dl_dcch_transaction_id(rrc: &[u8]) -> u8 {
+    let mut r = BitReader::new(rrc);
+    let _ = r.get(5); // c1 + index
+    r.get(2).unwrap_or(0) as u8
+}
+
 /// UPER length determinant for an unconstrained count `n` (TS X.691 §11.9).
 fn put_length(w: &mut BitWriter, n: usize) {
     if n < 128 {
@@ -208,6 +242,26 @@ pub fn parse_srb1_dl_rrc(mac_pdu: &[u8]) -> Option<Vec<u8>> {
     parse_srb1_dl_rrc_sn(mac_pdu).map(|(_, rrc)| rrc)
 }
 
+/// Unstack a DL-SCH SRB1 MAC PDU → `(pdcp_count, pdcp_msg, mac_i)` for PDCP
+/// integrity verification: `pdcp_msg` = PDCP header || RRC (the 128-NIA2 input),
+/// `mac_i` the received 4-octet MAC-I. The RRC PDU is `pdcp_msg[2..]`.
+pub fn parse_srb1_dl_pdcp(mac_pdu: &[u8]) -> Option<(u16, Vec<u8>, [u8; 4])> {
+    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+        let rlc = &s.payload;
+        if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
+            continue;
+        }
+        let pdcp = &rlc[2..];
+        if pdcp.len() < 2 + 4 {
+            continue;
+        }
+        let pdcp_sn = (((pdcp[0] & 0x0f) as u16) << 8) | pdcp[1] as u16;
+        let cut = pdcp.len() - 4;
+        return Some((pdcp_sn, pdcp[..cut].to_vec(), pdcp[cut..].try_into().unwrap()));
+    }
+    None
+}
+
 /// The DL-DCCH c1 message index (TS 38.331): 0=rrcReconfiguration, 2=rrcRelease,
 /// 4=securityModeCommand, 5=dlInformationTransfer, … Returns None if not a c1.
 pub fn dl_dcch_type(rrc: &[u8]) -> Option<u8> {
@@ -253,16 +307,22 @@ pub const LCID_DL_CCCH: u8 = 0; // DL CCCH SDU (has length field)
 pub const LCID_DL_CON_RES: u8 = 62; // UE Contention Resolution Identity CE (6 bytes)
 
 /// Frame an RRC message for SRB1 into a UL-SCH MAC PDU (Msg5). Stacks:
-/// PDCP Data PDU (SRB, 12-bit SN + 4-octet MAC-I=0 since integrity is not yet
-/// active, TS 38.323) → RLC AM Data PDU (complete SDU, 12-bit SN, poll set,
-/// TS 38.322) → MAC subPDU (LCID 1 = DCCH/SRB1, 8/16-bit L) + padding to `tbs`.
-pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize) -> Vec<u8> {
-    // PDCP Data PDU for SRB: [RRRR|SN(4 MSB)][SN(8 LSB)] || data || MAC-I(4 = 0).
+/// PDCP Data PDU (SRB, 12-bit SN + 4-octet MAC-I, TS 38.323) → RLC AM Data PDU
+/// (complete SDU, 12-bit SN, poll set, TS 38.322) → MAC subPDU (LCID 1 =
+/// DCCH/SRB1, 8/16-bit L) + padding to `tbs`. Before AS security the MAC-I is 0;
+/// once `k_rrcint` is set it is the 128-NIA2 MAC over the PDCP PDU (count = SN,
+/// bearer 0 = SRB1, uplink direction).
+pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize, k_rrcint: Option<&[u8; 16]>) -> Vec<u8> {
+    // PDCP Data PDU for SRB: [RRRR|SN(4 MSB)][SN(8 LSB)] || data || MAC-I(4).
     let mut pdcp = Vec::with_capacity(rrc.len() + 6);
     pdcp.push(((pdcp_sn >> 8) & 0x0f) as u8);
     pdcp.push((pdcp_sn & 0xff) as u8);
     pdcp.extend_from_slice(rrc);
-    pdcp.extend_from_slice(&[0, 0, 0, 0]); // MAC-I (no integrity yet)
+    let mac_i = match k_rrcint {
+        Some(ik) => crate::milenage::nia2_mac(ik, pdcp_sn as u32, 0, 0, &pdcp),
+        None => [0, 0, 0, 0],
+    };
+    pdcp.extend_from_slice(&mac_i);
 
     // RLC AM Data PDU (12-bit SN): [D/C=1|P=1|SI=00|SN(4 MSB)][SN(8 LSB)] || data.
     let mut rlc = Vec::with_capacity(pdcp.len() + 2);

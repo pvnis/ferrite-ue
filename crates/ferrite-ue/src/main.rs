@@ -22,7 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
-use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -442,6 +442,10 @@ fn run(cfg: Config) {
     // NAS registration state machine: each DL NAS message queues a UL reply.
     let mut auth_done = false; // AuthenticationResponse queued
     let mut smc_done = false; // SecurityModeComplete queued
+    let mut as_sec_done = false; // RRC securityModeComplete queued (AS security)
+    let mut recfg_done = false; // rrcReconfigurationComplete queued
+    let mut k_amf_st: Option<[u8; 32]> = None; // K_AMF, for K_gNB derivation
+    let mut k_rrcint: Option<[u8; 16]> = None; // 128-NIA2 RRC integrity key (AS)
     let mut reg_done = false; // RegistrationComplete queued
     let mut nas_ul_count: u32 = 0; // NAS COUNT for uplink integrity protection
     let mut k_nasint: Option<[u8; 16]> = None; // 128-NIA2 key, derived after AKA
@@ -539,7 +543,7 @@ fn run(cfg: Config) {
                             (mac_short_bsr(need, tbs_bytes), format!("Short BSR (need {need}B)"))
                         } else {
                             let rrc = ul_queue.pop_front().unwrap();
-                            let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes);
+                            let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
                             let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
                             srb1_sn += 1;
                             (m, k)
@@ -693,9 +697,42 @@ fn run(cfg: Config) {
                                 let dtype = dl_dcch_type(&rrc);
                                 println!("★ DL RRC (slot {slot_idx} rlcSN {rlc_sn}): c1={dtype:?} {}",
                                     rrc.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                                // securityModeCommand (4) and rrcReconfiguration (0) are
-                                // handled in the AS-security milestone; for now dispatch the
-                                // NAS carried in dlInformationTransfer (5).
+                                // RRC securityModeCommand (4): activate AS security. Derive
+                                // K_gNB → K_RRCint; verify the DL PDCP MAC-I (validates the
+                                // key) trying UL-NAS-COUNT candidates; reply RRC
+                                // securityModeComplete (integrity-protected PDCP MAC-I).
+                                if dtype == Some(4) && !as_sec_done {
+                                    as_sec_done = true;
+                                    if let (Some(kamf), Some((pdcp_sn, pmsg, pmac))) = (&k_amf_st, ferrite_ue::rrc::parse_srb1_dl_pdcp(&tb)) {
+                                        let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
+                                        let mut found = None;
+                                        for c in 0..4u32 {
+                                            let kg = ferrite_ue::milenage::k_gnb(kamf, c);
+                                            let ki = algo_key(&kg, 4, 2); // RRC-int, 128-NIA2
+                                            let exp = ferrite_ue::milenage::nia2_mac(&ki, pdcp_sn as u32, 0, 1, &pmsg);
+                                            if exp == pmac { found = Some((c, ki)); break; }
+                                        }
+                                        match found {
+                                            Some((c, ki)) => {
+                                                k_rrcint = Some(ki);
+                                                println!("   RRC SMC MAC=OK (K_gNB ul_nas_count={c}) → activating AS security");
+                                                ul_queue.push_back(rrc_security_mode_complete(tid));
+                                                println!("   ⇒ queued RRC SecurityModeComplete (tid {tid})");
+                                            }
+                                            None => println!("   RRC SMC MAC=BAD for ul_nas_count 0..3 (K_gNB derivation off)"),
+                                        }
+                                    }
+                                    break;
+                                }
+                                // rrcReconfiguration (0): reply rrcReconfigurationComplete
+                                // (its piggybacked NAS RegistrationAccept is handled below).
+                                if dtype == Some(0) && !recfg_done {
+                                    recfg_done = true;
+                                    let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
+                                    ul_queue.push_back(rrc_reconfiguration_complete(tid));
+                                    println!("   ⇒ queued RRCReconfigurationComplete (tid {tid}) — ATTACH near-complete");
+                                    break;
+                                }
                                 let Some(nas) = parse_dl_dcch_nas(&rrc).filter(|_| dtype == Some(5)) else { break };
                                 let (sht, dl_mac, dl_seq, inner) = strip_security_header(&nas);
                                 let mtype = nas_msg_type(inner);
@@ -720,6 +757,7 @@ fn run(cfg: Config) {
                                             let kseaf = k_seaf(&kausf, &snn);
                                             let kamf = k_amf(&kseaf, &imsi, &ar.abba);
                                             k_nasint = Some(algo_key(&kamf, 2, 2));
+                                            k_amf_st = Some(kamf);
                                             println!("   AKA: MAC={} RES*={}", if mac_ok { "OK" } else { "BAD" },
                                                 rs.iter().map(|b| format!("{b:02x}")).collect::<String>());
                                             if mac_ok {

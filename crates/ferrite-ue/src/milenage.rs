@@ -140,9 +140,21 @@ pub fn k_amf(k_seaf: &[u8; 32], supi: &str, abba: &[u8]) -> [u8; 32] {
     kdf(k_seaf, &s)
 }
 
-/// NAS/RRC algorithm key (TS 33.501 §A.8): KDF(K_AMF, FC=0x69 || algo-type-dist
-/// || algo-id), low 128 bits. `algo_type`: 1=NAS-enc, 2=NAS-int. `algo_id`: the
-/// NEA/NIA identifier (0..3).
+/// K_gNB (TS 33.501 §A.9): KDF(K_AMF, FC=0x6E || uplink-NAS-COUNT(4) || 0x0004 ||
+/// access-type-distinguisher 0x01 (3GPP) || 0x0001).
+pub fn k_gnb(k_amf: &[u8; 32], ul_nas_count: u32) -> [u8; 32] {
+    let mut s = Vec::new();
+    s.push(0x6e);
+    s.extend_from_slice(&ul_nas_count.to_be_bytes());
+    s.extend_from_slice(&[0x00, 0x04]);
+    s.push(0x01);
+    s.extend_from_slice(&[0x00, 0x01]);
+    kdf(k_amf, &s)
+}
+
+/// NAS/RRC algorithm key (TS 33.501 §A.8): KDF(K_AMF or K_gNB, FC=0x69 ||
+/// algo-type-dist || algo-id), low 128 bits. `algo_type`: 1=NAS-enc, 2=NAS-int,
+/// 3=RRC-enc, 4=RRC-int. `algo_id`: the NEA/NIA identifier (0..3).
 pub fn algo_key(k_amf: &[u8; 32], algo_type: u8, algo_id: u8) -> [u8; 16] {
     let s = [0x69, algo_type, 0x00, 0x01, algo_id, 0x00, 0x01];
     let out = kdf(k_amf, &s);
