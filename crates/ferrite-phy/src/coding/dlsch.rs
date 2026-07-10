@@ -321,6 +321,66 @@ pub fn check_cb_crc(cb: &[u8]) -> bool {
     CRC24B.check(cb)
 }
 
+/// De-rate-match ONE HARQ (re)transmission's `E` soft bits into the length-`Ncb`
+/// circular buffer at this RV's offset, WITHOUT the filler override. Filler bits are
+/// not transmitted so they stay 0 here; the caller sums these buffers across the RVs
+/// of one transport block (HARQ soft-combining / incremental redundancy) and decodes
+/// the sum with [`dlsch_decode_cb`]. Returns an empty vec if the block isn't single-CB.
+pub fn dlsch_cb_llr(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> Vec<f32> {
+    let p = seg_params(tbs, r);
+    if p.c != 1 {
+        return Vec::new();
+    }
+    let b_len = tbs + tb_crc(tbs).width();
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return Vec::new();
+    };
+    let ncb = g.n() - 2 * p.zc;
+    let mut filler = vec![false; ncb];
+    let fstart = b_len.saturating_sub(2 * p.zc);
+    for fi in fstart..(p.k - 2 * p.zc) {
+        filler[fi] = true;
+    }
+    let k0 = k0_of(rv, p.bg, ncb, p.zc);
+    // Scatter E soft bits into the buffer, skipping (untransmitted) filler positions;
+    // do NOT pin filler to 1e6 (that happens once, at decode, after summing).
+    let e = deinterleave(f, qm);
+    let mut cb = vec![0f32; ncb];
+    let (mut j, mut k) = (0usize, 0usize);
+    while k < e.len() {
+        let pos = (k0 + j) % ncb;
+        if !filler[pos] {
+            cb[pos] += e[k];
+            k += 1;
+        }
+        j += 1;
+    }
+    cb
+}
+
+/// Decode an accumulated circular buffer (the sum of one or more RVs' [`dlsch_cb_llr`]
+/// outputs for one TB) into `(tb_bits, converged, crc_ok)`. Pins the filler bits to
+/// known-0, prepends the 2·Zc punctured systematic bits, and LDPC-decodes. Combining
+/// several RVs before this call is what lets a TB that no single (re)transmission could
+/// decode succeed once enough redundancy has accumulated.
+pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<u8>, bool, bool) {
+    let p = seg_params(tbs, r);
+    let b_len = tbs + tb_crc(tbs).width();
+    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    let ncb = g.n() - 2 * p.zc;
+    let mut cbf = cb.to_vec();
+    cbf.resize(ncb, 0.0);
+    let fstart = b_len.saturating_sub(2 * p.zc);
+    for pos in fstart..(p.k - 2 * p.zc) {
+        cbf[pos] = 1e6; // filler = known 0
+    }
+    let mut full = vec![0f32; g.n()];
+    full[2 * p.zc..].copy_from_slice(&cbf);
+    let (info, converged) = g.decode(&full, max_iter, 0.75);
+    let b = &info[..b_len];
+    (b[..tbs.min(b.len())].to_vec(), converged, tb_crc(tbs).check(b))
+}
+
 /// De-rate-match `E` soft bits to the full LDPC codeword LLRs (length
 /// `N_base·Zc`, first `2·Zc` punctured = 0), *without* LDPC decoding. The
 /// systematic bits are then the info bits directly: `codeword[0..K]` = the
@@ -419,6 +479,60 @@ mod tests {
 
         let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 40).expect("CRC failed");
         assert_eq!(dec, tb);
+    }
+
+    /// A single RV of a high-rate TB fails to decode, but soft-combining two RVs
+    /// (0 and 2) of the SAME TB recovers it — the essence of HARQ IR combining.
+    /// Scans SNR to land in the regime where combining *strictly* helps.
+    #[test]
+    fn harq_soft_combining_recovers() {
+        let (tbs, qm, r) = (400usize, 2usize, 0.88); // near-capacity rate → one RV is weak
+        let e_len = ((tbs + 16) as f64 / r) as usize / qm * qm;
+        for sigma_x100 in (70..=180).rev().step_by(3) {
+            let sigma = sigma_x100 as f32 / 100.0;
+            let mut rng = Rng(0xC0FF_EE01);
+            let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+            let mut tx = |rv: u8| -> Vec<f32> {
+                dlsch_encode_single(&tb, e_len, r, qm, rv)
+                    .iter()
+                    .map(|&b| {
+                        let x = (1.0 - 2.0 * b as f32) + rng.normal() * sigma;
+                        2.0 * x / (sigma * sigma)
+                    })
+                    .collect()
+            };
+            let (f0, f2) = (tx(0), tx(2));
+            let (_, _, c0) = dlsch_decode_single_bits(&f0, tbs, r, qm, 0, 40);
+            // Sum the two RVs' circular buffers and decode the combination.
+            let cb0 = dlsch_cb_llr(&f0, tbs, r, qm, 0);
+            let cb2 = dlsch_cb_llr(&f2, tbs, r, qm, 2);
+            let acc: Vec<f32> = cb0.iter().zip(&cb2).map(|(a, b)| a + b).collect();
+            let (bits, _conv, cc) = dlsch_decode_cb(&acc, tbs, r, 40);
+            if !c0 && cc {
+                // Found an SNR where RV 0 alone fails but adding RV 2's redundancy
+                // (incremental-redundancy soft-combining) recovers the transport block.
+                assert_eq!(&bits[..tbs], &tb[..]);
+                return;
+            }
+        }
+        panic!("no SNR regime found where combining strictly recovers the TB");
+    }
+
+    /// A single-RV round trip through the combining API matches the direct decoder.
+    #[test]
+    fn cb_api_matches_single() {
+        let mut rng = Rng(0xC0FF_EE02);
+        let (tbs, qm, r) = (776usize, 2usize, 0.2);
+        let e_len = ((tbs + 24) as f64 / r) as usize / qm * qm;
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        let llr: Vec<f32> = dlsch_encode_single(&tb, e_len, r, qm, 0)
+            .iter()
+            .map(|&b| (1.0 - 2.0 * b as f32) + rng.normal() * 0.5)
+            .collect();
+        let cb = dlsch_cb_llr(&llr, tbs, r, qm, 0);
+        let (bits, _, crc) = dlsch_decode_cb(&cb, tbs, r, 40);
+        assert!(crc);
+        assert_eq!(&bits[..tbs], &tb[..]);
     }
 
     /// SIB1 regime: E < Ncb (the transmitted bits are a *prefix* of the
