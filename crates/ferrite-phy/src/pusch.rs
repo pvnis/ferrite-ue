@@ -123,8 +123,11 @@ pub fn pusch_modulate_slot_uci(
     // the scrambling bits are c[2·di], c[2·di+1] (same sequence as the data). For
     // 1 bit the two QPSK components repeat the (scrambled) bit (placeholder y); for
     // 2 bits the [a0,a1,a0⊕a1] small block code is spread over the REs.
-    if !harq_ack.is_empty() {
-        let o_ack = harq_ack.len().min(2);
+    // Only 1-2 ACK bits (puncturing) are implemented; ≥3 bits need Reed-Muller +
+    // UL-SCH rate-matching, so leave the PUSCH as plain data (the gNB reads DTX and
+    // retransmits) rather than corrupting it with a wrong placement.
+    if harq_ack.len() == 1 || harq_ack.len() == 2 {
+        let o_ack = harq_ack.len();
         let n_sc = 12 * alloc.n_rb;
         let res = harq_ack_pusch_res(&alloc.dmrs_symbols, alloc.n_rb, o_ack, beta_harq, tb_bits);
         let code = |k: usize| -> u8 {
