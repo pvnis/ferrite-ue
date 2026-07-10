@@ -473,6 +473,10 @@ fn run(cfg: Config) {
     // and must be bundled into one 1-2 bit PUCCH, ordered by DAI — else the gNB (which
     // expects harq_bit_len bits) can't read the ACK and stalls the DL HARQ.
     let mut ack_book: std::collections::HashMap<i64, (u32, [Option<u8>; 4])> = std::collections::HashMap::new();
+    // A UL grant decoded this slot, modulated only AFTER the DL decode so a HARQ-ACK
+    // whose UL slot coincides with this PUSCH can be multiplexed onto it (UCI-on-PUSCH)
+    // instead of a PUCCH: (UL pos, PUSCH slot, rate-matched UL-SCH, alloc, TB bits).
+    let mut pending_pusch: Option<(i64, i64, Vec<u8>, PuschAlloc, usize)> = None;
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -682,14 +686,13 @@ fn run(cfg: Config) {
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
                         let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
-                        let mut m5 = pusch_modulate_slot(&ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize, crnti, center_hz, fs);
-                        let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                        for s in &mut m5 { *s *= amp / pk; }
                         let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
                         if !kind.is_empty() {
                             println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
                         }
-                        pend_ul.push((pos, m5));
+                        // Modulate after the DL decode (below), so a co-scheduled HARQ-ACK
+                        // can be multiplexed onto this PUSCH.
+                        pending_pusch = Some((pos, m5_slot, ulsch, m5_alloc, tbs_bytes * 8));
                     }
                 }
             }
@@ -1123,6 +1126,24 @@ fn run(cfg: Config) {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_sr = None;
             }
+        }
+        // Build the UL grant's PUSCH now that the DL codebook is populated. If a
+        // HARQ-ACK is due at this PUSCH's UL slot, multiplex it onto the PUSCH
+        // (UCI-on-PUSCH) — the gNB expects it there, not on the PUCCH — and remove it
+        // from the codebook so it isn't also sent on a PUCCH.
+        if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits)) = pending_pusch.take() {
+            let ack: Vec<u8> = ack_book.remove(&pos).map(|(_, book)| {
+                let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
+                (0..size).map(|i| book[i].unwrap_or(0)).collect()
+            }).unwrap_or_default();
+            const BETA_HARQ: f32 = 20.0; // beta_offset_harq_ack index 11
+            let crnti = connected.unwrap_or(0);
+            let mut m5 = ferrite_phy::pusch::pusch_modulate_slot_uci(
+                &ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize,
+                crnti, center_hz, fs, &ack, BETA_HARQ, tb_bits);
+            let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+            for s in &mut m5 { *s *= amp / pk; }
+            pend_ul.push((pos, m5));
         }
         // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
         // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
