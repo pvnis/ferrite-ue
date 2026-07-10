@@ -466,7 +466,13 @@ fn run(cfg: Config) {
     let mut last_ta: i64 = 5;
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
     let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
+    let mut pend_csi: Option<(i64, Vec<Complex32>)> = None; // pending CSI report (PUCCH F2)
     let mut pend_acks: Vec<(i64, Vec<Complex32>)> = Vec::new(); // in-flight DL HARQ-ACKs
+    // Latest CQI measured from the NZP-CSI-RS (row 1, k0=1, symbol 4). Set only when a
+    // valid CSI-RS is seen (high SINR); the CSI-RS is transmitted in even frames slots
+    // 2-4, so this is Some exactly in the frames whose slot-8 report the gNB reads —
+    // which is why gating the report on it needs no SFN tracking.
+    let mut pending_cqi: Option<u8> = None;
     // Dynamic HARQ-ACK codebook: accumulate per UL-slot ACK bits keyed by their UL
     // sample position; each entry holds (slot-in-frame, [ACK bit per C-DAI 0..3]).
     // Several DL PDSCHs (e.g. the two segments of one DL SDU) map to the SAME UL slot
@@ -560,7 +566,7 @@ fn run(cfg: Config) {
             // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
             // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
             let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
-            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr], &pend_acks, &pend_ul);
+            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_csi], &pend_acks, &pend_ul);
         }
 
         // Decode this slot's RA search space.
@@ -823,6 +829,21 @@ fn run(cfg: Config) {
                     }
                 }
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                    // NZP-CSI-RS measurement: the gNB sends the CSI-RS (row 1, k0=1,
+                    // symbol 4, 3 REs/RB over the BWP) in even frames, slots 2-4. Measure
+                    // the DL SINR from it and cache the mapped CQI. A valid (high) SINR
+                    // means the CSI-RS is actually present — i.e. an even frame — so the
+                    // slot-8 report it feeds lands in the gNB's report window with no need
+                    // to track the SFN. scramblingID = 1 (== PCI here).
+                    if matches!(slot_idx, 2..=4) {
+                        let sinr = ferrite_phy::csi::measure_csi_rs_sinr(
+                            &grids[4], |sc: usize| sc_to_bin(sc as i32),
+                            acq.cell_id, slot_idx, 4, carrier_rb, 1,
+                        );
+                        if sinr > 15.0 {
+                            pending_cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
+                        }
+                    }
                     // Cheap presence gate: every connected DL PDSCH starts at RB 0, so a
                     // DM-RS probe at rb[0,2) detects one. Skip the whole brute-force in the
                     // (common) slots with no PDSCH for us, keeping the loop fast.
@@ -1097,6 +1118,29 @@ fn run(cfg: Config) {
             pend_sr = Some((pos, sw));
         }
 
+        // Periodic CSI report: send the measured CQI on the PUCCH F2 (PRB 23, symb
+        // [0,2)) at slot 8. Queue it at slot 6 (2 slots ahead) once the frame's
+        // CSI-RS has been measured (slots 2-4). pending_cqi is Some only in frames
+        // where a valid CSI-RS was seen (even frames), which is exactly when the gNB
+        // reads the slot-8 report — so no SFN parity check is needed.
+        if connected.is_some() && slot_idx == 6 && pend_csi.is_none() {
+            if let Some(cqi) = pending_cqi.take() {
+                let csi_slot = 8i64;
+                let cfg = ferrite_phy::pucch::PucchF2 {
+                    prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2,
+                    rnti: connected.unwrap(), n_id: acq.cell_id, n_id0: acq.cell_id, carrier_rb,
+                };
+                // 4-bit wideband CQI, MSB first.
+                let bits = [(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1];
+                let mut cw = ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, csi_slot as u32, center_hz, fs);
+                let pk = cw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                for s in &mut cw { *s *= amp / pk; }
+                let pos = slot_start_ul + (csi_slot - slot_idx as i64) * slot_len
+                    + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                pend_csi = Some((pos, cw));
+            }
+        }
+
         slot_idx = (slot_idx + 1) % 20;
         if slot_idx == 0 {
             frames_at_offset += 1;
@@ -1125,6 +1169,11 @@ fn run(cfg: Config) {
         if let Some((pos, wave)) = &pend_sr {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_sr = None;
+            }
+        }
+        if let Some((pos, wave)) = &pend_csi {
+            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+                pend_csi = None;
             }
         }
         // Build the UL grant's PUSCH now that the DL codebook is populated. If a

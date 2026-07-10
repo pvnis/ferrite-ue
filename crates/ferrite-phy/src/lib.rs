@@ -6,6 +6,7 @@
 //! path: SSB detection via PSS/SSS, then MIB decode from the PBCH.
 
 pub mod coding;
+pub mod csi;
 pub mod numerology;
 pub mod ofdm;
 pub mod pdcch;

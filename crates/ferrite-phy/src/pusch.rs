@@ -189,7 +189,7 @@ const RM_BASIS: [[u8; 32]; 11] = [
 
 /// Encode 3-11 UCI bits with the (32, O) Reed-Muller code (TS 38.212 §5.3.3.2),
 /// rate-matched (repeated) to `e` bits.
-fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
+pub(crate) fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
     let mut d = [0u8; 32];
     for (i, &b) in bits.iter().enumerate() {
         if b == 1 {
