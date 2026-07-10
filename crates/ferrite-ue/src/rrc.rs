@@ -277,6 +277,96 @@ pub fn parse_srb1_dl_rrc(mac_pdu: &[u8]) -> Option<Vec<u8>> {
     parse_srb1_dl_rrc_sn(mac_pdu).map(|(_, rrc)| rrc)
 }
 
+/// Parsed RLC AM Data PDU header (TS 38.322 §6.2.2.4, 12-bit SN). `si`:
+/// 0b00 = complete SDU, 0b01 = first segment, 0b10 = last, 0b11 = middle.
+pub struct RlcAmHeader {
+    pub si: u8,
+    pub sn: u16,
+    pub so: u16,
+    pub hdr_len: usize,
+}
+
+/// Parse the header of an RLC AM Data PDU. Returns None for a STATUS PDU (D/C=0)
+/// or a too-short buffer. A last/middle segment carries a 2-octet Segment Offset.
+pub fn parse_rlc_am_header(rlc: &[u8]) -> Option<RlcAmHeader> {
+    if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
+        return None; // STATUS PDU or empty
+    }
+    let si = (rlc[0] >> 4) & 0x03;
+    let sn = (((rlc[0] & 0x0f) as u16) << 8) | rlc[1] as u16;
+    let (so, hdr_len) = if si == 0b10 || si == 0b11 {
+        (((*rlc.get(2)? as u16) << 8) | *rlc.get(3)? as u16, 4)
+    } else {
+        (0, 2)
+    };
+    Some(RlcAmHeader { si, sn, so, hdr_len })
+}
+
+/// Reassembles RLC AM SDUs from (possibly segmented, possibly retransmitted) AM
+/// Data PDUs (TS 38.322 §5.2.3). Keeps per-SN segment buffers keyed by segment
+/// offset; delivers a full SDU once all bytes up to the last segment are present.
+#[derive(Default)]
+pub struct RlcReassembler {
+    segs: std::collections::HashMap<u16, (std::collections::BTreeMap<usize, Vec<u8>>, Option<usize>)>,
+}
+
+impl RlcReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one RLC AM Data PDU (header + data). Returns the completed SDU if this
+    /// PDU finishes one. A complete-SDU PDU (SI=00) is returned directly.
+    pub fn push(&mut self, rlc: &[u8]) -> Option<Vec<u8>> {
+        let h = parse_rlc_am_header(rlc)?;
+        let data = rlc.get(h.hdr_len..)?.to_vec();
+        if h.si == 0b00 {
+            return Some(data); // whole SDU, no segmentation
+        }
+        let entry = self.segs.entry(h.sn).or_default();
+        let end = h.so as usize + data.len();
+        entry.0.insert(h.so as usize, data);
+        if h.si == 0b10 {
+            entry.1 = Some(end); // last segment fixes the SDU length
+        }
+        let total = entry.1?;
+        // Walk the offset-ordered segments; require contiguity from 0.
+        let mut out: Vec<u8> = Vec::new();
+        for (&so, seg) in entry.0.iter() {
+            if so == out.len() {
+                out.extend_from_slice(seg);
+            } else if so < out.len() {
+                // overlap (retransmission); extend only past what we already have
+                if so + seg.len() > out.len() {
+                    out.extend_from_slice(&seg[out.len() - so..]);
+                }
+            } else {
+                return None; // gap — wait for the missing segment
+            }
+        }
+        if out.len() >= total {
+            self.segs.remove(&h.sn);
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+/// Feed the SRB1 (LCID 1) RLC AM PDU from a DL-SCH MAC PDU into `reasm`. Returns
+/// `(rlc_sn, Option<rrc>)`: the RLC SN (for STATUS reporting) and, once a full SDU
+/// reassembles, the RRC PDU (PDCP header + trailing MAC-I stripped; NEA0 plaintext).
+pub fn srb1_dl_rrc_reasm(reasm: &mut RlcReassembler, mac_pdu: &[u8]) -> Option<(u16, Option<Vec<u8>>)> {
+    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+        let h = parse_rlc_am_header(&s.payload)?; // None = STATUS PDU, skip
+        let rrc = reasm.push(&s.payload).and_then(|pdcp| {
+            (pdcp.len() >= 2 + 4).then(|| pdcp[2..pdcp.len() - 4].to_vec())
+        });
+        return Some((h.sn, rrc));
+    }
+    None
+}
+
 /// Unstack a DL-SCH SRB1 MAC PDU → `(pdcp_count, pdcp_msg, mac_i)` for PDCP
 /// integrity verification: `pdcp_msg` = PDCP header || RRC (the 128-NIA2 input),
 /// `mac_i` the received 4-octet MAC-I. The RRC PDU is `pdcp_msg[2..]`.

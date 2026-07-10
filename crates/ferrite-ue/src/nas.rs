@@ -63,6 +63,17 @@ pub fn registration_request(imsi: &str) -> Vec<u8> {
     m
 }
 
+/// Extract the N1 SM payload container (the inner 5GSM message) from a plain
+/// UL/DL NAS Transport (TS 24.501 §8.2.10/8.2.11). Layout:
+/// [7e | SHT | msgtype(0x67/0x68) | payload-container-type | len(2) | container | …].
+pub fn nas_transport_payload(plain: &[u8]) -> Option<&[u8]> {
+    if plain.len() < 6 || plain[2] != 0x67 && plain[2] != 0x68 {
+        return None;
+    }
+    let len = ((plain[4] as usize) << 8) | plain[5] as usize;
+    plain.get(6..6 + len)
+}
+
 /// Parsed 5GS AuthenticationRequest (TS 24.501 §8.2.1): RAND (IEI 0x21) and
 /// AUTN (IEI 0x20), plus ngKSI and ABBA.
 pub struct AuthRequest {
@@ -164,9 +175,57 @@ pub fn registration_complete() -> Vec<u8> {
     vec![0x7e, 0x00, 0x43]
 }
 
+/// Build a 5GSM PDU Session Establishment Request (TS 24.501 §8.3.1): request an
+/// IPv4 PDU session, SSC mode 1, full integrity-protection data rate. `psi` = PDU
+/// session identity, `pti` = procedure transaction identity.
+pub fn pdu_session_establishment_request(psi: u8, pti: u8) -> Vec<u8> {
+    vec![
+        0x2e,       // EPD: 5GS session management
+        psi,        // PDU session identity
+        pti,        // procedure transaction identity
+        0xc1,       // message type: PDU session establishment request
+        0xff, 0xff, // integrity protection maximum data rate: full (both directions)
+        0x91,       // PDU session type (type-1 IE, IEI 0x9): IPv4 (value 1)
+        0xa1,       // SSC mode (type-1 IE, IEI 0xA): SSC mode 1 (value 1)
+    ]
+}
+
+/// Build a plain 5GMM UL NAS Transport (TS 24.501 §8.2.10) that carries a 5GSM
+/// PDU Session Establishment Request as N1 SM information — how the UE asks the
+/// core (SMF) to set up a user-plane PDU session after registration. `psi` must
+/// match the inner 5GSM header; `dnn` is the data network name (e.g. "internet").
+pub fn ul_nas_transport_pdu_session(psi: u8, pti: u8, dnn: &str) -> Vec<u8> {
+    let sm = pdu_session_establishment_request(psi, pti);
+    let mut m = vec![0x7e, 0x00, 0x67]; // 5GMM, plain, UL NAS transport
+    m.push(0x01); // payload container type = N1 SM information
+    // Payload container (type-6 LV-E): 2-octet length + the 5GSM message.
+    m.push((sm.len() >> 8) as u8);
+    m.push((sm.len() & 0xff) as u8);
+    m.extend_from_slice(&sm);
+    // PDU session ID (IEI 0x12).
+    m.push(0x12);
+    m.push(psi);
+    // Request type (type-1 IE, IEI 0x8): initial request (value 1).
+    m.push(0x80 | 0x01);
+    // S-NSSAI (IEI 0x22): SST only. (qcore ignores this IE, but it's standard.)
+    m.push(0x22);
+    m.push(0x01);
+    m.push(0x01); // SST = 1
+    // DNN (IEI 0x25): a length-prefixed label.
+    m.push(0x25);
+    m.push((dnn.len() + 1) as u8); // IE length = label-length octet + label
+    m.push(dnn.len() as u8);
+    m.extend_from_slice(dnn.as_bytes());
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hx(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
 
     #[test]
     fn suci_layout() {
@@ -186,5 +245,15 @@ mod tests {
     fn reg_request_header() {
         let r = registration_request("001010167891203");
         assert_eq!(&r[0..4], &[0x7e, 0x00, 0x41, 0x79]);
+    }
+
+    /// Byte-exact vs the oxirush-nas reference encoder (the NAS library qcore uses):
+    /// UL NAS Transport carrying a PDU Session Establishment Request (IPv4, SSC1),
+    /// PDU session id 5, PTI 1, DNN "internet".
+    #[test]
+    fn ul_nas_transport_pdu_session_matches_reference() {
+        let m = ul_nas_transport_pdu_session(5, 1, "internet");
+        let expect = hx("7e00670100082e0501c1ffff91a1120581220101250908696e7465726e6574");
+        assert_eq!(m, expect);
     }
 }

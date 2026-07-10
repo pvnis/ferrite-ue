@@ -21,8 +21,8 @@ use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
-use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
-use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
+use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -457,10 +457,12 @@ fn run(cfg: Config) {
     let mut k_amf_st: Option<[u8; 32]> = None; // K_AMF, for K_gNB derivation
     let mut k_rrcint: Option<[u8; 16]> = None; // 128-NIA2 RRC integrity key (AS)
     let mut reg_done = false; // RegistrationComplete queued
+    const PDU_SESSION_ID: u8 = 5; // UE-chosen PDU session identity
     let mut nas_ul_count: u32 = 0; // NAS COUNT for uplink integrity protection
     let mut k_nasint: Option<[u8; 16]> = None; // 128-NIA2 key, derived after AKA
     let mut dl_rlc_next: u16 = 0; // next expected DL RLC SN (for RLC STATUS ACK)
     let mut pending_status: Option<u16> = None; // ACK_SN to report so the gNB DL advances
+    let mut srb1_reasm = RlcReassembler::new(); // reassembles segmented DL SRB1 SDUs
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -653,7 +655,7 @@ fn run(cfg: Config) {
         // allocation is variable, so read it from the DCI 1_1 assignment in the
         // CORESET1 USS (frequency = FDRA bits[1..10]); fall back to the fixed
         // rb[0,10/11) (the AuthReq) if no DCI decodes. MCS is brute-forced.
-        if connected.is_some() && !reg_done && srb1_sn >= 1 {
+        if connected.is_some() && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
                 let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
@@ -715,10 +717,14 @@ fn run(cfg: Config) {
                                         pend_acks.push((pos, aw));
                                     }
                                 }
-                                let Some((rlc_sn, rrc)) = parse_srb1_dl_rrc_sn(&tb) else { break };
-                                // On a NEW DL RLC SDU, arm an RLC STATUS ACK so the
-                                // gNB advances (don't re-arm on retransmissions, which
-                                // would starve our own UL data).
+                                let Some((rlc_sn, rrc_opt)) = srb1_dl_rrc_reasm(&mut srb1_reasm, &tb) else { break };
+                                // A segment arrived but the SDU isn't whole yet: wait for
+                                // the rest before ACKing (a large RRCReconfiguration is
+                                // split across RLC AM segments) — don't advance the window.
+                                let Some(rrc) = rrc_opt else { break };
+                                // On a NEW, fully-reassembled DL RLC SDU, arm an RLC STATUS
+                                // ACK so the gNB advances (don't re-arm on retransmissions,
+                                // which would starve our own UL data).
                                 if rlc_sn >= dl_rlc_next {
                                     dl_rlc_next = rlc_sn + 1;
                                     pending_status = Some(dl_rlc_next);
@@ -819,7 +825,8 @@ fn run(cfg: Config) {
                                             println!("   ⇒ queued SecurityModeComplete (count {})", nas_ul_count - 1);
                                         }
                                     }
-                                    // RegistrationAccept → send RegistrationComplete = attach done.
+                                    // RegistrationAccept → send RegistrationComplete = attach done,
+                                    // then immediately request an IPv4 PDU session (user plane).
                                     Some(0x42) if smc_done && !reg_done => {
                                         reg_done = true;
                                         if let Some(ni) = &k_nasint {
@@ -827,6 +834,20 @@ fn run(cfg: Config) {
                                             nas_ul_count += 1;
                                             ul_queue.push_back(rrc_ul_information_transfer(&prot));
                                             println!("   ⇒ queued RegistrationComplete — ATTACH COMPLETE");
+                                            let pdu = ul_nas_transport_pdu_session(PDU_SESSION_ID, 1, "internet");
+                                            let prot2 = nas_protect(0x02, ni, nas_ul_count, 0, &pdu);
+                                            nas_ul_count += 1;
+                                            ul_queue.push_back(rrc_ul_information_transfer(&prot2));
+                                            println!("   ⇒ queued PDU Session Establishment Request (psi {PDU_SESSION_ID})");
+                                        }
+                                    }
+                                    // DL NAS Transport → carries the SMF's PDU Session
+                                    // Establishment Accept/Reject (5GSM) in its payload container.
+                                    Some(0x68) => {
+                                        if let Some(sm) = nas_transport_payload(inner) {
+                                            let smtype = sm.get(3).copied();
+                                            println!("   ⇒ DL NAS Transport 5GSM type={smtype:?} payload={}",
+                                                sm.iter().map(|b| format!("{b:02x}")).collect::<String>());
                                         }
                                     }
                                     _ => {}
