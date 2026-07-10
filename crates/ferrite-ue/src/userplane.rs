@@ -88,24 +88,21 @@ pub fn parse_ipv4_icmp_echo_reply(pkt: &[u8]) -> Option<IcmpEchoReply> {
     })
 }
 
-/// Frame an SDU (an IP packet) for uplink on DRB 1 into a DL-SCH... rather UL-SCH
-/// MAC PDU: SDAP (no header) → PDCP 18-bit Data PDU (NEA0, no MAC-I) → RLC UM
-/// complete-SDU PDU → MAC subheader (LCID 4). Padded to `tbs` bytes.
-pub fn drb_ul_pdu(pdcp_sn: u32, ip_packet: &[u8], tbs: usize) -> Vec<u8> {
-    // PDCP Data PDU, 18-bit SN (TS 38.323 §6.2.2.1): [D/C=1|R(5)|SN(18)] over 3
-    // octets, then the (NEA0 = plaintext) payload; no MAC-I (DRB, no integrity).
+/// Build a PDCP Data PDU for the DRB, 18-bit SN (TS 38.323 §6.2.2.1):
+/// [D/C=1|R(5)|SN(18)] over 3 octets, then the (NEA0 = plaintext) payload; no
+/// MAC-I (DRB, no integrity). The payload is an SDAP SDU = the raw IP packet
+/// (SDAP headers are absent for this DRB).
+pub fn pdcp_data_pdu(pdcp_sn: u32, ip_packet: &[u8]) -> Vec<u8> {
     let mut pdcp = Vec::with_capacity(3 + ip_packet.len());
     pdcp.push(0x80 | ((pdcp_sn >> 16) & 0x03) as u8);
     pdcp.push((pdcp_sn >> 8) as u8);
     pdcp.push(pdcp_sn as u8);
     pdcp.extend_from_slice(ip_packet);
+    pdcp
+}
 
-    // RLC UM Data PDU, complete SDU (TS 38.322 §6.2.2.3): 1-octet header, SI=00.
-    let mut rlc = Vec::with_capacity(1 + pdcp.len());
-    rlc.push(0x00); // SI=00 (complete SDU), no SN
-    rlc.extend_from_slice(&pdcp);
-
-    // MAC subPDU: subheader (LCID 4, R=0, F/L field) + the RLC PDU + padding.
+/// Wrap one RLC PDU in a UL-SCH MAC subPDU for DRB 1 (LCID 4) and pad to `tbs`.
+pub fn drb_mac_wrap(rlc: &[u8], tbs: usize) -> Vec<u8> {
     let mut mac = Vec::with_capacity(tbs);
     if rlc.len() < 256 {
         mac.push(LCID_DRB1); // R=0, F=0 (8-bit L), LCID=4
@@ -115,12 +112,58 @@ pub fn drb_ul_pdu(pdcp_sn: u32, ip_packet: &[u8], tbs: usize) -> Vec<u8> {
         mac.push((rlc.len() >> 8) as u8);
         mac.push((rlc.len() & 0xff) as u8);
     }
-    mac.extend_from_slice(&rlc);
+    mac.extend_from_slice(rlc);
     if mac.len() < tbs {
         mac.push(LCID_PADDING);
         mac.resize(tbs, 0);
     }
     mac
+}
+
+/// Frame a complete IP packet for uplink on DRB 1: PDCP 18-bit Data PDU → RLC UM
+/// complete-SDU PDU (1-octet header, SI=00) → MAC subheader (LCID 4), padded to
+/// `tbs`. Used for small packets (e.g. the built-in ping) that fit one grant.
+pub fn drb_ul_pdu(pdcp_sn: u32, ip_packet: &[u8], tbs: usize) -> Vec<u8> {
+    let pdcp = pdcp_data_pdu(pdcp_sn, ip_packet);
+    let mut rlc = Vec::with_capacity(1 + pdcp.len());
+    rlc.push(0x00); // RLC UM, SI=00 (complete SDU), no SN
+    rlc.extend_from_slice(&pdcp);
+    drb_mac_wrap(&rlc, tbs)
+}
+
+/// Produce one RLC UM Data PDU (TS 38.322 §6.2.2.3, 12-bit SN) carrying `sdu` from
+/// byte `offset`, no larger than `max_len` octets total. Returns `(pdu, new_offset)`;
+/// when `new_offset == sdu.len()` the SDU is fully transmitted. Emits a complete-SDU
+/// PDU (SI=00) when the whole SDU fits from the start, else first/middle/last
+/// segments with a Segment Offset — for IP packets larger than a single UL grant.
+pub fn rlc_um_segment(sdu: &[u8], offset: usize, sn: u16, max_len: usize) -> (Vec<u8>, usize) {
+    let first = offset == 0;
+    if first && 1 + sdu.len() <= max_len {
+        let mut p = Vec::with_capacity(1 + sdu.len());
+        p.push(0x00); // SI=00 complete SDU
+        p.extend_from_slice(sdu);
+        return (p, sdu.len());
+    }
+    let hdr = if first { 2 } else { 4 }; // first: SI+SN(2); mid/last: SI+SN+SO(4)
+    if max_len <= hdr {
+        return (Vec::new(), offset); // grant can't hold any data this round
+    }
+    let take = (max_len - hdr).min(sdu.len() - offset);
+    let last = offset + take == sdu.len();
+    let si: u8 = match (first, last) {
+        (true, _) => 0b01,  // first segment
+        (false, true) => 0b10,  // last segment
+        (false, false) => 0b11, // middle segment
+    };
+    let mut p = Vec::with_capacity(hdr + take);
+    p.push((si << 6) | ((sn >> 8) & 0x0f) as u8);
+    p.push((sn & 0xff) as u8);
+    if !first {
+        p.push((offset >> 8) as u8);
+        p.push((offset & 0xff) as u8);
+    }
+    p.extend_from_slice(&sdu[offset..offset + take]);
+    (p, offset + take)
 }
 
 /// Reassembles RLC UM SDUs (TS 38.322 §6.2.2.3, 12-bit SN). Keeps per-SN segment
@@ -239,5 +282,27 @@ mod tests {
         let mut reasm = RlcUmReassembler::new();
         let got = parse_drb_dl_ip(&mut reasm, &mac).unwrap();
         assert_eq!(got, ip);
+    }
+
+    #[test]
+    fn rlc_um_segmentation_roundtrip() {
+        // A large IP packet that must be split across several small grants, then
+        // reassembled by the RLC UM receiver.
+        let ip = ipv4_icmp_echo_request([10, 255, 0, 3], [8, 8, 8, 8], 9, 5, &vec![0xab; 400]);
+        let pdcp = pdcp_data_pdu(3, &ip);
+        let mut reasm = RlcUmReassembler::new();
+        let mut off = 0;
+        let mut done = None;
+        while off < pdcp.len() {
+            let (rlc, new_off) = rlc_um_segment(&pdcp, off, 12, 90); // 90-byte grants
+            assert!(new_off > off, "segment made progress");
+            off = new_off;
+            if let Some(sdu) = reasm.push(&rlc) {
+                done = Some(sdu);
+            }
+        }
+        assert_eq!(done.unwrap(), pdcp);
+        // And the reassembled PDCP unstacks (strip 3-byte header) back to the IP.
+        // (parse_drb_dl_ip does MAC+RLC+PDCP; here we already have the PDCP SDU.)
     }
 }

@@ -22,11 +22,14 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
-use ferrite_ue::userplane::{drb_ul_pdu, ipv4_icmp_echo_request};
+use ferrite_ue::userplane::{drb_mac_wrap, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
 use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
+use ferrite_ue::tun::{configure_tun, open_tun};
 use num_complex::Complex32;
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Read, Write};
 
 /// Parse a fixed-length hex string into a byte array.
 fn hexn<const N: usize>(s: &str) -> [u8; N] {
@@ -66,6 +69,12 @@ struct Config {
     /// ICMP echo target. If `ue_ip` is None, no ping is attempted after attach.
     ue_ip: Option<[u8; 4]>,
     ping_target: [u8; 4],
+    /// If set, create a TUN interface (this name) and carry real host IP traffic
+    /// over the DRB instead of the built-in ping. `netns` optionally moves it into
+    /// a network namespace. Needs privileges (run under sudo).
+    tun: Option<String>,
+    netns: Option<String>,
+    tun_mtu: u32,
 }
 
 impl Config {
@@ -89,6 +98,9 @@ impl Config {
             snn: arg("--snn", "5G:mnc001.mcc001.3gppnetwork.org"),
             ue_ip: arg_opt("--ue-ip").as_deref().map(parse_ipv4),
             ping_target: parse_ipv4(&arg("--ping-target", "10.255.0.1")),
+            tun: arg_opt("--tun"),
+            netns: arg_opt("--netns"),
+            tun_mtu: arg("--tun-mtu", "1400").parse().unwrap(),
         }
     }
 }
@@ -298,6 +310,7 @@ fn run(cfg: Config) {
     let Config {
         tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
         toff_lo, toff_hi, toff_step, imsi, ki, opc, snn, ue_ip, ping_target,
+        tun, netns, tun_mtu,
     } = cfg;
 
     let fft = (fs / 30_000.0).round() as usize;
@@ -498,11 +511,28 @@ fn run(cfg: Config) {
     let mut ping_acked = false; // an echo reply was received
     let mut drb_reasm = ferrite_ue::userplane::RlcUmReassembler::new();
     const PING_ID: u16 = 0xfe11;
+    // TUN mode: shuttle real host IP packets over the DRB. `tun_ul` queues packets
+    // read from the TUN; `um_tx` is the SDU currently being segmented onto grants.
+    let mut tun_fd: Option<File> = None;
+    let mut tun_ul: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut um_tx: Option<(Vec<u8>, usize, u16)> = None; // (PDCP PDU, bytes sent, UM SN)
+    let mut um_sn: u16 = 0;
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
     loop {
         let slot_start_ul = ul_counter as i64;
+        // TUN mode: drain any IP packets the OS wants to send and queue them for
+        // the DRB uplink (non-blocking; each read() returns one packet, IFF_NO_PI).
+        if let Some(tun) = tun_fd.as_mut() {
+            let mut buf = [0u8; 2048];
+            for _ in 0..16 {
+                match tun.read(&mut buf) {
+                    Ok(n) if n > 0 => tun_ul.push_back(buf[..n].to_vec()),
+                    _ => break, // WouldBlock or EOF
+                }
+            }
+        }
         // Read one slot of DL, serving UL (PRACH + pending Msg3) in lockstep.
         // PRACH base = first frame boundary + occasion offset + sweep offset.
         for b in 0..blocks_per_slot {
@@ -594,7 +624,31 @@ fn run(cfg: Config) {
                             let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
                             srb1_sn += 1;
                             (m, k)
-                        } else if let (true, false, Some(uip)) = (drb_up, ping_acked, ue_ip) {
+                        } else if drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty()) {
+                            // TUN mode: carry a real host IP packet over the DRB (LCID 4),
+                            // segmenting it across UL grants (RLC UM) if it doesn't fit one.
+                            if um_tx.is_none() {
+                                let ip = tun_ul.pop_front().unwrap();
+                                um_tx = Some((pdcp_data_pdu(pdcp_tx_sn, &ip), 0, um_sn));
+                                pdcp_tx_sn += 1;
+                                um_sn = um_sn.wrapping_add(1);
+                            }
+                            let (pdcp, off, sn) = um_tx.take().unwrap();
+                            let remaining = pdcp.len() - off;
+                            if tbs_bytes < remaining + 3 && tbs_bytes < 100 {
+                                // Grant too small for meaningful progress → solicit a bigger one.
+                                um_tx = Some((pdcp, off, sn));
+                                (mac_short_bsr((remaining + 3).max(220), tbs_bytes), format!("DRB BSR (need {remaining}B)"))
+                            } else {
+                                let (rlc, new_off) = rlc_um_segment(&pdcp, off, sn, tbs_bytes.saturating_sub(3));
+                                let m = drb_mac_wrap(&rlc, tbs_bytes);
+                                let s = format!("DRB UL {new_off}/{} B (sn {sn})", pdcp.len());
+                                if new_off < pdcp.len() {
+                                    um_tx = Some((pdcp, new_off, sn));
+                                }
+                                (m, s)
+                            }
+                        } else if let (true, true, false, Some(uip)) = (tun.is_none(), drb_up, ping_acked, ue_ip) {
                             if ping_seq < 20 {
                                 // User plane: send an ICMP echo on DRB 1 (LCID 4) and
                                 // await the reply. Resend on each grant until acked.
@@ -769,7 +823,10 @@ fn run(cfg: Config) {
                                 // DRB 1 (LCID 4) DL user data: an IP packet. If it is
                                 // the ICMP echo reply to our ping, the round trip works.
                                 if let Some(ip) = ferrite_ue::userplane::parse_drb_dl_ip(&mut drb_reasm, &tb) {
-                                    if let Some(r) = ferrite_ue::userplane::parse_ipv4_icmp_echo_reply(&ip) {
+                                    if let Some(tun) = tun_fd.as_mut() {
+                                        // Hand the packet to the OS via the TUN interface.
+                                        let _ = tun.write(&ip);
+                                    } else if let Some(r) = ferrite_ue::userplane::parse_ipv4_icmp_echo_reply(&ip) {
                                         ping_acked = true;
                                         println!("🏓 PING REPLY from {}.{}.{}.{} id={:#06x} seq={} — END-TO-END PING WORKS",
                                             r.src[0], r.src[1], r.src[2], r.src[3], r.id, r.seq);
@@ -832,6 +889,20 @@ fn run(cfg: Config) {
                                         ue_ip = ferrite_ue::rrc::reconfig_pdu_session_ip(&rrc);
                                         if let Some(ip) = ue_ip {
                                             println!("   UE IP {}.{}.{}.{} (from PDU Session Accept)", ip[0], ip[1], ip[2], ip[3]);
+                                        }
+                                    }
+                                    // TUN mode: create the interface now that the DRB is up
+                                    // and our IP is known, so the OS can drive real traffic.
+                                    if let (Some(name), Some(ip), None) = (&tun, ue_ip, &tun_fd) {
+                                        match open_tun(name) {
+                                            Ok(f) => {
+                                                let _ = configure_tun(name, ip, tun_mtu, netns.as_deref());
+                                                tun_fd = Some(f);
+                                                let where_ = netns.as_deref().map(|n| format!(" in netns {n}")).unwrap_or_default();
+                                                println!("   TUN {name} up ({}.{}.{}.{}/mtu {tun_mtu}){where_} — carrying host traffic over the DRB",
+                                                    ip[0], ip[1], ip[2], ip[3]);
+                                            }
+                                            Err(e) => println!("   TUN {name} creation FAILED: {e} (run under sudo?)"),
                                         }
                                     }
                                     let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
@@ -979,8 +1050,9 @@ fn run(cfg: Config) {
         // Send a Scheduling Request each frame at slot 7 whenever an SRB1 PDU is
         // queued (RRCSetupComplete, then the AuthenticationResponse) to solicit
         // a UL grant. Stops once the queue drains so we don't over-request.
-        let want_ping = drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
-        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping) && slot_idx == 0 && pend_sr.is_none() {
+        let want_ping = tun.is_none() && drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
+        let want_drb = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
+        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb) && slot_idx == 0 && pend_sr.is_none() {
             let sr_slot = 7i64;
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);

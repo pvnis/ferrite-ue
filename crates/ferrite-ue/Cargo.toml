@@ -16,6 +16,7 @@ aes = "0.8"
 cmac = "0.7"
 sha2 = "0.10"
 hmac = "0.12"
+libc = "0.2"
 
 [[bin]]
 name = "ssb-scan"
