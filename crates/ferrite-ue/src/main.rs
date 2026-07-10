@@ -655,30 +655,38 @@ fn run(cfg: Config) {
         if connected.is_some() && !reg_done && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
-                // Decode DCI 1_1 in the CORESET1 USS → (rb_start, n_rb, MCS, k1, PRI).
-                // Layout (from the gNB dci_1_1_pack, this config): id[0] FDRA[1..10]
-                // time[10] MCS[11..16] NDI[16] RV[17..19] HARQ[19..23] DAI[23..25]
-                // TPC[25..27] PRI[27..30] k1[30..33] antenna[33..37] SRS[37..39] DMRS[39].
                 let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
-                let mut allocs: Vec<(usize, usize, u8, u8, u8)> = uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
-                    .into_iter()
-                    .filter_map(|cand| {
-                        let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
-                        pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
-                        dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1).map(|b| {
-                            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                            let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                            let a = (rb0, nrb, bits5(&b, 11, 5), bits5(&b, 30, 3), bits5(&b, 27, 3));
-                            if auth_done { println!("  [dbg] DCI1_1 slot{slot_idx} rb[{},{}) mcs{} k1={} pri={}", a.0, a.0 + a.1, a.2, a.3, a.4); }
-                            a
-                        })
-                    })
-                    .collect();
-                // Fallbacks when the DCI 1_1 doesn't decode: cover the connected-mode
-                // DL allocations the gNB actually uses (rb[0,{10,11,13}) at a few low
-                // MCS; the CDM-group is tried both ways in try_decode). No HARQ-ACK
-                // (k1 unknown) for these.
-                for (nrb, mcs) in [(10, 2), (11, 2), (13, 2), (11, 1), (13, 1), (10, 0), (13, 0), (20, 2)] {
+                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), PRI).
+                let mut allocs: Vec<(usize, usize, u8, u8, u8)> = Vec::new();
+                // PRIMARY: the gNB schedules the connected-mode DL PDSCH with DCI 1_0 in
+                // CORESET0 (common SS, AL4 CCE0) — decode it (reliable, same path as the
+                // RAR). DCI 1_0 (37b): id[0] FDRA[1..10] time[10..14] vrb[14] MCS[15..20]
+                // NDI[20] RV[21..23] HARQ[23..27] DAI[27..29] TPC[29..31] PRI[31..34]
+                // k1[34..37]. DCI 1_0 k1 field → {1..8} (k1 = field+1).
+                {
+                    let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &ra_cand);
+                    pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
+                    if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
+                        let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                        let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
+                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 31, 3)));
+                    }
+                }
+                // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it occasionally).
+                // Layout: id[0] FDRA[1..10] time[10] MCS[11..16] … PRI[27..30] k1[30..33].
+                // k1 field indexes dl-DataToUL-ACK [4,5,6,7,8,9,11,12].
+                for cand in uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)]) {
+                    let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
+                    pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
+                    if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
+                        const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                        let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                        let (rb0, nrb) = riv_decode(riv, carrier_rb);
+                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 27, 3)));
+                    }
+                }
+                // Fallbacks (no DCI decoded): the small allocations the gNB uses; no ACK.
+                for (nrb, mcs) in [(2, 2), (3, 2), (5, 2), (10, 2), (11, 2), (13, 2)] {
                     allocs.push((0, nrb, mcs, 0xff, 0));
                 }
                 let allocs_len = allocs.len();
@@ -700,10 +708,7 @@ fn run(cfg: Config) {
                                 // k1 is 4-12 slots ahead so several are in flight.
                                 if k1 != 0xff {
                                     let _ = pri; // PRI selects the resource; only cs0/occ0 here
-                                    // The 3-bit k1 field indexes the dl-DataToUL-ACK list
-                                    // (from the gNB config): [4,5,6,7,8,9,11,12].
-                                    const K1_LIST: [i64; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-                                    let k1a = K1_LIST[k1 as usize & 7];
+                                    let k1a = k1 as i64; // already the actual k1 in slots
                                     let ack_slot = slot_idx as i64 + k1a;
                                     let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(
                                         &ofdm, &harq_cfg, &[1], (ack_slot % 20) as u32, center_hz, fs);
