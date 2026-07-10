@@ -690,18 +690,13 @@ fn run(cfg: Config) {
                 for (nrb, mcs) in [(2, 2), (3, 2), (5, 2), (10, 2), (11, 2), (13, 2)] {
                     allocs.push((0, nrb, mcs, 0xff, 0));
                 }
-                let allocs_len = allocs.len();
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
-                    let mut any_metric = false;
-                    let mut decoded_ok = false;
                     for (rb0, nrb, mcs, k1, pri) in allocs {
                         let (qm, _) = mcs_params(mcs);
                         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
-                            any_metric = true;
                             if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs) {
-                                decoded_ok = true;
                                 // HARQ-ACK the PDSCH k1 slots later on the dedicated PUCCH
                                 // F1 resource (prb0/cs0/occ0, no hop), so the gNB stops
                                 // retransmitting and delivers the next SDU. ACK EVERY
@@ -839,9 +834,6 @@ fn run(cfg: Config) {
                                 break;
                             }
                         }
-                    }
-                    if auth_done && any_metric && !decoded_ok {
-                        println!("  [dbg] PDSCH present slot{slot_idx} but NO decode ({} allocs tried)", allocs_len);
                     }
                 }
             }
