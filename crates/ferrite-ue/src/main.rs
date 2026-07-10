@@ -248,6 +248,43 @@ fn try_decode_msg4(
 /// from the DCI 1_1 assignment; the MCS is brute-forced (LDPC+CRC rejects wrong
 /// guesses), covering the gNB's varying allocations. 1 CDM group, 12 symbols.
 /// Returns the raw MAC TB on success.
+/// Per-HARQ-process DL soft-combining buffer: the accumulated circular-buffer LLRs
+/// for the transport block currently in flight on this HARQ process, plus the code
+/// parameters they were built with (a change ⇒ the gNB reused the process for a new
+/// TB, so the buffer is reset).
+struct HarqDl {
+    tbs: usize,
+    qm: usize,
+    acc: Vec<f32>,
+    n_rx: usize,
+}
+
+/// Pack MSB-first bits into bytes.
+fn pack_bits(bits: &[u8]) -> Vec<u8> {
+    bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect()
+}
+
+/// Accept a decoded TB only if it is a plausible DRB IP packet or a known DL-DCCH RRC
+/// PDU — rejects a wrong (mcs, cdm) guess that slips the CRC on a retransmission.
+fn plausible_dl_tb(tb: &[u8]) -> bool {
+    if ferrite_ue::userplane::looks_like_drb_ip(tb) {
+        return true;
+    }
+    let Some(rrc) = parse_srb1_dl_rrc(tb) else { return false };
+    match dl_dcch_type(&rrc) {
+        Some(5) => parse_dl_dcch_nas(&rrc).is_some_and(|n| n.first() == Some(&0x7e)),
+        Some(0 | 2 | 4 | 6) => true, // rrcReconfig / rrcRelease / securityModeCommand / ueCapabilityEnquiry
+        _ => false,
+    }
+}
+
+/// Decode one DL PDSCH into its transport block. `rv`/`h_id` come from the DCI
+/// (0xff `h_id` = fallback guess, no combining). On top of a standalone decode at the
+/// correct RV, HARQ soft-combining accumulates each (re)transmission's circular-buffer
+/// LLRs into `harq_dl[h_id]` and decodes the sum, recovering TBs that no single
+/// (re)transmission could. `lock` pins the cell-fixed DM-RS layout (CDM groups,
+/// time-first) after the first success so combining uses a consistent extraction.
+#[allow(clippy::too_many_arguments)]
 fn try_decode_dl_srb1(
     grids: &[Vec<Complex32>],
     sc_to_bin: impl Fn(i32) -> usize + Copy,
@@ -257,45 +294,64 @@ fn try_decode_dl_srb1(
     rb_start: usize,
     n_rb: usize,
     mcs: u8,
+    rv: u8,
+    h_id: u8,
+    lock: &mut Option<(usize, bool)>,
+    harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
 ) -> Option<Vec<u8>> {
-    // The MCS comes from the DCI 1_1 assignment; only the DM-RS CDM-group count
-    // (1 group ⇒ data on the odd SCs of DM-RS symbols; 2 groups ⇒ none) is tried
-    // both ways. n_re follows the CDM-group choice.
-    for cdm in [1usize, 2] {
+    let (qm, r) = mcs_params(mcs);
+    let (qm, r) = (qm as usize, r);
+    use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb, dlsch_decode_single_bits};
+    // Always brute-force the cell-fixed (CDM groups, time-first) DM-RS layout for the
+    // standalone decode (never restrict it — different PDSCHs must all still decode).
+    // `lock` only records the layout that works, to pick ONE consistent combo for the
+    // soft-combining accumulation (which must line up across a TB's RVs).
+    for (cdm, time_first) in [(1usize, true), (1, false), (2, true), (2, false)] {
         let n_re = n_rb * ((12 - 3) * 12 + if cdm == 1 { 3 * 6 } else { 0 });
-        {
-            let (qm, r) = mcs_params(mcs);
-            let (qm, r) = (qm as usize, r);
-            let tbs = tbs_from_nre(n_re, r, qm);
-            let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: cdm };
-            let hit = [true, false].into_iter().find_map(|time_first| {
-                let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
-                let mut llr = px.llrs.clone();
-                descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
-                let (bits, _conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
-                if !crc {
-                    return None;
+        let tbs = tbs_from_nre(n_re, r, qm);
+        let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: cdm };
+        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+        let mut llr = px.llrs;
+        descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
+        // Standalone decode at the DCI's RV (was hardcoded rv=0, so retransmissions
+        // could never decode).
+        let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, rv, 40);
+        if crc {
+            let tb = pack_bits(&bits);
+            if plausible_dl_tb(&tb) {
+                *lock = Some((cdm, time_first));
+                harq_dl.remove(&h_id); // HARQ process delivered
+                return Some(tb);
+            }
+            continue;
+        }
+        // HARQ soft-combining: accumulate this RV's circular buffer into the per-process
+        // buffer and decode the running sum. Only for the locked (cell-fixed) layout, a
+        // real HARQ process, and a single-CB block (cb empty ⇒ multi-CB, skip). rv==0
+        // starts a new TB, so reset the buffer.
+        if h_id != 0xff && *lock == Some((cdm, time_first)) {
+            let cb = dlsch_cb_llr(&llr, tbs, r, qm, rv);
+            if cb.is_empty() {
+                continue;
+            }
+            let e = harq_dl.entry(h_id).or_insert_with(|| HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
+            if e.tbs != tbs || e.qm != qm || e.acc.len() != cb.len() || rv == 0 {
+                *e = HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 };
+            }
+            for (a, &c) in e.acc.iter_mut().zip(&cb) {
+                *a += c;
+            }
+            e.n_rx += 1;
+            // Only worth an LDPC pass once ≥2 (re)transmissions have accumulated.
+            if e.n_rx >= 2 {
+                let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 40);
+                if ccrc {
+                    let tb = pack_bits(&cbits);
+                    if plausible_dl_tb(&tb) {
+                        harq_dl.remove(&h_id);
+                        return Some(tb);
+                    }
                 }
-                let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-                // DRB (LCID 4) DL user data: accept if it carries a plausible IPv4
-                // packet (e.g. our ping's echo reply).
-                if ferrite_ue::userplane::looks_like_drb_ip(&tb) {
-                    return Some(tb);
-                }
-                // A wrong (mcs, cdm) guess can still pass the 24-bit CRC on a
-                // retransmission; require the TB to unstack to a plausible DL-DCCH
-                // RRC PDU (known c1 type; a dlInformationTransfer must carry a 0x7e
-                // NAS) so the brute-force keeps trying until the real decode.
-                let rrc = parse_srb1_dl_rrc(&tb)?;
-                let ok = match dl_dcch_type(&rrc) {
-                    Some(5) => parse_dl_dcch_nas(&rrc).is_some_and(|n| n.first() == Some(&0x7e)),
-                    Some(0 | 2 | 4 | 6) => true, // rrcReconfig / rrcRelease / securityModeCommand / ueCapabilityEnquiry
-                    _ => false,
-                };
-                if ok { Some(tb) } else { None }
-            });
-            if hit.is_some() {
-                return hit;
             }
         }
     }
@@ -540,6 +596,10 @@ fn run(cfg: Config) {
     let mut um_tx: Option<(Vec<u8>, usize, u16)> = None; // (PDCP PDU, bytes sent, UM SN)
     let mut um_sn: u16 = 0;
     let mut dl_seen: VecDeque<u32> = VecDeque::new(); // recent DL PDCP SNs (drop HARQ dup)
+    // DL HARQ soft-combining: per-process accumulated circular-buffer LLRs, plus the
+    // cell-fixed (CDM groups, time-first) DM-RS layout locked on the first decode.
+    let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
+    let mut dl_dmrs_lock: Option<(usize, bool)> = None;
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -784,8 +844,9 @@ fn run(cfg: Config) {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
                 let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
-                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), C-DAI).
-                let mut allocs: Vec<(usize, usize, u8, u8, u8)> = Vec::new();
+                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), C-DAI,
+                // RV, HARQ process id (0xff = fallback guess ⇒ no soft-combining)).
+                let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8)> = Vec::new();
                 // PRIMARY: the gNB schedules the connected-mode DL PDSCH with DCI 1_0 in
                 // CORESET0 (common SS, AL4 CCE0) — decode it (reliable, same path as the
                 // RAR). DCI 1_0 (37b): id[0] FDRA[1..10] time[10..14] vrb[14] MCS[15..20]
@@ -797,8 +858,8 @@ fn run(cfg: Config) {
                     if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
                         let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                         let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-                        // DCI 1_0 DAI at bits[27..29].
-                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2)));
+                        // DCI 1_0 DAI at bits[27..29], RV at [21..23], HARQ at [23..27].
+                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4)));
                     }
                 }
                 // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it for the DRB DL).
@@ -812,8 +873,8 @@ fn run(cfg: Config) {
                         const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
                         let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                         let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                        // DCI 1_1 DAI at bits[23..25].
-                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2)));
+                        // DCI 1_1 DAI at bits[23..25], RV at [17..19], HARQ at [19..23].
+                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
                     }
                 }
                 // Fallbacks (no DCI decoded): the gNB schedules the connected DL PDSCH
@@ -825,7 +886,7 @@ fn run(cfg: Config) {
                 // the DL PDCP SN dedups the gNB's HARQ retransmissions.
                 for &nrb in &[2usize, 5, 13, 17, 18, 24] {
                     for mcs in [0u8, 1, 2] {
-                        allocs.push((0, nrb, mcs, 0xff, 0));
+                        allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
                     }
                 }
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
@@ -849,12 +910,12 @@ fn run(cfg: Config) {
                     // (common) slots with no PDSCH for us, keeping the loop fast.
                     let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric > 0.9;
                     let allocs = if present { allocs } else { Vec::new() };
-                    for (rb0, nrb, mcs, k1, dai) in allocs {
+                    for (rb0, nrb, mcs, k1, dai, rv, h_id) in allocs {
                         let (qm, _) = mcs_params(mcs);
                         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
-                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs) {
+                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, &mut dl_dmrs_lock, &mut harq_dl) {
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
                                 // at its UL slot (n+k1), positioned by C-DAI. It's modulated
                                 // and sent as a bundled 1-2 bit PUCCH once its UL slot nears
