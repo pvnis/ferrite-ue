@@ -356,7 +356,8 @@ fn run(cfg: Config) {
                  counter: &mut u64,
                  base: i64,
                  bursts: &[&Option<(i64, Vec<Complex32>)>],
-                 acks: &[(i64, Vec<Complex32>)]| {
+                 acks: &[(i64, Vec<Complex32>)],
+                 uls: &[(i64, Vec<Complex32>)]| {
         loop {
             let ok = ul.serve_with(counter, |c, block| {
                 let (c, bl) = (c as i64, block.len() as i64);
@@ -389,6 +390,11 @@ fn run(cfg: Config) {
                 for (pos, wave) in acks {
                     place(*pos, wave, block);
                 }
+                // Pending PUSCH bursts (a queue: fill EVERY UL grant the gNB gives,
+                // else the unfilled grants decode as noise → the gNB collapses UL MCS).
+                for (pos, wave) in uls {
+                    place(*pos, wave, block);
+                }
             }).expect("ul");
             if ok { break; }
         }
@@ -400,7 +406,7 @@ fn run(cfg: Config) {
     while cap.len() < cap_len {
         fill_dl(&mut dl, &mut blk);
         cap.extend_from_slice(&blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
     }
     let (df, _r, shifted) = gscn_scan(&cap, fs, center_hz, &searcher).expect("no SSB");
     let acq = sync.acquire(&shifted).expect("acquire");
@@ -416,12 +422,12 @@ fn run(cfg: Config) {
     let mut to_skip = acq.skip_to_frame;
     while to_skip >= block_len {
         fill_dl(&mut dl, &mut blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
         to_skip -= block_len;
     }
     if to_skip > 0 {
         fill_dl(&mut dl, &mut blk[..to_skip]);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
     }
 
     let blocks_per_slot = slot_len as usize / block_len; // 4
@@ -481,7 +487,7 @@ fn run(cfg: Config) {
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
-    let mut pend_msg5: Option<(i64, Vec<Complex32>)> = None;
+    let mut pend_ul: Vec<(i64, Vec<Complex32>)> = Vec::new(); // queued PUSCH bursts (fill every grant)
     // Connected-mode UL: a queue of RRC PDUs to send on successive grants
     // (RRCSetupComplete, then the AuthenticationResponse, …), with a shared
     // SRB1 RLC/PDCP sequence number that increments per PDU.
@@ -517,6 +523,7 @@ fn run(cfg: Config) {
     let mut tun_ul: VecDeque<Vec<u8>> = VecDeque::new();
     let mut um_tx: Option<(Vec<u8>, usize, u16)> = None; // (PDCP PDU, bytes sent, UM SN)
     let mut um_sn: u16 = 0;
+    let mut dl_seen: VecDeque<u32> = VecDeque::new(); // recent DL PDCP SNs (drop HARQ dup)
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -543,7 +550,7 @@ fn run(cfg: Config) {
             // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
             // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
             let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
-            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5], &pend_acks);
+            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr], &pend_acks, &pend_ul);
         }
 
         // Decode this slot's RA search space.
@@ -565,11 +572,11 @@ fn run(cfg: Config) {
         // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
         const DCI_0_1_SIZE: usize = 36;
         if let Some(crnti) = connected {
-            // Decode a UL grant every slot (not only when we have data): a grant the
-            // UE leaves empty is decoded as noise (crc=KO) and enough consecutive KOs
-            // trip the gNB's "MAC max KOs" radio-link failure. So always fill a
-            // decoded grant with a valid MAC PDU (reporting an empty buffer when idle).
-            if pend_msg5.is_none() {
+            // Decode the UL grant EVERY slot and fill it: an unfilled grant decodes
+            // as noise (crc=KO) and a burst of KOs makes the gNB collapse UL MCS (and
+            // eventually trips "MAC max KOs" RLF). The gNB grants back-to-back to drain
+            // a buffer, so keep a QUEUE of in-flight PUSCH bursts, not just one.
+            if pend_ul.len() < 16 {
                 let c0 = Candidate { agg_level: 4, cces: (0..4).collect() };
                 let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
@@ -676,7 +683,7 @@ fn run(cfg: Config) {
                         if !kind.is_empty() {
                             println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
                         }
-                        pend_msg5 = Some((pos, m5));
+                        pend_ul.push((pos, m5));
                     }
                 }
             }
@@ -791,11 +798,24 @@ fn run(cfg: Config) {
                         allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 27, 3)));
                     }
                 }
-                // Fallbacks (no DCI decoded): the small allocations the gNB uses; no ACK.
-                for (nrb, mcs) in [(2, 2), (3, 2), (5, 2), (10, 2), (11, 2), (13, 2)] {
-                    allocs.push((0, nrb, mcs, 0xff, 0));
+                // Fallbacks (no DCI decoded): the gNB schedules the connected DL PDSCH
+                // (incl. the DRB, whose DCI 1_1 in the CORESET1 USS the UE decodes
+                // unreliably) as rb[0,N) QPSK. Its DL link adaptation collapses to a low
+                // MCS while the UE isn't ACKing DRB DL, so brute-force the common N with
+                // MCS 0-2. The per-alloc DM-RS metric gate + CRC + plausibility filter
+                // reject wrong (N, MCS) guesses, decoding the DRB DL directly. No ACK —
+                // the DL PDCP SN dedups the gNB's HARQ retransmissions.
+                for &nrb in &[2usize, 5, 13, 17, 18, 24] {
+                    for mcs in [0u8, 1, 2] {
+                        allocs.push((0, nrb, mcs, 0xff, 0));
+                    }
                 }
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                    // Cheap presence gate: every connected DL PDSCH starts at RB 0, so a
+                    // DM-RS probe at rb[0,2) detects one. Skip the whole brute-force in the
+                    // (common) slots with no PDSCH for us, keeping the loop fast.
+                    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric > 0.9;
+                    let allocs = if present { allocs } else { Vec::new() };
                     for (rb0, nrb, mcs, k1, pri) in allocs {
                         let (qm, _) = mcs_params(mcs);
                         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
@@ -822,7 +842,17 @@ fn run(cfg: Config) {
                                 }
                                 // DRB 1 (LCID 4) DL user data: an IP packet. If it is
                                 // the ICMP echo reply to our ping, the round trip works.
-                                if let Some(ip) = ferrite_ue::userplane::parse_drb_dl_ip(&mut drb_reasm, &tb) {
+                                if let Some((sn, ip)) = ferrite_ue::userplane::parse_drb_dl_ip(&mut drb_reasm, &tb) {
+                                    // Drop HARQ-retransmitted duplicates (same PDCP SN):
+                                    // the gNB retransmits DL until ACKed, and RLC UM has no
+                                    // dedup of its own, so the same packet can decode twice.
+                                    if dl_seen.contains(&sn) {
+                                        break;
+                                    }
+                                    dl_seen.push_back(sn);
+                                    if dl_seen.len() > 64 {
+                                        dl_seen.pop_front();
+                                    }
                                     if let Some(tun) = tun_fd.as_mut() {
                                         // Hand the packet to the OS via the TUN interface.
                                         let _ = tun.write(&ip);
@@ -1092,12 +1122,8 @@ fn run(cfg: Config) {
                 pend_sr = None;
             }
         }
-        // Drop HARQ-ACK bursts whose UL window has passed.
+        // Drop HARQ-ACK and PUSCH bursts whose UL window has passed.
         pend_acks.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
-        if let Some((pos, wave)) = &pend_msg5 {
-            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
-                pend_msg5 = None;
-            }
-        }
+        pend_ul.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
     }
 }

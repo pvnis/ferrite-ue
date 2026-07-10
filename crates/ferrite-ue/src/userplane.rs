@@ -221,26 +221,41 @@ impl RlcUmReassembler {
     }
 }
 
-/// Plausibility check for a DL-SCH MAC PDU carrying DRB 1 (LCID 4) user data whose
-/// PDCP payload looks like an IPv4 packet — used to accept a brute-forced DRB PDSCH
-/// decode (which otherwise wouldn't unstack to a known RRC message).
+/// Plausibility check for a DL-SCH MAC PDU carrying DRB 1 (LCID 4) user data — used
+/// to accept a brute-forced DRB PDSCH decode (which otherwise wouldn't unstack to a
+/// known RRC message). The gNB segments DL SDUs across RLC UM PDUs, so accept the
+/// complete SDU AND the first/middle/last segments: a complete SDU or first segment
+/// starts a PDCP data PDU (D/C=1) + IPv4 packet; mid/last segments are mid-PDU, so
+/// the 24-bit TB CRC (already passed) is the guarantee and only the RLC header is checked.
 pub fn looks_like_drb_ip(mac_pdu: &[u8]) -> bool {
     parse_dl_mac_pdu(mac_pdu).iter().any(|s| {
-        s.lcid == LCID_DRB1
-            && s.payload.len() >= 5
-            && (s.payload[0] >> 6) == 0 // RLC UM complete SDU (SI=00)
-            && (s.payload[1] & 0x80) != 0 // PDCP D/C=1 (data PDU)
-            && (s.payload[4] >> 4) == 4 // IPv4 version nibble
+        let p = &s.payload;
+        if s.lcid != LCID_DRB1 || p.is_empty() {
+            return false;
+        }
+        match (p[0] >> 6) & 0x03 {
+            // Complete SDU (SI=00): [0x00 | PDCP(3) | IPv4…].
+            0b00 => p.len() >= 5 && (p[1] & 0x80) != 0 && (p[4] >> 4) == 4,
+            // First segment (SI=01, 2-byte header): [hdr(2) | PDCP(3) | IPv4…].
+            0b01 => p.len() >= 6 && (p[2] & 0x80) != 0 && (p[5] >> 4) == 4,
+            // Last/middle segment (SI=10/11, 4-byte SN+SO header): mid-PDU.
+            _ => p.len() >= 5,
+        }
     })
 }
 
 /// Unstack a DL-SCH MAC PDU for DRB 1: MAC (LCID 4) → RLC UM reassembly → PDCP
-/// (strip the 3-octet 18-bit-SN header; NEA0 plaintext). Returns the IP packet
-/// once a full SDU reassembles.
-pub fn parse_drb_dl_ip(reasm: &mut RlcUmReassembler, mac_pdu: &[u8]) -> Option<Vec<u8>> {
+/// (strip the 3-octet 18-bit-SN header; NEA0 plaintext). Returns `(pdcp_sn, ip)`
+/// once a full SDU reassembles — the SN lets the caller drop HARQ-retransmitted
+/// duplicates.
+pub fn parse_drb_dl_ip(reasm: &mut RlcUmReassembler, mac_pdu: &[u8]) -> Option<(u32, Vec<u8>)> {
     for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == LCID_DRB1) {
         if let Some(pdcp) = reasm.push(&s.payload) {
-            return pdcp.get(3..).map(|ip| ip.to_vec()); // strip PDCP 18-bit header
+            if pdcp.len() < 3 {
+                return None;
+            }
+            let sn = (((pdcp[0] & 0x03) as u32) << 16) | ((pdcp[1] as u32) << 8) | pdcp[2] as u32;
+            return pdcp.get(3..).map(|ip| (sn, ip.to_vec()));
         }
     }
     None
@@ -280,7 +295,8 @@ mod tests {
         let ip = ipv4_icmp_echo_request([10, 255, 0, 3], [8, 8, 8, 8], 7, 2, b"x");
         let mac = drb_ul_pdu(0, &ip, 80);
         let mut reasm = RlcUmReassembler::new();
-        let got = parse_drb_dl_ip(&mut reasm, &mac).unwrap();
+        let (sn, got) = parse_drb_dl_ip(&mut reasm, &mac).unwrap();
+        assert_eq!(sn, 0);
         assert_eq!(got, ip);
     }
 
