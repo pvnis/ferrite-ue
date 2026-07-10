@@ -120,30 +120,32 @@ pub fn pusch_modulate_slot_uci(
 
     // UCI-on-PUSCH: overwrite (puncture) the selected data REs with the HARQ-ACK
     // QPSK symbols. Each ACK RE is at data index `di` in the k'-first, then-l map;
-    // the scrambling bits are c[2·di], c[2·di+1] (same sequence as the data). For
-    // 1 bit the two QPSK components repeat the (scrambled) bit (placeholder y); for
-    // 2 bits the [a0,a1,a0⊕a1] small block code is spread over the REs.
-    // Only 1-2 ACK bits (puncturing) are implemented; ≥3 bits need Reed-Muller +
-    // UL-SCH rate-matching, so leave the PUSCH as plain data (the gNB reads DTX and
-    // retransmits) rather than corrupting it with a wrong placement.
-    if harq_ack.len() == 1 || harq_ack.len() == 2 {
+    // the scrambling bits are c[2·di], c[2·di+1] (same sequence as the data).
+    //   1-2 bits: small-block "placeholder" code — 1 bit → both QPSK components repeat
+    //     the (scrambled) bit; 2 bits → the [a0,a1,a0⊕a1] sequence over the REs.
+    //   3-11 bits: Reed-Muller (32,O) coded, rate-matched to the ACK REs, scrambled.
+    // (For ≥3 bits the gNB actually rate-matches the UL-SCH around the ACK REs; we
+    // still puncture, so that PUSCH's own UL data fails CRC and retransmits — but the
+    // gNB reads the ACK from these REs regardless, which frees the DL HARQ.)
+    if !harq_ack.is_empty() && harq_ack.len() <= 11 {
         let o_ack = harq_ack.len();
         let n_sc = 12 * alloc.n_rb;
         let res = harq_ack_pusch_res(&alloc.dmrs_symbols, alloc.n_rb, o_ack, beta_harq, tb_bits);
-        let code = |k: usize| -> u8 {
-            match o_ack {
-                1 => harq_ack[0],
-                _ => [harq_ack[0], harq_ack[1], harq_ack[0] ^ harq_ack[1]][k % 3],
-            }
-        };
+        // Coded bit `k` of the UCI (per RE-pair): ≤2 use the small-block form, ≥3 RM.
+        let rm = if o_ack >= 3 { rm_encode(harq_ack, res.len() * 2) } else { Vec::new() };
         for (i, &(l, sc_a)) in res.iter().enumerate() {
             let di = data_syms.iter().position(|&x| x == l).unwrap() * n_sc + sc_a;
             let (m0, m1) = (c[2 * di], c[2 * di + 1]);
-            let sym = if o_ack == 1 {
-                let b = harq_ack[0] ^ m0; // placeholder y: both components carry a0⊕c0
-                qpsk(b, b)
-            } else {
-                qpsk(code(2 * i) ^ m0, code(2 * i + 1) ^ m1)
+            let sym = match o_ack {
+                1 => {
+                    let b = harq_ack[0] ^ m0; // placeholder y: both components carry a0⊕c0
+                    qpsk(b, b)
+                }
+                2 => {
+                    let seq = [harq_ack[0], harq_ack[1], harq_ack[0] ^ harq_ack[1]];
+                    qpsk(seq[(2 * i) % 3] ^ m0, seq[(2 * i + 1) % 3] ^ m1)
+                }
+                _ => qpsk(rm[2 * i] ^ m0, rm[2 * i + 1] ^ m1),
             };
             grids[l][bin(12 * alloc.rb_start + sc_a)] = sym;
         }
@@ -167,6 +169,36 @@ pub fn pusch_modulate_slot_uci(
         sub_off += cp + n;
     }
     out
+}
+
+/// Reed-Muller (32, O) basis sequences (TS 38.212 Table 5.3.3.2-1), for encoding
+/// 3-11 UCI bits.
+const RM_BASIS: [[u8; 32]; 11] = [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0],
+    [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0],
+    [0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0],
+    [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0],
+    [0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0],
+    [0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0],
+    [0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0],
+    [0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0],
+];
+
+/// Encode 3-11 UCI bits with the (32, O) Reed-Muller code (TS 38.212 §5.3.3.2),
+/// rate-matched (repeated) to `e` bits.
+fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
+    let mut d = [0u8; 32];
+    for (i, &b) in bits.iter().enumerate() {
+        if b == 1 {
+            for (j, dj) in d.iter_mut().enumerate() {
+                *dj ^= RM_BASIS[i][j];
+            }
+        }
+    }
+    (0..e).map(|k| d[k % 32]).collect()
 }
 
 /// HARQ-ACK-on-PUSCH RE placement for 1-2 ACK bits (QPSK), matching OCUDU's
@@ -193,6 +225,27 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_ack: usize, beta: f
         left.min(nof_re_uci_l0)
     };
     let q_ack = q_of(o_ack).max(1);
+    // >2 ACK bits: select Q'_ACK REs DIRECTLY (Step 2, no reserved set), strided per
+    // symbol across the non-DM-RS symbols from l1 (the UL-SCH is rate-matched around
+    // them — here punctured, since we don't reduce the UL-SCH E).
+    if o_ack >= 3 {
+        let mut res = Vec::new();
+        let mut placed = 0usize;
+        for &l in data_syms.iter().filter(|&&l| l >= l1) {
+            let rem = q_ack - placed;
+            if rem > 0 {
+                let (d, cnt) = if rem < n_sc { (n_sc / rem, rem) } else { (1, n_sc) };
+                for i in 0..cnt {
+                    res.push((l, i * d));
+                }
+                placed += cnt;
+            }
+            if placed >= q_ack {
+                break;
+            }
+        }
+        return res;
+    }
     // For <2 ACK bits the reserved count is computed as if there were 2.
     let q_rvd = if o_ack < 2 { q_of(2).max(q_ack) } else { q_ack };
 
@@ -248,6 +301,27 @@ mod tests {
         assert_eq!(res.len(), 33);
         assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
         assert_eq!(&res[..3], &[(3, 0), (3, 6), (3, 12)]);
+    }
+
+    /// Reed-Muller (32,O): input bit i selects basis row i; all-zero → all-zero.
+    #[test]
+    fn reed_muller_basis() {
+        assert!(rm_encode(&[0, 0, 0], 32).iter().all(|&b| b == 0));
+        assert_eq!(rm_encode(&[1, 0, 0], 32), RM_BASIS[0]); // row 0 = all ones
+        assert_eq!(rm_encode(&[0, 1, 0], 32), RM_BASIS[1]);
+        // input [1,1,0] = row0 XOR row1.
+        let expect: Vec<u8> = (0..32).map(|j| RM_BASIS[0][j] ^ RM_BASIS[1][j]).collect();
+        assert_eq!(rm_encode(&[1, 1, 0], 32), expect);
+    }
+
+    /// 3-bit HARQ-ACK RE placement (direct, not reserved): Q'_ACK=ceil(3·20·2640/1616)
+    /// = 99 REs in symbol 3, strided at subcarriers 0,2,4,…
+    #[test]
+    fn harq_ack_pusch_re_placement_3bit() {
+        let res = harq_ack_pusch_res(&[2, 7, 11], 20, 3, 20.0, 1600);
+        assert_eq!(res.len(), 99);
+        assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
+        assert_eq!(&res[..3], &[(3, 0), (3, 2), (3, 4)]);
     }
 
     /// Modulate a Msg3-sized PUSCH, demodulate it, equalise trivially (no
