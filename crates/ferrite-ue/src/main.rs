@@ -467,6 +467,12 @@ fn run(cfg: Config) {
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
     let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
     let mut pend_acks: Vec<(i64, Vec<Complex32>)> = Vec::new(); // in-flight DL HARQ-ACKs
+    // Dynamic HARQ-ACK codebook: accumulate per UL-slot ACK bits keyed by their UL
+    // sample position; each entry holds (slot-in-frame, [ACK bit per C-DAI 0..3]).
+    // Several DL PDSCHs (e.g. the two segments of one DL SDU) map to the SAME UL slot
+    // and must be bundled into one 1-2 bit PUCCH, ordered by DAI — else the gNB (which
+    // expects harq_bit_len bits) can't read the ACK and stalls the DL HARQ.
+    let mut ack_book: std::collections::HashMap<i64, (u32, [Option<u8>; 4])> = std::collections::HashMap::new();
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -769,7 +775,7 @@ fn run(cfg: Config) {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
                 let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
-                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), PRI).
+                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), C-DAI).
                 let mut allocs: Vec<(usize, usize, u8, u8, u8)> = Vec::new();
                 // PRIMARY: the gNB schedules the connected-mode DL PDSCH with DCI 1_0 in
                 // CORESET0 (common SS, AL4 CCE0) — decode it (reliable, same path as the
@@ -782,11 +788,13 @@ fn run(cfg: Config) {
                     if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
                         let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                         let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 31, 3)));
+                        // DCI 1_0 DAI at bits[27..29].
+                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2)));
                     }
                 }
-                // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it occasionally).
-                // Layout: id[0] FDRA[1..10] time[10] MCS[11..16] … PRI[27..30] k1[30..33].
+                // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it for the DRB DL).
+                // Layout: id[0] FDRA[1..10] time[10] MCS[11..16] NDI[16] RV[17..19]
+                // HARQ[19..23] DAI[23..25] TPC[25..27] PRI[27..30] k1[30..33].
                 // k1 field indexes dl-DataToUL-ACK [4,5,6,7,8,9,11,12].
                 for cand in uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)]) {
                     let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
@@ -795,7 +803,8 @@ fn run(cfg: Config) {
                         const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
                         let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                         let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 27, 3)));
+                        // DCI 1_1 DAI at bits[23..25].
+                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2)));
                     }
                 }
                 // Fallbacks (no DCI decoded): the gNB schedules the connected DL PDSCH
@@ -816,29 +825,22 @@ fn run(cfg: Config) {
                     // (common) slots with no PDSCH for us, keeping the loop fast.
                     let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric > 0.9;
                     let allocs = if present { allocs } else { Vec::new() };
-                    for (rb0, nrb, mcs, k1, pri) in allocs {
+                    for (rb0, nrb, mcs, k1, dai) in allocs {
                         let (qm, _) = mcs_params(mcs);
                         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
                             if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs) {
-                                // HARQ-ACK the PDSCH k1 slots later on the dedicated PUCCH
-                                // F1 resource (prb0/cs0/occ0, no hop), so the gNB stops
-                                // retransmitting and delivers the next SDU. ACK EVERY
-                                // decoded PDSCH (incl. retransmissions) — a queue, since
-                                // k1 is 4-12 slots ahead so several are in flight.
+                                // Record a positive HARQ-ACK for this PDSCH into the codebook
+                                // at its UL slot (n+k1), positioned by C-DAI. It's modulated
+                                // and sent as a bundled 1-2 bit PUCCH once its UL slot nears
+                                // (below), so several PDSCHs sharing one UL slot ACK together.
                                 if k1 != 0xff {
-                                    let _ = pri; // PRI selects the resource; only cs0/occ0 here
                                     let k1a = k1 as i64; // already the actual k1 in slots
                                     let ack_slot = slot_idx as i64 + k1a;
-                                    let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(
-                                        &ofdm, &harq_cfg, &[1], (ack_slot % 20) as u32, center_hz, fs);
-                                    let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                                    for s in &mut aw { *s *= amp / pk; }
                                     let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                                    if pend_acks.len() < 8 {
-                                        pend_acks.push((pos, aw));
-                                    }
+                                    let e = ack_book.entry(pos).or_insert(((ack_slot % 20) as u32, [None; 4]));
+                                    e.1[(dai & 3) as usize] = Some(1); // 1 = ACK
                                 }
                                 // DRB 1 (LCID 4) DL user data: an IP packet, written to
                                 // the TUN (or matched against the built-in ping).
@@ -1120,6 +1122,27 @@ fn run(cfg: Config) {
         if let Some((pos, wave)) = &pend_sr {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_sr = None;
+            }
+        }
+        // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
+        // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
+        // The bundle is sized by the highest C-DAI seen (missing positions → NACK bit 0),
+        // ordered by C-DAI, so the gNB reads the exact harq_bit_len bits it expects.
+        let due: Vec<i64> = ack_book.keys().copied().filter(|&pos| pos <= ul_counter as i64 + 3 * slot_len).collect();
+        for pos in due {
+            let (slot_mod20, book) = ack_book.remove(&pos).unwrap();
+            let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
+            if size == 0 {
+                continue;
+            }
+            let bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();
+            let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
+            let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+            for s in &mut aw {
+                *s *= amp / pk;
+            }
+            if pend_acks.len() < 12 {
+                pend_acks.push((pos, aw));
             }
         }
         // Drop HARQ-ACK and PUSCH bursts whose UL window has passed.
