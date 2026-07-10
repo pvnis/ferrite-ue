@@ -840,8 +840,8 @@ fn run(cfg: Config) {
                                         pend_acks.push((pos, aw));
                                     }
                                 }
-                                // DRB 1 (LCID 4) DL user data: an IP packet. If it is
-                                // the ICMP echo reply to our ping, the round trip works.
+                                // DRB 1 (LCID 4) DL user data: an IP packet, written to
+                                // the TUN (or matched against the built-in ping).
                                 if let Some((sn, ip)) = ferrite_ue::userplane::parse_drb_dl_ip(&mut drb_reasm, &tb) {
                                     // Drop HARQ-retransmitted duplicates (same PDCP SN):
                                     // the gNB retransmits DL until ACKed, and RLC UM has no
