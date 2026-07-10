@@ -316,7 +316,8 @@ fn run(cfg: Config) {
     let serve = |ul: &mut ZmqSink,
                  counter: &mut u64,
                  base: i64,
-                 bursts: &[&Option<(i64, Vec<Complex32>)>]| {
+                 bursts: &[&Option<(i64, Vec<Complex32>)>],
+                 acks: &[(i64, Vec<Complex32>)]| {
         loop {
             let ok = ul.serve_with(counter, |c, block| {
                 let (c, bl) = (c as i64, block.len() as i64);
@@ -330,16 +331,24 @@ fn run(cfg: Config) {
                         }
                     }
                 }
-                for burst in bursts.iter().copied() {
-                    if let Some((pos, wave)) = burst {
-                        for (i, &s) in wave.iter().enumerate() {
-                            let abs = pos + i as i64;
-                            if abs >= c && abs < c + bl {
-                                block[(abs - c) as usize] = s;
-                                injected.set(injected.get() + 1);
-                            }
+                let place = |pos: i64, wave: &[Complex32], block: &mut [Complex32]| {
+                    for (i, &s) in wave.iter().enumerate() {
+                        let abs = pos + i as i64;
+                        if abs >= c && abs < c + bl {
+                            block[(abs - c) as usize] = s;
+                            injected.set(injected.get() + 1);
                         }
                     }
+                };
+                for burst in bursts.iter().copied() {
+                    if let Some((pos, wave)) = burst {
+                        place(*pos, wave, block);
+                    }
+                }
+                // Pending HARQ-ACK PUCCH bursts (a queue: several can be in flight
+                // since k1 is 4-12 slots ahead and DL PDSCHs arrive back to back).
+                for (pos, wave) in acks {
+                    place(*pos, wave, block);
                 }
             }).expect("ul");
             if ok { break; }
@@ -352,7 +361,7 @@ fn run(cfg: Config) {
     while cap.len() < cap_len {
         fill_dl(&mut dl, &mut blk);
         cap.extend_from_slice(&blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
     }
     let (df, _r, shifted) = gscn_scan(&cap, fs, center_hz, &searcher).expect("no SSB");
     let acq = sync.acquire(&shifted).expect("acquire");
@@ -368,12 +377,12 @@ fn run(cfg: Config) {
     let mut to_skip = acq.skip_to_frame;
     while to_skip >= block_len {
         fill_dl(&mut dl, &mut blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
         to_skip -= block_len;
     }
     if to_skip > 0 {
         fill_dl(&mut dl, &mut blk[..to_skip]);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[]);
+        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[]);
     }
 
     let blocks_per_slot = slot_len as usize / block_len; // 4
@@ -412,7 +421,7 @@ fn run(cfg: Config) {
     let mut last_ta: i64 = 5;
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
     let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
-    let mut pend_ack: Option<(i64, Vec<Complex32>)> = None; // connected-mode DL HARQ-ACK
+    let mut pend_acks: Vec<(i64, Vec<Complex32>)> = Vec::new(); // in-flight DL HARQ-ACKs
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -466,7 +475,7 @@ fn run(cfg: Config) {
             // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
             // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
             let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
-            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5, &pend_ack]);
+            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_msg5], &pend_acks);
         }
 
         // Decode this slot's RA search space.
@@ -540,7 +549,11 @@ fn run(cfg: Config) {
                             (mac_short_bsr(0, tbs_bytes), String::new())
                         } else if ul_queue.front().unwrap().len() + 10 > tbs_bytes {
                             let need = ul_queue.front().unwrap().len() + 10;
-                            (mac_short_bsr(need, tbs_bytes), format!("Short BSR (need {need}B)"))
+                            // Over-report the buffer so the gNB grants MORE RBs — its UL
+                            // MCS drops under the (lossless-channel) KO noise, so a
+                            // truthful ~52B report yields sub-52B grants that never fit
+                            // the SRB1 PDU. A big report forces a wide grant we can pad.
+                            (mac_short_bsr(need.max(220), tbs_bytes), format!("Short BSR (need {need}B)"))
                         } else {
                             let rrc = ul_queue.pop_front().unwrap();
                             let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
@@ -655,24 +668,37 @@ fn run(cfg: Config) {
                         dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1).map(|b| {
                             let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                             let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                            (rb0, nrb, bits5(&b, 11, 5), bits5(&b, 30, 3), bits5(&b, 27, 3))
+                            let a = (rb0, nrb, bits5(&b, 11, 5), bits5(&b, 30, 3), bits5(&b, 27, 3));
+                            if auth_done { println!("  [dbg] DCI1_1 slot{slot_idx} rb[{},{}) mcs{} k1={} pri={}", a.0, a.0 + a.1, a.2, a.3, a.4); }
+                            a
                         })
                     })
                     .collect();
-                // Fallbacks (no DCI): the AuthReq's fixed rb[0,10/11) MCS2, no HARQ-ACK.
-                allocs.push((0, 10, 2, 0xff, 0));
-                allocs.push((0, 11, 2, 0xff, 0));
+                // Fallbacks when the DCI 1_1 doesn't decode: cover the connected-mode
+                // DL allocations the gNB actually uses (rb[0,{10,11,13}) at a few low
+                // MCS; the CDM-group is tried both ways in try_decode). No HARQ-ACK
+                // (k1 unknown) for these.
+                for (nrb, mcs) in [(10, 2), (11, 2), (13, 2), (11, 1), (13, 1), (10, 0), (13, 0), (20, 2)] {
+                    allocs.push((0, nrb, mcs, 0xff, 0));
+                }
+                let allocs_len = allocs.len();
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                    let mut any_metric = false;
+                    let mut decoded_ok = false;
                     for (rb0, nrb, mcs, k1, pri) in allocs {
                         let (qm, _) = mcs_params(mcs);
                         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
                         let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
                         if metric > 0.9 {
+                            any_metric = true;
                             if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs) {
-                                // HARQ-ACK the PDSCH k1 slots later on the PUCCH F1
-                                // resource (this cell always uses cs0/occ0/prb0, = the
-                                // Msg4-ACK resource), so the gNB stops retransmitting.
-                                if k1 != 0xff && pend_ack.is_none() {
+                                decoded_ok = true;
+                                // HARQ-ACK the PDSCH k1 slots later on the dedicated PUCCH
+                                // F1 resource (prb0/cs0/occ0, no hop), so the gNB stops
+                                // retransmitting and delivers the next SDU. ACK EVERY
+                                // decoded PDSCH (incl. retransmissions) — a queue, since
+                                // k1 is 4-12 slots ahead so several are in flight.
+                                if k1 != 0xff {
                                     let _ = pri; // PRI selects the resource; only cs0/occ0 here
                                     // The 3-bit k1 field indexes the dl-DataToUL-ACK list
                                     // (from the gNB config): [4,5,6,7,8,9,11,12].
@@ -684,7 +710,9 @@ fn run(cfg: Config) {
                                     let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                                     for s in &mut aw { *s *= amp / pk; }
                                     let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                                    pend_ack = Some((pos, aw));
+                                    if pend_acks.len() < 8 {
+                                        pend_acks.push((pos, aw));
+                                    }
                                 }
                                 let Some((rlc_sn, rrc)) = parse_srb1_dl_rrc_sn(&tb) else { break };
                                 // On a NEW DL RLC SDU, arm an RLC STATUS ACK so the
@@ -797,6 +825,9 @@ fn run(cfg: Config) {
                             }
                         }
                     }
+                    if auth_done && any_metric && !decoded_ok {
+                        println!("  [dbg] PDSCH present slot{slot_idx} but NO decode ({} allocs tried)", allocs_len);
+                    }
                 }
             }
         }
@@ -889,11 +920,8 @@ fn run(cfg: Config) {
                 pend_sr = None;
             }
         }
-        if let Some((pos, wave)) = &pend_ack {
-            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
-                pend_ack = None;
-            }
-        }
+        // Drop HARQ-ACK bursts whose UL window has passed.
+        pend_acks.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
         if let Some((pos, wave)) = &pend_msg5 {
             if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
                 pend_msg5 = None;
