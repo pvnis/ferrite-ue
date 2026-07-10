@@ -492,6 +492,7 @@ fn run(cfg: Config) {
     // User plane (DRB 1 / LCID 4): once the DRB is up, send ICMP echo requests and
     // watch the DL for the reply. `ue_ip` = the address the PDU session assigned us.
     let mut drb_up = false; // RRCReconfiguration (DRB) applied
+    let mut ue_ip = ue_ip; // assigned IP: from --ue-ip, else the PDU Session Accept
     let mut ping_seq: u16 = 0; // ICMP echo sequence number
     let mut pdcp_tx_sn: u32 = 0; // DRB uplink PDCP SN
     let mut ping_acked = false; // an echo reply was received
@@ -825,6 +826,14 @@ fn run(cfg: Config) {
                                 if dtype == Some(0) && !recfg_done {
                                     recfg_done = true;
                                     drb_up = true; // the DRB (LCID 4) is now configured
+                                    // Learn our assigned IP from the PDU Session Accept
+                                    // piggybacked in this reconfiguration (unless --ue-ip set).
+                                    if ue_ip.is_none() {
+                                        ue_ip = ferrite_ue::rrc::reconfig_pdu_session_ip(&rrc);
+                                        if let Some(ip) = ue_ip {
+                                            println!("   UE IP {}.{}.{}.{} (from PDU Session Accept)", ip[0], ip[1], ip[2], ip[3]);
+                                        }
+                                    }
                                     let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
                                     ul_queue.push_back(rrc_reconfiguration_complete(tid));
                                     println!("   ⇒ queued RRCReconfigurationComplete (tid {tid}) — DRB up");

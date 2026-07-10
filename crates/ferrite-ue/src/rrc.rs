@@ -387,6 +387,51 @@ pub fn parse_srb1_dl_pdcp(mac_pdu: &[u8]) -> Option<(u16, Vec<u8>, [u8; 4])> {
     None
 }
 
+/// Left-shift a byte array by `shift` bits (0..8), pulling bits in from the next
+/// byte — used to re-align a UPER-packed field to a byte boundary for scanning.
+fn bitshift_left(data: &[u8], shift: usize) -> Vec<u8> {
+    if shift == 0 {
+        return data.to_vec();
+    }
+    (0..data.len())
+        .map(|i| {
+            let hi = (data[i] as usize) << shift;
+            let lo = data.get(i + 1).map(|&b| (b as usize) >> (8 - shift)).unwrap_or(0);
+            ((hi | lo) & 0xff) as u8
+        })
+        .collect()
+}
+
+/// Extract the UE's assigned IPv4 address from an RRCReconfiguration that carries
+/// a PDU Session Establishment Accept in its `dedicatedNAS-MessageList`. That NAS
+/// message is UPER bit-packed (not byte-aligned) inside the reconfiguration, so
+/// rather than decode the whole RadioBearerConfig, try all 8 bit alignments and
+/// look for the DL NAS Transport (`7e 00 68 01`) whose payload container (the 5GSM
+/// Accept) contains a PDU-address IE (`29 05 01` = IPv4). Validating the full chain
+/// makes a wrong alignment essentially impossible to false-match.
+pub fn reconfig_pdu_session_ip(rrc: &[u8]) -> Option<[u8; 4]> {
+    for shift in 0..8 {
+        let buf = bitshift_left(rrc, shift);
+        let mut i = 0;
+        while i + 6 <= buf.len() {
+            // DL NAS Transport header + N1 SM payload container type.
+            if buf[i] == 0x7e && buf[i + 1] == 0x00 && buf[i + 2] == 0x68 && buf[i + 3] == 0x01 {
+                let plen = ((buf[i + 4] as usize) << 8) | buf[i + 5] as usize;
+                if let Some(accept) = buf.get(i + 6..i + 6 + plen) {
+                    // PDU address IE: IEI 0x29, length 5, PDU type 0x01 (IPv4), 4 octets.
+                    if let Some(ip) = accept.windows(7).find_map(|w| {
+                        (w[0] == 0x29 && w[1] == 0x05 && w[2] == 0x01).then(|| [w[3], w[4], w[5], w[6]])
+                    }) {
+                        return Some(ip);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 /// The DL-DCCH c1 message index (TS 38.331): 0=rrcReconfiguration, 2=rrcRelease,
 /// 4=securityModeCommand, 5=dlInformationTransfer, … Returns None if not a c1.
 pub fn dl_dcch_type(rrc: &[u8]) -> Option<u8> {
@@ -593,6 +638,19 @@ pub fn parse_dl_mac_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hx(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// A real gNB RRCReconfiguration (reassembled) carrying a PDU Session
+    /// Establishment Accept: the UE IP must be extracted despite the NAS being
+    /// UPER bit-packed inside the message. This capture assigned 10.255.0.3.
+    #[test]
+    fn extract_ue_ip_from_reconfig() {
+        let rrc = hx("068a80409a05e00205e3f05d00bac01584888bd76380832f00058e03f441a0b200811801001c5f80b6fbd20e00df801a0040188b8140708440024040018c4c40407fc041828000c28000ca414042bfc000c881004000001e4001804810404041dec009e02008440080000420418202020220c1820201010003410202020200034102020101000400815e0942421a5b9d195c9b995d048140");
+        assert_eq!(reconfig_pdu_session_ip(&rrc), Some([10, 255, 0, 3]));
+    }
 
     #[test]
     fn setup_request_layout() {
