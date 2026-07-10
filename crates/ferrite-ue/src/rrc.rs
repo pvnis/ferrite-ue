@@ -142,17 +142,38 @@ pub fn rrc_reconfiguration_complete(transaction_id: u8) -> Vec<u8> {
     w.finish()
 }
 
+/// A minimal UE-NR-Capability (TS 38.331): accessStratumRelease rel15 + a single
+/// supported band n78, every optional feature set absent. UPER-encoded and
+/// validated byte-exact against OCUDU's `ue_nr_cap_s` packer (`rrc_dec gen-uecap`).
+/// This is the UE's claimed radio capability — the minimum the gNB accepts to
+/// finish the capability transfer and proceed to RRCReconfiguration.
+pub fn ue_nr_capability() -> Vec<u8> {
+    vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9a]
+}
+
 /// Encode `UL-DCCH-Message { c1: ueCapabilityInformation }` (TS 38.331): c1 index
-/// 9, rrc-TransactionIdentifier, critExt=0, and a 3-bit IEs optional bitmap with
-/// everything absent (no ue-CapabilityRAT-ContainerList) — a minimal "no extra
-/// capabilities" answer to a UECapabilityEnquiry.
+/// 9, carrying one UE-CapabilityRAT-Container (rat-Type nr) with the minimal
+/// UE-NR-Capability. Answer to a UECapabilityEnquiry. Validated byte-exact vs
+/// OCUDU (`rrc_dec gen-uecapinfo` → 4882028000000000000000002680 for tid 0).
+///
+/// Layout: [1: c1=0][4: idx=9][2: tid][1: critExt=0][3: IEs opt bitmap=100
+/// (ratContainerList present)][4: list SIZE(0..8) count=1][1: rat-Type ext=0]
+/// [2: rat-Type nr=0][OCTET STRING: length + UE-NR-Capability octets].
 pub fn rrc_ue_capability_information(transaction_id: u8) -> Vec<u8> {
+    let cap = ue_nr_capability();
     let mut w = BitWriter::new();
     w.put(0, 1);
     w.put(9, 4);
     w.put((transaction_id & 3) as u64, 2);
     w.put(0, 1);
-    w.put(0, 3); // {ratContainerList, lateNonCritExt, nonCritExt} all absent
+    w.put(0b100, 3); // ue-CapabilityRAT-ContainerList present
+    w.put(1, 4); // container list count = 1
+    w.put(0, 1); // rat-Type extension bit
+    w.put(0, 2); // rat-Type = nr
+    put_length(&mut w, cap.len());
+    for &b in &cap {
+        w.put(b as u64, 8);
+    }
     w.finish()
 }
 
