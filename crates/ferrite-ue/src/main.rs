@@ -22,7 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header};
-use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, parse_srb1_dl_rrc_sn, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_msg5_pdu, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -251,7 +251,7 @@ fn try_decode_dl_srb1(
                 let rrc = parse_srb1_dl_rrc(&tb)?;
                 let ok = match dl_dcch_type(&rrc) {
                     Some(5) => parse_dl_dcch_nas(&rrc).is_some_and(|n| n.first() == Some(&0x7e)),
-                    Some(0 | 2 | 4) => true,
+                    Some(0 | 2 | 4 | 6) => true, // rrcReconfig / rrcRelease / securityModeCommand / ueCapabilityEnquiry
                     _ => false,
                 };
                 if ok { Some(tb) } else { None }
@@ -452,6 +452,7 @@ fn run(cfg: Config) {
     let mut auth_done = false; // AuthenticationResponse queued
     let mut smc_done = false; // SecurityModeComplete queued
     let mut as_sec_done = false; // RRC securityModeComplete queued (AS security)
+    let mut cap_done = false; // UECapabilityInformation queued
     let mut recfg_done = false; // rrcReconfigurationComplete queued
     let mut k_amf_st: Option<[u8; 32]> = None; // K_AMF, for K_gNB derivation
     let mut k_rrcint: Option<[u8; 16]> = None; // 128-NIA2 RRC integrity key (AS)
@@ -764,6 +765,15 @@ fn run(cfg: Config) {
                                     let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
                                     ul_queue.push_back(rrc_reconfiguration_complete(tid));
                                     println!("   ⇒ queued RRCReconfigurationComplete (tid {tid}) — ATTACH near-complete");
+                                    break;
+                                }
+                                // ueCapabilityEnquiry (6): answer with a minimal
+                                // ueCapabilityInformation (no extra capabilities).
+                                if dtype == Some(6) && !cap_done {
+                                    cap_done = true;
+                                    let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
+                                    ul_queue.push_back(rrc_ue_capability_information(tid));
+                                    println!("   ⇒ queued UECapabilityInformation (tid {tid})");
                                     break;
                                 }
                                 let Some(nas) = parse_dl_dcch_nas(&rrc).filter(|_| dtype == Some(5)) else { break };

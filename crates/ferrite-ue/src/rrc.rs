@@ -142,6 +142,20 @@ pub fn rrc_reconfiguration_complete(transaction_id: u8) -> Vec<u8> {
     w.finish()
 }
 
+/// Encode `UL-DCCH-Message { c1: ueCapabilityInformation }` (TS 38.331): c1 index
+/// 9, rrc-TransactionIdentifier, critExt=0, and a 3-bit IEs optional bitmap with
+/// everything absent (no ue-CapabilityRAT-ContainerList) — a minimal "no extra
+/// capabilities" answer to a UECapabilityEnquiry.
+pub fn rrc_ue_capability_information(transaction_id: u8) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(0, 1);
+    w.put(9, 4);
+    w.put((transaction_id & 3) as u64, 2);
+    w.put(0, 1);
+    w.put(0, 3); // {ratContainerList, lateNonCritExt, nonCritExt} all absent
+    w.finish()
+}
+
 /// The 2-bit rrc-TransactionIdentifier of a DL-DCCH c1 message (it follows the
 /// 1-bit c1 CHOICE + 4-bit message index).
 pub fn dl_dcch_transaction_id(rrc: &[u8]) -> u8 {
