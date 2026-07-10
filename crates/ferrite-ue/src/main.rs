@@ -22,6 +22,7 @@ use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
+use ferrite_ue::userplane::{drb_ul_pdu, ipv4_icmp_echo_request};
 use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use num_complex::Complex32;
@@ -61,6 +62,10 @@ struct Config {
     ki: [u8; 16],
     opc: [u8; 16],
     snn: String,
+    /// User-plane ping: the UE's assigned IP (from the PDU Session Accept) and the
+    /// ICMP echo target. If `ue_ip` is None, no ping is attempted after attach.
+    ue_ip: Option<[u8; 4]>,
+    ping_target: [u8; 4],
 }
 
 impl Config {
@@ -82,6 +87,8 @@ impl Config {
             ki: hexn(&arg("--ki", "5122250214c33e723a5dd523fc145fc0")),
             opc: hexn(&arg("--opc", "981d464c7c52eb6e5036234984ad0bcf")),
             snn: arg("--snn", "5G:mnc001.mcc001.3gppnetwork.org"),
+            ue_ip: arg_opt("--ue-ip").as_deref().map(parse_ipv4),
+            ping_target: parse_ipv4(&arg("--ping-target", "10.255.0.1")),
         }
     }
 }
@@ -89,6 +96,20 @@ impl Config {
 fn arg(name: &str, default: &str) -> String {
     let a: Vec<String> = std::env::args().collect();
     a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned()).unwrap_or_else(|| default.into())
+}
+
+fn arg_opt(name: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
+}
+
+/// Parse a dotted-quad IPv4 address into 4 octets.
+fn parse_ipv4(s: &str) -> [u8; 4] {
+    let mut o = [0u8; 4];
+    for (i, p) in s.split('.').enumerate().take(4) {
+        o[i] = p.parse().expect("ipv4 octet");
+    }
+    o
 }
 
 fn riv_decode(riv: usize, n: usize) -> (usize, usize) {
@@ -244,6 +265,11 @@ fn try_decode_dl_srb1(
                     return None;
                 }
                 let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+                // DRB (LCID 4) DL user data: accept if it carries a plausible IPv4
+                // packet (e.g. our ping's echo reply).
+                if ferrite_ue::userplane::looks_like_drb_ip(&tb) {
+                    return Some(tb);
+                }
                 // A wrong (mcs, cdm) guess can still pass the 24-bit CRC on a
                 // retransmission; require the TB to unstack to a plausible DL-DCCH
                 // RRC PDU (known c1 type; a dlInformationTransfer must carry a 0x7e
@@ -271,7 +297,7 @@ fn main() {
 fn run(cfg: Config) {
     let Config {
         tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
-        toff_lo, toff_hi, toff_step, imsi, ki, opc, snn,
+        toff_lo, toff_hi, toff_step, imsi, ki, opc, snn, ue_ip, ping_target,
     } = cfg;
 
     let fft = (fs / 30_000.0).round() as usize;
@@ -463,6 +489,14 @@ fn run(cfg: Config) {
     let mut dl_rlc_next: u16 = 0; // next expected DL RLC SN (for RLC STATUS ACK)
     let mut pending_status: Option<u16> = None; // ACK_SN to report so the gNB DL advances
     let mut srb1_reasm = RlcReassembler::new(); // reassembles segmented DL SRB1 SDUs
+    // User plane (DRB 1 / LCID 4): once the DRB is up, send ICMP echo requests and
+    // watch the DL for the reply. `ue_ip` = the address the PDU session assigned us.
+    let mut drb_up = false; // RRCReconfiguration (DRB) applied
+    let mut ping_seq: u16 = 0; // ICMP echo sequence number
+    let mut pdcp_tx_sn: u32 = 0; // DRB uplink PDCP SN
+    let mut ping_acked = false; // an echo reply was received
+    let mut drb_reasm = ferrite_ue::userplane::RlcUmReassembler::new();
+    const PING_ID: u16 = 0xfe11;
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -546,23 +580,37 @@ fn run(cfg: Config) {
                             // retransmitting and delivers the next one.
                             pending_status = None;
                             (rlc_status_mac_pdu(ack, tbs_bytes), format!("RLC STATUS ack={ack}"))
-                        } else if ul_queue.is_empty() {
-                            // Idle grant: a valid, decodable PDU that reports an empty
-                            // buffer so the gNB stops granting (and no crc=KO).
-                            (mac_short_bsr(0, tbs_bytes), String::new())
-                        } else if ul_queue.front().unwrap().len() + 10 > tbs_bytes {
+                        } else if !ul_queue.is_empty() && ul_queue.front().unwrap().len() + 10 > tbs_bytes {
                             let need = ul_queue.front().unwrap().len() + 10;
                             // Over-report the buffer so the gNB grants MORE RBs — its UL
                             // MCS drops under the (lossless-channel) KO noise, so a
                             // truthful ~52B report yields sub-52B grants that never fit
                             // the SRB1 PDU. A big report forces a wide grant we can pad.
                             (mac_short_bsr(need.max(220), tbs_bytes), format!("Short BSR (need {need}B)"))
-                        } else {
+                        } else if !ul_queue.is_empty() {
                             let rrc = ul_queue.pop_front().unwrap();
                             let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
                             let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
                             srb1_sn += 1;
                             (m, k)
+                        } else if let (true, false, Some(uip)) = (drb_up, ping_acked, ue_ip) {
+                            if ping_seq < 20 {
+                                // User plane: send an ICMP echo on DRB 1 (LCID 4) and
+                                // await the reply. Resend on each grant until acked.
+                                let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
+                                let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
+                                pdcp_tx_sn += 1;
+                                let s = format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
+                                    ping_target[0], ping_target[1], ping_target[2], ping_target[3]);
+                                ping_seq += 1;
+                                (m, s)
+                            } else {
+                                (mac_short_bsr(0, tbs_bytes), String::new())
+                            }
+                        } else {
+                            // Idle grant: a valid, decodable PDU that reports an empty
+                            // buffer so the gNB stops granting (and no crc=KO).
+                            (mac_short_bsr(0, tbs_bytes), String::new())
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
                         let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
@@ -717,6 +765,19 @@ fn run(cfg: Config) {
                                         pend_acks.push((pos, aw));
                                     }
                                 }
+                                // DRB 1 (LCID 4) DL user data: an IP packet. If it is
+                                // the ICMP echo reply to our ping, the round trip works.
+                                if let Some(ip) = ferrite_ue::userplane::parse_drb_dl_ip(&mut drb_reasm, &tb) {
+                                    if let Some(r) = ferrite_ue::userplane::parse_ipv4_icmp_echo_reply(&ip) {
+                                        ping_acked = true;
+                                        println!("🏓 PING REPLY from {}.{}.{}.{} id={:#06x} seq={} — END-TO-END PING WORKS",
+                                            r.src[0], r.src[1], r.src[2], r.src[3], r.id, r.seq);
+                                    } else {
+                                        println!("   DRB DL IP packet ({} B): {}", ip.len(),
+                                            ip.iter().take(20).map(|b| format!("{b:02x}")).collect::<String>());
+                                    }
+                                    break;
+                                }
                                 let Some((rlc_sn, rrc_opt)) = srb1_dl_rrc_reasm(&mut srb1_reasm, &tb) else { break };
                                 // A segment arrived but the SDU isn't whole yet: wait for
                                 // the rest before ACKing (a large RRCReconfiguration is
@@ -763,9 +824,10 @@ fn run(cfg: Config) {
                                 // (its piggybacked NAS RegistrationAccept is handled below).
                                 if dtype == Some(0) && !recfg_done {
                                     recfg_done = true;
+                                    drb_up = true; // the DRB (LCID 4) is now configured
                                     let tid = ferrite_ue::rrc::dl_dcch_transaction_id(&rrc);
                                     ul_queue.push_back(rrc_reconfiguration_complete(tid));
-                                    println!("   ⇒ queued RRCReconfigurationComplete (tid {tid}) — ATTACH near-complete");
+                                    println!("   ⇒ queued RRCReconfigurationComplete (tid {tid}) — DRB up");
                                     break;
                                 }
                                 // ueCapabilityEnquiry (6): answer with a minimal
@@ -908,7 +970,8 @@ fn run(cfg: Config) {
         // Send a Scheduling Request each frame at slot 7 whenever an SRB1 PDU is
         // queued (RRCSetupComplete, then the AuthenticationResponse) to solicit
         // a UL grant. Stops once the queue drains so we don't over-request.
-        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some()) && slot_idx == 0 && pend_sr.is_none() {
+        let want_ping = drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
+        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping) && slot_idx == 0 && pend_sr.is_none() {
             let sr_slot = 7i64;
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);

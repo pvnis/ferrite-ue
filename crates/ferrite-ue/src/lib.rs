@@ -6,3 +6,4 @@ pub mod nas;
 pub mod rrc;
 pub mod stream;
 pub mod sync;
+pub mod userplane;
