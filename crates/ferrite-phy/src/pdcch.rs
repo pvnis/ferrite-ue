@@ -329,6 +329,37 @@ pub fn equalize_candidate_c1_cached(
     llrs
 }
 
+/// Cheap per-candidate PDCCH presence metric (srsUE's get_measure → discard): the
+/// COHERENCE of the cached per-REG channel estimate across the candidate's REGs,
+/// `|mean(h)|² / mean(|h|²)`. When a PDCCH really occupies the candidate every REG sees
+/// the same channel ⇒ ≈1; over empty (noise-only DM-RS) REGs the estimates are random
+/// ⇒ ≈1/N. Gating the blind decode on this (skip if below ~0.5) avoids the equalize +
+/// polar decode for the ~13 of 15 candidates that carry nothing — using only the
+/// estimate from [`estimate_coreset_c1`], no extra reads.
+pub fn coreset_candidate_coherence(
+    h_reg: &std::collections::HashMap<(usize, usize), Complex32>,
+    cand: &Candidate,
+    n_symb: usize,
+) -> f32 {
+    let mut sum = Complex32::new(0.0, 0.0);
+    let mut power = 0.0f32;
+    let mut n = 0u32;
+    for &cce in &cand.cces {
+        for reg in 6 * cce..6 * cce + 6 {
+            let (l, rb) = reg_to_symbol_rb(reg, n_symb);
+            if let Some(&h) = h_reg.get(&(l, rb)) {
+                sum += h;
+                power += h.norm_sqr();
+                n += 1;
+            }
+        }
+    }
+    if n == 0 || power <= 1e-12 {
+        return 0.0;
+    }
+    (sum / n as f32).norm_sqr() / (power / n as f32)
+}
+
 /// Shared equalization: per-(symbol, rb) LS channel estimate from each REG's
 /// 3 DMRS REs, then match-filter the data REs into LLRs (positive ⇒ bit 0).
 fn equalize_layout(
@@ -405,6 +436,32 @@ mod tests {
                 assert!((a - b).abs() < 1e-4, "AL{al} cce{base}: {a} vs {b}");
             }
         }
+    }
+
+    /// The coherence gate: a candidate whose REGs all see the same channel scores ≈1;
+    /// one over random (noise-only) estimates scores ≪ the 0.5 gate.
+    #[test]
+    fn candidate_coherence_gates_noise() {
+        let n_symb = 2usize;
+        let h = Complex32::new(0.7, -0.4);
+        let mut coherent = std::collections::HashMap::new();
+        let mut noise = std::collections::HashMap::new();
+        let mut seed = 0x1234_5678u64;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+        };
+        for l in 0..n_symb {
+            for rb in 0..24 {
+                coherent.insert((l, rb), h);
+                noise.insert((l, rb), Complex32::new(rng(), rng()));
+            }
+        }
+        let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
+        assert!(coreset_candidate_coherence(&coherent, &cand, n_symb) > 0.95, "coherent ≈ 1");
+        assert!(coreset_candidate_coherence(&noise, &cand, n_symb) < 0.5, "noise low");
     }
 
     /// Exhaustive candidates cover every CCE-aligned position, in particular the

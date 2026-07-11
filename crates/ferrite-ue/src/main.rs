@@ -11,7 +11,7 @@
 
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
-use ferrite_phy::pdcch::{all_candidates, equalize_candidate, equalize_candidate_c1_cached, estimate_coreset_c1, Candidate, Coreset0};
+use ferrite_phy::pdcch::{all_candidates, coreset_candidate_coherence, equalize_candidate, equalize_candidate_c1_cached, estimate_coreset_c1, Candidate, Coreset0};
 use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, pdsch_scramble_c_init, PdschAlloc};
 use ferrite_phy::pdsch_params::mcs_params;
 use ferrite_phy::prach::{prach_ncs_unrestricted, prach_occasion_waveform, prach_preamble_seq, PrachOccasion, PrachScs, PrachSeqLen};
@@ -435,6 +435,11 @@ fn decode_dl(
     if allocs.is_empty() {
         let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, cell_id, slot_idx);
         for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
+            // Skip candidates with no PDCCH (low DM-RS coherence) before the equalize +
+            // polar decode — most of the 15 candidates carry nothing.
+            if coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb) < 0.5 {
+                continue;
+            }
             let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
             pdcch_descramble_llr(&mut mm, u32::from(cell_id));
             if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
@@ -814,6 +819,9 @@ fn run(cfg: Config) {
                     let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
                     all_candidates(coreset.n_cce(), &[1, 2, 4, 8])
                         .into_iter()
+                        // Gate on DM-RS coherence: skip the equalize + polar decode for the
+                        // candidates (most of them) that carry no PDCCH.
+                        .filter(|cand| coreset_candidate_coherence(&h_reg, cand, coreset.n_symb) >= 0.5)
                         .find_map(|cand| {
                             let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
                             pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
