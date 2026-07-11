@@ -11,7 +11,7 @@
 
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
-use ferrite_phy::pdcch::{equalize_candidate, equalize_candidate_c1, uss_candidates, Candidate, Coreset0};
+use ferrite_phy::pdcch::{all_candidates, equalize_candidate, equalize_candidate_c1_cached, estimate_coreset_c1, Candidate, Coreset0};
 use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, pdsch_scramble_c_init, PdschAlloc};
 use ferrite_phy::pdsch_params::mcs_params;
 use ferrite_phy::prach::{prach_ncs_unrestricted, prach_occasion_waveform, prach_preamble_seq, PrachOccasion, PrachScs, PrachSeqLen};
@@ -657,12 +657,15 @@ fn run(cfg: Config) {
                 let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
                 let dci = dci_decode(&m, crnti, a_len).or_else(|| {
-                    // CORESET1 UE-specific search space: DCI 0_1 (non-interleaved,
-                    // AL2×4 + AL4×2 candidates). n_ID/n_RNTI for scrambling = cell_id/0.
-                    uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)])
+                    // CORESET1 search space: DCI 0_1 (non-interleaved). Blind-decode
+                    // every AL1/2/4/8 candidate — with CQI feedback the gNB uses AL1 at
+                    // Y=0 CCEs the rnti-hashed USS wouldn't cover. Scrambling n_ID/n_RNTI
+                    // = cell_id/0.
+                    let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
+                    all_candidates(coreset.n_cce(), &[1, 2, 4, 8])
                         .into_iter()
                         .find_map(|cand| {
-                            let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
+                            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
                             pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
                             dci_decode(&mm, crnti, DCI_0_1_SIZE)
                         })
@@ -865,28 +868,35 @@ fn run(cfg: Config) {
                 // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it for the DRB DL).
                 // Layout: id[0] FDRA[1..10] time[10] MCS[11..16] NDI[16] RV[17..19]
                 // HARQ[19..23] DAI[23..25] TPC[25..27] PRI[27..30] k1[30..33].
-                // k1 field indexes dl-DataToUL-ACK [4,5,6,7,8,9,11,12].
-                for cand in uss_candidates(coreset.n_cce(), 1, crnti, slot_idx, &[(2, 4), (4, 2)]) {
-                    let mut mm = equalize_candidate_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx, &cand);
-                    pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
-                    if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
-                        const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-                        let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                        let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                        // DCI 1_1 DAI at bits[23..25], RV at [17..19], HARQ at [19..23].
-                        allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
+                // k1 field indexes dl-DataToUL-ACK [4,5,6,7,8,9,11,12]. Only searched
+                // when the CORESET0 DCI 1_0 didn't decode (there is ≤1 PDSCH per slot for
+                // us): during registration that DCI 1_0 carries the SRB, so this whole
+                // exhaustive CORESET1 search is skipped, keeping the UE real-time.
+                if allocs.is_empty() {
+                    let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
+                    for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
+                        let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
+                        pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
+                        if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
+                            const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                            let (rb0, nrb) = riv_decode(riv, carrier_rb);
+                            // DCI 1_1 DAI at bits[23..25], RV at [17..19], HARQ at [19..23].
+                            allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
+                            break; // one PDSCH per slot; stop at the first decoded DCI
+                        }
                     }
                 }
-                // Fallbacks (no DCI decoded): the gNB schedules the connected DL PDSCH
-                // (incl. the DRB, whose DCI 1_1 in the CORESET1 USS the UE decodes
-                // unreliably) as rb[0,N) QPSK. Its DL link adaptation collapses to a low
-                // MCS while the UE isn't ACKing DRB DL, so brute-force the common N with
-                // MCS 0-2. The per-alloc DM-RS metric gate + CRC + plausibility filter
-                // reject wrong (N, MCS) guesses, decoding the DRB DL directly. No ACK —
-                // the DL PDCP SN dedups the gNB's HARQ retransmissions.
-                for &nrb in &[2usize, 5, 13, 17, 18, 24] {
-                    for mcs in [0u8, 1, 2] {
-                        allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
+                // Fallback ONLY when no DCI decoded (the exhaustive CORESET1 search now
+                // decodes the DCI 1_1 reliably, giving exact rb/mcs/rv/h_id). Brute-force
+                // rb[0,N) × MCS 0-2 — the DM-RS metric gate + CRC + plausibility filter
+                // reject wrong guesses. Skipping this when a DCI decoded avoids ~18 wasted
+                // LDPC decodes per slot, which is what let the UE fall behind real-time.
+                if allocs.is_empty() {
+                    for &nrb in &[2usize, 5, 13, 17, 18, 24] {
+                        for mcs in [0u8, 1, 2] {
+                            allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
+                        }
                     }
                 }
                 if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {

@@ -223,6 +223,28 @@ pub fn uss_candidates(n_cce: usize, coreset_id: u16, rnti: u16, slot: u32, al_co
     out
 }
 
+/// Every CCE-aligned candidate on a small CORESET, for each aggregation level in
+/// `als`: candidate m of level L occupies CCEs `[m·L, m·L+L)`. This is an exhaustive
+/// SUPERSET of whatever hashed candidates the actual SearchSpace defines (any Y, any
+/// nrofCandidates), so it blind-decodes the DCI without tracking the exact SearchSpace
+/// config. Sound because the 24-bit RNTI-masked CRC rejects the (few) empty positions,
+/// and cheap on an 8-CCE CORESET. Needed because with CQI feedback the gNB drops the
+/// PDCCH to AL1 with Y=0-style CCEs {0,2,4,6}, which the rnti-hashed USS misses.
+pub fn all_candidates(n_cce: usize, als: &[usize]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for &l in als {
+        if l == 0 || l > n_cce {
+            continue;
+        }
+        let mut base = 0;
+        while base + l <= n_cce {
+            out.push(Candidate { agg_level: l, cces: (base..base + l).collect() });
+            base += l;
+        }
+    }
+    out
+}
+
 /// Equalize one candidate from per-symbol frequency grids and produce its
 /// `108·L` LLRs (positive ⇒ bit 0), before descrambling.
 ///
@@ -257,6 +279,54 @@ pub fn equalize_candidate_c1(
 ) -> Vec<f32> {
     let layout = layout_from_bundles(n_symb, cand, |cce| cce);
     equalize_layout(grids, sc_to_bin, &layout, cell_id, slot, n_symb, n_rb)
+}
+
+/// Estimate the per-(symbol, RB) channel across a whole non-interleaved CORESET from
+/// its PDCCH DM-RS, ONCE, so the many overlapping blind-decode candidates can reuse it
+/// (the DM-RS correlation is the expensive part; the same REG's estimate is identical
+/// for every candidate that touches it). Keyed by (symbol, rb).
+pub fn estimate_coreset_c1(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    n_rb: usize,
+    n_symb: usize,
+    cell_id: u16,
+    slot: u32,
+) -> std::collections::HashMap<(usize, usize), Complex32> {
+    let dmrs_ref: Vec<Vec<Complex32>> =
+        (0..n_symb).map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb)).collect();
+    let mut h = std::collections::HashMap::new();
+    for l in 0..n_symb {
+        for rb in 0..n_rb {
+            let mut sum = Complex32::new(0.0, 0.0);
+            for (i, sc) in (1..12).step_by(4).enumerate() {
+                let rx = grids[l][sc_to_bin(12 * rb + sc)];
+                sum += rx * dmrs_ref[l][3 * rb + i].conj();
+            }
+            h.insert((l, rb), sum / 3.0);
+        }
+    }
+    h
+}
+
+/// Produce one candidate's LLRs from a precomputed CORESET channel estimate (see
+/// [`estimate_coreset_c1`]) — match-filter the data REs only, no re-estimation. Same
+/// result as [`equalize_candidate_c1`] but cheap enough to blind-decode every AL/CCE.
+pub fn equalize_candidate_c1_cached(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    n_symb: usize,
+    cand: &Candidate,
+    h_reg: &std::collections::HashMap<(usize, usize), Complex32>,
+) -> Vec<f32> {
+    let layout = layout_from_bundles(n_symb, cand, |cce| cce);
+    let mut llrs = Vec::with_capacity(layout.data.len() * 2);
+    for &(l, k) in &layout.data {
+        let z = grids[l][sc_to_bin(k)] * h_reg[&(l, k / 12)].conj();
+        llrs.push(z.re);
+        llrs.push(z.im);
+    }
+    llrs
 }
 
 /// Shared equalization: per-(symbol, rb) LS channel estimate from each REG's
@@ -305,6 +375,55 @@ mod tests {
         dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE,
     };
     use crate::sequence::gold_sequence as gold;
+
+    /// The cached-channel candidate equalization matches the per-candidate one bit for
+    /// bit (so blind-decoding every candidate off one channel estimate is exact).
+    #[test]
+    fn cached_equalization_matches_direct() {
+        let (n_rb, n_symb, cell_id, slot) = (24usize, 2usize, 1u16, 3u32);
+        // Synthetic CORESET grids: DM-RS + arbitrary data, a flat channel h.
+        let h = Complex32::new(0.7, 0.4);
+        let dmrs: Vec<Vec<Complex32>> = (0..n_symb).map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb)).collect();
+        let mut grids = vec![vec![Complex32::new(0.0, 0.0); 12 * n_rb]; n_symb];
+        for l in 0..n_symb {
+            for rb in 0..n_rb {
+                for (i, sc) in (1..12).step_by(4).enumerate() {
+                    grids[l][12 * rb + sc] = h * dmrs[l][3 * rb + i];
+                }
+                for sc in (0..12).filter(|s| s % 4 != 1) {
+                    grids[l][12 * rb + sc] = h * Complex32::new((rb as f32).cos(), (sc as f32).sin());
+                }
+            }
+        }
+        let hmap = estimate_coreset_c1(&grids, |sc| sc, n_rb, n_symb, cell_id, slot);
+        for &(al, base) in &[(1usize, 3usize), (2, 4), (4, 0)] {
+            let cand = Candidate { agg_level: al, cces: (base..base + al).collect() };
+            let direct = equalize_candidate_c1(&grids, |sc| sc, n_rb, n_symb, cell_id, slot, &cand);
+            let cached = equalize_candidate_c1_cached(&grids, |sc| sc, n_symb, &cand, &hmap);
+            assert_eq!(direct.len(), cached.len());
+            for (a, b) in direct.iter().zip(&cached) {
+                assert!((a - b).abs() < 1e-4, "AL{al} cce{base}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// Exhaustive candidates cover every CCE-aligned position, in particular the
+    /// gNB's AL1 CCEs {0,2,4,6} (which the rnti-hashed USS could place at odd CCEs).
+    #[test]
+    fn all_candidates_cover_al1() {
+        let c = all_candidates(8, &[1, 2, 4, 8]);
+        let al1: Vec<usize> = c.iter().filter(|x| x.agg_level == 1).map(|x| x.cces[0]).collect();
+        assert_eq!(al1, vec![0, 1, 2, 3, 4, 5, 6, 7]); // covers {0,2,4,6}
+        assert_eq!(c.iter().filter(|x| x.agg_level == 2).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0, 2, 4, 6]);
+        assert_eq!(c.iter().filter(|x| x.agg_level == 4).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0, 4]);
+        assert_eq!(c.iter().filter(|x| x.agg_level == 8).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0]);
+        // Every candidate is contiguous and aligned.
+        for cand in &c {
+            assert_eq!(cand.cces.len(), cand.agg_level);
+            assert_eq!(cand.cces[0] % cand.agg_level, 0);
+            assert!(cand.cces.windows(2).all(|w| w[1] == w[0] + 1));
+        }
+    }
 
     #[test]
     fn uss_hashing_matches_live_gnb() {
