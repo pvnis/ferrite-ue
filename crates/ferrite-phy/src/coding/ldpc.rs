@@ -7,13 +7,23 @@
 //! belief propagation on the lifted graph.
 
 use crate::coding::ldpc_tables::{BG1_EDGES, BG1_M, BG1_N, BG2_EDGES, BG2_M, BG2_N, LIFTING_SETS};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Which NR LDPC base graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BaseGraph {
     Bg1,
     Bg2,
 }
+
+/// Cache of the packed parity-solver matrix S per (base graph, Zc): the parity part
+/// H_p of the check matrix depends only on (bg, Zc), so its inversion (the expensive
+/// Gaussian elimination) is done ONCE per size and reused. Encoding is then
+/// `p[col] = parity(S[col] & (H_s · info))` — a cheap packed matrix-vector product,
+/// turning a per-PUSCH ~300 ms elimination into ~0.3 ms.
+static PARITY_SOLVER: LazyLock<Mutex<HashMap<(BaseGraph, usize), Arc<Vec<u64>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl BaseGraph {
     /// Number of systematic (information) base columns: 22 for BG1, 10 for BG2.
@@ -129,76 +139,115 @@ impl LdpcGraph {
         true
     }
 
-    /// Systematically encode `info` (length `k()`) into a full codeword
-    /// (length `n()`). The `M·Zc` parity bits are solved from `H·c = 0` by
-    /// Gaussian elimination over GF(2) — correct for any base graph and
-    /// consistent with [`Self::is_codeword`] by construction. (Encoding is only
-    /// needed by tests/tools; a real UE only decodes.)
-    pub fn encode(&self, info: &[u8]) -> Vec<u8> {
-        assert_eq!(info.len(), self.k());
-        let kb = self.bg.info_cols();
-        let zc = self.zc;
-        let np = self.m(); // number of parity bits = M·Zc (= unknowns = equations)
+    /// Build the packed parity-solver matrix S (rows = parity unknowns, `words` u64
+    /// each): `p = S · rhs` where `rhs = H_s · info`. Derived once by Gauss-Jordan on
+    /// `[H_p | I]` — the right half at the pivot row of each column is that column's
+    /// solver row (the accumulated GF(2) row operations = H_p⁻¹ up to the pivot order).
+    /// info-independent, so cached per (bg, Zc). O(np³) but paid once per size.
+    fn build_parity_solver(&self) -> Vec<u64> {
+        let (kb, zc, np) = (self.bg.info_cols(), self.zc, self.m());
         let words = np.div_ceil(64);
-
-        // Each equation: augmented row over `np` parity unknowns + RHS bit.
-        // Parity unknown index for base col n (>=kb), offset z: (n-kb)*zc + z.
-        let mut a: Vec<Vec<u64>> = Vec::with_capacity(np);
-        let mut rhs: Vec<u8> = Vec::with_capacity(np);
+        let stride = 2 * words; // each row: [ H_p (words) | I→inverse (words) ]
+        let mut aug = vec![0u64; np * stride];
+        let mut eqn = 0usize;
         for row in &self.rows {
             for zoff in 0..zc {
-                let mut eq = vec![0u64; words];
-                let mut b = 0u8;
                 for &(n, s) in row {
-                    let z = (zoff + s) % zc;
-                    if n < kb {
-                        b ^= info[n * zc + z];
-                    } else {
-                        let u = (n - kb) * zc + z;
-                        eq[u / 64] ^= 1u64 << (u % 64);
+                    if n >= kb {
+                        let u = (n - kb) * zc + (zoff + s) % zc;
+                        aug[eqn * stride + u / 64] ^= 1u64 << (u % 64);
                     }
                 }
-                a.push(eq);
-                rhs.push(b);
+                aug[eqn * stride + words + eqn / 64] ^= 1u64 << (eqn % 64); // identity
+                eqn += 1;
             }
         }
-
-        // Forward elimination to reduced form, tracking pivots.
-        let mut pivot_of = vec![usize::MAX; np]; // column -> equation row
-        let mut r = 0;
+        let mut pivot_of = vec![usize::MAX; np];
+        let mut r = 0usize;
         for col in 0..np {
             let (w, bit) = (col / 64, col % 64);
-            let mut piv = None;
-            for rr in r..np {
-                if a[rr][w] >> bit & 1 == 1 {
-                    piv = Some(rr);
-                    break;
+            let Some(piv) = (r..np).find(|&rr| (aug[rr * stride + w] >> bit) & 1 == 1) else {
+                continue;
+            };
+            if piv != r {
+                for k in 0..stride {
+                    aug.swap(r * stride + k, piv * stride + k);
                 }
             }
-            let Some(piv) = piv else { continue };
-            a.swap(r, piv);
-            rhs.swap(r, piv);
+            // Eliminate this column from every other row (Gauss-Jordan). Split the
+            // buffer at the pivot row so the read (pivot) and write (target) don't alias.
             for rr in 0..np {
-                if rr != r && a[rr][w] >> bit & 1 == 1 {
-                    for k in 0..words {
-                        a[rr][k] ^= a[r][k];
-                    }
-                    rhs[rr] ^= rhs[r];
+                if rr == r || (aug[rr * stride + w] >> bit) & 1 == 0 {
+                    continue;
+                }
+                let (pivot, target) = if rr < r {
+                    let (left, right) = aug.split_at_mut(r * stride);
+                    (&right[..stride], &mut left[rr * stride..rr * stride + stride])
+                } else {
+                    let (left, right) = aug.split_at_mut(rr * stride);
+                    (&left[r * stride..r * stride + stride], &mut right[..stride])
+                };
+                for k in 0..stride {
+                    target[k] ^= pivot[k];
                 }
             }
             pivot_of[col] = r;
             r += 1;
         }
+        let mut solver = vec![0u64; np * words];
+        for col in 0..np {
+            let row = pivot_of[col];
+            if row != usize::MAX {
+                solver[col * words..col * words + words]
+                    .copy_from_slice(&aug[row * stride + words..row * stride + stride]);
+            }
+        }
+        solver
+    }
 
-        // Back out the parity bits (unique solution: H_parity is full rank).
+    /// The cached parity solver for this (bg, Zc); builds it on first use.
+    fn parity_solver(&self) -> Arc<Vec<u64>> {
+        let mut cache = PARITY_SOLVER.lock().unwrap();
+        cache
+            .entry((self.bg, self.zc))
+            .or_insert_with(|| Arc::new(self.build_parity_solver()))
+            .clone()
+    }
+
+    /// Systematically encode `info` (length `k()`) into a full codeword (length
+    /// `n()`). Computes the systematic syndrome `rhs = H_s · info`, then the `M·Zc`
+    /// parity bits `p = S · rhs` via the cached solver (a packed GF(2) matrix-vector
+    /// product) — consistent with [`Self::is_codeword`] by construction.
+    pub fn encode(&self, info: &[u8]) -> Vec<u8> {
+        assert_eq!(info.len(), self.k());
+        let (kb, zc, np) = (self.bg.info_cols(), self.zc, self.m());
+        let words = np.div_ceil(64);
+        // rhs = H_s · info, packed one bit per equation.
+        let mut rhs = vec![0u64; words];
+        let mut eqn = 0usize;
+        for row in &self.rows {
+            for zoff in 0..zc {
+                let mut b = 0u8;
+                for &(n, s) in row {
+                    if n < kb {
+                        b ^= info[n * zc + (zoff + s) % zc];
+                    }
+                }
+                if b != 0 {
+                    rhs[eqn / 64] ^= 1u64 << (eqn % 64);
+                }
+                eqn += 1;
+            }
+        }
+        let solver = self.parity_solver();
         let mut c = vec![0u8; self.n()];
         c[..self.k()].copy_from_slice(info);
         for col in 0..np {
-            let row = pivot_of[col];
-            let val = if row == usize::MAX { 0 } else { rhs[row] };
-            let n = kb + col / zc;
-            let z = col % zc;
-            c[n * zc + z] = val;
+            let s = &solver[col * words..col * words + words];
+            let acc = s.iter().zip(&rhs).fold(0u64, |a, (&x, &y)| a ^ (x & y));
+            if acc.count_ones() & 1 == 1 {
+                c[(kb + col / zc) * zc + col % zc] = 1;
+            }
         }
         c
     }
@@ -302,6 +351,32 @@ mod tests {
             let u1 = self.uniform().max(1e-9);
             let u2 = self.uniform();
             (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+        }
+    }
+
+    #[test]
+    #[test]
+    #[ignore = "timing benchmark; run with --ignored --nocapture"]
+    fn bench_encode_decode() {
+        for (bg, zc) in [(BaseGraph::Bg2, 192u16), (BaseGraph::Bg2, 80), (BaseGraph::Bg1, 96)] {
+            let g = LdpcGraph::new(bg, zc).unwrap();
+            let info: Vec<u8> = (0..g.k()).map(|i| (i % 3 == 0) as u8).collect();
+            let t0 = std::time::Instant::now();
+            let mut c = g.encode(&info); // first call builds + caches the solver
+            let first = t0.elapsed().as_micros();
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                c = g.encode(&info);
+            }
+            let enc = t.elapsed().as_micros() as f64 / 100.0;
+            println!("  (first encode incl. solver build: {first}us)");
+            let llr: Vec<f32> = c.iter().map(|&b| if b == 0 { 3.0 } else { -3.0 }).collect();
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = g.decode(&llr, 20, 0.75);
+            }
+            let dec = t.elapsed().as_micros() as f64 / 100.0;
+            println!("{bg:?} Zc={zc} (k={}, np={}): encode {enc:.0}us  decode {dec:.0}us  [slot=500us]", g.k(), g.m());
         }
     }
 
