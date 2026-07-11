@@ -12,6 +12,8 @@ ferrite-common.workspace = true
 ferrite-phy.workspace = true
 ferrite-radio = { workspace = true, features = ["zmq"] }
 num-complex.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
 aes = "0.8"
 cmac = "0.7"
 sha2 = "0.10"

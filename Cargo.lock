@@ -234,12 +234,14 @@ version = "0.0.1"
 dependencies = [
  "aes",
  "cmac",
+ "crossbeam-channel",
  "ferrite-common",
  "ferrite-phy",
  "ferrite-radio",
  "hmac",
  "libc",
  "num-complex",
+ "rayon",
  "sha2",
 ]
 

@@ -17,6 +17,8 @@ authors = ["Ferrite contributors"]
 num-complex = "0.4"
 rustfft = "6"
 thiserror = "2"
+crossbeam-channel = "0.5"
+rayon = "1"
 
 ferrite-common = { path = "crates/ferrite-common" }
 ferrite-phy = { path = "crates/ferrite-phy" }
