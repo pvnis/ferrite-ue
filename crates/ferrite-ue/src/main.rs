@@ -367,6 +367,25 @@ struct DlDecoded {
     bytes: Vec<u8>,
 }
 
+/// One connected DL slot handed to the RX-PHY worker thread: the frequency-shifted
+/// slot samples plus the timing context needed to demodulate and to place the ACK.
+struct DlJob {
+    slot_idx: u32,
+    slot_start_ul: i64,
+    crnti: u16,
+    fsh: Vec<Complex32>,
+}
+
+/// The worker's decode of one slot, returned to the timeline thread: the transport
+/// block (if any), the measured CQI, echoed with the slot's timing so the stack can
+/// place the HARQ-ACK relative to the DECODED slot.
+struct DlResult {
+    slot_idx: u32,
+    slot_start_ul: i64,
+    decoded: Option<DlDecoded>,
+    cqi: Option<u8>,
+}
+
 /// Pure RX-PHY decode of one connected-mode DL slot — the CPU-heavy work the concurrency
 /// rework (Phase 2) moves off the timeline thread. Demodulates the frequency-shifted slot
 /// `fsh`, blind-decodes the DCI (1_0 in CORESET0, else the exhaustive CORESET1 search),
@@ -703,10 +722,34 @@ fn run(cfg: Config) {
     let mut um_tx: Option<(Vec<u8>, usize, u16)> = None; // (PDCP PDU, bytes sent, UM SN)
     let mut um_sn: u16 = 0;
     let mut dl_seen: VecDeque<u32> = VecDeque::new(); // recent DL PDCP SNs (drop HARQ dup)
-    // DL HARQ soft-combining: per-process accumulated circular-buffer LLRs, plus the
-    // cell-fixed (CDM groups, time-first) DM-RS layout locked on the first decode.
-    let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
-    let mut dl_dmrs_lock: Option<(usize, bool)> = None;
+    // DL RX-PHY decode runs on a WORKER thread (Phase 2): the timeline loop offloads each
+    // connected DL slot and picks up the result a few slots later (k1 >= 4 covers the
+    // pipeline latency), so the heavy LDPC + HARQ combining + blind DCI search no longer
+    // stall the ZMQ I/O. The worker owns the only cross-slot decode state (the HARQ
+    // soft-combining buffers `harq_dl` and the cell-fixed DM-RS layout `dl_dmrs_lock`) and
+    // processes slots strictly in order, keeping the accumulator coherent.
+    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(8);
+    let (dl_res_tx, dl_res_rx) = ferrite_ue::rt::bounded::<DlResult>(8);
+    {
+        let (w_coreset, w_cell, w_carrier, w_alen, w_racand, w_firstsc) =
+            (coreset, acq.cell_id, carrier_rb, a_len, ra_cand.clone(), first_sc);
+        std::thread::Builder::new()
+            .name("ferrite-rxphy".into())
+            .spawn(move || {
+                let ofdm = Ofdm::new(fft);
+                let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
+                let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
+                let mut dl_dmrs_lock: Option<(usize, bool)> = None;
+                while let Ok(job) = dl_job_rx.recv() {
+                    let DlJob { slot_idx, slot_start_ul, crnti, fsh } = job;
+                    let (decoded, cqi) = decode_dl(&fsh, &ofdm, &w_coreset, w_cell, w_carrier, sc_to_bin, w_alen, &w_racand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock);
+                    if dl_res_tx.send(DlResult { slot_idx, slot_start_ul, decoded, cqi }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn rxphy worker");
+    }
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
@@ -950,22 +993,25 @@ fn run(cfg: Config) {
         // allocation is variable, so read it from the DCI 1_1 assignment in the
         // CORESET1 USS (frequency = FDRA bits[1..10]); fall back to the fixed
         // rb[0,10/11) (the AuthReq) if no DCI decodes. MCS is brute-forced.
-        if connected.is_some() && srb1_sn >= 1 {
-            if matches!(slot_idx % 10, 0..=5) {
-                let crnti = connected.unwrap();
-                // RX-PHY decode moved into decode_dl() (Phase 2 seam): demod + DCI blind
-                // decode + PDSCH decode + HARQ combine + CSI measure. It owns nothing but
-                // the two cross-slot decode-state maps, passed by &mut. `for … in decoded`
-                // iterates the Option 0-or-1 times, so the stack body's `break`s (which
-                // stop processing this slot's TB) keep working unchanged.
-                let (decoded, cqi) = decode_dl(&fsh, &ofdm, &coreset, acq.cell_id, carrier_rb, sc_to_bin, a_len, &ra_cand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock);
-                if cqi.is_some() {
-                    pending_cqi = cqi;
-                }
-                // `for` (not `if let`) so the stack body's `break`s still have a loop to
-                // exit; the Option yields the one decoded TB (or none).
-                #[allow(for_loops_over_fallibles)]
-                for DlDecoded { k1, dai, bytes: tb } in decoded {
+        // Offload this connected DL slot's RX decode to the worker thread (pipelined);
+        // the result is picked up below, a few slots later.
+        if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=5) {
+            let crnti = connected.unwrap();
+            let _ = dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, crnti, fsh: fsh.clone() });
+        }
+        // Drain completed decode results and run the RRC/NAS/MAC stack on each. slot_idx /
+        // slot_start_ul are shadowed to the DECODED slot's values, so the HARQ-ACK still
+        // targets that slot's n+k1 (the other timeline params are constant in steady state).
+        // `for … in Option` yields the one decoded TB, keeping the body's `break`s valid.
+        while let Ok(res) = dl_res_rx.try_recv() {
+            if res.cqi.is_some() {
+                pending_cqi = res.cqi;
+            }
+            let (r_slot_idx, r_slot_start_ul) = (res.slot_idx, res.slot_start_ul);
+            #[allow(for_loops_over_fallibles)]
+            for DlDecoded { k1, dai, bytes: tb } in res.decoded {
+                let slot_idx = r_slot_idx;
+                let slot_start_ul = r_slot_start_ul;
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
                                 // at its UL slot (n+k1), positioned by C-DAI. It's modulated
                                 // and sent as a bundled 1-2 bit PUCCH once its UL slot nears
@@ -1162,7 +1208,6 @@ fn run(cfg: Config) {
                                     _ => {}
                                 }
                                 break;
-                }
             }
         }
 
