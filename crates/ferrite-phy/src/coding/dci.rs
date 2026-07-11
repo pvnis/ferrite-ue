@@ -11,7 +11,7 @@
 
 use crate::coding::crc::CRC24C;
 use crate::coding::polar::{
-    code_length, info_mask_rm, input_deinterleave, input_interleave, polar_encode, scl_decode,
+    code_length, info_mask_rm, input_deinterleave, input_interleave, polar_encode, sc_decode,
 };
 use crate::coding::ratematch::{de_rate_match, rate_match, subblock_interleave};
 
@@ -64,12 +64,19 @@ pub fn dci_decode(llrs: &[f32], rnti: u16, a_len: usize) -> Option<Vec<u8>> {
         let c = input_deinterleave(info);
         c[a_len..] == dci_crc(&c[..a_len], rnti)[..]
     };
-    let (info, crc_ok) = scl_decode(&d_llr, &mask, 8, check);
-    if !crc_ok {
-        return None;
+    // Blind decode is O(candidates·slots) and the coherence gate still passes several
+    // overlapping candidates per PDCCH (only one decodes), so the decoder must reject the
+    // wrong ones CHEAPLY. Use the single-path SC decoder (O(N log N)) — CRC-protected, it
+    // decodes the real DCI on a clean channel and rejects wrong/noise candidates fast.
+    // The old O(N²·L) CRC-aided list decoder (scl_decode, still available) ran per
+    // candidate and was ~60% of the UE's CPU — it stretched the ZMQ lockstep to ~26x
+    // slower than real time.
+    let info = sc_decode(&d_llr, &mask);
+    if check(&info) {
+        let c = input_deinterleave(&info);
+        return Some(c[..a_len].to_vec());
     }
-    let c = input_deinterleave(&info);
-    Some(c[..a_len].to_vec())
+    None
 }
 
 /// PDCCH coded-bit scrambling sequence applied to LLRs (38.211 §7.3.2.3):
