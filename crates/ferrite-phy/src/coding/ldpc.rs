@@ -258,32 +258,36 @@ impl LdpcGraph {
     pub fn decode(&self, llr: &[f32], max_iter: usize, alpha: f32) -> (Vec<u8>, bool) {
         assert_eq!(llr.len(), self.n());
         let zc = self.zc;
-        // Messages per edge (check->var), indexed by (row, edge-in-row, z).
-        let mut msg: Vec<Vec<Vec<f32>>> = self
-            .rows
-            .iter()
-            .map(|r| vec![vec![0f32; zc]; r.len()])
-            .collect();
+        // Flat check->var message store, indexed [(edge_off[m] + e)·Zc + z]: one
+        // allocation instead of the old jagged Vec<Vec<Vec<f32>>>. `vals`/`hard` are
+        // reused scratch (the old code allocated a Vec per check-node per Z per
+        // iteration). The Z rotation is a branch, not a `% Zc` modulo, in the hot loop.
+        let mut edge_off = Vec::with_capacity(self.rows.len());
+        let mut n_edges = 0usize;
+        for row in &self.rows {
+            edge_off.push(n_edges);
+            n_edges += row.len();
+        }
+        let mut msg = vec![0f32; n_edges * zc];
         let mut total = llr.to_vec();
+        let max_deg = self.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut vals = vec![0f32; max_deg];
+        let mut hard = vec![0u8; self.n()];
 
         for _ in 0..max_iter {
-            // Check node update (min-sum).
+            // Check-node update (normalized min-sum) per lifted equation z.
             for (m, row) in self.rows.iter().enumerate() {
+                let base = edge_off[m] * zc;
                 for zc_off in 0..zc {
-                    // Gather incoming var->check = total - msg for each edge.
                     let mut sign = 1.0f32;
                     let mut min1 = f32::INFINITY;
                     let mut min2 = f32::INFINITY;
                     let mut argmin = 0usize;
-                    let vals: Vec<f32> = row
-                        .iter()
-                        .enumerate()
-                        .map(|(e, &(n, s))| {
-                            let idx = self.bit(n, (zc_off + s) % zc);
-                            total[idx] - msg[m][e][zc_off]
-                        })
-                        .collect();
-                    for (e, &v) in vals.iter().enumerate() {
+                    for (e, &(n, s)) in row.iter().enumerate() {
+                        let z = zc_off + s;
+                        let z = if z < zc { z } else { z - zc };
+                        let v = total[n * zc + z] - msg[base + e * zc + zc_off];
+                        vals[e] = v;
                         if v < 0.0 {
                             sign = -sign;
                         }
@@ -296,32 +300,38 @@ impl LdpcGraph {
                             min2 = a;
                         }
                     }
-                    for (e, &v) in vals.iter().enumerate() {
+                    for (e, &v) in vals[..row.len()].iter().enumerate() {
                         let mag = if e == argmin { min2 } else { min1 };
                         let s = if v < 0.0 { -sign } else { sign };
-                        msg[m][e][zc_off] = alpha * s * mag;
+                        msg[base + e * zc + zc_off] = alpha * s * mag;
                     }
                 }
             }
-            // Variable node update: total = channel + sum of incoming checks.
+            // Variable-node update: total = channel + Σ incoming check messages.
             total.copy_from_slice(llr);
             for (m, row) in self.rows.iter().enumerate() {
+                let base = edge_off[m] * zc;
                 for (e, &(n, s)) in row.iter().enumerate() {
+                    let eb = base + e * zc;
                     for zc_off in 0..zc {
-                        let idx = self.bit(n, (zc_off + s) % zc);
-                        total[idx] += msg[m][e][zc_off];
+                        let z = zc_off + s;
+                        let z = if z < zc { z } else { z - zc };
+                        total[n * zc + z] += msg[eb + zc_off];
                     }
                 }
             }
-            // Hard decision + early exit if valid codeword.
-            let hard: Vec<u8> = total.iter().map(|&l| (l < 0.0) as u8).collect();
+            // Hard decision + early exit on a valid codeword.
+            for (h, &l) in hard.iter_mut().zip(&total) {
+                *h = (l < 0.0) as u8;
+            }
             if self.is_codeword(&hard) {
                 return (hard[..self.k()].to_vec(), true);
             }
         }
-        let hard: Vec<u8> = total.iter().map(|&l| (l < 0.0) as u8).collect();
-        let ok = self.is_codeword(&hard);
-        (hard[..self.k()].to_vec(), ok)
+        for (h, &l) in hard.iter_mut().zip(&total) {
+            *h = (l < 0.0) as u8;
+        }
+        (hard[..self.k()].to_vec(), self.is_codeword(&hard))
     }
 }
 
