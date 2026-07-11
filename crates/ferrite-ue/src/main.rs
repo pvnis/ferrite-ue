@@ -358,6 +358,113 @@ fn try_decode_dl_srb1(
     None
 }
 
+/// A DL PDSCH decoded in a connected-mode slot: the transport block plus the HARQ-ACK
+/// timing (`k1` slots ahead, `dai` C-DAI). `k1 == 0xff` ⇒ a fallback (no-DCI) decode
+/// that must not be ACKed.
+struct DlDecoded {
+    k1: u8,
+    dai: u8,
+    bytes: Vec<u8>,
+}
+
+/// Pure RX-PHY decode of one connected-mode DL slot — the CPU-heavy work the concurrency
+/// rework (Phase 2) moves off the timeline thread. Demodulates the frequency-shifted slot
+/// `fsh`, blind-decodes the DCI (1_0 in CORESET0, else the exhaustive CORESET1 search),
+/// measures the NZP-CSI-RS, and decodes the granted PDSCH with HARQ soft-combining.
+/// Returns the first plausible transport block (≤1 PDSCH/slot for us) and the measured
+/// wideband CQI. `harq_dl`/`dl_dmrs_lock` are the only cross-slot state and so must be
+/// owned by a single ordered caller. Behaviour matches the previous inline decode exactly.
+#[allow(clippy::too_many_arguments)]
+fn decode_dl(
+    fsh: &[Complex32],
+    ofdm: &Ofdm,
+    coreset: &Coreset0,
+    cell_id: u16,
+    carrier_rb: usize,
+    sc_to_bin: impl Fn(i32) -> usize + Copy,
+    a_len: usize,
+    ra_cand: &Candidate,
+    crnti: u16,
+    slot_idx: u32,
+    harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
+    dl_dmrs_lock: &mut Option<(usize, bool)>,
+) -> (Option<DlDecoded>, Option<u8>) {
+    let fft = ofdm.fft_size();
+    // CORESET grids: the first coreset.n_symb OFDM symbols of the slot.
+    let mut cgrids = Vec::new();
+    let mut off = 0usize;
+    for l in 0..coreset.n_symb {
+        let cp = ofdm.cp_len((slot_idx as usize % 2) * 14 + l, 1);
+        cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
+        off += cp + fft;
+    }
+    let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
+    // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback)).
+    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8)> = Vec::new();
+    // PRIMARY: DCI 1_0 in CORESET0 (common SS, AL4 CCE0), reliable — same path as the RAR.
+    {
+        let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset, cell_id, slot_idx, ra_cand);
+        pdcch_descramble_llr(&mut m, u32::from(cell_id));
+        if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
+            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+            let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
+            allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4)));
+        }
+    }
+    // SECONDARY: DCI 1_1 in the CORESET1 USS (DRB DL) — exhaustive blind decode off one
+    // cached channel estimate; only when no DCI 1_0 decoded (≤1 PDSCH/slot for us).
+    if allocs.is_empty() {
+        let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, cell_id, slot_idx);
+        for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
+            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
+            pdcch_descramble_llr(&mut mm, u32::from(cell_id));
+            if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
+                const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                let (rb0, nrb) = riv_decode(riv, carrier_rb);
+                allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
+                break;
+            }
+        }
+    }
+    // Fallback (no DCI decoded): brute-force rb[0,N) x MCS 0-2 (CRC + plausibility reject
+    // wrong guesses); skipped entirely once a DCI decoded, keeping the UE real-time.
+    if allocs.is_empty() {
+        for &nrb in &[2usize, 5, 13, 17, 18, 24] {
+            for mcs in [0u8, 1, 2] {
+                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
+            }
+        }
+    }
+    let Some(grids) = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1) else {
+        return (None, None);
+    };
+    // NZP-CSI-RS measurement (row 1, k0=1, symbol 4) → wideband CQI, only in the even-frame
+    // slots 2-4 where the CSI-RS is present (a high SINR gates it, no SFN tracking needed).
+    let mut cqi = None;
+    if matches!(slot_idx, 2..=4) {
+        let sinr = ferrite_phy::csi::measure_csi_rs_sinr(&grids[4], |sc: usize| sc_to_bin(sc as i32), cell_id, slot_idx, 4, carrier_rb, 1);
+        if sinr > 15.0 {
+            cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
+        }
+    }
+    // Cheap presence gate: every connected DL PDSCH starts at RB 0.
+    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
+    if !present {
+        return (None, cqi);
+    }
+    for (rb0, nrb, mcs, k1, dai, rv, h_id) in allocs {
+        let (qm, _) = mcs_params(mcs);
+        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
+        if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
+            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, dl_dmrs_lock, harq_dl) {
+                return (Some(DlDecoded { k1, dai, bytes: tb }), cqi);
+            }
+        }
+    }
+    (None, cqi)
+}
+
 fn main() {
     run(Config::from_args());
 }
@@ -846,86 +953,19 @@ fn run(cfg: Config) {
         if connected.is_some() && srb1_sn >= 1 {
             if matches!(slot_idx % 10, 0..=5) {
                 let crnti = connected.unwrap();
-                let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
-                // Each entry: (rb_start, n_rb, MCS, k1 slots (0xff = don't ACK), C-DAI,
-                // RV, HARQ process id (0xff = fallback guess ⇒ no soft-combining)).
-                let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8)> = Vec::new();
-                // PRIMARY: the gNB schedules the connected-mode DL PDSCH with DCI 1_0 in
-                // CORESET0 (common SS, AL4 CCE0) — decode it (reliable, same path as the
-                // RAR). DCI 1_0 (37b): id[0] FDRA[1..10] time[10..14] vrb[14] MCS[15..20]
-                // NDI[20] RV[21..23] HARQ[23..27] DAI[27..29] TPC[29..31] PRI[31..34]
-                // k1[34..37]. DCI 1_0 k1 field → {1..8} (k1 = field+1).
-                {
-                    let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &ra_cand);
-                    pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
-                    if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
-                        let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                        let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-                        // DCI 1_0 DAI at bits[27..29], RV at [21..23], HARQ at [23..27].
-                        allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4)));
-                    }
+                // RX-PHY decode moved into decode_dl() (Phase 2 seam): demod + DCI blind
+                // decode + PDSCH decode + HARQ combine + CSI measure. It owns nothing but
+                // the two cross-slot decode-state maps, passed by &mut. `for … in decoded`
+                // iterates the Option 0-or-1 times, so the stack body's `break`s (which
+                // stop processing this slot's TB) keep working unchanged.
+                let (decoded, cqi) = decode_dl(&fsh, &ofdm, &coreset, acq.cell_id, carrier_rb, sc_to_bin, a_len, &ra_cand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock);
+                if cqi.is_some() {
+                    pending_cqi = cqi;
                 }
-                // SECONDARY: DCI 1_1 in the CORESET1 USS (the gNB uses it for the DRB DL).
-                // Layout: id[0] FDRA[1..10] time[10] MCS[11..16] NDI[16] RV[17..19]
-                // HARQ[19..23] DAI[23..25] TPC[25..27] PRI[27..30] k1[30..33].
-                // k1 field indexes dl-DataToUL-ACK [4,5,6,7,8,9,11,12]. Only searched
-                // when the CORESET0 DCI 1_0 didn't decode (there is ≤1 PDSCH per slot for
-                // us): during registration that DCI 1_0 carries the SRB, so this whole
-                // exhaustive CORESET1 search is skipped, keeping the UE real-time.
-                if allocs.is_empty() {
-                    let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
-                    for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
-                        let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
-                        pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
-                        if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
-                            const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-                            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                            let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                            // DCI 1_1 DAI at bits[23..25], RV at [17..19], HARQ at [19..23].
-                            allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
-                            break; // one PDSCH per slot; stop at the first decoded DCI
-                        }
-                    }
-                }
-                // Fallback ONLY when no DCI decoded (the exhaustive CORESET1 search now
-                // decodes the DCI 1_1 reliably, giving exact rb/mcs/rv/h_id). Brute-force
-                // rb[0,N) × MCS 0-2 — the DM-RS metric gate + CRC + plausibility filter
-                // reject wrong guesses. Skipping this when a DCI decoded avoids ~18 wasted
-                // LDPC decodes per slot, which is what let the UE fall behind real-time.
-                if allocs.is_empty() {
-                    for &nrb in &[2usize, 5, 13, 17, 18, 24] {
-                        for mcs in [0u8, 1, 2] {
-                            allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
-                        }
-                    }
-                }
-                if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
-                    // NZP-CSI-RS measurement: the gNB sends the CSI-RS (row 1, k0=1,
-                    // symbol 4, 3 REs/RB over the BWP) in even frames, slots 2-4. Measure
-                    // the DL SINR from it and cache the mapped CQI. A valid (high) SINR
-                    // means the CSI-RS is actually present — i.e. an even frame — so the
-                    // slot-8 report it feeds lands in the gNB's report window with no need
-                    // to track the SFN. scramblingID = 1 (== PCI here).
-                    if matches!(slot_idx, 2..=4) {
-                        let sinr = ferrite_phy::csi::measure_csi_rs_sinr(
-                            &grids[4], |sc: usize| sc_to_bin(sc as i32),
-                            acq.cell_id, slot_idx, 4, carrier_rb, 1,
-                        );
-                        if sinr > 15.0 {
-                            pending_cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
-                        }
-                    }
-                    // Cheap presence gate: every connected DL PDSCH starts at RB 0, so a
-                    // DM-RS probe at rb[0,2) detects one. Skip the whole brute-force in the
-                    // (common) slots with no PDSCH for us, keeping the loop fast.
-                    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric > 0.9;
-                    let allocs = if present { allocs } else { Vec::new() };
-                    for (rb0, nrb, mcs, k1, dai, rv, h_id) in allocs {
-                        let (qm, _) = mcs_params(mcs);
-                        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
-                        let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
-                        if metric > 0.9 {
-                            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, acq.cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, &mut dl_dmrs_lock, &mut harq_dl) {
+                // `for` (not `if let`) so the stack body's `break`s still have a loop to
+                // exit; the Option yields the one decoded TB (or none).
+                #[allow(for_loops_over_fallibles)]
+                for DlDecoded { k1, dai, bytes: tb } in decoded {
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
                                 // at its UL slot (n+k1), positioned by C-DAI. It's modulated
                                 // and sent as a bundled 1-2 bit PUCCH once its UL slot nears
@@ -1122,9 +1162,6 @@ fn run(cfg: Config) {
                                     _ => {}
                                 }
                                 break;
-                            }
-                        }
-                    }
                 }
             }
         }
