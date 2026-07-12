@@ -573,6 +573,44 @@ mod tests {
         assert_eq!(dec, tb);
     }
 
+    /// Reproduce the live-failing DRB grant: 2-RB MCS-9 (R=616/1024, QPSK), the tiny
+    /// high-rate TB the UE decodes ~1% of on a LOSSLESS channel. rv0 carries the
+    /// systematic bits, so with perfect LLRs it MUST round-trip standalone; if it does,
+    /// the dlsch chain is fine and the live failure is in the grid→LLR path (extract/
+    /// descramble), not the decoder. (rv1/2/3 alone are mostly parity and not
+    /// self-decodable at this rate — HARQ combining is covered by harq_soft_combining_recovers.)
+    #[test]
+    fn dlsch_roundtrip_mcs9_2rb_perfect_llr() {
+        let mut rng = Rng(0xD15C_9209);
+        let tbs = 336usize; // 42 bytes, matches gNB tbs=42
+        let qm = 2usize;
+        let r = 616.0 / 1024.0;
+        let e_len = 504usize; // cdm=1: 252 data REs × 2 bits
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
+        assert_eq!(f_bits.len(), e_len);
+        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 20.0 } else { -20.0 }).collect();
+        assert_eq!(dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(), Some(&tb[..]));
+    }
+
+    /// The LDPC decoder is scale-invariant: clean LLRs decode regardless of magnitude. The
+    /// live UE feeds raw equalized QPSK components (≈±0.7), not ±20; this pins that small
+    /// magnitude never causes a false failure on a clean channel (ruling that out as a decode
+    /// cause), across many random TBs at the 2-RB MCS-9 working point.
+    #[test]
+    fn dlsch_mcs9_magnitude_scale_invariant() {
+        let (tbs, qm, r, e_len) = (336usize, 2usize, 616.0 / 1024.0, 504usize);
+        for &mag in &[20.0f32, 1.0, 0.707, 0.1] {
+            let mut rng = Rng(0xA53F_0001);
+            for _ in 0..200 {
+                let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+                let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
+                let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { mag } else { -mag }).collect();
+                assert_eq!(dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(), Some(&tb[..]), "mag ±{mag}");
+            }
+        }
+    }
+
     #[test]
     fn wrong_tbs_fails_crc() {
         let mut rng = Rng(0xD15C_0002);

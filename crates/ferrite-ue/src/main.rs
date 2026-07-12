@@ -278,6 +278,33 @@ fn plausible_dl_tb(tb: &[u8]) -> bool {
     }
 }
 
+/// Extract the 6-bit Timing Advance Command from a DL-SCH MAC PDU's TA Command MAC CE
+/// (38.321: LCID 61, one payload octet = 2-bit TAG id + 6-bit T_A), if present. Walks
+/// the subPDU subheaders in order and stops at padding; returns None if there is no TA
+/// command or the layout isn't understood.
+fn parse_ta_command_ce(tb: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < tb.len() {
+        let (lcid, f) = (tb[i] & 0x3f, (tb[i] >> 6) & 1);
+        match lcid {
+            63 => return None,                             // padding: rest is padding
+            61 => return tb.get(i + 1).map(|&v| v & 0x3f), // TA Command CE: 1-octet payload
+            60 | 59 => i += 1,                             // (Long) DRX Command: 0-octet payload
+            62 => i += 1 + 6,                              // Contention Resolution Identity: 6 octets
+            1..=32 => {                                    // logical-channel SDU: R/F/LCID + L(+SDU)
+                let (len, hdr) = if f == 1 {
+                    (((*tb.get(i + 1)? as usize) << 8) | *tb.get(i + 2)? as usize, 3)
+                } else {
+                    (*tb.get(i + 1)? as usize, 2)
+                };
+                i += hdr + len;
+            }
+            _ => return None, // unknown subheader: bail safely
+        }
+    }
+    None
+}
+
 /// Decode one DL PDSCH into its transport block. `rv`/`h_id` come from the DCI
 /// (0xff `h_id` = fallback guess, no combining). On top of a standalone decode at the
 /// correct RV, HARQ soft-combining accumulates each (re)transmission's circular-buffer
@@ -298,7 +325,7 @@ fn try_decode_dl_srb1(
     h_id: u8,
     lock: &mut Option<(usize, bool)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
     use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb, dlsch_decode_single_bits};
@@ -318,10 +345,22 @@ fn try_decode_dl_srb1(
         let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, rv, 40);
         if crc {
             let tb = pack_bits(&bits);
+            // A recognizable PDU (DRB IP / SRB1 RRC): the right layout — lock it, deliver
+            // it up the stack, and HARQ-ACK it.
             if plausible_dl_tb(&tb) {
                 *lock = Some((cdm, time_first));
                 harq_dl.remove(&h_id); // HARQ process delivered
-                return Some(tb);
+                return Some((tb, true));
+            }
+            // A faithful CRC-pass on the KNOWN-GOOD (locked) layout whose content we don't
+            // deliver up the stack (a MAC CE like the Timing Advance Command, or a
+            // padding-only PDU). HARQ-ACK is a PHY-layer acknowledgement of TB reception
+            // (CRC), NOT a statement that the MAC found the content useful — so this MUST
+            // still be ACKed, else the gNB sees DTX and retransmits it forever (the ~90%
+            // DTX / retx-flood that was starving the DRB). Return ack-only (deliver=false).
+            if *lock == Some((cdm, time_first)) {
+                harq_dl.remove(&h_id);
+                return Some((tb, false));
             }
             continue;
         }
@@ -346,11 +385,12 @@ fn try_decode_dl_srb1(
             if e.n_rx >= 2 {
                 let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 40);
                 if ccrc {
+                    // Combining only runs on the locked layout, so a CRC-pass here is
+                    // faithful: ACK it always; deliver only if it's a recognizable PDU.
                     let tb = pack_bits(&cbits);
-                    if plausible_dl_tb(&tb) {
-                        harq_dl.remove(&h_id);
-                        return Some(tb);
-                    }
+                    let deliver = plausible_dl_tb(&tb);
+                    harq_dl.remove(&h_id);
+                    return Some((tb, deliver));
                 }
             }
         }
@@ -358,13 +398,16 @@ fn try_decode_dl_srb1(
     None
 }
 
-/// A DL PDSCH decoded in a connected-mode slot: the transport block plus the HARQ-ACK
-/// timing (`k1` slots ahead, `dai` C-DAI). `k1 == 0xff` ⇒ a fallback (no-DCI) decode
-/// that must not be ACKed.
+/// A DL PDSCH decoded (CRC OK) in a connected-mode slot: the transport block plus the
+/// HARQ-ACK timing (`k1` slots ahead, `dai` C-DAI). `k1 == 0xff` ⇒ a fallback (no-DCI)
+/// decode that must not be ACKed. `deliver` is false when the TB was correctly received
+/// but carries only content the stack doesn't consume (a MAC CE / padding) — it is still
+/// HARQ-ACKed (CRC OK) but not handed up.
 struct DlDecoded {
     k1: u8,
     dai: u8,
     bytes: Vec<u8>,
+    deliver: bool,
 }
 
 /// One connected DL slot handed to the RX-PHY worker thread: the frequency-shifted
@@ -481,8 +524,8 @@ fn decode_dl(
         let (qm, _) = mcs_params(mcs);
         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
-            if let Some(tb) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, dl_dmrs_lock, harq_dl) {
-                return (Some(DlDecoded { k1, dai, bytes: tb }), cqi);
+            if let Some((tb, deliver)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, dl_dmrs_lock, harq_dl) {
+                return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
             }
         }
     }
@@ -1017,19 +1060,33 @@ fn run(cfg: Config) {
             }
             let (r_slot_idx, r_slot_start_ul) = (res.slot_idx, res.slot_start_ul);
             #[allow(for_loops_over_fallibles)]
-            for DlDecoded { k1, dai, bytes: tb } in res.decoded {
+            for DlDecoded { k1, dai, bytes: tb, deliver } in res.decoded {
                 let slot_idx = r_slot_idx;
                 let slot_start_ul = r_slot_start_ul;
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
                                 // at its UL slot (n+k1), positioned by C-DAI. It's modulated
                                 // and sent as a bundled 1-2 bit PUCCH once its UL slot nears
                                 // (below), so several PDSCHs sharing one UL slot ACK together.
+                                // ACK reflects a successful PHY decode (CRC OK) regardless of
+                                // whether the MAC content is delivered — a TB carrying only a
+                                // MAC CE / padding is still ACKed.
                                 if k1 != 0xff {
                                     let k1a = k1 as i64; // already the actual k1 in slots
                                     let ack_slot = slot_idx as i64 + k1a;
                                     let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
                                     let e = ack_book.entry(pos).or_insert(((ack_slot % 20) as u32, [None; 4]));
                                     e.1[(dai & 3) as usize] = Some(1); // 1 = ACK
+                                }
+                                // ACK-only TB (no deliverable SDU): apply a Timing Advance
+                                // Command MAC CE if present (keeps UL aligned so the gNB stops
+                                // re-issuing it), then done — nothing to hand up the stack.
+                                if !deliver {
+                                    if let Some(ta) = parse_ta_command_ce(&tb) {
+                                        // N_TA += (T_A - 31) · 16·64/2^μ; last_ta is in those
+                                        // same RAR-TA units, so the delta is simply (T_A - 31).
+                                        last_ta += ta as i64 - 31;
+                                    }
+                                    break;
                                 }
                                 // DRB 1 (LCID 4) DL user data: an IP packet, written to
                                 // the TUN (or matched against the built-in ping).
@@ -1379,5 +1436,36 @@ fn run(cfg: Config) {
         // Drop HARQ-ACK and PUSCH bursts whose UL window has passed.
         pend_acks.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
         pend_ul.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live-captured TA-command PDU `3d 1a 3f 00…` = [TA Command CE (LCID 61),
+    /// TAG 0, T_A 26][padding]. Parse must extract T_A = 26 (0x1a & 0x3f).
+    #[test]
+    fn ta_command_ce_parsed() {
+        let mut tb = vec![0u8; 42];
+        tb[0] = 0x3d; // R|F|LCID=61 (Timing Advance Command)
+        tb[1] = 0x1a; // TAG=0, T_A=26
+        tb[2] = 0x3f; // padding (LCID 63)
+        assert_eq!(parse_ta_command_ce(&tb), Some(26));
+    }
+
+    /// A TA command after a logical-channel SDU is still found (subheader walk).
+    #[test]
+    fn ta_command_ce_after_sdu() {
+        // [lcid=1, L=3, "abc"][TA CE, T_A=5][padding]
+        let tb = [0x01, 0x03, b'a', b'b', b'c', 0x3d, 0x05, 0x3f, 0x00];
+        assert_eq!(parse_ta_command_ce(&tb), Some(5));
+    }
+
+    /// No TA command in a plain SDU-only / padding PDU.
+    #[test]
+    fn ta_command_ce_absent() {
+        assert_eq!(parse_ta_command_ce(&[0x01, 0x02, 0xaa, 0xbb, 0x3f, 0x00]), None);
+        assert_eq!(parse_ta_command_ce(&[0x3f, 0, 0, 0]), None); // padding only
     }
 }

@@ -139,6 +139,9 @@ pub struct PdschLlrs {
     pub evm: f32,
     /// Number of data resource elements.
     pub n_data_re: usize,
+    /// Estimated residual-CFO slope (rad/OFDM-symbol) from the DM-RS symbols. Exposed for
+    /// receive-side diagnostics (e.g. the `pdsch-grid-drb` reference-vector tool).
+    pub dbg_slope: f32,
 }
 
 /// Extract, equalize, and descramble the PDSCH into LLRs.
@@ -296,6 +299,7 @@ pub fn extract_pdsch(
         dmrs_metric,
         evm,
         n_data_re,
+        dbg_slope: slope,
     }
 }
 
