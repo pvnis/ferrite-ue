@@ -21,7 +21,10 @@ use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
+use ferrite_ue::rt::{InjectionTable, ReadyWaveform};
 use ferrite_ue::stream::BufferedStream;
+use std::sync::atomic::{AtomicI64, Ordering::Relaxed as Rlx};
+use std::sync::{Arc, Mutex};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
 use ferrite_ue::userplane::{drb_mac_wrap, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
 use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
@@ -721,6 +724,82 @@ fn run(cfg: Config) {
     let mut offset: i64 = 0;
     let mut frames_at_offset = 0i64;
     let mut sweep = sweep0;
+
+    // ── Decoupled, real-time-paced radio thread ──────────────────────────────────────────
+    // Move the ZmqSink onto its own thread so T0 (this loop) never stalls on the gNB's UL pull.
+    // The thread serves UL from a position-keyed InjectionTable (filled by T0 via `inj`) plus the
+    // periodic PRACH (shared `prach_base`, MAX/2 once connected), and PACES the serving to real
+    // time (μ=1 → slot_len samples per 500µs). The pace is the crucial bit: without it the gNB
+    // free-runs its scheduler faster than it can fill DL grants (~395µs → empty grants → decode
+    // collapse). Pacing the UL caps the gNB's DL to ~rx_to_tx_max_delay ahead of real time — the
+    // same operating point srsUE holds (~521µs). T0 publishes the serving position in `ul_pos`
+    // for its own deadline checks.
+    let ul_pos = Arc::new(AtomicI64::new(align_ul));
+    // T0's downlink slot position, published each iteration. The radio thread gates its UL serve
+    // to stay within `lead` slots of this: a T0 stall then stalls the serve too (bounding the DL
+    // buffer), so T0's slot clock can't drift hundreds of slots behind the serving position and
+    // mis-place every UL waveform — but the serve I/O still stays off T0's critical path.
+    let t0_pos = Arc::new(AtomicI64::new(align_ul));
+    let prach_base = Arc::new(AtomicI64::new(align_ul + occ_off + offset));
+    let inj: Arc<Mutex<InjectionTable>> = Arc::new(Mutex::new(InjectionTable::new()));
+    {
+        let (ul_pos_t, t0_pos_t, prach_base_t, inj_t) = (ul_pos.clone(), t0_pos.clone(), prach_base.clone(), inj.clone());
+        let prach = prach.clone();
+        let frame_len_i = frame_len as i64;
+        // How many slots the UL serve may run ahead of T0's DL consumption. Must be < k1/k2
+        // (≥4) so a HARQ-ACK/PUSCH at T0+k is still ahead of the serving position.
+        let lead: i64 = std::env::var("FERRITE_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(2) * slot_len;
+        // Wall-clock µs/slot the serve paces to (default 500 = real time). Caps the gNB's rate so
+        // its scheduler doesn't free-run past what it can fill (empty grants → decode collapse).
+        let pace_us: f64 = std::env::var("FERRITE_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0);
+        let pace_ratio = pace_us / 500.0;
+        std::thread::Builder::new().name("ferrite-radio".into()).spawn(move || {
+            set_rt_thread(4, 25, "radio");
+            let start = std::time::Instant::now();
+            let mut c = align_ul as u64;
+            loop {
+                // Gate: don't serve a block T0 hasn't reached yet (+lead). This paces the gNB to
+                // T0's DL consumption and keeps the buffer bounded, without T0 doing the serve.
+                while c as i64 > t0_pos_t.load(Rlx) + lead {
+                    std::thread::sleep(std::time::Duration::from_micros(20));
+                }
+                // Pace: never serve faster than the target rate (caps the gNB to ~real time).
+                let served = (c as i64 - align_ul).max(0) as f64;
+                let target = std::time::Duration::from_secs_f64(served / fs * pace_ratio);
+                let el = start.elapsed();
+                if el < target {
+                    std::thread::sleep(target - el);
+                }
+                let ok = ul
+                    .serve_with(&mut c, |cc, block| {
+                        let (cc, bl) = (cc as i64, block.len() as i64);
+                        let base = prach_base_t.load(Rlx);
+                        if base < i64::MAX / 4 {
+                            let k0 = ((cc - prach_len - base).div_euclid(frame_len_i)).max(0);
+                            for kk in k0..=k0 + 1 {
+                                let o = base + kk * frame_len_i;
+                                for i in 0..prach_len {
+                                    let abs = o + i;
+                                    if abs >= cc && abs < cc + bl {
+                                        block[(abs - cc) as usize] = prach[i as usize];
+                                    }
+                                }
+                            }
+                        }
+                        inj_t.lock().unwrap().fill(cc, block);
+                    })
+                    .expect("ul serve");
+                if ok {
+                    ul_pos_t.store(c as i64, Rlx);
+                }
+            }
+        })
+        .expect("spawn radio thread");
+    }
+    // T0's slot clock in the UL sample frame (advances one slot per loop iteration, matching the
+    // gNB's slot rate since T0 reads DL at that rate from the buffer).
+    let mut slot_start_ul_t0 = align_ul;
+
     let mut pend: Option<(i64, Vec<Complex32>)> = None;
     let mut slot_buf = vec![Complex32::default(); slot_len as usize];
     let mut slot_idx = 0u32; // 0..20 within the frame
@@ -847,7 +926,7 @@ fn run(cfg: Config) {
                 let mut dl_dmrs_lock: Option<(usize, bool)> = None;
                 // [perf] per-slot RX-PHY timing: decode_dl total vs its OFDM-demod (lower PHY).
                 use std::sync::atomic::Ordering::Relaxed;
-                let (mut w_n, mut w_decode_ns) = (0u64, 0u64);
+                let (mut w_n, mut w_decode_ns, mut w_ok) = (0u64, 0u64, 0u64);
                 let perf_on = std::env::var_os("FERRITE_PERF").is_some();
                 while let Ok(job) = dl_job_rx.recv() {
                     let DlJob { slot_idx, slot_start_ul, crnti, fsh } = job;
@@ -865,12 +944,13 @@ fn run(cfg: Config) {
                         let _ = std::fs::write("/tmp/ferrite_fsh.bin", &b);
                         eprintln!("[dl-bench] dumped granted-slot fsh: slot={slot_idx} crnti={crnti:#x} len={}", fsh.len());
                     }
+                    if decoded.as_ref().is_some_and(|d| d.k1 != 0xff) { w_ok += 1; }
                     if perf_on && w_n % 1000 == 0 {
                         let demod_ns = PERF_DEMOD_NS.swap(0, Relaxed);
                         let dci_ns = PERF_DCI_NS.swap(0, Relaxed);
                         let pdsch_ns = PERF_PDSCH_NS.swap(0, Relaxed);
                         let us = |ns: u64| ns as f64 / 1000.0 / 1e3;
-                        eprintln!("[perf-ue-rxphy] {w_n} slots: decode_dl {:.1} µs/slot = OFDM-demod {:.1} + DCI-blind-search {:.1} + PDSCH-decode {:.1}",
+                        eprintln!("[perf-ue-rxphy] {w_n} slots ({w_ok} CRC-OK): decode_dl {:.1} µs/slot = OFDM-demod {:.1} + DCI-blind-search {:.1} + PDSCH-decode {:.1}",
                             us(w_decode_ns), us(demod_ns), us(dci_ns), us(pdsch_ns));
                         w_decode_ns = 0;
                     }
@@ -919,7 +999,17 @@ fn run(cfg: Config) {
         }
         perf_last = perf_iter;
         perf_have_last = true;
-        let slot_start_ul = ul_counter as i64;
+        // T0's slot position in the UL frame (its own clock, advanced once per slot). The radio
+        // thread serves UL asynchronously; `ul_counter` shadows the *serving* position (behind
+        // T0) so the deadline/late checks measure against what's actually been sent.
+        let slot_start_ul = slot_start_ul_t0;
+        slot_start_ul_t0 += slot_len;
+        t0_pos.store(slot_start_ul_t0, Rlx); // publish DL consumption for the radio's serve gate
+        prach_base.store(if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset }, Rlx);
+        let ul_counter = ul_pos.load(Rlx) as u64;
+        if std::env::var_os("FERRITE_DRIFT").is_some() && connected.is_some() && slot_idx % 5 == 0 {
+            eprintln!("[drift] t0={slot_start_ul} serving={ul_counter} diff={}", slot_start_ul - ul_counter as i64);
+        }
         // TUN mode: drain any IP packets the OS wants to send and queue them for
         // the DRB uplink (non-blocking; each read() returns one packet, IFF_NO_PI).
         if let Some(tun) = tun_fd.as_mut() {
@@ -939,12 +1029,6 @@ fn run(cfg: Config) {
             dl_stream.read_exact(&mut blk).expect("dl stream ended");
             perf_fill_ns += perf_fill.elapsed().as_nanos() as u64;
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
-            // Stop the periodic PRACH once connected: otherwise each frame's
-            // preamble spawns a fresh TC-RNTI at the gNB, and the accumulated RA
-            // UEs congest the PDCCH ("No space in PDCCH") so our connected UE can
-            // no longer be granted UL/DL. i64::MAX/2 pushes PRACH out of range.
-            let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
-            serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_csi], &pend_acks, &pend_ul);
         }
         perf_io_ns += perf_io.elapsed().as_nanos() as u64;
 
@@ -1172,6 +1256,7 @@ fn run(cfg: Config) {
                                 // PRACH offset can sit anywhere in the wide detection window).
                                 attempt += 1;
                                 let pos = pos0 + toff;
+                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave.clone() }, ul_counter as i64);
                                 pend = Some((pos, wave));
                                 recent_tc.push_back((tc, toff));
                                 while recent_tc.len() > 24 {
@@ -1461,6 +1546,7 @@ fn run(cfg: Config) {
                                 let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
                                     + offset + toffx - last_ta * 4;
                                 println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
+                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: pw.clone() }, ul_counter as i64);
                                 pend_pucch = Some((pos, pw));
                             }
                             if connected.is_none() {
@@ -1487,6 +1573,7 @@ fn run(cfg: Config) {
             for s in &mut sw { *s *= amp / pk; }
             let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
                 + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw.clone() }, ul_counter as i64);
             pend_sr = Some((pos, sw));
         }
 
@@ -1509,6 +1596,7 @@ fn run(cfg: Config) {
                 for s in &mut cw { *s *= amp / pk; }
                 let pos = slot_start_ul + (csi_slot - slot_idx as i64) * slot_len
                     + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                inj.lock().unwrap().push(ReadyWaveform { pos, samples: cw.clone() }, ul_counter as i64);
                 pend_csi = Some((pos, cw));
             }
         }
@@ -1564,13 +1652,16 @@ fn run(cfg: Config) {
                 crnti, center_hz, fs, &ack, BETA_HARQ, tb_bits);
             let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
             for s in &mut m5 { *s *= amp / pk; }
+            inj.lock().unwrap().push(ReadyWaveform { pos, samples: m5.clone() }, ul_counter as i64);
             pend_ul.push((pos, m5));
         }
         // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
         // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
         // The bundle is sized by the highest C-DAI seen (missing positions → NACK bit 0),
         // ordered by C-DAI, so the gNB reads the exact harq_bit_len bits it expects.
-        let due: Vec<i64> = ack_book.keys().copied().filter(|&pos| pos <= ul_counter as i64 + 3 * slot_len).collect();
+        // Modulate ACKs whose UL slot is within ~3 slots of T0's own progress (their contributing
+        // DL PDSCHs are decoded by then); the radio thread serves them at their absolute position.
+        let due: Vec<i64> = ack_book.keys().copied().filter(|&pos| pos <= slot_start_ul + 3 * slot_len).collect();
         for pos in due {
             let (slot_mod20, book) = ack_book.remove(&pos).unwrap();
             let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
@@ -1588,6 +1679,7 @@ fn run(cfg: Config) {
                 *s *= amp / pk;
             }
             if pend_acks.len() < 12 {
+                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw.clone() }, ul_counter as i64);
                 pend_acks.push((pos, aw));
             } else {
                 ack_qfull += 1;
