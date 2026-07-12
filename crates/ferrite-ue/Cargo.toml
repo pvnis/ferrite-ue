@@ -53,6 +53,10 @@ name = "pdsch-cmp"
 path = "src/bin/pdsch_cmp.rs"
 
 [[bin]]
+name = "pdsch-grid-drb"
+path = "src/bin/pdsch_grid_drb.rs"
+
+[[bin]]
 name = "pdsch-chan"
 path = "src/bin/pdsch_chan.rs"
 
