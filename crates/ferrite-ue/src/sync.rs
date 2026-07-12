@@ -226,20 +226,56 @@ pub fn freq_shift(
     start_index: usize,
 ) -> Vec<Complex32> {
     use std::f64::consts::TAU;
-    samples
-        .iter()
-        .enumerate()
-        .map(|(m, s)| {
-            let ph = TAU * shift_hz * (start_index + m) as f64 / fs;
-            s * Complex32::new(ph.cos() as f32, ph.sin() as f32)
-        })
-        .collect()
+    // The mixing phase advances by a constant `dph` per sample, so rotate incrementally
+    // (one complex multiply/sample) instead of a sin/cos per sample — the phasor is the
+    // hot part of the timeline thread. `dph` is reduced mod 2π and the per-slot start
+    // phase is computed once at full f64 precision; the running phasor's magnitude drift
+    // over a slot (~1e-13) is negligible.
+    let dph = (TAU * shift_hz / fs).rem_euclid(TAU);
+    let ph0 = (TAU * shift_hz * start_index as f64 / fs).rem_euclid(TAU);
+    let (mut rr, mut ri) = (ph0.cos(), ph0.sin()); // running phasor e^{j·ph}
+    let (sr, si) = (dph.cos(), dph.sin()); // per-sample step e^{j·dph}
+    let mut out = Vec::with_capacity(samples.len());
+    for s in samples {
+        let (x, y) = (s.re as f64, s.im as f64);
+        out.push(Complex32::new((x * rr - y * ri) as f32, (x * ri + y * rr) as f32));
+        let nr = rr * sr - ri * si;
+        ri = rr * si + ri * sr;
+        rr = nr;
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ferrite_phy::sync::ssb::build_ssb_waveform;
+
+    /// The incremental `freq_shift` must match the per-sample sin/cos reference, including
+    /// at the large `start_index` a long steady-state run reaches (the mixing phase must not
+    /// drift). Checks a realistic slot at several offsets and start indices.
+    #[test]
+    fn freq_shift_matches_reference() {
+        use std::f64::consts::TAU;
+        let reference = |samples: &[Complex32], shift_hz: f64, fs: f64, start: usize| -> Vec<Complex32> {
+            samples.iter().enumerate().map(|(m, s)| {
+                let ph = TAU * shift_hz * (start + m) as f64 / fs;
+                s * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            }).collect()
+        };
+        let fs = 11_520_000.0;
+        let samples: Vec<Complex32> = (0..6144)
+            .map(|i| Complex32::new((i as f32 * 0.31).sin(), (i as f32 * 0.17).cos()))
+            .collect();
+        for &shift in &[-540_000.0f64, 30_000.0, 3_500_000.0] {
+            for &start in &[0usize, 5760, 400_000_000, 4_000_000_000] {
+                let got = freq_shift(&samples, shift, fs, start);
+                let want = reference(&samples, shift, fs, start);
+                let max_err = got.iter().zip(&want).map(|(a, b)| (a - b).norm()).fold(0.0f32, f32::max);
+                assert!(max_err < 1e-3, "shift={shift} start={start}: max_err={max_err}");
+            }
+        }
+    }
 
     /// Synthesize `n_frames` back-to-back 10 ms frames, each carrying an SSB
     /// (i_SSB 0, first half-frame) with per-frame SFN, then acquire + track.

@@ -329,11 +329,16 @@ fn try_decode_dl_srb1(
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
     use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb, dlsch_decode_single_bits};
-    // Always brute-force the cell-fixed (CDM groups, time-first) DM-RS layout for the
-    // standalone decode (never restrict it — different PDSCHs must all still decode).
-    // `lock` only records the layout that works, to pick ONE consistent combo for the
-    // soft-combining accumulation (which must line up across a TB's RVs).
-    for (cdm, time_first) in [(1usize, true), (1, false), (2, true), (2, false)] {
+    // The time-first RE-mapping ORDER is cell-fixed — lock it after the first success and
+    // skip the wrong order every slot thereafter (halves the extract+LDPC work, the dominant
+    // PDSCH-decode cost). The CDM-group count, though, varies per grant (small grants use 1,
+    // larger ones like RRCReconfiguration use 2), so still sweep both CDM values.
+    for &(cdm, time_first) in &[(1usize, true), (1, false), (2, true), (2, false)] {
+        if let Some((_, tf)) = *lock {
+            if time_first != tf {
+                continue;
+            }
+        }
         let n_re = n_rb * ((12 - 3) * 12 + if cdm == 1 { 3 * 6 } else { 0 });
         let tbs = tbs_from_nre(n_re, r, qm);
         let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: cdm };
@@ -429,6 +434,13 @@ struct DlResult {
     cqi: Option<u8>,
 }
 
+/// [perf] Nanoseconds per phase of `decode_dl`, summed across slots; drained by the RX-PHY
+/// worker each report. DEMOD = OFDM (CORESET + full slot), DCI = the blind PDCCH search
+/// (fixed cost, data-rate-independent), PDSCH = present-gate + PDSCH/LDPC decode.
+static PERF_DEMOD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_DCI_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PERF_PDSCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Pure RX-PHY decode of one connected-mode DL slot — the CPU-heavy work the concurrency
 /// rework (Phase 2) moves off the timeline thread. Demodulates the frequency-shifted slot
 /// `fsh`, blind-decodes the DCI (1_0 in CORESET0, else the exhaustive CORESET1 search),
@@ -453,6 +465,7 @@ fn decode_dl(
 ) -> (Option<DlDecoded>, Option<u8>) {
     let fft = ofdm.fft_size();
     // CORESET grids: the first coreset.n_symb OFDM symbols of the slot.
+    let t_demod = std::time::Instant::now();
     let mut cgrids = Vec::new();
     let mut off = 0usize;
     for l in 0..coreset.n_symb {
@@ -460,6 +473,8 @@ fn decode_dl(
         cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
         off += cp + fft;
     }
+    PERF_DEMOD_NS.fetch_add(t_demod.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let t_dci = std::time::Instant::now();
     let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
     // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback)).
     let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8)> = Vec::new();
@@ -503,9 +518,14 @@ fn decode_dl(
             }
         }
     }
-    let Some(grids) = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1) else {
+    PERF_DCI_NS.fetch_add(t_dci.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let t_ds = std::time::Instant::now();
+    let grids = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1);
+    PERF_DEMOD_NS.fetch_add(t_ds.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let Some(grids) = grids else {
         return (None, None);
     };
+    let t_pdsch = std::time::Instant::now();
     // NZP-CSI-RS measurement (row 1, k0=1, symbol 4) → wideband CQI, only in the even-frame
     // slots 2-4 where the CSI-RS is present (a high SINR gates it, no SFN tracking needed).
     let mut cqi = None;
@@ -518,6 +538,7 @@ fn decode_dl(
     // Cheap presence gate: every connected DL PDSCH starts at RB 0.
     let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
     if !present {
+        PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         return (None, cqi);
     }
     for (rb0, nrb, mcs, k1, dai, rv, h_id) in allocs {
@@ -525,11 +546,36 @@ fn decode_dl(
         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
             if let Some((tb, deliver)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, dl_dmrs_lock, harq_dl) {
+                PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
             }
         }
     }
+    PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     (None, cqi)
+}
+
+/// Pin the current thread to `cpu` and give it real-time SCHED_FIFO priority, so other
+/// processes / OS jitter can't preempt the timeline and decode threads and spike the
+/// decode→ACK pipeline lag (which makes HARQ-ACKs miss their UL injection window). This
+/// is the difference between holding a 500 µs slot period and drifting under load.
+/// Best-effort: needs CAP_SYS_NICE (run as root); logs and continues on failure. Opt-in
+/// via `FERRITE_RT=1` so a normal run is unaffected.
+fn set_rt_thread(cpu: usize, prio: i32, name: &str) {
+    if std::env::var_os("FERRITE_RT").is_none() {
+        return;
+    }
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        let param = libc::sched_param { sched_priority: prio };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
+            eprintln!("[rt] {name}: SCHED_FIFO(prio {prio}) failed — run as root for CAP_SYS_NICE");
+        } else {
+            eprintln!("[rt] {name}: cpu {cpu}, SCHED_FIFO prio {prio}");
+        }
+    }
 }
 
 fn main() {
@@ -784,13 +830,40 @@ fn run(cfg: Config) {
         std::thread::Builder::new()
             .name("ferrite-rxphy".into())
             .spawn(move || {
+                set_rt_thread(3, 20, "rxphy"); // dedicated core, below the timeline thread
                 let ofdm = Ofdm::new(fft);
                 let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
                 let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
                 let mut dl_dmrs_lock: Option<(usize, bool)> = None;
+                // [perf] per-slot RX-PHY timing: decode_dl total vs its OFDM-demod (lower PHY).
+                use std::sync::atomic::Ordering::Relaxed;
+                let (mut w_n, mut w_decode_ns) = (0u64, 0u64);
+                let perf_on = std::env::var_os("FERRITE_PERF").is_some();
                 while let Ok(job) = dl_job_rx.recv() {
                     let DlJob { slot_idx, slot_start_ul, crnti, fsh } = job;
+                    let t = std::time::Instant::now();
                     let (decoded, cqi) = decode_dl(&fsh, &ofdm, &w_coreset, w_cell, w_carrier, sc_to_bin, w_alen, &w_racand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock);
+                    w_decode_ns += t.elapsed().as_nanos() as u64;
+                    w_n += 1;
+                    // [perf] one-shot: dump a granted-slot fsh so dl-bench can time the
+                    // decode offline. Header: slot_idx, crnti (u32 LE) then f32 re/im pairs.
+                    if decoded.as_ref().is_some_and(|d| d.k1 != 0xff) && std::env::var_os("FERRITE_DUMP_FSH").is_some() && !std::path::Path::new("/tmp/ferrite_fsh.bin").exists() {
+                        let mut b = Vec::with_capacity(8 + fsh.len() * 8);
+                        b.extend_from_slice(&slot_idx.to_le_bytes());
+                        b.extend_from_slice(&(crnti as u32).to_le_bytes());
+                        for s in &fsh { b.extend_from_slice(&s.re.to_le_bytes()); b.extend_from_slice(&s.im.to_le_bytes()); }
+                        let _ = std::fs::write("/tmp/ferrite_fsh.bin", &b);
+                        eprintln!("[dl-bench] dumped granted-slot fsh: slot={slot_idx} crnti={crnti:#x} len={}", fsh.len());
+                    }
+                    if perf_on && w_n % 1000 == 0 {
+                        let demod_ns = PERF_DEMOD_NS.swap(0, Relaxed);
+                        let dci_ns = PERF_DCI_NS.swap(0, Relaxed);
+                        let pdsch_ns = PERF_PDSCH_NS.swap(0, Relaxed);
+                        let us = |ns: u64| ns as f64 / 1000.0 / 1e3;
+                        eprintln!("[perf-ue-rxphy] {w_n} slots: decode_dl {:.1} µs/slot = OFDM-demod {:.1} + DCI-blind-search {:.1} + PDSCH-decode {:.1}",
+                            us(w_decode_ns), us(demod_ns), us(dci_ns), us(pdsch_ns));
+                        w_decode_ns = 0;
+                    }
                     if dl_res_tx.send(DlResult { slot_idx, slot_start_ul, decoded, cqi }).is_err() {
                         break;
                     }
@@ -801,7 +874,41 @@ fn run(cfg: Config) {
     // Msg5 payload: RRCSetupComplete carrying a NAS RegistrationRequest (SUCI).
     let rrc_sc = rrc_setup_complete(0, 1, &registration_request(&imsi));
 
+    // The timeline thread is the hard-real-time pace-setter — give it the top priority and a
+    // dedicated core so nothing preempts the read-DL / serve-UL loop.
+    set_rt_thread(2, 30, "timeline");
+    // [perf] T0 (timeline) per-slot wall-clock: total slot period (the achieved slot rate,
+    // gated by the ZMQ lockstep), of which ZMQ I/O (the read+serve lockstep wait) and the
+    // freq-shift+CORESET OFDM demod (T0's lower-PHY share).
+    let (mut perf_last, mut perf_have_last) = (std::time::Instant::now(), false);
+    let (mut perf_n, mut perf_period_ns, mut perf_io_ns, mut perf_demod_ns) = (0u64, 0u64, 0u64, 0u64);
+    let (mut perf_fs_ns, mut perf_ulgrant_ns, mut perf_ra_ns, mut perf_drain_ns) = (0u64, 0u64, 0u64, 0u64);
+    let mut perf_fill_ns = 0u64; // DL-read (fill_dl) wait — the lockstep round-trip to the gNB
+    // [perf] HARQ-ACK injection outcomes (cumulative): total produced, "late" = target UL
+    // position already behind ul_counter when produced (its block was already served → the
+    // ACK can never be injected → gNB sees DTX), and "qfull" = dropped because pend_acks
+    // was full. This is the UE-side deadline-miss counter the InjectionTable would track.
+    let (mut ack_total, mut ack_late, mut ack_qfull) = (0u64, 0u64, 0u64);
+    // [perf] decode→drain pipeline lag in slots (current slot − decoded slot when drained):
+    // this is the depth the HARQ-ACK must beat (needs lag < k1). Sum/max/count per window.
+    let (mut lag_sum, mut lag_max, mut lag_n) = (0u64, 0u32, 0u64);
+    let (mut dlag_sum, mut dlag_max, mut dlag_n) = (0u64, 0u32, 0u64); // lag for DECODED drains only
+    // [perf] instrumentation is off unless FERRITE_PERF is set (the per-slot timers run
+    // cheaply either way; only the periodic stderr reports are gated).
+    let perf_on = std::env::var_os("FERRITE_PERF").is_some();
+    // [perf] optional pad-sleep per slot (µs) to test how T0 pace affects the ZMQ lockstep.
+    let perf_pad_us: u64 = std::env::var("FERRITE_PAD_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+
     loop {
+        if perf_pad_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(perf_pad_us));
+        }
+        let perf_iter = std::time::Instant::now();
+        if perf_have_last {
+            perf_period_ns += (perf_iter - perf_last).as_nanos() as u64;
+        }
+        perf_last = perf_iter;
+        perf_have_last = true;
         let slot_start_ul = ul_counter as i64;
         // TUN mode: drain any IP packets the OS wants to send and queue them for
         // the DRB uplink (non-blocking; each read() returns one packet, IFF_NO_PI).
@@ -816,8 +923,11 @@ fn run(cfg: Config) {
         }
         // Read one slot of DL, serving UL (PRACH + pending Msg3) in lockstep.
         // PRACH base = first frame boundary + occasion offset + sweep offset.
+        let perf_io = std::time::Instant::now();
         for b in 0..blocks_per_slot {
+            let perf_fill = std::time::Instant::now();
             fill_dl(&mut dl, &mut blk);
+            perf_fill_ns += perf_fill.elapsed().as_nanos() as u64;
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
             // Stop the periodic PRACH once connected: otherwise each frame's
             // preamble spawns a fresh TC-RNTI at the gNB, and the accumulated RA
@@ -826,15 +936,35 @@ fn run(cfg: Config) {
             let prach_base = if connected.is_some() { i64::MAX / 2 } else { align_ul + occ_off + offset };
             serve(&mut ul, &mut ul_counter, prach_base, &[&pend, &pend_pucch, &pend_sr, &pend_csi], &pend_acks, &pend_ul);
         }
+        perf_io_ns += perf_io.elapsed().as_nanos() as u64;
 
         // Decode this slot's RA search space.
+        let perf_fs = std::time::Instant::now();
         let fsh = freq_shift(&slot_buf, -df, fs, slot_start_ul as usize);
+        perf_fs_ns += perf_fs.elapsed().as_nanos() as u64;
+        let perf_dm = std::time::Instant::now();
         let mut cgrids = Vec::new();
         let mut off = 0usize;
         for l in 0..coreset.n_symb {
             let cp = ofdm.cp_len((slot_idx as usize % 2) * 14 + l, 1);
             cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
             off += cp + fft;
+        }
+        perf_demod_ns += perf_dm.elapsed().as_nanos() as u64;
+        let perf_ulgrant = std::time::Instant::now();
+        perf_n += 1;
+        if perf_n % 1000 == 0 {
+            if perf_on {
+                let a = |ns: u64| ns as f64 / perf_n as f64 / 1e3; // µs/slot
+                let p = perf_period_ns as f64 / perf_n as f64;
+                eprintln!("[perf-ue-t0] {perf_n} slots: period {:.0}µs ({:.0}/s) = zmq-io {:.0} (fill-dl {:.0} + serve {:.0}) + freqshift {:.0} + coreset-demod {:.0} + ul-grant-pdcch {:.0} + ra-search {:.0} + drain+tx {:.0} µs",
+                    p / 1e3, 1e9 / p, a(perf_io_ns), a(perf_fill_ns), a(perf_io_ns.saturating_sub(perf_fill_ns)), a(perf_fs_ns), a(perf_demod_ns), a(perf_ulgrant_ns), a(perf_ra_ns), a(perf_drain_ns));
+                eprintln!("[perf-ue-ack] HARQ-ACK cumulative: produced={ack_total} late(missed-window)={ack_late} qfull-dropped={ack_qfull}; all-drain-lag avg={:.1} max={lag_max}; DECODED-drain-lag avg={:.1} max={dlag_max} ({dlag_n})",
+                    lag_sum as f64 / lag_n.max(1) as f64, dlag_sum as f64 / dlag_n.max(1) as f64);
+            }
+            lag_sum = 0; lag_max = 0; lag_n = 0; dlag_sum = 0; dlag_max = 0; dlag_n = 0;
+            perf_n = 0; perf_period_ns = 0; perf_io_ns = 0; perf_demod_ns = 0;
+            perf_fs_ns = 0; perf_ulgrant_ns = 0; perf_ra_ns = 0; perf_drain_ns = 0; perf_fill_ns = 0;
         }
         // Connected: decode the C-RNTI UL grant and send the next queued SRB1 RRC
         // PDU on the granted PUSCH, k2 slots later. The gNB grants the FIRST UL
@@ -967,7 +1097,13 @@ fn run(cfg: Config) {
                 }
             }
         }
+        perf_ulgrant_ns += perf_ulgrant.elapsed().as_nanos() as u64;
 
+        let perf_ra = std::time::Instant::now();
+        // The RA-RNTI (RAR/Msg2) search is only meaningful during attach: once connected,
+        // PRACH is off (no RAR can arrive), so skip the equalize + blind DCI decode + Msg2
+        // PDSCH demod entirely — ~90 µs/slot of pure waste in steady state.
+        if connected.is_none() {
         let mut llrs = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &ra_cand);
         pdcch_descramble_llr(&mut llrs, u32::from(acq.cell_id));
         if let Some(bits) = dci_decode(&llrs, ra_rnti, a_len) {
@@ -1038,6 +1174,7 @@ fn run(cfg: Config) {
                 }
             }
         }
+        } // end: if connected.is_none() (RA/RAR search)
 
         // Connected DL: decode the SRB1 PDSCH at DL slots and drive the NAS
         // registration state machine (AuthReq → SMC → RegistrationAccept). The DL
@@ -1046,6 +1183,8 @@ fn run(cfg: Config) {
         // rb[0,10/11) (the AuthReq) if no DCI decodes. MCS is brute-forced.
         // Offload this connected DL slot's RX decode to the worker thread (pipelined);
         // the result is picked up below, a few slots later.
+        perf_ra_ns += perf_ra.elapsed().as_nanos() as u64;
+        let perf_drain = std::time::Instant::now();
         if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=5) {
             let crnti = connected.unwrap();
             let _ = dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, crnti, fsh: fsh.clone() });
@@ -1059,8 +1198,13 @@ fn run(cfg: Config) {
                 pending_cqi = res.cqi;
             }
             let (r_slot_idx, r_slot_start_ul) = (res.slot_idx, res.slot_start_ul);
+            let lag = (slot_idx + 20 - r_slot_idx) % 20; // slot_idx is mod 20
+            lag_sum += lag as u64;
+            lag_max = lag_max.max(lag);
+            lag_n += 1;
             #[allow(for_loops_over_fallibles)]
             for DlDecoded { k1, dai, bytes: tb, deliver } in res.decoded {
+                dlag_sum += lag as u64; dlag_max = dlag_max.max(lag); dlag_n += 1;
                 let slot_idx = r_slot_idx;
                 let slot_start_ul = r_slot_start_ul;
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
@@ -1423,6 +1567,10 @@ fn run(cfg: Config) {
             if size == 0 {
                 continue;
             }
+            ack_total += 1;
+            if pos < ul_counter as i64 {
+                ack_late += 1; // its UL block was already served — can never be injected
+            }
             let bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();
             let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
             let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
@@ -1431,11 +1579,14 @@ fn run(cfg: Config) {
             }
             if pend_acks.len() < 12 {
                 pend_acks.push((pos, aw));
+            } else {
+                ack_qfull += 1;
             }
         }
         // Drop HARQ-ACK and PUSCH bursts whose UL window has passed.
         pend_acks.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
         pend_ul.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
+        perf_drain_ns += perf_drain.elapsed().as_nanos() as u64;
     }
 }
 
