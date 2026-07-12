@@ -21,6 +21,7 @@ use ferrite_phy::Ofdm;
 use ferrite_radio::zmq::{ZmqSink, ZmqSource};
 use ferrite_radio::SampleSource;
 use ferrite_ue::milenage::{algo_key, k_amf, k_ausf, k_seaf, milenage, res_star};
+use ferrite_ue::stream::BufferedStream;
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
 use ferrite_ue::userplane::{drb_mac_wrap, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
 use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
@@ -706,6 +707,15 @@ fn run(cfg: Config) {
         serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
     }
 
+    // Hand the DL socket to a dedicated drain thread and read it read-ahead from here on.
+    // In the ZMQ lockstep the gNB's DU runs on wall-clock and stalls (error-spirals) if its
+    // TX buffer backs up — which is exactly what happens when the timeline thread pauses on
+    // the UL-serve or a decode burst and stops reading DL. Draining continuously in the
+    // background keeps the gNB producing smoothly, absorbing the per-slot jitter (the srsUE
+    // radio↔PHY decoupling that lets it hold ~520µs where the tight read→process→serve loop
+    // collapses). The gNB's ~1ms TX lead caps the buffer depth, so it stays bounded.
+    let mut dl_stream = BufferedStream::spawn(dl, block_len);
+
     let blocks_per_slot = slot_len as usize / block_len; // 4
     let align_ul = ul_counter as i64; // first frame-boundary UL position
     let mut offset: i64 = 0;
@@ -926,7 +936,7 @@ fn run(cfg: Config) {
         let perf_io = std::time::Instant::now();
         for b in 0..blocks_per_slot {
             let perf_fill = std::time::Instant::now();
-            fill_dl(&mut dl, &mut blk);
+            dl_stream.read_exact(&mut blk).expect("dl stream ended");
             perf_fill_ns += perf_fill.elapsed().as_nanos() as u64;
             slot_buf[b * block_len..(b + 1) * block_len].copy_from_slice(&blk);
             // Stop the periodic PRACH once connected: otherwise each frame's
