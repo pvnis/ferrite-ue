@@ -1091,14 +1091,15 @@ fn run(cfg: Config) {
     // stall the ZMQ I/O. The worker owns the only cross-slot decode state (the HARQ
     // soft-combining buffers `harq_dl` and the cell-fixed DM-RS layout `dl_dmrs_lock`) and
     // processes slots strictly in order, keeping the accumulator coherent.
-    // Job queue depth 2 (was 8): the queue depth IS the decode→ACK pipeline lag bound
-    // (lag ≈ (depth+1) × per-job wall). At 8, any transient spike fills the queue and the lag
-    // sits at 8-10 slots — past the k1=4 ACK window — so every ACK is late, every TB is
-    // retransmitted, and the flood keeps the queue full: a self-sustaining storm. At 2, a
-    // burst drops the excess slots instead (the gNB retransmits them WITH a fresh DCI, and
-    // those retx get decoded and ACKed on time) — the storm converges. Real-time triage:
-    // decoding 80% of slots on time beats decoding 100% of them too late.
-    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(2);
+    // Job queue depth 1 (was 8, then 2): the queue depth directly adds to the decode→ACK
+    // pipeline lag (each queued job is a slot the ACK waits before it's produced), and that
+    // lag must beat the gNB's MINIMUM k1 (=4) or the HARQ-ACK lands after the UL slot the gNB
+    // pulls it in → DTX → retransmit → the flood refills the queue → self-sustaining storm.
+    // Measured lag ≈ read-ahead burst (~2) + queue + drain; at depth 2 that put k1=4/5 ACKs
+    // right at/behind the serving position (~50% late = the gNB's ~50% DL nok). Depth 1 shaves
+    // a slot so the low-k1 ACKs land in time. Decode is ~160µs now (was 5ms when depth 8 made
+    // sense), so a shallow queue costs almost nothing and a dropped burst slot is retransmitted.
+    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(1);
     let (dl_res_tx, dl_res_rx) = ferrite_ue::rt::bounded::<DlResult>(8);
     {
         let (w_coreset, w_cell, w_carrier, w_alen, w_racand, w_firstsc) =
@@ -1200,10 +1201,33 @@ fn run(cfg: Config) {
     let perf_on = std::env::var_os("FERRITE_PERF").is_some();
     // [perf] optional pad-sleep per slot (µs) to test how T0 pace affects the ZMQ lockstep.
     let perf_pad_us: u64 = std::env::var("FERRITE_PAD_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // Pace T0's slot consumption to real time (matches the radio thread's UL pace). The DL
+    // read-ahead buffer lets T0 burn through several buffered slots back-to-back; when it does,
+    // its slot clock (and the gated UL serve) race ~2-3 slots ahead of the decode→ACK pipeline,
+    // so the HARQ-ACK for the slot just decoded is already at/behind the served position — fatal
+    // for the gNB's minimum k1=4. Pacing T0 keeps its clock with the worker (the buffer still
+    // absorbs the gNB's production jitter), so the ACK is produced ~2 slots ahead of serving.
+    let mut t0_start = std::time::Instant::now();
+    let mut t0_n = 0u64;
+    let t0_pace: f64 = std::env::var("FERRITE_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0) * 1e-6;
 
     loop {
         if perf_pad_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(perf_pad_us));
+        }
+        // Real-time pace: never run T0's slot clock ahead of wall-clock (see above).
+        if connected.is_some() {
+            let target = std::time::Duration::from_secs_f64(t0_n as f64 * t0_pace);
+            let el = t0_start.elapsed();
+            if el < target {
+                std::thread::sleep(target - el);
+            }
+            t0_n += 1;
+        } else {
+            // During RA/attach run free (the timing sweep needs to iterate fast); keep the pace
+            // baseline fresh so it starts from zero at the first connected slot.
+            t0_start = std::time::Instant::now();
+            t0_n = 0;
         }
         let perf_iter = std::time::Instant::now();
         if perf_have_last {
