@@ -438,6 +438,24 @@ struct DlResult {
     cqi: Option<u8>,
 }
 
+/// A UL waveform-build request handed from the timeline thread (T0) to the TX-build stage,
+/// which modulates it and pushes the samples to the [`InjectionTable`] at `pos`. Moving the
+/// (expensive, bursty) PUCCH/PUSCH modulation off T0 keeps its per-slot drain light so a burst
+/// of decoded results can't stall the decode→ACK pipeline. `now` is T0's serving-position
+/// snapshot for the injection deadline check.
+enum TxReq {
+    /// PUCCH Format 1: `harq` picks the HARQ-ACK resource (bits = ACK codebook) vs the SR
+    /// resource (bits empty = positive SR).
+    PucchF1 { harq: bool, bits: Vec<u8>, slot_mod20: u32, pos: i64, now: i64 },
+    /// PUCCH Format 2: a CSI (wideband CQI) report.
+    PucchF2 { cfg: ferrite_phy::pucch::PucchF2, bits: Vec<u8>, slot_mod20: u32, pos: i64, now: i64 },
+    /// PUSCH (+ optional multiplexed UCI HARQ-ACK).
+    Pusch {
+        ulsch: Vec<u8>, alloc: PuschAlloc, slot_mod20: u32, slot_parity: usize, crnti: u16,
+        ack: Vec<u8>, beta: f32, tb_bits: usize, pos: i64, now: i64,
+    },
+}
+
 /// [perf] Nanoseconds per phase of `decode_dl`, summed across slots; drained by the RX-PHY
 /// worker each report. DEMOD = OFDM (CORESET + full slot), DCI = the blind PDCCH search
 /// (fixed cost, data-rate-independent), PDSCH = present-gate + PDSCH/LDPC decode.
@@ -830,9 +848,11 @@ fn run(cfg: Config) {
     // used to advance UL timing; `pend_pucch` is the pending PUCCH F1 burst.
     let mut last_ta: i64 = 5;
     let mut pend_pucch: Option<(i64, Vec<Complex32>)> = None;
-    let mut pend_sr: Option<(i64, Vec<Complex32>)> = None;
-    let mut pend_csi: Option<(i64, Vec<Complex32>)> = None; // pending CSI report (PUCCH F2)
-    let mut pend_acks: Vec<(i64, Vec<Complex32>)> = Vec::new(); // in-flight DL HARQ-ACKs
+    // These track only the UL *position* of in-flight bursts (modulated on the TX-build thread,
+    // served by the InjectionTable); T0 keeps them for the arm-once gate + a queue-depth cap.
+    let mut pend_sr: Option<i64> = None;
+    let mut pend_csi: Option<i64> = None; // pending CSI report (PUCCH F2)
+    let mut pend_acks: Vec<i64> = Vec::new(); // in-flight DL HARQ-ACKs
     // Latest CQI measured from the NZP-CSI-RS (row 1, k0=1, symbol 4). Set only when a
     // valid CSI-RS is seen (high SINR); the CSI-RS is transmitted in even frames slots
     // 2-4, so this is Some exactly in the frames whose slot-8 report the gNB reads —
@@ -865,10 +885,48 @@ fn run(cfg: Config) {
         prb1: 0, prb2: 0, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 6, occ_index: 3, n_id: acq.cell_id, carrier_rb,
     };
+
+    // ── TX-build thread ──────────────────────────────────────────────────────────────────
+    // Modulate the connected-mode UL (PUCCH SR/ACK/CSI, PUSCH) off T0 and push the samples to
+    // the InjectionTable. The modulation is the heavy, bursty part of T0's per-slot drain
+    // (a burst of decoded results → a burst of ACKs/PUSCH to modulate → 1.7ms spike → stalls
+    // the decode→ACK pipeline → late ACKs). T0 now just decides WHAT to send (cheap) and hands
+    // a `TxReq` here; this thread modulates and injects at the absolute position T0 computed.
+    let (tx_req_tx, tx_req_rx) = ferrite_ue::rt::bounded::<TxReq>(64);
+    {
+        let inj_t = inj.clone();
+        let (harq_cfg_t, sr_cfg_t) = (harq_cfg.clone(), sr_cfg.clone());
+        let cell_id = acq.cell_id;
+        std::thread::Builder::new().name("ferrite-txbuild".into()).spawn(move || {
+            set_rt_thread(5, 15, "txbuild");
+            let ofdm = Ofdm::new(fft);
+            let norm = |w: &mut Vec<Complex32>| {
+                let pk = w.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                for s in w.iter_mut() { *s *= amp / pk; }
+            };
+            while let Ok(req) = tx_req_rx.recv() {
+                let (mut wave, pos, now) = match req {
+                    TxReq::PucchF1 { harq, bits, slot_mod20, pos, now } => {
+                        let cfg = if harq { &harq_cfg_t } else { &sr_cfg_t };
+                        (ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, cfg, &bits, slot_mod20, center_hz, fs), pos, now)
+                    }
+                    TxReq::PucchF2 { cfg, bits, slot_mod20, pos, now } => {
+                        (ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, slot_mod20, center_hz, fs), pos, now)
+                    }
+                    TxReq::Pusch { ulsch, alloc, slot_mod20, slot_parity, crnti, ack, beta, tb_bits, pos, now } => {
+                        (ferrite_phy::pusch::pusch_modulate_slot_uci(&ofdm, &ulsch, &alloc, cell_id, slot_mod20, slot_parity, crnti, center_hz, fs, &ack, beta, tb_bits), pos, now)
+                    }
+                };
+                norm(&mut wave);
+                inj_t.lock().unwrap().push(ReadyWaveform { pos, samples: wave }, now);
+            }
+        }).expect("spawn txbuild thread");
+    }
+
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
-    let mut pend_ul: Vec<(i64, Vec<Complex32>)> = Vec::new(); // queued PUSCH bursts (fill every grant)
+    let mut pend_ul: Vec<i64> = Vec::new(); // in-flight PUSCH burst positions (fill every grant)
     // Connected-mode UL: a queue of RRC PDUs to send on successive grants
     // (RRCSetupComplete, then the AuthenticationResponse, …), with a shared
     // SRB1 RLC/PDCP sequence number that increments per PDU.
@@ -1568,13 +1626,14 @@ fn run(cfg: Config) {
         let want_drb = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
         if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb) && slot_idx == 0 && pend_sr.is_none() {
             let sr_slot = 7i64;
+            let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
+                + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+            // SR kept in T0: cheap (one PUCCH F1/frame) and latency-critical (drives grants).
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
             for s in &mut sw { *s *= amp / pk; }
-            let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
-                + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw.clone() }, ul_counter as i64);
-            pend_sr = Some((pos, sw));
+            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw }, ul_counter as i64);
+            pend_sr = Some(pos);
         }
 
         // Periodic CSI report: send the measured CQI on the PUCCH F2 (PRB 23, symb
@@ -1590,14 +1649,11 @@ fn run(cfg: Config) {
                     rnti: connected.unwrap(), n_id: acq.cell_id, n_id0: acq.cell_id, carrier_rb,
                 };
                 // 4-bit wideband CQI, MSB first.
-                let bits = [(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1];
-                let mut cw = ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, csi_slot as u32, center_hz, fs);
-                let pk = cw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                for s in &mut cw { *s *= amp / pk; }
+                let bits = vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1];
                 let pos = slot_start_ul + (csi_slot - slot_idx as i64) * slot_len
                     + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                inj.lock().unwrap().push(ReadyWaveform { pos, samples: cw.clone() }, ul_counter as i64);
-                pend_csi = Some((pos, cw));
+                let _ = tx_req_tx.try_send(TxReq::PucchF2 { cfg, bits, slot_mod20: csi_slot as u32, pos, now: ul_counter as i64 });
+                pend_csi = Some(pos);
             }
         }
 
@@ -1626,13 +1682,13 @@ fn run(cfg: Config) {
                 pend_pucch = None;
             }
         }
-        if let Some((pos, wave)) = &pend_sr {
-            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+        if let Some(pos) = pend_sr {
+            if ul_counter as i64 > pos + 2 * slot_len {
                 pend_sr = None;
             }
         }
-        if let Some((pos, wave)) = &pend_csi {
-            if ul_counter as i64 > pos + wave.len() as i64 + slot_len {
+        if let Some(pos) = pend_csi {
+            if ul_counter as i64 > pos + 2 * slot_len {
                 pend_csi = None;
             }
         }
@@ -1647,13 +1703,11 @@ fn run(cfg: Config) {
             }).unwrap_or_default();
             const BETA_HARQ: f32 = 20.0; // beta_offset_harq_ack index 11
             let crnti = connected.unwrap_or(0);
-            let mut m5 = ferrite_phy::pusch::pusch_modulate_slot_uci(
-                &ofdm, &ulsch, &m5_alloc, acq.cell_id, (m5_slot % 20) as u32, (m5_slot % 2) as usize,
-                crnti, center_hz, fs, &ack, BETA_HARQ, tb_bits);
-            let pk = m5.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-            for s in &mut m5 { *s *= amp / pk; }
-            inj.lock().unwrap().push(ReadyWaveform { pos, samples: m5.clone() }, ul_counter as i64);
-            pend_ul.push((pos, m5));
+            let _ = tx_req_tx.try_send(TxReq::Pusch {
+                ulsch, alloc: m5_alloc, slot_mod20: (m5_slot % 20) as u32, slot_parity: (m5_slot % 2) as usize,
+                crnti, ack, beta: BETA_HARQ, tb_bits, pos, now: ul_counter as i64,
+            });
+            pend_ul.push(pos);
         }
         // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
         // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
@@ -1671,23 +1725,28 @@ fn run(cfg: Config) {
             ack_total += 1;
             if pos < ul_counter as i64 {
                 ack_late += 1; // its UL block was already served — can never be injected
+                if std::env::var_os("FERRITE_DRIFT").is_some() && ack_late < 16 {
+                    eprintln!("[ack-late] pos={pos} serving={ul_counter} pos-serving={} pos-t0(slots)={} last_ta={last_ta} ta*4(slots)={}",
+                        pos - ul_counter as i64, (pos - slot_start_ul) / slot_len, (last_ta * 4) / slot_len);
+                }
             }
             let bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();
-            let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
-            let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-            for s in &mut aw {
-                *s *= amp / pk;
-            }
             if pend_acks.len() < 12 {
-                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw.clone() }, ul_counter as i64);
-                pend_acks.push((pos, aw));
+                // HARQ-ACK kept in T0: cheap (1-2 bit PUCCH F1) and the most latency-critical UL
+                // (a TX-thread hop delays it past its k1 window). Modulate + inject inline.
+                let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
+                let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                for s in &mut aw { *s *= amp / pk; }
+                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw }, ul_counter as i64);
+                pend_acks.push(pos);
             } else {
                 ack_qfull += 1;
             }
         }
-        // Drop HARQ-ACK and PUSCH bursts whose UL window has passed.
-        pend_acks.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
-        pend_ul.retain(|(pos, wave)| (ul_counter as i64) <= pos + wave.len() as i64 + slot_len);
+        // Drop HARQ-ACK and PUSCH position trackers whose UL window has passed (the actual
+        // waveforms are dropped by the InjectionTable once served); a PUCCH/PUSCH spans one slot.
+        pend_acks.retain(|&pos| (ul_counter as i64) <= pos + 2 * slot_len);
+        pend_ul.retain(|&pos| (ul_counter as i64) <= pos + 2 * slot_len);
         perf_drain_ns += perf_drain.elapsed().as_nanos() as u64;
     }
 }

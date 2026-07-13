@@ -187,6 +187,7 @@ pub fn pucch_f1_modulate_slot(
 
 /// PUCCH Format 2 resource: 1+ PRB over 1-2 symbols, carrying 3-11 UCI bits (here a
 /// 4-bit wideband CQI). DMRS occupies subcarriers 3m+1; data the remaining 8/PRB.
+#[derive(Clone, Debug)]
 pub struct PucchF2 {
     pub prb_start: usize,
     pub nof_prb: usize,
