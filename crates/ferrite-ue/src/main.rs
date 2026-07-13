@@ -758,7 +758,13 @@ fn run(cfg: Config) {
     let fill_dl = |dl: &mut ZmqSource, blk: &mut [Complex32]| {
         let mut got = 0;
         while got < blk.len() {
-            got += dl.read(&mut blk[got..]).expect("dl read");
+            // The ZMQ DL socket is non-blocking: at startup the gNB may not be producing yet
+            // (EAGAIN). Retry rather than panic — this setup read races the gNB coming up, and a
+            // hard `.expect` here was an intermittent attach failure (panic "dl read: EAGAIN").
+            match dl.read(&mut blk[got..]) {
+                Ok(n) => got += n,
+                Err(_) => std::thread::sleep(std::time::Duration::from_micros(50)),
+            }
         }
     };
 
