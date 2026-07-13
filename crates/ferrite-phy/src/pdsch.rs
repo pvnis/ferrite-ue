@@ -163,6 +163,27 @@ pub fn extract_pdsch(
     n_id: u16,
     time_first: bool,
 ) -> PdschLlrs {
+    extract_pdsch_rm(grids, sc_to_bin, alloc, cell_id, slot, dmrs_base, rnti, n_id, time_first, None)
+}
+
+/// [`extract_pdsch`] with PDSCH-to-CSI-RS rate matching (TS 38.214 §5.1.4):
+/// `rm_skip(l, k_in_rb)` marks REs occupied by ZP/NZP CSI-RS resources, which the
+/// gNB maps the PDSCH *around*. Skipping them keeps the extracted LLR sequence
+/// aligned with the transmitted codeword (the TBS is unaffected — TS 38.214's
+/// N'_RE ignores CSI-RS — only the rate-matched length E shrinks).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_pdsch_rm(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(i32) -> usize,
+    alloc: &PdschAlloc,
+    cell_id: u16,
+    slot: u32,
+    dmrs_base: usize,
+    rnti: u16,
+    n_id: u16,
+    time_first: bool,
+    rm_skip: Option<&dyn Fn(usize, usize) -> bool>,
+) -> PdschLlrs {
     let n_rb = alloc.n_rb;
     // Physical (CORESET0-relative) PRB for each local VRB (interleaved for SIB1).
     let prb: Vec<usize> = (0..n_rb).map(|v| alloc.prb_of(v)).collect();
@@ -258,6 +279,9 @@ pub fn extract_pdsch(
     // subcarrier. With 1 CDM group, the odd subcarriers of DM-RS symbols do carry
     // data (config type 1 → DM-RS on even subcarriers only).
     let is_data_re = |l: usize, k_in_rb: usize| -> bool {
+        if rm_skip.is_some_and(|f| f(l, k_in_rb)) {
+            return false; // PDSCH rate-matched around a CSI-RS RE
+        }
         if !dmrs_set.contains(&l) {
             return true;
         }

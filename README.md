@@ -93,7 +93,7 @@ Off by default; useful for measurement and for pushing the real-time envelope.
 |--------------------|---------|--------|
 | `FERRITE_PERF`     | off     | Per-slot performance reports on stderr: timeline (`[perf-ue-t0]`), RX-PHY worker (`[perf-ue-rxphy]`), HARQ-ACK lag/lateness + job drops (`[perf-ue-ack]`) |
 | `FERRITE_PACE_US`  | `500`   | Wall-clock µs/slot the radio thread paces the gNB to (real time). Larger = slower/looser |
-| `FERRITE_LEAD`     | `0`     | Slots the UL serve may run ahead of T0's DL consumption. Each slot of lead eats the k1 HARQ-ACK budget |
+| `FERRITE_LEAD`     | `-2`    | Slots the UL serve may run ahead of T0's DL consumption. Each slot of lead eats the k1 HARQ-ACK budget; negative gates the serve *behind* T0, adding ACK margin (the lockstep gNB absorbs the trail) |
 | `FERRITE_FB`       | off     | Re-enable the no-DCI brute-force PDSCH fallback (off by default: it can't be HARQ-ACKed and its worst case triggers retx storms) |
 | `FERRITE_RT`       | off     | Pin the timeline / RX-PHY / radio threads to SCHED_FIFO cores (needs `CAP_SYS_NICE` / root) |
 | `FERRITE_DRIFT`    | off     | Diagnostic: log T0-vs-serving drift and each late-ACK's position |

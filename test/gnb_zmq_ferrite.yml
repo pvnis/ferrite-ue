@@ -85,4 +85,4 @@ log:
  hex_max_size: 1024
 
 metrics:
- autostart_stdout_metrics: 0
+ autostart_stdout_metrics: 1

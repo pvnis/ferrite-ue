@@ -12,7 +12,7 @@
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
 use ferrite_phy::pdcch::{all_candidates, coreset_candidate_coherence, equalize_candidate, equalize_candidate_c1_cached, estimate_coreset_c1, Candidate, Coreset0};
-use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, pdsch_scramble_c_init, PdschAlloc};
+use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, extract_pdsch_rm, pdsch_scramble_c_init, PdschAlloc};
 use ferrite_phy::pdsch_params::mcs_params;
 use ferrite_phy::prach::{prach_ncs_unrestricted, prach_occasion_waveform, prach_preamble_seq, PrachOccasion, PrachScs, PrachSeqLen};
 use ferrite_phy::pusch::{pusch_e_len, pusch_modulate_slot, PuschAlloc};
@@ -201,7 +201,7 @@ fn try_decode_msg4(
     slot_idx: u32,
     tc: u16,
     ccch_sdu: &[u8; 6],
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     // Msg4 allocation (fallback DCI 1_0 defaults): PRB[0,21), symbols[2,14),
     // QPSK MCS7 (Qm2, R=526/1024), 2 CDM groups, non-interleaved VRB-to-PRB.
     let (rb0, nrb, qm, r) = (0usize, 21usize, 2usize, 526.0 / 1024.0);
@@ -209,9 +209,11 @@ fn try_decode_msg4(
     let tbs = tbs_from_nre(n_re, r, qm);
     let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0 , nof_cdm_groups: 2};
     // CORESET0 RB0 = CRB0 here (base 0, confirmed by the SIB1 sanity). Data RE
-    // mapping order is l,k' (time_first) for these common PDSCHs; try both.
+    // mapping order is l,k' (time_first) for these common PDSCHs; try both. The
+    // winning tf is returned — it's CELL-FIXED, so it seeds the connected-mode
+    // worker's DM-RS layout sweep (halving its cold first-decode cost).
     let dbg = std::env::var("MSG4DBG").is_ok();
-    let tb = [true, false].into_iter().find_map(|time_first| {
+    let (tb, tf_won) = [true, false].into_iter().find_map(|time_first| {
         let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, tc, cell_id, time_first);
         let mut llr = px.llrs.clone();
         descramble_llrs(&mut llr, pdsch_scramble_c_init(tc, cell_id));
@@ -226,7 +228,7 @@ fn try_decode_msg4(
         if tb.iter().all(|&b| b == 0) {
             None
         } else {
-            Some(tb)
+            Some((tb, time_first))
         }
     })?;
     let subs = parse_dl_mac_pdu(&tb);
@@ -242,7 +244,7 @@ fn try_decode_msg4(
                 println!("   DL-CCCH RRCSetup ({} bytes): {}", s.payload.len(), s.payload.iter().map(|b| format!("{b:02x}")).collect::<String>());
             }
         }
-        return Some(tb);
+        return Some((tb, tf_won));
     }
     None
 }
@@ -266,6 +268,44 @@ struct HarqDl {
 /// Pack MSB-first bits into bytes.
 fn pack_bits(bits: &[u8]) -> Vec<u8> {
     bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect()
+}
+
+/// Structurally valid DL-SCH MAC PDU: a subheader chain of known LCIDs whose lengths
+/// exactly tile the TB (padding closes it). This accepts TBs that carry an RLC
+/// SEGMENT — mid-reassembly pieces the gNB produces when its post-NACK link
+/// adaptation shrinks the grants — which `plausible_dl_tb` (full-PDU check) rejects.
+/// Without it a genuinely-decoded segment TB is discarded as a suspected false CRC
+/// pass on an unverified layout, NACKs forever, and the retx flood wedges the attach.
+/// Used only to allow an ACK (deliver=false), never to deliver content or move the
+/// layout lock, so a residual CRC16-collision false accept costs one RLC retx at most.
+fn plausible_mac_pdu(tb: &[u8]) -> bool {
+    let mut i = 0;
+    let mut subpdus = 0usize;
+    while i < tb.len() {
+        let (lcid, f) = (tb[i] & 0x3f, (tb[i] >> 6) & 1);
+        match lcid {
+            63 => return subpdus > 0, // padding: rest of the TB
+            61 => i += 2,             // TA Command CE
+            60 | 59 => i += 1,        // (Long) DRX Command
+            62 => i += 1 + 6,         // Contention Resolution Identity
+            1..=32 => {
+                let (len, hdr) = if f == 1 {
+                    let (Some(&h), Some(&l)) = (tb.get(i + 1), tb.get(i + 2)) else { return false };
+                    (((h as usize) << 8) | l as usize, 3)
+                } else {
+                    let Some(&l) = tb.get(i + 1) else { return false };
+                    (l as usize, 2)
+                };
+                i += hdr + len;
+            }
+            _ => return false,
+        }
+        if i > tb.len() {
+            return false;
+        }
+        subpdus += 1;
+    }
+    subpdus > 0
 }
 
 /// Accept a decoded TB only if it is a plausible DRB IP packet or a known DL-DCCH RRC
@@ -326,6 +366,23 @@ fn dl_pdsch_shape(short: bool) -> (usize, usize, Vec<usize>) {
     }
 }
 
+/// REs occupied by this cell's periodic CSI-RS resources (TS 38.211 §7.4.1.5), which the
+/// gNB rate-matches connected-mode PDSCH around (TS 38.214 §5.1.4). Pattern read live from
+/// the gNB's FAPI debug output (values only), 20 ms periodic — the caller gates on the
+/// CSI frame parity (see the anchor in `decode_dl`):
+///   slots 2,3: TRS, row 1, density 3, k0=1 → k ∈ {1,5,9} at symbols 4 AND 8;
+///   slot 4:    NZP row 2, density 1, k0=1 → k=1 at symbol 4;
+///              ZP row 4 (4 REs) at symbol 8 → k ∈ {4..8} (k0=4).
+/// `k` is the subcarrier within the RB (the resources span the whole 24-RB BWP, so the
+/// per-RB pattern repeats). SIB1 (slot 1) and RAR (slot 10) never land in these slots.
+fn csi_rs_rm_re(slot: u32, l: usize, k: usize) -> bool {
+    match slot {
+        2 | 3 => (l == 4 || l == 8) && k % 4 == 1,
+        4 => (l == 4 && k == 1) || (l == 8 && (4..8).contains(&k)),
+        _ => false,
+    }
+}
+
 /// The pure per-layout PDSCH work: extract at one (CDM-groups, time-first) layout,
 /// descramble, and standalone-LDPC-decode at the DCI's RV. No shared state — safe to run
 /// layouts (and fallback allocation guesses) in parallel on the rayon pool. Returns the
@@ -345,15 +402,31 @@ fn pdsch_standalone(
     cdm: usize,
     time_first: bool,
     short: bool,
+    rm_csi: bool,
+    tb_shape: (u8, usize, bool),
 ) -> (Vec<f32>, usize, Option<Vec<u8>>) {
     use ferrite_phy::coding::dlsch::dlsch_decode_single_bits;
     let (sym_start, n_sym, dmrs) = dl_pdsch_shape(short);
-    // REs: data symbols get all 12 subcarriers; with a single CDM group the DM-RS symbols
-    // also carry data on their 6 non-DM-RS subcarriers.
-    let n_re = n_rb * ((n_sym - dmrs.len()) * 12 + if cdm == 1 { dmrs.len() * 6 } else { 0 });
-    let tbs = tbs_from_nre(n_re, r, qm);
+    // TBS and base graph follow the TB's INITIAL transmission (TS 38.214 §5.1.3.2):
+    // `tb_shape` = (mcs, n_rb, short) of the first transmission of this HARQ process's
+    // TB. A retransmission may arrive with an ADAPTED (lower) MCS — the gNB's link
+    // adaptation reacts to the NACK — and a different allocation, but the TB keeps its
+    // original size. Recomputing TBS from the retx DCI (the old behaviour) made every
+    // adapted retx undecodable (wrong info length, e.g. true TBS 42 B computed as 11 B),
+    // which turned any first NACK into an unrecoverable retx storm. For a first
+    // transmission the caller passes this DCI's own (mcs, n_rb, short) — identical maths.
+    // NOTE: the CSI-RS rate matching below does NOT reduce the TBS RE count — TS 38.214's
+    // N'_RE ignores CSI-RS; only the extracted (rate-matched) LLR length E shrinks.
+    let (i_mcs, i_nrb, i_short) = tb_shape;
+    let (i_qm, i_r) = mcs_params(i_mcs);
+    let (_, i_nsym, i_dmrs) = dl_pdsch_shape(i_short);
+    let n_re = i_nrb * ((i_nsym - i_dmrs.len()) * 12 + if cdm == 1 { i_dmrs.len() * 6 } else { 0 });
+    let tbs = tbs_from_nre(n_re, i_r, i_qm as usize);
+    let _ = r;
     let alloc = PdschAlloc { rb_start, n_rb, sym_start, n_sym, dmrs_symbols: dmrs, qm, n_bwp: 0, nof_cdm_groups: cdm };
-    let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+    let skip = |l: usize, k: usize| csi_rs_rm_re(slot_idx, l, k);
+    let px = extract_pdsch_rm(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first,
+        rm_csi.then_some(&skip as &dyn Fn(usize, usize) -> bool));
     let mut llr = px.llrs;
     descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
     // Standalone decode at the DCI's RV (rv=0 hardcoded would make retransmissions undecodable).
@@ -362,8 +435,11 @@ fn pdsch_standalone(
     // TBS guess). At 40, those failures cost ~4× more, and during a retx flood (a PDSCH in
     // every slot) they push the per-job wall past the 500µs slot — the pipeline backs up
     // 10-70 slots, every HARQ-ACK misses its k1 window, and the flood feeds itself.
-    let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, rv, 10);
+    let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, i_r, qm, rv, 10);
     let tb = crc.then(|| pack_bits(&bits));
+    if std::env::var("FERRITE_DBG_SLOT").ok().and_then(|v| v.parse::<u32>().ok()) == Some(slot_idx) {
+        eprintln!("[std] slot={slot_idx} rb[{rb_start},+{n_rb}) qm={qm} rv={rv} cdm={cdm} tf={time_first} short={short} shape={tb_shape:?} tbs={tbs} e={} crc={crc}", llr.len());
+    }
     (llr, tbs, tb)
 }
 
@@ -386,81 +462,152 @@ fn try_decode_dl_srb1(
     rv: u8,
     h_id: u8,
     short: bool,
+    rm_csi: bool,
+    // (mcs, n_rb, short) of this TB's INITIAL transmission (= this DCI's own values for a
+    // first transmission) — TBS/base-graph follow it, not the retx DCI. See pdsch_standalone.
+    tb_shape: (u8, usize, bool),
+    // NDI unchanged vs the last DCI on this HARQ process ⇒ this is a retransmission.
+    is_retx: bool,
+    // Cell-fixed time-first order proven by the Msg4 decode — halves the pre-lock sweep.
+    tf_hint: Option<bool>,
+    // The gNB's typical first-transmission MCS (feeds the shape hypothesis below).
+    hyp_mcs: u8,
     lock: &mut Option<(usize, bool)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
-) -> Option<(Vec<u8>, bool)> {
+) -> Option<(Vec<u8>, bool, (u8, usize, bool))> {
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
     use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb};
     use rayon::prelude::*;
-    // The time-first RE-mapping ORDER is cell-fixed — lock it after the first success and
-    // skip the wrong order every slot thereafter (halves the extract+LDPC work, the dominant
-    // PDSCH-decode cost). The CDM-group count, though, varies per grant (small grants use 1,
-    // larger ones like RRCReconfiguration use 2), so still sweep both CDM values.
-    let layouts: Vec<(usize, bool)> = [(1usize, true), (1, false), (2, true), (2, false)]
-        .into_iter()
-        .filter(|&(_, tf)| lock.map_or(true, |(_, ltf)| tf == ltf))
-        .collect();
-    // The per-layout work (extract + descramble + standalone LDPC at the DCI's RV) is pure —
-    // run the layouts in parallel (the dominant PDSCH-decode cost, so this halves the worker's
-    // per-slot wall time with a lock, quarters it without). The decision + HARQ-combining logic
-    // below stays sequential in the original layout order, so behavior is unchanged.
-    let results: Vec<(usize, bool, Vec<f32>, usize, Option<Vec<u8>>)> = layouts
-        .par_iter()
-        .map(|&(cdm, time_first)| {
-            let (llr, tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short);
-            (cdm, time_first, llr, tbs, tb)
-        })
-        .collect();
-    for (cdm, time_first, llr, tbs, tb) in results {
-        if let Some(tb) = tb {
-            // A recognizable PDU (DRB IP / SRB1 RRC): the right layout — lock it, deliver
-            // it up the stack, and HARQ-ACK it.
-            if plausible_dl_tb(&tb) {
-                *lock = Some((cdm, time_first));
-                harq_dl.remove(&h_id); // HARQ process delivered
-                return Some((tb, true));
-            }
-            // A faithful CRC-pass on the KNOWN-GOOD (locked) layout whose content we don't
-            // deliver up the stack (a MAC CE like the Timing Advance Command, or a
-            // padding-only PDU). HARQ-ACK is a PHY-layer acknowledgement of TB reception
-            // (CRC), NOT a statement that the MAC found the content useful — so this MUST
-            // still be ACKed, else the gNB sees DTX and retransmits it forever (the ~90%
-            // DTX / retx-flood that was starving the DRB). Return ack-only (deliver=false).
-            if *lock == Some((cdm, time_first)) {
-                harq_dl.remove(&h_id);
-                return Some((tb, false));
-            }
-            continue;
+    // Sweep ALL four (CDM-groups × time-first) layouts. The time-first order is NOT
+    // cell-fixed across CDM values (verified offline on a live capture: a cdm=1 small-TB
+    // PDSCH decodes ONLY at tf=true while the cdm=2 PDSCHs of the same cell decode at
+    // tf=false) — filtering tf by a lock taken from a cdm=2 decode made every cdm=1 grant
+    // undecodable. find_map_any returns at the first winner, so the sweep's wall cost is
+    // ~one decode; the losers only occupy pool threads (cheap for the small TBs that
+    // dominate; the rare wide-band first tx pays once until its HARQ process resolves).
+    let _ = tf_hint;
+    let layouts: Vec<(usize, bool)> = vec![(1, true), (1, false), (2, true), (2, false)];
+    // The per-layout work (extract + descramble + standalone LDPC at the DCI's RV) is pure.
+    // FAST PATH: run the layouts in parallel and return on the FIRST that CRCs, WITHOUT waiting
+    // for the wrong-CDM layout to run its LDPC to full max_iter (~500µs for a wide-band BG1 TB —
+    // that wait is what made big-TB decode overrun the 500µs slot, overflow the worker queue and
+    // drop the DL burst). `find_map_any` returns as soon as any layout succeeds; the loser keeps
+    // running on its pool thread but no longer gates this decode's latency. `lock0` is a
+    // read-only copy so the parallel closure needn't borrow `&mut lock`.
+    let lock0 = *lock;
+    // Retransmission (NDI unchanged) with the layout already locked: skip the multi-layout
+    // standalone sweep — rv 1/3 are rarely self-decodable, so on failure the sweep burns 2
+    // full-max_iter LDPC passes PLUS the combine path's re-extract (~4 passes ≈ 2 slots), and
+    // during a retx flood that arrives every slot, which is exactly when the worker can least
+    // afford it (late ACKs feed the flood). The combine path below extracts the locked layout
+    // ONCE and decodes the accumulated sum — for a retx whose earlier transmissions we dropped,
+    // the sum IS this transmission alone, so nothing is lost vs the standalone attempt.
+    let retx_combine_only = is_retx && h_id != 0xff && lock0.is_some();
+    let hit = if retx_combine_only { None } else { layouts.par_iter().find_map_any(|&(cdm, time_first)| {
+        let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short, rm_csi, tb_shape);
+        let tb = tb?;
+        // Deliverable PDU (DRB IP / SRB1 RRC) on the right layout → lock it and deliver up the
+        // stack. A CRC-pass on the already-locked layout that isn't a recognizable PDU (a MAC CE
+        // / padding) is still a faithful TB reception → ACK-only (must be ACKed or the gNB DTXs
+        // and retransmits forever). A CRC-pass on some other, unlocked layout that isn't
+        // plausible is ignored.
+        if plausible_dl_tb(&tb) {
+            Some((cdm, time_first, tb, true))
+        } else if lock0 == Some((cdm, time_first)) || plausible_mac_pdu(&tb) {
+            Some((cdm, time_first, tb, false))
+        } else {
+            None
         }
-        // HARQ soft-combining: accumulate this RV's circular buffer into the per-process
-        // buffer and decode the running sum. Only for the locked (cell-fixed) layout, a
-        // real HARQ process, and a single-CB block (cb empty ⇒ multi-CB, skip). rv==0
-        // starts a new TB, so reset the buffer.
-        if h_id != 0xff && *lock == Some((cdm, time_first)) {
+    }) };
+    if let Some((cdm, time_first, tb, deliver)) = hit {
+        if deliver {
+            *lock = Some((cdm, time_first));
+        }
+        harq_dl.remove(&h_id); // HARQ process delivered / faithfully received
+        return Some((tb, deliver, tb_shape));
+    }
+    // SLOW PATH — no standalone success, i.e. a retransmission that needs HARQ soft-combining.
+    // Re-extract JUST the locked (cell-fixed) layout, accumulate this RV's circular buffer into
+    // the per-process buffer, and decode the running sum (recovering a TB no single (re)tx could).
+    // Only reached on retx, which the fast first-transmission path above should keep rare.
+    if h_id != 0xff {
+        if let Some((lcdm, ltf)) = lock0 {
+            let (llr, tbs, _tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, lcdm, ltf, short, rm_csi, tb_shape);
             let cb = dlsch_cb_llr(&llr, tbs, r, qm, rv);
-            if cb.is_empty() {
-                continue;
-            }
-            let e = harq_dl.entry(h_id).or_insert_with(|| HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
-            if e.tbs != tbs || e.qm != qm || e.acc.len() != cb.len() || rv == 0 {
-                *e = HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 };
-            }
-            for (a, &c) in e.acc.iter_mut().zip(&cb) {
-                *a += c;
-            }
-            e.n_rx += 1;
-            // Only worth an LDPC pass once ≥2 (re)transmissions have accumulated.
-            if e.n_rx >= 2 {
-                let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 10);
-                if ccrc {
-                    // Combining only runs on the locked layout, so a CRC-pass here is
-                    // faithful: ACK it always; deliver only if it's a recognizable PDU.
-                    let tb = pack_bits(&cbits);
-                    let deliver = plausible_dl_tb(&tb);
-                    harq_dl.remove(&h_id);
-                    return Some((tb, deliver));
+            if !cb.is_empty() {
+                let e = harq_dl.entry(h_id).or_insert_with(|| HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
+                if e.tbs != tbs || e.qm != qm || e.acc.len() != cb.len() || rv == 0 {
+                    *e = HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 };
                 }
+                for (a, &c) in e.acc.iter_mut().zip(&cb) {
+                    *a += c;
+                }
+                e.n_rx += 1;
+                // Combine-only retx path: always attempt the sum (n_rx==1 means the rv=0
+                // was dropped and the sum IS this transmission — the standalone attempt
+                // this path replaced). Sweep-first path: only from the 2nd reception on
+                // (the 1st already failed standalone above; re-decoding the same LLRs
+                // alone would just burn another max_iter).
+                if e.n_rx >= 2 || retx_combine_only {
+                    let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 10);
+                    if ccrc {
+                        let tb = pack_bits(&cbits);
+                        let deliver = plausible_dl_tb(&tb);
+                        harq_dl.remove(&h_id);
+                        return Some((tb, deliver, tb_shape));
+                    }
+                }
+            }
+        }
+    }
+    // Shape hypotheses: the primary shape failed every path, which happens when the
+    // per-process shape record is WRONG for this transmission. Two real cases (both
+    // observed live, both otherwise permanent):
+    //  · NDI double-toggle: we missed an entire TB generation on this process (dropped
+    //    slots), so a NEW TB reuses the recorded NDI value and is misclassified as a
+    //    retx of the OLD TB → decoded with a stale shape (e.g. TBS 336 vs actual 88).
+    //    Antidote: the DCI's OWN shape.
+    //  · Dropped-initial adaptation: the initial DCI was dropped and this is a
+    //    link-adapted retx, so the DCI's (lowered) MCS gives the wrong TBS.
+    //    Antidote: the gNB's usual first-transmission MCS on this allocation.
+    // Each extra attempt is one standalone sweep; on success the caller re-records the
+    // shape that decoded, so the process returns to the fast blind-ACK/combine paths.
+    if h_id != 0xff {
+        let mut shapes: Vec<(u8, usize, bool)> = Vec::new();
+        // The combine-only fast path above skipped the standalone sweep AND its combine
+        // extraction trusts the locked layout — which is per-grant-wrong when the CDM
+        // group count differs (observed live: a cdm=1 retx never decodes against a cdm=2
+        // lock, silently). Recover with the full-sweep standalone attempt it skipped.
+        if retx_combine_only {
+            shapes.push(tb_shape);
+        }
+        let dci_shape = (mcs, n_rb, short);
+        if dci_shape != tb_shape {
+            shapes.push(dci_shape);
+        }
+        let hyp = (hyp_mcs, n_rb, short);
+        if tb_shape.0 < hyp_mcs && hyp != dci_shape {
+            shapes.push(hyp);
+        }
+        for cand_shape in shapes {
+            let hyp_hit = layouts.par_iter().find_map_any(|&(cdm, time_first)| {
+                let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short, rm_csi, cand_shape);
+                let tb = tb?;
+                if plausible_dl_tb(&tb) {
+                    Some((cdm, time_first, tb, true))
+                } else if lock0 == Some((cdm, time_first)) || plausible_mac_pdu(&tb) {
+                    Some((cdm, time_first, tb, false))
+                } else {
+                    None
+                }
+            });
+            if let Some((cdm, time_first, tb, deliver)) = hyp_hit {
+                if deliver {
+                    *lock = Some((cdm, time_first));
+                }
+                harq_dl.remove(&h_id);
+                return Some((tb, deliver, cand_shape));
             }
         }
     }
@@ -484,7 +631,18 @@ struct DlDecoded {
 struct DlJob {
     slot_idx: u32,
     slot_start_ul: i64,
+    /// Frame parity from the monotonic slot position (slot_start_ul advances exactly one
+    /// slot_len per slot, so this survives job drops) — gates the 20 ms-periodic CSI-RS
+    /// rate matching in `decode_dl`.
+    frame_even: bool,
     crnti: u16,
+    /// The DL assignment T0's blind search found in this slot's PDCCH (rb0, nrb, mcs, k1,
+    /// C-DAI, rv, h_id, short-TDRA, ndi) — T0 searches the CORESETs once per slot for its
+    /// UL grant anyway, so the worker reuses the result instead of repeating the ~200µs
+    /// search (which was the margin that blew its 500µs budget under a retx flood).
+    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)>,
+    /// The cell-fixed time-first RE order proven by the Msg4 decode (see `msg4_tf`).
+    tf_hint: Option<bool>,
     fsh: Vec<Complex32>,
 }
 
@@ -509,10 +667,13 @@ enum TxReq {
     PucchF1 { harq: bool, bits: Vec<u8>, slot_mod20: u32, pos: i64, now: i64 },
     /// PUCCH Format 2: a CSI (wideband CQI) report.
     PucchF2 { cfg: ferrite_phy::pucch::PucchF2, bits: Vec<u8>, slot_mod20: u32, pos: i64, now: i64 },
-    /// PUSCH (+ optional multiplexed UCI HARQ-ACK).
+    /// PUSCH (+ optional multiplexed UCI HARQ-ACK). Carries the already-encoded UL-SCH:
+    /// the LDPC encode stays on T0 — moving it here (tried) added enough latency that the
+    /// waveform could land inside its serve window and garble the PUSCH; T0's encode spike
+    /// is tolerable now that the depth-2 job queue absorbs the pace-catch-up bursts.
     Pusch {
-        ulsch: Vec<u8>, alloc: PuschAlloc, slot_mod20: u32, slot_parity: usize, crnti: u16,
-        ack: Vec<u8>, beta: f32, tb_bits: usize, pos: i64, now: i64,
+        ulsch: Vec<u8>, alloc: PuschAlloc, slot_mod20: u32, slot_parity: usize,
+        crnti: u16, ack: Vec<u8>, beta: f32, tb_bits: usize, pos: i64, now: i64,
     },
 }
 
@@ -534,70 +695,45 @@ static PERF_PDSCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 fn decode_dl(
     fsh: &[Complex32],
     ofdm: &Ofdm,
-    coreset: &Coreset0,
     cell_id: u16,
     carrier_rb: usize,
     sc_to_bin: impl Fn(i32) -> usize + Copy + Sync,
-    a_len: usize,
-    ra_cand: &Candidate,
     crnti: u16,
     slot_idx: u32,
+    // The DL assignment T0's per-slot blind search found (T0 searches for its UL grant
+    // anyway; the worker reusing it removes a duplicate ~200µs search from its budget).
+    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
+    // Per-HARQ-process delivered state: h_id → NDI of the last TB this process CRC-OK'd.
+    // A later DCI with the same (h_id, NDI) is a retransmission of that TB → ACK from the
+    // DCI alone, no decode (see the short-circuit below).
+    harq_done: &mut std::collections::HashMap<u8, u8>,
+    // Per-HARQ-process INITIAL-transmission shape: h_id → (ndi, mcs, n_rb, short) recorded
+    // at first sight of each new TB. A retransmission (same NDI) keeps the TB's original
+    // TBS even when the gNB adapts the MCS/allocation down — decode with the stored shape.
+    harq_init: &mut std::collections::HashMap<u8, (u8, u8, usize, bool)>,
+    // CSI-RS frame-parity anchor: the cell's CSI-RS/TRS are 20 ms periodic (every OTHER
+    // frame) but slot_idx only spans one frame, so PDSCH-around-CSI-RS rate matching
+    // (see `csi_rs_rm_re`) applies only when this slot's frame parity matches the parity
+    // where CSI-RS was DETECTED (SINR ≫ 0 on the TRS REs — a lossless-channel discriminator).
+    // `frame_even` comes from the monotonic slot position, so job drops can't desync it.
+    frame_even: bool,
+    csi_parity: &mut Option<bool>,
+    // Cell-fixed time-first order proven by the Msg4 decode (pre-lock sweep seed).
+    tf_hint: Option<bool>,
+    // The gNB's typical first-transmission MCS, learned from successful first decodes —
+    // feeds try_decode_dl_srb1's shape hypothesis for retx whose initial DCI we dropped.
+    init_mcs_typ: &mut u8,
     dl_dmrs_lock: &mut Option<(usize, bool)>,
     backlog: bool,
 ) -> (Option<DlDecoded>, Option<u8>) {
-    let fft = ofdm.fft_size();
-    // CORESET grids: the first coreset.n_symb OFDM symbols of the slot.
-    let t_demod = std::time::Instant::now();
-    let mut cgrids = Vec::new();
-    let mut off = 0usize;
-    for l in 0..coreset.n_symb {
-        let cp = ofdm.cp_len((slot_idx as usize % 2) * 14 + l, 1);
-        cgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
-        off += cp + fft;
-    }
-    PERF_DEMOD_NS.fetch_add(t_demod.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-    let t_dci = std::time::Instant::now();
-    let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
     // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback),
-    //  short time allocation — the DCI's 1-bit TDRA row: false = symb [2,14), true = [2,8)).
-    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8, bool)> = Vec::new();
-    // PRIMARY: DCI 1_0 in CORESET0 (common SS, AL4 CCE0), reliable — same path as the RAR.
-    // Always the full [2,14) allocation (its 4-bit default-table TDRA row 0 in this cell).
-    {
-        let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset, cell_id, slot_idx, ra_cand);
-        pdcch_descramble_llr(&mut m, u32::from(cell_id));
-        if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
-            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-            let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-            allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4), false));
-        }
-    }
-    // SECONDARY: DCI 1_1 in the CORESET1 USS (DRB DL) — exhaustive blind decode off one
-    // cached channel estimate; only when no DCI 1_0 decoded (≤1 PDSCH/slot for us).
-    if allocs.is_empty() {
-        use rayon::prelude::*;
-        let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, cell_id, slot_idx);
-        // Coherence-gate first (cheap; most of the 15 candidates carry no PDCCH), then
-        // blind-decode the survivors in parallel — each equalize + polar decode is pure, and a
-        // CRC pass (RNTI-masked) is genuine whichever candidate finds it first.
-        let cands: Vec<Candidate> = all_candidates(coreset.n_cce(), &[1, 2, 4, 8])
-            .into_iter()
-            .filter(|cand| coreset_candidate_coherence(&h_reg, cand, coreset.n_symb) >= 0.5)
-            .collect();
-        if let Some(b) = cands.par_iter().find_map_any(|cand| {
-            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, cand, &h_reg);
-            pdcch_descramble_llr(&mut mm, u32::from(cell_id));
-            dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1)
-        }) {
-            const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-            let (rb0, nrb) = riv_decode(riv, carrier_rb);
-            // b[10] = the 1-bit TDRA (2-row list): row 1 is the short [2,8) allocation the
-            // scheduler uses for the TDD special slot AND for every HARQ retransmission of a
-            // TB first sent there (retx keep the TBS ⇒ keep the time allocation, in any slot).
-            allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4), b[10] == 1));
-        }
+    //  short time allocation — the DCI's 1-bit TDRA row: false = symb [2,14), true = [2,8) —
+    //  and NDI, the 1-bit new-data indicator that distinguishes a retransmission from a
+    //  fresh TB on the same HARQ process). From T0's blind search (in the DlJob).
+    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8, bool, u8)> = Vec::new();
+    if let Some(a) = dl_dci {
+        allocs.push(a);
     }
     // Fallback (no DCI decoded): brute-force rb[0,N) x MCS 0-2 (CRC + plausibility reject
     // wrong guesses). OFF by default (opt-in via FERRITE_FB=1, pre-layout-lock + no-backlog
@@ -610,49 +746,162 @@ fn decode_dl(
     if allocs.is_empty() && !backlog && dl_dmrs_lock.is_none() && std::env::var_os("FERRITE_FB").is_some() {
         for &nrb in &[2usize, 5, 13, 17, 18, 24] {
             for mcs in [0u8, 1, 2] {
-                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff, false));
+                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff, false, 0));
             }
         }
     }
-    PERF_DCI_NS.fetch_add(t_dci.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    // HARQ retransmission of a TB this process already decoded (NDI not toggled,
+    // TS 38.321 §5.3.2): the gNB is only retransmitting because our ACK didn't land.
+    // ACK straight from the DCI — skip the PDSCH demod + LDPC entirely. This collapses
+    // a retx storm at its source: each flood slot costs ~120µs of PDCCH search instead
+    // of a full decode, so the worker keeps up and every ACK lands inside its k1 window
+    // (without this, a burst of retx saturates the depth-1 job queue → dropped slots →
+    // more DTX → more retx — the self-sustaining storm that wedged the NAS attach).
+    let diag = std::env::var_os("FERRITE_DRIFT").is_some();
+    let dbg15 = diag && slot_idx == 15 && !allocs.is_empty();
+    if dbg15 {
+        eprintln!("[w15] entry allocs={allocs:?} backlog={backlog}");
+    }
+    // ONLY under backlog: with worker headroom, decode the retx fully instead. The
+    // (h_id, NDI) match is ambiguous — if we silently missed an entire TB generation
+    // on this process, a NEW TB reuses the recorded NDI value and a blind ACK here
+    // swallows it unseen (observed live: the post-SMC SecurityModeCommand blind-ACKed
+    // 5 times → never delivered → the gNB declared the UE lost). A full decode of a
+    // true retx costs ~300µs we have; of a misclassified new TB, it DELIVERS it.
+    if backlog {
+        if let [(.., k1, dai, _, h_id, _, ndi)] = allocs[..] {
+            if h_id != 0xff && harq_done.get(&h_id) == Some(&ndi) {
+                if diag {
+                    eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} k1={k1} blind-ACK (retx of delivered TB)");
+                }
+                return (Some(DlDecoded { k1, dai, bytes: Vec::new(), deliver: false }), None);
+            }
+        }
+    }
+    // Nothing to do this slot: no DL assignment, no fallback guesses, and no CSI-RS
+    // occasion to measure (slots 2-4) → skip the full-slot OFDM demod entirely.
+    if allocs.is_empty() && !matches!(slot_idx, 2..=4) {
+        // Diagnostic (FERRITE_DRIFT): a PDSCH with no DCI found means T0's blind search
+        // missed it — probe cheaply and dump the first such slot for offline analysis.
+        if diag && slot_idx != 1 && !std::path::Path::new("/tmp/ferrite_nodci.bin").exists() {
+            if let Some(grids) = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1) {
+                let probe = PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 6, dmrs_symbols: vec![2, 7], qm: 2, n_bwp: 0, nof_cdm_groups: 1 };
+                if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
+                    eprintln!("[dl] slot={slot_idx} PDSCH present, NO DCI FOUND — dumping /tmp/ferrite_nodci.bin");
+                    let mut b = Vec::with_capacity(36 + fsh.len() * 8);
+                    for v in [slot_idx, crnti as u32, 0, 0, 0, 0, 0, 0, sc_to_bin(0) as u32] {
+                        b.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for s in fsh { b.extend_from_slice(&s.re.to_le_bytes()); b.extend_from_slice(&s.im.to_le_bytes()); }
+                    let _ = std::fs::write("/tmp/ferrite_nodci.bin", &b);
+                }
+            }
+        }
+        return (None, None);
+    }
     let t_ds = std::time::Instant::now();
     let grids = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1);
     PERF_DEMOD_NS.fetch_add(t_ds.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let Some(grids) = grids else {
+        if dbg15 {
+            eprintln!("[w15] demod_slot FAILED (fsh len {})", fsh.len());
+        }
         return (None, None);
     };
+    if dbg15 {
+        eprintln!("[w15] demod ok");
+    }
     let t_pdsch = std::time::Instant::now();
     // NZP-CSI-RS measurement (row 1, k0=1, symbol 4) → wideband CQI, only in the even-frame
     // slots 2-4 where the CSI-RS is present (a high SINR gates it, no SFN tracking needed).
     let mut cqi = None;
+    let mut rm_csi = false;
     if matches!(slot_idx, 2..=4) {
         let sinr = ferrite_phy::csi::measure_csi_rs_sinr(&grids[4], |sc: usize| sc_to_bin(sc as i32), cell_id, slot_idx, 4, carrier_rb, 1);
         if sinr > 15.0 {
             cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
+            // Anchor the CSI frame parity on the solid TRS slots (2, 3 — full {1,5,9}
+            // pattern at symbol 4; slot 4 has only 1 CSI RE there so its measurement
+            // mixes PDSCH data and can't be trusted as a detector).
+            if slot_idx != 4 {
+                *csi_parity = Some(frame_even);
+            }
         }
+        // PDSCH in a CSI-RS slot of a CSI frame is rate-matched around the CSI-RS REs.
+        rm_csi = csi_parity.is_some_and(|p| p == frame_even);
     }
     // Cheap presence gate: every connected DL PDSCH starts at RB 0. Probe with the DM-RS
     // symbols COMMON to both time allocations ({2,7} — the [2,8) shape's full set, a subset
     // of [2,14)'s {2,7,11}) so a short PDSCH in any slot still passes.
     let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 6, dmrs_symbols: vec![2, 7], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
     if !present {
+        if diag && !allocs.is_empty() {
+            let (rb0, nrb, _, _, _, rv, h_id, short, ndi) = allocs[0];
+            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) short={short} PRESENT-GATE FAIL", rb0 + nrb);
+        }
         PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         return (None, cqi);
     }
     if allocs.len() == 1 {
         // Steady state (a DCI decoded): one allocation — probe, then decode with the layout
         // sweep parallelized inside try_decode_dl_srb1 (HARQ combining included).
-        let (rb0, nrb, mcs, k1, dai, rv, h_id, short) = allocs[0];
+        let (rb0, nrb, mcs, k1, dai, rv, h_id, short, ndi) = allocs[0];
+        // First sight of a new TB (NDI toggled or unknown process) → record its shape;
+        // NDI unchanged → a retransmission: TBS follows the RECORDED initial shape (the
+        // gNB adapts MCS down after a NACK but the TB keeps its size — recomputing TBS
+        // from the retx DCI made every adapted retx undecodable and storms unrecoverable).
+        let mut tb_shape = (mcs, nrb, short);
+        let mut is_retx = false;
+        if h_id != 0xff {
+            match harq_init.get(&h_id) {
+                Some(&(i_ndi, i_mcs, i_nrb, i_short)) if i_ndi == ndi => {
+                    is_retx = true;
+                    tb_shape = (i_mcs, i_nrb, i_short);
+                }
+                _ => {
+                    harq_init.insert(h_id, (ndi, mcs, nrb, short));
+                }
+            }
+        }
         let (qm, _) = mcs_params(mcs);
         let (p_start, p_nsym, p_dmrs) = dl_pdsch_shape(short);
         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: p_start, n_sym: p_nsym, dmrs_symbols: p_dmrs, qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
-            if let Some((tb, deliver)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, short, dl_dmrs_lock, harq_dl) {
+            if let Some((tb, deliver, shape_used)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, short, rm_csi, tb_shape, is_retx, tf_hint, *init_mcs_typ, dl_dmrs_lock, harq_dl) {
+                if h_id != 0xff {
+                    // Mark (h_id, NDI) delivered so its retransmissions ACK without decode,
+                    // and record the shape that actually decoded (the hypothesis may have
+                    // corrected a wrong first-sight-at-retx shape).
+                    harq_done.insert(h_id, ndi);
+                    harq_init.insert(h_id, (ndi, shape_used.0, shape_used.1, shape_used.2));
+                    // Learn the gNB's first-transmission MCS from genuine first decodes.
+                    if !is_retx && shape_used == tb_shape && mcs >= 4 {
+                        *init_mcs_typ = mcs;
+                    }
+                }
                 PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
+            } else if diag {
+                eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} short={short} DECODE FAIL", rb0 + nrb);
+                // One-shot: dump the failing slot's samples + params for offline analysis
+                // (crates/ferrite-ue/src/bin — the pdsch_fail tool).
+                if !std::path::Path::new("/tmp/ferrite_fail.bin").exists() {
+                    let mut b = Vec::with_capacity(28 + fsh.len() * 8);
+                    for v in [slot_idx, crnti as u32, rb0 as u32, nrb as u32, mcs as u32, rv as u32, h_id as u32, u32::from(short), sc_to_bin(0) as u32] {
+                        b.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for s in fsh { b.extend_from_slice(&s.re.to_le_bytes()); b.extend_from_slice(&s.im.to_le_bytes()); }
+                    let _ = std::fs::write("/tmp/ferrite_fail.bin", &b);
+                    eprintln!("[dl] dumped failing slot to /tmp/ferrite_fail.bin");
+                }
             }
+        } else if diag {
+            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) short={short} PROBE FAIL", rb0 + nrb);
         }
     } else {
+        if diag && allocs.is_empty() {
+            eprintln!("[dl] slot={slot_idx} PDSCH present, NO DCI FOUND");
+        }
         // Fallback (no DCI decoded): brute-force guesses, h_id=0xff ⇒ no HARQ combining, so the
         // whole (guess × layout) grid is pure — flat-parallel sweep, first hit in guess order
         // wins (this was the worker's multi-ms spike: up to 18 probes + serial LDPC passes).
@@ -673,7 +922,7 @@ fn decode_dl(
             if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric <= 0.9 {
                 return None;
             }
-            let (_llr, _tbs, tb) = pdsch_standalone(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, qm as usize, r, 0, cdm, tf, false);
+            let (_llr, _tbs, tb) = pdsch_standalone(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, qm as usize, r, 0, cdm, tf, false, rm_csi, (mcs, nrb, false));
             let tb = tb?;
             if plausible_dl_tb(&tb) {
                 return Some((tb, true, Some((cdm, tf))));
@@ -890,11 +1139,13 @@ fn run(cfg: Config) {
         let frame_len_i = frame_len as i64;
         // How many slots the UL serve may run ahead of T0's DL consumption. Every slot of lead
         // eats directly into the k1=4 HARQ-ACK budget (an ACK produced at T0 must land at a
-        // position the radio hasn't served yet), so default 0: serving trails T0 by up to a
-        // block, the gNB's rx_to_tx window still keeps ~1 slot of DL buffered ahead of T0, and
-        // the ACK margin is ~k1-2.5 slots. (2 completes the attach too but leaves <1 slot of
-        // ACK margin — ping collapses on any decode jitter.)
-        let lead: i64 = std::env::var("FERRITE_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0) * slot_len;
+        // position the radio hasn't served yet); NEGATIVE lead gates the serve BEHIND T0,
+        // handing that many extra slots of margin to every ACK/PUSCH the pipeline produces.
+        // Default -2: the ZMQ-lockstep gNB tolerates the serve trailing (its rx_to_tx window
+        // exists for exactly this), and the 2-slot cushion absorbs the decode+drain jitter
+        // that otherwise put k1=4 HARQ-ACKs behind the served position under load (verified:
+        // late(missed-window) fell from ~100-200 per attach to 0). Positive values re-tighten.
+        let lead: i64 = std::env::var("FERRITE_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(-2) * slot_len;
         // Wall-clock µs/slot the serve paces to (default 500 = real time). Caps the gNB's rate so
         // its scheduler doesn't free-run past what it can fill (empty grants → decode collapse).
         let pace_us: f64 = std::env::var("FERRITE_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0);
@@ -994,8 +1245,11 @@ fn run(cfg: Config) {
     let mut ack_book: std::collections::HashMap<i64, (u32, [Option<u8>; 4])> = std::collections::HashMap::new();
     // A UL grant decoded this slot, modulated only AFTER the DL decode so a HARQ-ACK
     // whose UL slot coincides with this PUSCH can be multiplexed onto it (UCI-on-PUSCH)
-    // instead of a PUCCH: (UL pos, PUSCH slot, rate-matched UL-SCH, alloc, TB bits).
-    let mut pending_pusch: Option<(i64, i64, Vec<u8>, PuschAlloc, usize)> = None;
+    // instead of a PUCCH: (UL pos, PUSCH slot, rate-matched UL-SCH, alloc, TB bits,
+    // UL T-DAI). The T-DAI is Some(0..=3) for a DCI 0_1 grant (it carries the 2-bit
+    // total-DAI that sizes the UCI HARQ-ACK codebook even if the UE dropped the PDSCH),
+    // None for a DCI 0_0 fallback grant (no DAI field).
+    let mut pending_pusch: Option<(i64, i64, Vec<u8>, PuschAlloc, usize, Option<u8>)> = None;
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -1032,6 +1286,19 @@ fn run(cfg: Config) {
                 let pk = w.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                 for s in w.iter_mut() { *s *= amp / pk; }
             };
+            // Warm-up: fault in the modulator paths (FFT plans, gold sequences, buffers)
+            // before the first real request — a cold first PUSCH modulate arrived at the
+            // injection table after the radio had begun serving its block, so the gNB saw
+            // a partial waveform (sinr −24 dB → crc=KO) and the lost RLC STATUS cost an
+            // RLC recovery round out of the AMF's 3 s registration budget, every attach.
+            {
+                let walloc = PuschAlloc { rb_start: 0, n_rb: 4, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 0 };
+                let wul = dlsch_encode_single(&vec![0u8; 256], pusch_e_len(&walloc), 0.245, 2, 0);
+                let _ = ferrite_phy::pusch::pusch_modulate_slot_uci(&ofdm, &wul, &walloc, cell_id, 19, 1, 0x4601, center_hz, fs, &[1], 20.0, 256);
+                let _ = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg_t, &[1], 7, center_hz, fs);
+                let wf2 = ferrite_phy::pucch::PucchF2 { prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2, rnti: 0x4601, n_id: cell_id, n_id0: cell_id, carrier_rb };
+                let _ = ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &wf2, &[1, 0, 1, 0], 8, center_hz, fs);
+            }
             while let Ok(req) = tx_req_rx.recv() {
                 let (mut wave, pos, now) = match req {
                     TxReq::PucchF1 { harq, bits, slot_mod20, pos, now } => {
@@ -1054,6 +1321,11 @@ fn run(cfg: Config) {
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
+    // The cell-fixed data RE-mapping order (time-first) proven by the Msg4 decode —
+    // seeds the worker's DM-RS layout sweep so its first connected decode doesn't
+    // burn the full 4-layout cold sweep (~2 ms → 3-4 dropped slots right at the
+    // Auth-Request burst, whose lost initial DCIs made the retx storm unrecoverable).
+    let mut msg4_tf: Option<bool> = None;
     let mut pend_ul: Vec<i64> = Vec::new(); // in-flight PUSCH burst positions (fill every grant)
     // Connected-mode UL: a queue of RRC PDUs to send on successive grants
     // (RRCSetupComplete, then the AuthenticationResponse, …), with a shared
@@ -1097,19 +1369,19 @@ fn run(cfg: Config) {
     // stall the ZMQ I/O. The worker owns the only cross-slot decode state (the HARQ
     // soft-combining buffers `harq_dl` and the cell-fixed DM-RS layout `dl_dmrs_lock`) and
     // processes slots strictly in order, keeping the accumulator coherent.
-    // Job queue depth 1 (was 8, then 2): the queue depth directly adds to the decode→ACK
-    // pipeline lag (each queued job is a slot the ACK waits before it's produced), and that
-    // lag must beat the gNB's MINIMUM k1 (=4) or the HARQ-ACK lands after the UL slot the gNB
-    // pulls it in → DTX → retransmit → the flood refills the queue → self-sustaining storm.
-    // Measured lag ≈ read-ahead burst (~2) + queue + drain; at depth 2 that put k1=4/5 ACKs
-    // right at/behind the serving position (~50% late = the gNB's ~50% DL nok). Depth 1 shaves
-    // a slot so the low-k1 ACKs land in time. Decode is ~160µs now (was 5ms when depth 8 made
-    // sense), so a shallow queue costs almost nothing and a dropped burst slot is retransmitted.
-    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(1);
+    // Job queue depth 2. The queue depth adds to the decode→ACK pipeline lag, which must
+    // beat the gNB's MINIMUM k1 (=4) — at ~500µs/job (decode incl. its own DCI search) each
+    // queue level cost a FULL slot of lag, so depth 2 put k1=4/5 ACKs behind the serving
+    // position (~25-50% late) and depth had to stay 1. NOW a job is ~26µs steady / ~300µs
+    // under a retx flood (T0's search result rides in the DlJob; retx blind-ACK / combine-
+    // only paths), so a queued job adds ~0.3 slots — and the depth-2 slack is what absorbs
+    // the attach-phase DL burst (7 fresh pre-lock decodes back to back at ~600µs each),
+    // whose depth-1 drops lost initial DCIs, corrupted the shared UL-slot ACK bundles, and
+    // piled the codebook into PUCCH-F2 territory the UE can't transmit (the storm seed).
+    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(2);
     let (dl_res_tx, dl_res_rx) = ferrite_ue::rt::bounded::<DlResult>(8);
     {
-        let (w_coreset, w_cell, w_carrier, w_alen, w_racand, w_firstsc) =
-            (coreset, acq.cell_id, carrier_rb, a_len, ra_cand.clone(), first_sc);
+        let (w_cell, w_carrier, w_alen, w_firstsc) = (acq.cell_id, carrier_rb, a_len, first_sc);
         std::thread::Builder::new()
             .name("ferrite-rxphy".into())
             .spawn(move || {
@@ -1127,7 +1399,71 @@ fn run(cfg: Config) {
                 let ofdm = Ofdm::new(fft);
                 let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
                 let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
+                let mut harq_done: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
+                let mut harq_init: std::collections::HashMap<u8, (u8, u8, usize, bool)> = std::collections::HashMap::new();
+                let mut csi_parity: Option<bool> = None;
+                let mut init_mcs_typ: u8 = 9; // the gNB's observed first-tx MCS at top CQI
                 let mut dl_dmrs_lock: Option<(usize, bool)> = None;
+                // Warm-up: fault in the whole decode path (LDPC lifting tables, FFT plans,
+                // channel-estimate/equalize buffers, allocator arenas, the pool's threads)
+                // before the first real job — the first cold decode measured ~2.2 ms (4+
+                // slots), which dropped the next slots' jobs right at the start of the NAS
+                // phase and could seed a retx storm. Zero-LLR blocks exercise the BG2
+                // (small-TB) and BG1 (wide-band) LDPC paths to a CRC fail; full decode_dl
+                // passes on noise slots exercise the OFDM demod + blind DCI search + probes.
+                {
+                    use ferrite_phy::coding::dlsch::dlsch_decode_single_bits;
+                    let t = std::time::Instant::now();
+                    pool.install(|| {
+                        use rayon::prelude::*;
+                        [(3000usize, 800usize), (13000, 6200)].par_iter().for_each(|&(n, tbs)| {
+                            let _ = dlsch_decode_single_bits(&vec![0.1f32; n], tbs, 0.5, 2, 0, 10);
+                        });
+                    });
+                    // The polar (DCI) decoder never runs on noise slots — the DM-RS coherence
+                    // gate filters noise candidates first — so warm it directly at every
+                    // aggregation-level LLR length and payload size used live.
+                    for e_llr in [108usize, 216, 432, 864] {
+                        for a in [w_alen, 36, 40] {
+                            let _ = dci_decode(&vec![0.1f32; e_llr], 0x4601, a);
+                        }
+                    }
+                    let slot_samples: usize = (0..14).map(|l| ofdm.cp_len(l, 1) + fft).sum();
+                    let mut seed = 0x2545f491u32;
+                    let noise: Vec<Complex32> = (0..slot_samples).map(|_| {
+                        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                        Complex32::new((seed >> 16) as f32 / 65536.0 - 0.5, (seed & 0xffff) as f32 / 65536.0 - 0.5) * 0.02
+                    }).collect();
+                    for warm_slot in [2u32, 7, 11] {
+                        let _ = pool.install(|| decode_dl(&noise, &ofdm, w_cell, w_carrier, sc_to_bin, 0x4601, warm_slot, None, &mut harq_dl, &mut harq_done, &mut harq_init, true, &mut csi_parity, None, &mut init_mcs_typ, &mut dl_dmrs_lock, false));
+                    }
+                    // The gates above never reach the real PDSCH path on noise (no DCI, no
+                    // DM-RS), so run pdsch_standalone directly at the shapes the attach
+                    // actually sees — faulting in extract_pdsch's channel-estimate buffers,
+                    // the DM-RS gold sequences, and the LDPC lifting tables at the REAL
+                    // block sizes (they're per-Z: warming one TBS leaves the others cold —
+                    // the first live decode still measured ~1.9 ms before this).
+                    if let Some(grids) = demod_slot(&ofdm, &noise, 0, 0, 1) {
+                        pool.install(|| {
+                            use rayon::prelude::*;
+                            let shapes: Vec<(usize, u8, usize)> = [(21usize, 9u8), (4, 9), (24, 16), (2, 2), (13, 9)]
+                                .iter().flat_map(|&(nrb, mcs)| [(nrb, mcs, 1usize), (nrb, mcs, 2)]).collect();
+                            shapes.par_iter().for_each(|&(nrb, mcs, cdm)| {
+                                let (qm, r) = mcs_params(mcs);
+                                let _ = pdsch_standalone(&grids, sc_to_bin, w_cell, 2, 0x4601, 0, nrb, qm as usize, r, 0, cdm, true, false, false, (mcs, nrb, false));
+                            });
+                        });
+                    }
+                    // The warm-up must leave no decode state behind.
+                    harq_dl.clear();
+                    harq_done.clear();
+                    harq_init.clear();
+                    csi_parity = None;
+                    dl_dmrs_lock = None;
+                    if std::env::var_os("FERRITE_PERF").is_some() {
+                        eprintln!("[perf-ue-rxphy] decoder warm-up: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
                 // [perf] per-slot RX-PHY timing: decode_dl total vs its OFDM-demod (lower PHY).
                 use std::sync::atomic::Ordering::Relaxed;
                 let (mut w_n, mut w_decode_ns, mut w_ok) = (0u64, 0u64, 0u64);
@@ -1142,10 +1478,10 @@ fn run(cfg: Config) {
                         w_wall_ns += (now - l).as_nanos() as u64;
                     }
                     w_last = Some(now);
-                    let DlJob { slot_idx, slot_start_ul, crnti, fsh } = job;
+                    let DlJob { slot_idx, slot_start_ul, frame_even, crnti, dl_dci, tf_hint, fsh } = job;
                     let t = std::time::Instant::now();
                     let backlog = !dl_job_rx.is_empty(); // jobs waiting → shed the opportunistic work
-                    let (decoded, cqi) = pool.install(|| decode_dl(&fsh, &ofdm, &w_coreset, w_cell, w_carrier, sc_to_bin, w_alen, &w_racand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock, backlog));
+                    let (decoded, cqi) = pool.install(|| decode_dl(&fsh, &ofdm, w_cell, w_carrier, sc_to_bin, crnti, slot_idx, dl_dci, &mut harq_dl, &mut harq_done, &mut harq_init, frame_even, &mut csi_parity, tf_hint, &mut init_mcs_typ, &mut dl_dmrs_lock, backlog));
                     let job_ns = t.elapsed().as_nanos() as u64;
                     w_decode_ns += job_ns;
                     w_max_ns = w_max_ns.max(job_ns);
@@ -1227,6 +1563,15 @@ fn run(cfg: Config) {
             let el = t0_start.elapsed();
             if el < target {
                 std::thread::sleep(target - el);
+            } else if el > target + std::time::Duration::from_secs_f64(t0_pace) {
+                // Behind by more than a slot (a slow iteration: UL-SCH encode, NAS crypto,
+                // a print). Do NOT sprint to catch up — back-to-back iterations dispatch
+                // back-to-back DL jobs, overflow the depth-1 worker queue, and the dropped
+                // slots corrupt their shared UL-slot ACK bundles (→ retx storm). Re-anchor
+                // the pace baseline instead: the wall clock slips by the deficit, which the
+                // ZMQ-lockstep gNB (throttled by our reads/serves) absorbs harmlessly.
+                t0_start = std::time::Instant::now();
+                t0_n = 0;
             }
             t0_n += 1;
         } else {
@@ -1311,44 +1656,94 @@ fn run(cfg: Config) {
         // the payload size and the search space differ. CORESET1 spans the whole
         // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
         const DCI_0_1_SIZE: usize = 36;
+        const DCI_1_1_SIZE: usize = 40;
+        // The DL assignment found by T0's blind search this slot, shipped to the RX-PHY
+        // worker in its DlJob: (rb0, nrb, mcs, k1, C-DAI, rv, h_id, short-TDRA, ndi).
+        let mut dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)> = None;
         if let Some(crnti) = connected {
-            // Decode the UL grant EVERY slot and fill it: an unfilled grant decodes
-            // as noise (crc=KO) and a burst of KOs makes the gNB collapse UL MCS (and
-            // eventually trips "MAC max KOs" RLF). The gNB grants back-to-back to drain
-            // a buffer, so keep a QUEUE of in-flight PUSCH bursts, not just one.
-            if pend_ul.len() < 16 {
+            // ONE blind search covers BOTH directions: the UL grant (DCI 0_0/0_1, acted
+            // on below — an unfilled grant decodes as noise (crc=KO) and a burst of KOs
+            // collapses the gNB's UL MCS / trips RLF) and the DL assignment (DCI 1_0/1_1,
+            // handed to the RX-PHY worker so it doesn't repeat this ~200µs search per
+            // slot: under a retx flood that duplicate was the margin that pushed the
+            // worker past the 500µs slot budget → dropped jobs → the flood fed itself).
+            let mut ul_bits: Option<Vec<u8>> = None;
+            {
+                let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
+                // CORESET0 CSS (AL4 CCE0): fallback DCI 0_0 (UL) or 1_0 (DL).
                 let c0 = Candidate { agg_level: 4, cces: (0..4).collect() };
                 let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &c0);
                 pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
-                let dci = dci_decode(&m, crnti, a_len).or_else(|| {
-                    // CORESET1 search space: DCI 0_1 (non-interleaved). Blind-decode
-                    // every AL1/2/4/8 candidate — with CQI feedback the gNB uses AL1 at
-                    // Y=0 CCEs the rnti-hashed USS wouldn't cover. Scrambling n_ID/n_RNTI
-                    // = cell_id/0.
+                if let Some(b) = dci_decode(&m, crnti, a_len) {
+                    if b[0] == 0 {
+                        ul_bits = Some(b);
+                    } else {
+                        // DL 1_0: always the full [2,14) shape (4-bit default-table TDRA
+                        // row 0 in this cell), k1 = 3-bit field + 1, NDI at b[20].
+                        let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                        let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
+                        dl_dci = Some((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4), false, b[20]));
+                    }
+                }
+                // CORESET1 USS sweep for whichever direction is still missing: DCI 0_1
+                // (36 b, UL) and 1_1 (40 b, DL) on the same equalized candidate LLRs.
+                // Coherence-gated; with CQI feedback the gNB uses AL1 at Y=0 CCEs the
+                // rnti-hashed USS wouldn't cover, so all AL1/2/4/8 candidates are tried.
+                if ul_bits.is_none() || dl_dci.is_none() {
                     let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
-                    all_candidates(coreset.n_cce(), &[1, 2, 4, 8])
-                        .into_iter()
-                        // Gate on DM-RS coherence: skip the equalize + polar decode for the
-                        // candidates (most of them) that carry no PDCCH.
-                        .filter(|cand| coreset_candidate_coherence(&h_reg, cand, coreset.n_symb) >= 0.5)
-                        .find_map(|cand| {
-                            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
-                            pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
-                            dci_decode(&mm, crnti, DCI_0_1_SIZE)
-                        })
-                });
-                if let Some(bits) = dci {
+                    for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
+                        if ul_bits.is_some() && dl_dci.is_some() {
+                            break;
+                        }
+                        if coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb) < 0.5 {
+                            continue;
+                        }
+                        let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
+                        pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
+                        if ul_bits.is_none() {
+                            if let Some(b) = dci_decode(&mm, crnti, DCI_0_1_SIZE).filter(|b| b[0] == 0) {
+                                ul_bits = Some(b);
+                                continue;
+                            }
+                        }
+                        if dl_dci.is_none() {
+                            if let Some(b) = dci_decode(&mm, crnti, DCI_1_1_SIZE).filter(|b| b[0] == 1) {
+                                // DL 1_1: b[10] = 1-bit TDRA (row 1 = the short [2,8)
+                                // allocation, kept by HARQ retx of a TB first sent there),
+                                // k1 from the dl-DataToUL-ACK list, NDI at b[16].
+                                const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                                let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                                let (rb0, nrb) = riv_decode(riv, carrier_rb);
+                                dl_dci = Some((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4), b[10] == 1, b[16]));
+                            }
+                        }
+                    }
+                }
+            }
+            // Fill the UL grant (queue-bounded: the gNB grants back-to-back to drain
+            // a buffer, so keep a QUEUE of in-flight PUSCH bursts, not just one).
+            if pend_ul.len() < 16 {
+                if let Some(bits) = ul_bits {
                     // UL grant. Both formats share id(1) + FDRA(9, type-1 RIV/N=24)
                     // at bits[1..10]; after that DCI 0_0 has time(4)+hop(1) then MCS,
                     // while DCI 0_1 (this config) has only a 3-bit time field and no
                     // hop flag, so its MCS/NDI sit 2 bits earlier. Verified live vs the
                     // gNB's scheduled grant (MCS/RV/HARQ aligned).
-                    if bits[0] == 0 {
-                        let mcs_lo = if bits.len() == DCI_0_1_SIZE { 13 } else { 15 };
+                    {
+                        let is_0_1 = bits.len() == DCI_0_1_SIZE;
+                        let mcs_lo = if is_0_1 { 13 } else { 15 };
                         let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
                         let mcs = bits[mcs_lo..mcs_lo + 5].iter().fold(0u8, |a, &b| a << 1 | b);
                         let ndi = bits[mcs_lo + 5];
+                        // DCI 0_1 layout: id(1) fdra(9) tdra(3) mcs(5) ndi(1) rv(2)
+                        // harq(4) → 1st-DAI (2 bits) at bits[25..27]. This UL total-DAI
+                        // = (HARQ-ACK bit count − 1) mod 4, so it lets us size the
+                        // UCI-on-PUSCH codebook (below) from the grant itself — robust to
+                        // a dropped DL PDSCH (we NACK-pad) instead of sizing purely from
+                        // our own decode. DCI 0_0 has no DAI field.
+                        let t_dai: Option<u8> = is_0_1
+                            .then(|| bits[25..27].iter().fold(0u8, |a, &b| a << 1 | b));
                         let (qm, r) = mcs_params(mcs);
                         let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
                         let n_data_sym = 14 - 3;
@@ -1437,7 +1832,7 @@ fn run(cfg: Config) {
                         }
                         // Modulate after the DL decode (below), so a co-scheduled HARQ-ACK
                         // can be multiplexed onto this PUSCH.
-                        pending_pusch = Some((pos, m5_slot, ulsch, m5_alloc, tbs_bytes * 8));
+                        pending_pusch = Some((pos, m5_slot, ulsch, m5_alloc, tbs_bytes * 8, t_dai));
                     }
                 }
             }
@@ -1535,8 +1930,14 @@ fn run(cfg: Config) {
         // 8 DL symbols — the gNB schedules PDSCH there too, e.g. the RRC SMC).
         if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=6) {
             let crnti = connected.unwrap();
-            if dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, crnti, fsh: fsh.clone() }).is_err() {
+            if std::env::var_os("FERRITE_DRIFT").is_some() && slot_idx == 15 && connected.is_some() {
+                eprintln!("[t0-dl] slot=15 t0={slot_start_ul} dl_dci={dl_dci:?}");
+            }
+            if dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, frame_even: (slot_start_ul / slot_len / 20) % 2 == 0, crnti, dl_dci, tf_hint: msg4_tf, fsh: fsh.clone() }).is_err() {
                 job_drops += 1; // queue full: the worker is behind — this DL slot is never decoded
+                if std::env::var_os("FERRITE_DRIFT").is_some() && job_drops <= 40 {
+                    eprintln!("[job-drop] #{job_drops} slot={slot_idx} t0={slot_start_ul}");
+                }
             }
         }
         // Drain completed decode results and run the RRC/NAS/MAC stack on each. slot_idx /
@@ -1616,12 +2017,15 @@ fn run(cfg: Config) {
                                 // split across RLC AM segments) — don't advance the window.
                                 let Some(rrc) = rrc_opt else { break };
                                 // On a NEW, fully-reassembled DL RLC SDU, arm an RLC STATUS
-                                // ACK so the gNB advances (don't re-arm on retransmissions,
-                                // which would starve our own UL data).
-                                if rlc_sn >= dl_rlc_next {
-                                    dl_rlc_next = rlc_sn + 1;
-                                    pending_status = Some(dl_rlc_next);
-                                }
+                                // ACK so the gNB advances. Re-arm on RE-DELIVERIES too: the
+                                // peer only re-delivers an SN because our previous STATUS was
+                                // lost (e.g. that PUSCH CRC-failed), so withholding it wedges
+                                // its RLC AM window on this SN forever (observed live: the
+                                // Auth Request re-delivered for 40 s while the NAS was stuck).
+                                // The gNB stops re-delivering as soon as one STATUS lands, so
+                                // this can't starve our own UL for more than a grant or two.
+                                dl_rlc_next = dl_rlc_next.max(rlc_sn + 1);
+                                pending_status = Some(dl_rlc_next);
                                 let dtype = dl_dcch_type(&rrc);
                                 println!("★ DL RRC (slot {slot_idx} rlcSN {rlc_sn}): c1={dtype:?} {}",
                                     rrc.iter().map(|b| format!("{b:02x}")).collect::<String>());
@@ -1785,7 +2189,10 @@ fn run(cfg: Config) {
                 if metric > 0.9 {
                     let cands: Vec<(u16, i64)> = recent_tc.iter().rev().copied().collect();
                     for (tcx, toffx) in cands {
-                        if try_decode_msg4(&grids, sc_to_bin, acq.cell_id, slot_idx, tcx, &ccch_sdu).is_some() {
+                        if let Some((_tb4, tf4)) = try_decode_msg4(&grids, sc_to_bin, acq.cell_id, slot_idx, tcx, &ccch_sdu) {
+                            // The data RE-mapping order (time-first) is cell-fixed: seed the
+                            // RX-PHY worker's layout sweep with the one Msg4 just proved.
+                            msg4_tf = Some(tf4);
                             msg4_wins += 1;
                             if locked_toff != Some(toffx) {
                                 locked_toff = Some(toffx);
@@ -1895,11 +2302,30 @@ fn run(cfg: Config) {
         // HARQ-ACK is due at this PUSCH's UL slot, multiplex it onto the PUSCH
         // (UCI-on-PUSCH) — the gNB expects it there, not on the PUCCH — and remove it
         // from the codebook so it isn't also sent on a PUCCH.
-        if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits)) = pending_pusch.take() {
-            let ack: Vec<u8> = ack_book.remove(&pos).map(|(_, book)| {
-                let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
-                (0..size).map(|i| book[i].unwrap_or(0)).collect()
-            }).unwrap_or_default();
+        if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits, t_dai)) = pending_pusch.take() {
+            let book = ack_book.remove(&pos).map(|(_, b)| b);
+            let book_nonempty = book.is_some_and(|b| b.iter().any(Option::is_some));
+            let ack: Vec<u8> = match t_dai {
+                // DCI 0_1: size the HARQ-ACK codebook from the grant's UL total-DAI,
+                // not from our own decode, so a dropped/late PDSCH still muxes the exact
+                // number of bits the gNB reads (NACK for the ones we missed) instead of
+                // shifting the PUSCH data REs → CRC KO. T-DAI = (count−1) mod 4:
+                //   0→1  1→2  2→3   3→ 0 (empty codebook) or the wrap to 4 when a
+                // decoded ACK is actually due here. During attach the count is only ever
+                // 0 or 1, so 3 = "no HARQ-ACK on this PUSCH".
+                Some(v) => {
+                    let n = match v { 0 => 1, 1 => 2, 2 => 3, _ => if book_nonempty { 4 } else { 0 } };
+                    if std::env::var_os("FERRITE_DRIFT").is_some() {
+                        eprintln!("[uci] pos={pos} t_dai={v} n_ack={n} book_nonempty={book_nonempty}");
+                    }
+                    (0..n).map(|i| book.and_then(|b| b.get(i).copied().flatten()).unwrap_or(0)).collect()
+                }
+                // DCI 0_0 fallback grant (no DAI): size from our decoded codebook.
+                None => book.map(|b| {
+                    let size = b.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
+                    (0..size).map(|i| b[i].unwrap_or(0)).collect()
+                }).unwrap_or_default(),
+            };
             const BETA_HARQ: f32 = 20.0; // beta_offset_harq_ack index 11
             let crnti = connected.unwrap_or(0);
             let _ = tx_req_tx.try_send(TxReq::Pusch {
