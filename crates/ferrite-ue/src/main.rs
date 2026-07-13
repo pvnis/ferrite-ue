@@ -215,7 +215,7 @@ fn try_decode_msg4(
         let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, tc, cell_id, time_first);
         let mut llr = px.llrs.clone();
         descramble_llrs(&mut llr, pdsch_scramble_c_init(tc, cell_id));
-        let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+        let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 10);
         if dbg {
             eprintln!("  [msg4] tc={tc:#06x} slot {slot_idx} tf={time_first} dmrs={:.2} conv={conv} crc={crc}", px.dmrs_metric);
         }
@@ -309,6 +309,64 @@ fn parse_ta_command_ce(tb: &[u8]) -> Option<u8> {
     None
 }
 
+/// Time-domain shape of a connected-mode DL PDSCH: (sym_start, n_sym, DM-RS symbols),
+/// selected by the DCI's 1-bit time-domain-resource-assignment (the cell's TDA list has
+/// exactly two rows). Row 0 = the full [2,14) with DM-RS {2,7,11}; row 1 = [2,8) with
+/// DM-RS {2,7} (both from the gNB's scheduler log dl_dmrs_symb_pos). The short row is
+/// used in the TDD special slot (slot 6 — only 8 DL symbols) for FIRST transmissions,
+/// but HARQ retransmissions of such a TB keep the short shape in NORMAL slots too (same
+/// TBS ⇒ same allocation), so the shape must come from the DCI, not the slot index:
+/// inferring it from the slot wedged the attach whenever the slot-6 first TX was missed
+/// (every retx then extracted as 12-symbol and could never CRC → registration timeout).
+fn dl_pdsch_shape(short: bool) -> (usize, usize, Vec<usize>) {
+    if short {
+        (2, 6, vec![2, 7])
+    } else {
+        (2, 12, vec![2, 7, 11])
+    }
+}
+
+/// The pure per-layout PDSCH work: extract at one (CDM-groups, time-first) layout,
+/// descramble, and standalone-LDPC-decode at the DCI's RV. No shared state — safe to run
+/// layouts (and fallback allocation guesses) in parallel on the rayon pool. Returns the
+/// descrambled LLRs + TBS (for the caller's HARQ combining) and the TB when CRC passes.
+#[allow(clippy::too_many_arguments)]
+fn pdsch_standalone(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(i32) -> usize + Copy + Sync,
+    cell_id: u16,
+    slot_idx: u32,
+    crnti: u16,
+    rb_start: usize,
+    n_rb: usize,
+    qm: usize,
+    r: f64,
+    rv: u8,
+    cdm: usize,
+    time_first: bool,
+    short: bool,
+) -> (Vec<f32>, usize, Option<Vec<u8>>) {
+    use ferrite_phy::coding::dlsch::dlsch_decode_single_bits;
+    let (sym_start, n_sym, dmrs) = dl_pdsch_shape(short);
+    // REs: data symbols get all 12 subcarriers; with a single CDM group the DM-RS symbols
+    // also carry data on their 6 non-DM-RS subcarriers.
+    let n_re = n_rb * ((n_sym - dmrs.len()) * 12 + if cdm == 1 { dmrs.len() * 6 } else { 0 });
+    let tbs = tbs_from_nre(n_re, r, qm);
+    let alloc = PdschAlloc { rb_start, n_rb, sym_start, n_sym, dmrs_symbols: dmrs, qm, n_bwp: 0, nof_cdm_groups: cdm };
+    let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
+    let mut llr = px.llrs;
+    descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
+    // Standalone decode at the DCI's RV (rv=0 hardcoded would make retransmissions undecodable).
+    // max_iter 10 (was 40): the LDPC early-exits on success (1-3 iters on this clean channel),
+    // so max_iter is only ever burned in full by decodes that CANNOT succeed (wrong layout/RV/
+    // TBS guess). At 40, those failures cost ~4× more, and during a retx flood (a PDSCH in
+    // every slot) they push the per-job wall past the 500µs slot — the pipeline backs up
+    // 10-70 slots, every HARQ-ACK misses its k1 window, and the flood feeds itself.
+    let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, rv, 10);
+    let tb = crc.then(|| pack_bits(&bits));
+    (llr, tbs, tb)
+}
+
 /// Decode one DL PDSCH into its transport block. `rv`/`h_id` come from the DCI
 /// (0xff `h_id` = fallback guess, no combining). On top of a standalone decode at the
 /// correct RV, HARQ soft-combining accumulates each (re)transmission's circular-buffer
@@ -318,7 +376,7 @@ fn parse_ta_command_ce(tb: &[u8]) -> Option<u8> {
 #[allow(clippy::too_many_arguments)]
 fn try_decode_dl_srb1(
     grids: &[Vec<Complex32>],
-    sc_to_bin: impl Fn(i32) -> usize + Copy,
+    sc_to_bin: impl Fn(i32) -> usize + Copy + Sync,
     cell_id: u16,
     slot_idx: u32,
     crnti: u16,
@@ -327,33 +385,35 @@ fn try_decode_dl_srb1(
     mcs: u8,
     rv: u8,
     h_id: u8,
+    short: bool,
     lock: &mut Option<(usize, bool)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
 ) -> Option<(Vec<u8>, bool)> {
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
-    use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb, dlsch_decode_single_bits};
+    use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb};
+    use rayon::prelude::*;
     // The time-first RE-mapping ORDER is cell-fixed — lock it after the first success and
     // skip the wrong order every slot thereafter (halves the extract+LDPC work, the dominant
     // PDSCH-decode cost). The CDM-group count, though, varies per grant (small grants use 1,
     // larger ones like RRCReconfiguration use 2), so still sweep both CDM values.
-    for &(cdm, time_first) in &[(1usize, true), (1, false), (2, true), (2, false)] {
-        if let Some((_, tf)) = *lock {
-            if time_first != tf {
-                continue;
-            }
-        }
-        let n_re = n_rb * ((12 - 3) * 12 + if cdm == 1 { 3 * 6 } else { 0 });
-        let tbs = tbs_from_nre(n_re, r, qm);
-        let alloc = PdschAlloc { rb_start, n_rb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: cdm };
-        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, crnti, cell_id, time_first);
-        let mut llr = px.llrs;
-        descramble_llrs(&mut llr, pdsch_scramble_c_init(crnti, cell_id));
-        // Standalone decode at the DCI's RV (was hardcoded rv=0, so retransmissions
-        // could never decode).
-        let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, rv, 40);
-        if crc {
-            let tb = pack_bits(&bits);
+    let layouts: Vec<(usize, bool)> = [(1usize, true), (1, false), (2, true), (2, false)]
+        .into_iter()
+        .filter(|&(_, tf)| lock.map_or(true, |(_, ltf)| tf == ltf))
+        .collect();
+    // The per-layout work (extract + descramble + standalone LDPC at the DCI's RV) is pure —
+    // run the layouts in parallel (the dominant PDSCH-decode cost, so this halves the worker's
+    // per-slot wall time with a lock, quarters it without). The decision + HARQ-combining logic
+    // below stays sequential in the original layout order, so behavior is unchanged.
+    let results: Vec<(usize, bool, Vec<f32>, usize, Option<Vec<u8>>)> = layouts
+        .par_iter()
+        .map(|&(cdm, time_first)| {
+            let (llr, tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short);
+            (cdm, time_first, llr, tbs, tb)
+        })
+        .collect();
+    for (cdm, time_first, llr, tbs, tb) in results {
+        if let Some(tb) = tb {
             // A recognizable PDU (DRB IP / SRB1 RRC): the right layout — lock it, deliver
             // it up the stack, and HARQ-ACK it.
             if plausible_dl_tb(&tb) {
@@ -392,7 +452,7 @@ fn try_decode_dl_srb1(
             e.n_rx += 1;
             // Only worth an LDPC pass once ≥2 (re)transmissions have accumulated.
             if e.n_rx >= 2 {
-                let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 40);
+                let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 10);
                 if ccrc {
                     // Combining only runs on the locked layout, so a CRC-pass here is
                     // faithful: ACK it always; deliver only if it's a recognizable PDU.
@@ -477,13 +537,14 @@ fn decode_dl(
     coreset: &Coreset0,
     cell_id: u16,
     carrier_rb: usize,
-    sc_to_bin: impl Fn(i32) -> usize + Copy,
+    sc_to_bin: impl Fn(i32) -> usize + Copy + Sync,
     a_len: usize,
     ra_cand: &Candidate,
     crnti: u16,
     slot_idx: u32,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
     dl_dmrs_lock: &mut Option<(usize, bool)>,
+    backlog: bool,
 ) -> (Option<DlDecoded>, Option<u8>) {
     let fft = ofdm.fft_size();
     // CORESET grids: the first coreset.n_symb OFDM symbols of the slot.
@@ -498,45 +559,58 @@ fn decode_dl(
     PERF_DEMOD_NS.fetch_add(t_demod.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let t_dci = std::time::Instant::now();
     let bits5 = |b: &[u8], lo: usize, n: usize| b[lo..lo + n].iter().fold(0u8, |a, &x| a << 1 | x);
-    // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback)).
-    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8)> = Vec::new();
+    // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback),
+    //  short time allocation — the DCI's 1-bit TDRA row: false = symb [2,14), true = [2,8)).
+    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8, bool)> = Vec::new();
     // PRIMARY: DCI 1_0 in CORESET0 (common SS, AL4 CCE0), reliable — same path as the RAR.
+    // Always the full [2,14) allocation (its 4-bit default-table TDRA row 0 in this cell).
     {
         let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset, cell_id, slot_idx, ra_cand);
         pdcch_descramble_llr(&mut m, u32::from(cell_id));
         if let Some(b) = dci_decode(&m, crnti, a_len).filter(|b| b[0] == 1) {
             let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
             let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-            allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4)));
+            allocs.push((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4), false));
         }
     }
     // SECONDARY: DCI 1_1 in the CORESET1 USS (DRB DL) — exhaustive blind decode off one
     // cached channel estimate; only when no DCI 1_0 decoded (≤1 PDSCH/slot for us).
     if allocs.is_empty() {
+        use rayon::prelude::*;
         let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, cell_id, slot_idx);
-        for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
-            // Skip candidates with no PDCCH (low DM-RS coherence) before the equalize +
-            // polar decode — most of the 15 candidates carry nothing.
-            if coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb) < 0.5 {
-                continue;
-            }
-            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
+        // Coherence-gate first (cheap; most of the 15 candidates carry no PDCCH), then
+        // blind-decode the survivors in parallel — each equalize + polar decode is pure, and a
+        // CRC pass (RNTI-masked) is genuine whichever candidate finds it first.
+        let cands: Vec<Candidate> = all_candidates(coreset.n_cce(), &[1, 2, 4, 8])
+            .into_iter()
+            .filter(|cand| coreset_candidate_coherence(&h_reg, cand, coreset.n_symb) >= 0.5)
+            .collect();
+        if let Some(b) = cands.par_iter().find_map_any(|cand| {
+            let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, cand, &h_reg);
             pdcch_descramble_llr(&mut mm, u32::from(cell_id));
-            if let Some(b) = dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1) {
-                const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-                let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4)));
-                break;
-            }
+            dci_decode(&mm, crnti, 40).filter(|b| b[0] == 1)
+        }) {
+            const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+            let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+            let (rb0, nrb) = riv_decode(riv, carrier_rb);
+            // b[10] = the 1-bit TDRA (2-row list): row 1 is the short [2,8) allocation the
+            // scheduler uses for the TDD special slot AND for every HARQ retransmission of a
+            // TB first sent there (retx keep the TBS ⇒ keep the time allocation, in any slot).
+            allocs.push((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4), b[10] == 1));
         }
     }
     // Fallback (no DCI decoded): brute-force rb[0,N) x MCS 0-2 (CRC + plausibility reject
-    // wrong guesses); skipped entirely once a DCI decoded, keeping the UE real-time.
-    if allocs.is_empty() {
+    // wrong guesses). OFF by default (opt-in via FERRITE_FB=1, pre-layout-lock + no-backlog
+    // gated): the DCI 1_0/1_1 paths now cover every connected DL PDSCH including the AuthReq
+    // this sweep was written for, a missed DCI is harmless (the gNB retransmits WITH a fresh
+    // DCI), and the sweep can't even be ACKed (k1 unknown ⇒ 0xff) — while being the worker's
+    // multi-ms worst case: one spike during a retx burst fills the job queue, drops the next
+    // rv=0 slots, and self-feeds a retx storm (measured: 4-5ms job → 20-40 slots of decode
+    // lag → 96% of HARQ-ACKs miss their k1 window → registration times out).
+    if allocs.is_empty() && !backlog && dl_dmrs_lock.is_none() && std::env::var_os("FERRITE_FB").is_some() {
         for &nrb in &[2usize, 5, 13, 17, 18, 24] {
             for mcs in [0u8, 1, 2] {
-                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff));
+                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff, false));
             }
         }
     }
@@ -557,20 +631,64 @@ fn decode_dl(
             cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
         }
     }
-    // Cheap presence gate: every connected DL PDSCH starts at RB 0.
-    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
+    // Cheap presence gate: every connected DL PDSCH starts at RB 0. Probe with the DM-RS
+    // symbols COMMON to both time allocations ({2,7} — the [2,8) shape's full set, a subset
+    // of [2,14)'s {2,7,11}) so a short PDSCH in any slot still passes.
+    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 6, dmrs_symbols: vec![2, 7], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
     if !present {
         PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         return (None, cqi);
     }
-    for (rb0, nrb, mcs, k1, dai, rv, h_id) in allocs {
+    if allocs.len() == 1 {
+        // Steady state (a DCI decoded): one allocation — probe, then decode with the layout
+        // sweep parallelized inside try_decode_dl_srb1 (HARQ combining included).
+        let (rb0, nrb, mcs, k1, dai, rv, h_id, short) = allocs[0];
         let (qm, _) = mcs_params(mcs);
-        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
+        let (p_start, p_nsym, p_dmrs) = dl_pdsch_shape(short);
+        let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: p_start, n_sym: p_nsym, dmrs_symbols: p_dmrs, qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
-            if let Some((tb, deliver)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, dl_dmrs_lock, harq_dl) {
+            if let Some((tb, deliver)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, short, dl_dmrs_lock, harq_dl) {
                 PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
             }
+        }
+    } else {
+        // Fallback (no DCI decoded): brute-force guesses, h_id=0xff ⇒ no HARQ combining, so the
+        // whole (guess × layout) grid is pure — flat-parallel sweep, first hit in guess order
+        // wins (this was the worker's multi-ms spike: up to 18 probes + serial LDPC passes).
+        use rayon::prelude::*;
+        let lock0 = *dl_dmrs_lock;
+        let layouts: Vec<(usize, bool)> = [(1usize, true), (1, false), (2, true), (2, false)]
+            .into_iter()
+            .filter(|&(_, tf)| lock0.map_or(true, |(_, ltf)| tf == ltf))
+            .collect();
+        let items: Vec<(usize, usize, u8, usize, bool)> = allocs
+            .iter()
+            .flat_map(|&(rb0, nrb, mcs, ..)| layouts.iter().map(move |&(cdm, tf)| (rb0, nrb, mcs, cdm, tf)))
+            .collect();
+        let hit = items.par_iter().find_map_first(|&(rb0, nrb, mcs, cdm, tf)| {
+            let (qm, r) = mcs_params(mcs);
+            // Fallback guesses are pre-lock first transmissions: the long [2,14) shape.
+            let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
+            if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric <= 0.9 {
+                return None;
+            }
+            let (_llr, _tbs, tb) = pdsch_standalone(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, qm as usize, r, 0, cdm, tf, false);
+            let tb = tb?;
+            if plausible_dl_tb(&tb) {
+                return Some((tb, true, Some((cdm, tf))));
+            }
+            if lock0 == Some((cdm, tf)) {
+                return Some((tb, false, None));
+            }
+            None
+        });
+        if let Some((tb, deliver, newlock)) = hit {
+            if let Some(nl) = newlock {
+                *dl_dmrs_lock = Some(nl);
+            }
+            PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            return (Some(DlDecoded { k1: 0xff, dai: 0, bytes: tb, deliver }), cqi);
         }
     }
     PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -764,9 +882,13 @@ fn run(cfg: Config) {
         let (ul_pos_t, t0_pos_t, prach_base_t, inj_t) = (ul_pos.clone(), t0_pos.clone(), prach_base.clone(), inj.clone());
         let prach = prach.clone();
         let frame_len_i = frame_len as i64;
-        // How many slots the UL serve may run ahead of T0's DL consumption. Must be < k1/k2
-        // (≥4) so a HARQ-ACK/PUSCH at T0+k is still ahead of the serving position.
-        let lead: i64 = std::env::var("FERRITE_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(2) * slot_len;
+        // How many slots the UL serve may run ahead of T0's DL consumption. Every slot of lead
+        // eats directly into the k1=4 HARQ-ACK budget (an ACK produced at T0 must land at a
+        // position the radio hasn't served yet), so default 0: serving trails T0 by up to a
+        // block, the gNB's rx_to_tx window still keeps ~1 slot of DL buffered ahead of T0, and
+        // the ACK margin is ~k1-2.5 slots. (2 completes the attach too but leaves <1 slot of
+        // ACK margin — ping collapses on any decode jitter.)
+        let lead: i64 = std::env::var("FERRITE_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0) * slot_len;
         // Wall-clock µs/slot the serve paces to (default 500 = real time). Caps the gNB's rate so
         // its scheduler doesn't free-run past what it can fill (empty grants → decode collapse).
         let pace_us: f64 = std::env::var("FERRITE_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0);
@@ -969,7 +1091,14 @@ fn run(cfg: Config) {
     // stall the ZMQ I/O. The worker owns the only cross-slot decode state (the HARQ
     // soft-combining buffers `harq_dl` and the cell-fixed DM-RS layout `dl_dmrs_lock`) and
     // processes slots strictly in order, keeping the accumulator coherent.
-    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(8);
+    // Job queue depth 2 (was 8): the queue depth IS the decode→ACK pipeline lag bound
+    // (lag ≈ (depth+1) × per-job wall). At 8, any transient spike fills the queue and the lag
+    // sits at 8-10 slots — past the k1=4 ACK window — so every ACK is late, every TB is
+    // retransmitted, and the flood keeps the queue full: a self-sustaining storm. At 2, a
+    // burst drops the excess slots instead (the gNB retransmits them WITH a fresh DCI, and
+    // those retx get decoded and ACKed on time) — the storm converges. Real-time triage:
+    // decoding 80% of slots on time beats decoding 100% of them too late.
+    let (dl_job_tx, dl_job_rx) = ferrite_ue::rt::bounded::<DlJob>(2);
     let (dl_res_tx, dl_res_rx) = ferrite_ue::rt::bounded::<DlResult>(8);
     {
         let (w_coreset, w_cell, w_carrier, w_alen, w_racand, w_firstsc) =
@@ -978,6 +1107,16 @@ fn run(cfg: Config) {
             .name("ferrite-rxphy".into())
             .spawn(move || {
                 set_rt_thread(3, 20, "rxphy"); // dedicated core, below the timeline thread
+                // Small dedicated rayon pool for the intra-slot parallelism (PDCCH candidates,
+                // PDSCH layouts). NOT the global pool: its default (= all 16 cores) of spinning
+                // workers oversubscribes the machine against T0/radio/gNB and slows everything
+                // ~2× (measured: T0 freqshift 45→93µs, period 500→1069µs). 4 threads = the
+                // pre-layout-lock sweep (4 (CDM, time-first) layouts) in ONE parallel batch —
+                // the pre-lock slots are the attach-critical ones, where a slow job drops the
+                // next slot, leaves a DAI gap in the ACK codebook, and corrupts the first
+                // UCI-on-PUSCH (gNB reads more ACK bits than the UE mux'd → data REs shift →
+                // CRC KO on the AuthenticationResponse).
+                let pool = ferrite_ue::rt::rayon_pool(4);
                 let ofdm = Ofdm::new(fft);
                 let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
                 let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
@@ -985,12 +1124,24 @@ fn run(cfg: Config) {
                 // [perf] per-slot RX-PHY timing: decode_dl total vs its OFDM-demod (lower PHY).
                 use std::sync::atomic::Ordering::Relaxed;
                 let (mut w_n, mut w_decode_ns, mut w_ok) = (0u64, 0u64, 0u64);
+                let (mut w_send_ns, mut w_wall_ns, mut w_max_ns) = (0u64, 0u64, 0u64);
+                let mut w_last: Option<std::time::Instant> = None;
                 let perf_on = std::env::var_os("FERRITE_PERF").is_some();
                 while let Ok(job) = dl_job_rx.recv() {
+                    // [perf] wall time between jobs (loop turnaround incl. recv wait) to find
+                    // time lost outside decode_dl (send-block, allocator, scheduling).
+                    let now = std::time::Instant::now();
+                    if let Some(l) = w_last {
+                        w_wall_ns += (now - l).as_nanos() as u64;
+                    }
+                    w_last = Some(now);
                     let DlJob { slot_idx, slot_start_ul, crnti, fsh } = job;
                     let t = std::time::Instant::now();
-                    let (decoded, cqi) = decode_dl(&fsh, &ofdm, &w_coreset, w_cell, w_carrier, sc_to_bin, w_alen, &w_racand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock);
-                    w_decode_ns += t.elapsed().as_nanos() as u64;
+                    let backlog = !dl_job_rx.is_empty(); // jobs waiting → shed the opportunistic work
+                    let (decoded, cqi) = pool.install(|| decode_dl(&fsh, &ofdm, &w_coreset, w_cell, w_carrier, sc_to_bin, w_alen, &w_racand, crnti, slot_idx, &mut harq_dl, &mut dl_dmrs_lock, backlog));
+                    let job_ns = t.elapsed().as_nanos() as u64;
+                    w_decode_ns += job_ns;
+                    w_max_ns = w_max_ns.max(job_ns);
                     w_n += 1;
                     // [perf] one-shot: dump a granted-slot fsh so dl-bench can time the
                     // decode offline. Header: slot_idx, crnti (u32 LE) then f32 re/im pairs.
@@ -1008,13 +1159,15 @@ fn run(cfg: Config) {
                         let dci_ns = PERF_DCI_NS.swap(0, Relaxed);
                         let pdsch_ns = PERF_PDSCH_NS.swap(0, Relaxed);
                         let us = |ns: u64| ns as f64 / 1000.0 / 1e3;
-                        eprintln!("[perf-ue-rxphy] {w_n} slots ({w_ok} CRC-OK): decode_dl {:.1} µs/slot = OFDM-demod {:.1} + DCI-blind-search {:.1} + PDSCH-decode {:.1}",
-                            us(w_decode_ns), us(demod_ns), us(dci_ns), us(pdsch_ns));
-                        w_decode_ns = 0;
+                        eprintln!("[perf-ue-rxphy] {w_n} slots ({w_ok} CRC-OK): decode_dl {:.1} µs/slot (max {:.0}) = OFDM-demod {:.1} + DCI-blind-search {:.1} + PDSCH-decode {:.1}; loop-wall {:.1} send-block {:.1}",
+                            us(w_decode_ns), w_max_ns as f64 / 1e3, us(demod_ns), us(dci_ns), us(pdsch_ns), us(w_wall_ns), us(w_send_ns));
+                        w_decode_ns = 0; w_wall_ns = 0; w_send_ns = 0; w_max_ns = 0;
                     }
+                    let t_send = std::time::Instant::now();
                     if dl_res_tx.send(DlResult { slot_idx, slot_start_ul, decoded, cqi }).is_err() {
                         break;
                     }
+                    w_send_ns += t_send.elapsed().as_nanos() as u64;
                 }
             })
             .expect("spawn rxphy worker");
@@ -1039,8 +1192,9 @@ fn run(cfg: Config) {
     let (mut ack_total, mut ack_late, mut ack_qfull) = (0u64, 0u64, 0u64);
     // [perf] decode→drain pipeline lag in slots (current slot − decoded slot when drained):
     // this is the depth the HARQ-ACK must beat (needs lag < k1). Sum/max/count per window.
-    let (mut lag_sum, mut lag_max, mut lag_n) = (0u64, 0u32, 0u64);
-    let (mut dlag_sum, mut dlag_max, mut dlag_n) = (0u64, 0u32, 0u64); // lag for DECODED drains only
+    let (mut lag_sum, mut lag_max, mut lag_n) = (0u64, 0u64, 0u64);
+    let (mut dlag_sum, mut dlag_max, mut dlag_n) = (0u64, 0u64, 0u64); // lag for DECODED drains only
+    let mut job_drops = 0u64; // DL jobs dropped because the worker queue was full (worker behind)
     // [perf] instrumentation is off unless FERRITE_PERF is set (the per-slot timers run
     // cheaply either way; only the periodic stderr reports are gated).
     let perf_on = std::env::var_os("FERRITE_PERF").is_some();
@@ -1111,7 +1265,7 @@ fn run(cfg: Config) {
                 let p = perf_period_ns as f64 / perf_n as f64;
                 eprintln!("[perf-ue-t0] {perf_n} slots: period {:.0}µs ({:.0}/s) = zmq-io {:.0} (fill-dl {:.0} + serve {:.0}) + freqshift {:.0} + coreset-demod {:.0} + ul-grant-pdcch {:.0} + ra-search {:.0} + drain+tx {:.0} µs",
                     p / 1e3, 1e9 / p, a(perf_io_ns), a(perf_fill_ns), a(perf_io_ns.saturating_sub(perf_fill_ns)), a(perf_fs_ns), a(perf_demod_ns), a(perf_ulgrant_ns), a(perf_ra_ns), a(perf_drain_ns));
-                eprintln!("[perf-ue-ack] HARQ-ACK cumulative: produced={ack_total} late(missed-window)={ack_late} qfull-dropped={ack_qfull}; all-drain-lag avg={:.1} max={lag_max}; DECODED-drain-lag avg={:.1} max={dlag_max} ({dlag_n})",
+                eprintln!("[perf-ue-ack] HARQ-ACK cumulative: produced={ack_total} late(missed-window)={ack_late} qfull-dropped={ack_qfull} job-drops={job_drops}; all-drain-lag avg={:.1} max={lag_max}; DECODED-drain-lag avg={:.1} max={dlag_max} ({dlag_n})",
                     lag_sum as f64 / lag_n.max(1) as f64, dlag_sum as f64 / dlag_n.max(1) as f64);
             }
             lag_sum = 0; lag_max = 0; lag_n = 0; dlag_sum = 0; dlag_max = 0; dlag_n = 0;
@@ -1270,7 +1424,7 @@ fn run(cfg: Config) {
                     let px = extract_pdsch(&grids, sc_to_bin, &alloc, acq.cell_id, slot_idx, 0, ra_rnti, acq.cell_id, tf);
                     let mut llr = px.llrs.clone();
                     descramble_llrs(&mut llr, pdsch_scramble_c_init(ra_rnti, acq.cell_id));
-                    if let Some(tbb) = dlsch_decode_single(&llr, 72, r, qm as usize, 0, 40) {
+                    if let Some(tbb) = dlsch_decode_single(&llr, 72, r, qm as usize, 0, 10) {
                         let tb: Vec<u8> = tbb.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
                         if let Some((ta, grant, tc)) = parse_rar(&tb, preamble as u8) {
                             // Grant → Msg3 PUSCH allocation.
@@ -1338,9 +1492,13 @@ fn run(cfg: Config) {
         // the result is picked up below, a few slots later.
         perf_ra_ns += perf_ra.elapsed().as_nanos() as u64;
         let perf_drain = std::time::Instant::now();
-        if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=5) {
+        // Dispatch every slot with DL symbols: 0-5 (full D) AND 6 (the TDD special slot,
+        // 8 DL symbols — the gNB schedules PDSCH there too, e.g. the RRC SMC).
+        if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=6) {
             let crnti = connected.unwrap();
-            let _ = dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, crnti, fsh: fsh.clone() });
+            if dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, crnti, fsh: fsh.clone() }).is_err() {
+                job_drops += 1; // queue full: the worker is behind — this DL slot is never decoded
+            }
         }
         // Drain completed decode results and run the RRC/NAS/MAC stack on each. slot_idx /
         // slot_start_ul are shadowed to the DECODED slot's values, so the HARQ-ACK still
@@ -1351,13 +1509,15 @@ fn run(cfg: Config) {
                 pending_cqi = res.cqi;
             }
             let (r_slot_idx, r_slot_start_ul) = (res.slot_idx, res.slot_start_ul);
-            let lag = (slot_idx + 20 - r_slot_idx) % 20; // slot_idx is mod 20
-            lag_sum += lag as u64;
+            // Absolute dispatch→drain lag in slots (slot_start_ul is monotonic; the old
+            // `slot_idx % 20` arithmetic wrapped and under-reported lag ≥ 20 slots).
+            let lag = ((slot_start_ul - r_slot_start_ul) / slot_len).max(0) as u64;
+            lag_sum += lag;
             lag_max = lag_max.max(lag);
             lag_n += 1;
             #[allow(for_loops_over_fallibles)]
             for DlDecoded { k1, dai, bytes: tb, deliver } in res.decoded {
-                dlag_sum += lag as u64; dlag_max = dlag_max.max(lag); dlag_n += 1;
+                dlag_sum += lag; dlag_max = dlag_max.max(lag); dlag_n += 1;
                 let slot_idx = r_slot_idx;
                 let slot_start_ul = r_slot_start_ul;
                                 // Record a positive HARQ-ACK for this PDSCH into the codebook
