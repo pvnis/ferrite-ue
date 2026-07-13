@@ -26,7 +26,7 @@ use ferrite_ue::stream::BufferedStream;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed as Rlx};
 use std::sync::{Arc, Mutex};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
-use ferrite_ue::userplane::{drb_mac_wrap, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
+use ferrite_ue::userplane::{drb_mac_wrap_bsr, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
 use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use ferrite_ue::tun::{configure_tun, open_tun};
@@ -1388,14 +1388,23 @@ fn run(cfg: Config) {
                             }
                             let (pdcp, off, sn) = um_tx.take().unwrap();
                             let remaining = pdcp.len() - off;
+                            // Bytes queued behind this packet (each still needs PDCP+RLC+MAC).
+                            let queued: usize = tun_ul.iter().map(|p| p.len() + 8).sum();
                             if tbs_bytes < remaining + 3 && tbs_bytes < 100 {
-                                // Grant too small for meaningful progress → solicit a bigger one.
+                                // Grant too small for meaningful progress → solicit a bigger one,
+                                // reporting the WHOLE DRB buffer so the gNB grants enough at once.
                                 um_tx = Some((pdcp, off, sn));
-                                (mac_short_bsr((remaining + 3).max(220), tbs_bytes), format!("DRB BSR (need {remaining}B)"))
+                                (mac_short_bsr((remaining + queued + 3).max(220), tbs_bytes), format!("DRB BSR (need {}B)", remaining + queued))
                             } else {
-                                let (rlc, new_off) = rlc_um_segment(&pdcp, off, sn, tbs_bytes.saturating_sub(3));
-                                let m = drb_mac_wrap(&rlc, tbs_bytes);
-                                let s = format!("DRB UL {new_off}/{} B (sn {sn})", pdcp.len());
+                                // Reserve 2 bytes for a piggyback BSR whenever more data remains
+                                // (this packet's tail or other queued packets) so the gNB keeps
+                                // granting continuously instead of one grant per SR/BSR round-trip.
+                                let more = (remaining > tbs_bytes.saturating_sub(3)) || queued > 0 || !tun_ul.is_empty();
+                                let rsv = if more { 5 } else { 3 }; // MAC subheader (3) + BSR (2)
+                                let (rlc, new_off) = rlc_um_segment(&pdcp, off, sn, tbs_bytes.saturating_sub(rsv));
+                                let after = pdcp.len() - new_off + queued; // total still buffered
+                                let m = drb_mac_wrap_bsr(&rlc, if after > 0 { after + 3 } else { 0 }, tbs_bytes);
+                                let s = format!("DRB UL {new_off}/{} B (sn {sn}, buf {after})", pdcp.len());
                                 if new_off < pdcp.len() {
                                     um_tx = Some((pdcp, new_off, sn));
                                 }

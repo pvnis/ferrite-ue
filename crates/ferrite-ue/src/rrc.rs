@@ -548,16 +548,21 @@ pub fn rlc_status_mac_pdu(ack_sn: u16, tbs: usize) -> Vec<u8> {
 /// bytes. Sent in a minimal grant to solicit a larger one when the queued SRB1
 /// PDU doesn't fit. The 5-bit buffer-size index is the smallest level whose
 /// upper bound ≥ `buf_bytes` (Table 6.1.3.1-1).
-pub fn mac_short_bsr(buf_bytes: usize, tbs: usize) -> Vec<u8> {
+/// TS 38.321 Table 6.1.3.1-1: map a buffer occupancy (bytes) to the 5-bit Short BSR
+/// buffer-size index (LCG 0).
+pub fn bsr_index(buf_bytes: usize) -> u8 {
     const LEVELS: [usize; 32] = [
         0, 10, 14, 20, 28, 38, 53, 74, 102, 142, 198, 276, 384, 528, 726, 1010,
         1420, 1983, 2765, 3839, 5446, 7594, 10570, 14099, 19468, 26971, 38326,
         49759, 65726, 86677, 114069, usize::MAX,
     ];
-    let idx = LEVELS.iter().position(|&l| l >= buf_bytes).unwrap_or(31) as u8;
+    LEVELS.iter().position(|&l| l >= buf_bytes).unwrap_or(31) as u8 & 0x1f
+}
+
+pub fn mac_short_bsr(buf_bytes: usize, tbs: usize) -> Vec<u8> {
     let mut mac = Vec::with_capacity(tbs);
     mac.push(LCID_SHORT_BSR); // R/R/LCID (fixed-size CE, no L field)
-    mac.push(idx & 0x1f); // LCG-ID (bits 7..5) = 0 | buffer-size index (bits 4..0)
+    mac.push(bsr_index(buf_bytes)); // LCG-ID (bits 7..5) = 0 | buffer-size index (bits 4..0)
     if mac.len() < tbs {
         mac.push(LCID_PADDING);
         mac.resize(tbs, 0);

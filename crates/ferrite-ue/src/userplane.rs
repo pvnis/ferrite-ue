@@ -3,7 +3,7 @@
 //! (from the gNB's RRCReconfiguration): DRB 1 = LCID 4, SDAP headers absent,
 //! PDCP 18-bit SN (NEA0, no integrity), RLC UM 12-bit SN. See TS 38.323/38.322/38.321.
 
-use crate::rrc::{parse_dl_mac_pdu, LCID_PADDING};
+use crate::rrc::{bsr_index, parse_dl_mac_pdu, LCID_PADDING, LCID_SHORT_BSR};
 
 /// DRB logical channel identity (from the masterCellGroup RLC-BearerConfig).
 pub const LCID_DRB1: u8 = 4;
@@ -113,6 +113,34 @@ pub fn drb_mac_wrap(rlc: &[u8], tbs: usize) -> Vec<u8> {
         mac.push((rlc.len() & 0xff) as u8);
     }
     mac.extend_from_slice(rlc);
+    if mac.len() < tbs {
+        mac.push(LCID_PADDING);
+        mac.resize(tbs, 0);
+    }
+    mac
+}
+
+/// Wrap one RLC PDU in a UL-SCH MAC subPDU for DRB 1 (LCID 4), and — when `bsr_bytes > 0`
+/// (more DRB data is still buffered) — piggyback a Short BSR CE reporting the total
+/// remaining buffer, then pad to `tbs`. The BSR keeps the gNB granting continuously to
+/// drain the whole queue instead of the UE having to SR/BSR once per packet (which serialises
+/// the queue behind the ~1-frame SR period and caps DRB throughput). Order per TS 38.321
+/// §6.1.2: SDU subPDU, then the CE subPDU, then padding.
+pub fn drb_mac_wrap_bsr(rlc: &[u8], bsr_bytes: usize, tbs: usize) -> Vec<u8> {
+    let mut mac = Vec::with_capacity(tbs);
+    if rlc.len() < 256 {
+        mac.push(LCID_DRB1);
+        mac.push(rlc.len() as u8);
+    } else {
+        mac.push(0x40 | LCID_DRB1);
+        mac.push((rlc.len() >> 8) as u8);
+        mac.push((rlc.len() & 0xff) as u8);
+    }
+    mac.extend_from_slice(rlc);
+    if bsr_bytes > 0 && mac.len() + 2 <= tbs {
+        mac.push(LCID_SHORT_BSR);
+        mac.push(bsr_index(bsr_bytes));
+    }
     if mac.len() < tbs {
         mac.push(LCID_PADDING);
         mac.resize(tbs, 0);
