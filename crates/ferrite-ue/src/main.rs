@@ -758,10 +758,6 @@ fn decode_dl(
     // (without this, a burst of retx saturates the depth-1 job queue → dropped slots →
     // more DTX → more retx — the self-sustaining storm that wedged the NAS attach).
     let diag = std::env::var_os("FERRITE_DRIFT").is_some();
-    let dbg15 = diag && slot_idx == 15 && !allocs.is_empty();
-    if dbg15 {
-        eprintln!("[w15] entry allocs={allocs:?} backlog={backlog}");
-    }
     // ONLY under backlog: with worker headroom, decode the retx fully instead. The
     // (h_id, NDI) match is ambiguous — if we silently missed an entire TB generation
     // on this process, a NEW TB reuses the recorded NDI value and a blind ACK here
@@ -803,14 +799,8 @@ fn decode_dl(
     let grids = demod_slot(ofdm, fsh, 0, slot_idx as usize % 2, 1);
     PERF_DEMOD_NS.fetch_add(t_ds.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let Some(grids) = grids else {
-        if dbg15 {
-            eprintln!("[w15] demod_slot FAILED (fsh len {})", fsh.len());
-        }
         return (None, None);
     };
-    if dbg15 {
-        eprintln!("[w15] demod ok");
-    }
     let t_pdsch = std::time::Instant::now();
     // NZP-CSI-RS measurement (row 1, k0=1, symbol 4) → wideband CQI, only in the even-frame
     // slots 2-4 where the CSI-RS is present (a high SINR gates it, no SFN tracking needed).
@@ -1237,12 +1227,27 @@ fn run(cfg: Config) {
     // 2-4, so this is Some exactly in the frames whose slot-8 report the gNB reads —
     // which is why gating the report on it needs no SFN tracking.
     let mut pending_cqi: Option<u8> = None;
-    // Dynamic HARQ-ACK codebook: accumulate per UL-slot ACK bits keyed by their UL
-    // sample position; each entry holds (slot-in-frame, [ACK bit per C-DAI 0..3]).
-    // Several DL PDSCHs (e.g. the two segments of one DL SDU) map to the SAME UL slot
-    // and must be bundled into one 1-2 bit PUCCH, ordered by DAI — else the gNB (which
-    // expects harq_bit_len bits) can't read the ACK and stalls the DL HARQ.
-    let mut ack_book: std::collections::HashMap<i64, (u32, [Option<u8>; 4])> = std::collections::HashMap::new();
+    // Dynamic HARQ-ACK codebook: accumulate per UL-slot ACK bits keyed by the ABSOLUTE
+    // UL SLOT INDEX (slot_start_ul / slot_len + k1); each entry holds (slot-in-frame,
+    // [ACK bit per C-DAI 0..3]). Several DL PDSCHs (e.g. the two segments of one DL SDU)
+    // map to the SAME UL slot and must be bundled into one 1-2 bit PUCCH, ordered by DAI
+    // — else the gNB (which expects harq_bit_len bits) can't read the ACK and stalls the
+    // DL HARQ. Keyed by the NEAREST-SLOT ROUNDING of the position, `(pos + slot_len/2)
+    // div slot_len`, NOT the exact position: the position includes `- last_ta*4`, so a
+    // TA command landing between the ACK's insertion and the PUSCH grant's lookup
+    // shifted the two computed positions apart (±tens of samples) — the UCI mux missed
+    // the entry (NACK muxed), the orphaned ACK then modulated as a standalone PUCCH F1
+    // overlapping the PUSCH's slot, and the two waveforms collided in the injection
+    // table (gNB: the recurring first-PUSCH sinr −24 dB crc=KO that burned an RLC
+    // recovery round out of the 3 s registration budget). Rounding at every site makes
+    // the keys agree by construction (the wobble is ≪ half a slot); slot-index
+    // arithmetic does NOT work here — the slot_idx and slot_start_ul streams are
+    // phase-offset, so index-derived keys disagreed by one between sites. The entry
+    // stores its insert-time position (a ±20-sample TA skew is well inside the CP).
+    let mut ack_book: std::collections::HashMap<i64, (u32, i64, [Option<u8>; 4])> = std::collections::HashMap::new();
+    // Absolute UL slots whose UCI a PUSCH has already claimed — an ACK draining later
+    // for such a slot must be dropped, not sent as a standalone (colliding) PUCCH.
+    let mut uci_claimed: VecDeque<i64> = VecDeque::new();
     // A UL grant decoded this slot, modulated only AFTER the DL decode so a HARQ-ACK
     // whose UL slot coincides with this PUSCH can be multiplexed onto it (UCI-on-PUSCH)
     // instead of a PUCCH: (UL pos, PUSCH slot, rate-matched UL-SCH, alloc, TB bits,
@@ -1300,20 +1305,20 @@ fn run(cfg: Config) {
                 let _ = ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &wf2, &[1, 0, 1, 0], 8, center_hz, fs);
             }
             while let Ok(req) = tx_req_rx.recv() {
-                let (mut wave, pos, now) = match req {
+                let (mut wave, pos, now, tag) = match req {
                     TxReq::PucchF1 { harq, bits, slot_mod20, pos, now } => {
                         let cfg = if harq { &harq_cfg_t } else { &sr_cfg_t };
-                        (ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, cfg, &bits, slot_mod20, center_hz, fs), pos, now)
+                        (ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, cfg, &bits, slot_mod20, center_hz, fs), pos, now, "tx-pucch1")
                     }
                     TxReq::PucchF2 { cfg, bits, slot_mod20, pos, now } => {
-                        (ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, slot_mod20, center_hz, fs), pos, now)
+                        (ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, slot_mod20, center_hz, fs), pos, now, "tx-csi")
                     }
                     TxReq::Pusch { ulsch, alloc, slot_mod20, slot_parity, crnti, ack, beta, tb_bits, pos, now } => {
-                        (ferrite_phy::pusch::pusch_modulate_slot_uci(&ofdm, &ulsch, &alloc, cell_id, slot_mod20, slot_parity, crnti, center_hz, fs, &ack, beta, tb_bits), pos, now)
+                        (ferrite_phy::pusch::pusch_modulate_slot_uci(&ofdm, &ulsch, &alloc, cell_id, slot_mod20, slot_parity, crnti, center_hz, fs, &ack, beta, tb_bits), pos, now, "pusch")
                     }
                 };
                 norm(&mut wave);
-                inj_t.lock().unwrap().push(ReadyWaveform { pos, samples: wave }, now);
+                inj_t.lock().unwrap().push(ReadyWaveform { pos, samples: wave, tag }, now);
             }
         }).expect("spawn txbuild thread");
     }
@@ -1902,7 +1907,7 @@ fn run(cfg: Config) {
                                 // PRACH offset can sit anywhere in the wide detection window).
                                 attempt += 1;
                                 let pos = pos0 + toff;
-                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave.clone() }, ul_counter as i64);
+                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave.clone(), tag: "msg3" }, ul_counter as i64);
                                 pend = Some((pos, wave));
                                 recent_tc.push_back((tc, toff));
                                 while recent_tc.len() > 24 {
@@ -1930,9 +1935,6 @@ fn run(cfg: Config) {
         // 8 DL symbols — the gNB schedules PDSCH there too, e.g. the RRC SMC).
         if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=6) {
             let crnti = connected.unwrap();
-            if std::env::var_os("FERRITE_DRIFT").is_some() && slot_idx == 15 && connected.is_some() {
-                eprintln!("[t0-dl] slot=15 t0={slot_start_ul} dl_dci={dl_dci:?}");
-            }
             if dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, frame_even: (slot_start_ul / slot_len / 20) % 2 == 0, crnti, dl_dci, tf_hint: msg4_tf, fsh: fsh.clone() }).is_err() {
                 job_drops += 1; // queue full: the worker is behind — this DL slot is never decoded
                 if std::env::var_os("FERRITE_DRIFT").is_some() && job_drops <= 40 {
@@ -1971,8 +1973,10 @@ fn run(cfg: Config) {
                                     let k1a = k1 as i64; // already the actual k1 in slots
                                     let ack_slot = slot_idx as i64 + k1a;
                                     let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-                                    let e = ack_book.entry(pos).or_insert(((ack_slot % 20) as u32, [None; 4]));
-                                    e.1[(dai & 3) as usize] = Some(1); // 1 = ACK
+                                    // Key by the nearest-slot rounding (TA-proof; see ack_book).
+                                    let key = (pos + slot_len / 2).div_euclid(slot_len);
+                                    let e = ack_book.entry(key).or_insert(((ack_slot % 20) as u32, pos, [None; 4]));
+                                    e.2[(dai & 3) as usize] = Some(1); // 1 = ACK
                                 }
                                 // ACK-only TB (no deliverable SDU): apply a Timing Advance
                                 // Command MAC CE if present (keeps UL aligned so the gNB stops
@@ -2210,7 +2214,7 @@ fn run(cfg: Config) {
                                 let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
                                     + offset + toffx - last_ta * 4;
                                 println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
-                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: pw.clone() }, ul_counter as i64);
+                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: pw.clone(), tag: "msg4ack" }, ul_counter as i64);
                                 pend_pucch = Some((pos, pw));
                             }
                             if connected.is_none() {
@@ -2238,7 +2242,7 @@ fn run(cfg: Config) {
             let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
             let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
             for s in &mut sw { *s *= amp / pk; }
-            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw }, ul_counter as i64);
+            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw, tag: "sr" }, ul_counter as i64);
             pend_sr = Some(pos);
         }
 
@@ -2303,7 +2307,12 @@ fn run(cfg: Config) {
         // (UCI-on-PUSCH) — the gNB expects it there, not on the PUCCH — and remove it
         // from the codebook so it isn't also sent on a PUCCH.
         if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits, t_dai)) = pending_pusch.take() {
-            let book = ack_book.remove(&pos).map(|(_, b)| b);
+            // The codebook lookup is by the nearest-slot rounding of the position, not
+            // the exact position — last_ta can change between the DL decode that
+            // inserted the ACK and this grant, aliasing the two apart (the missed lookup
+            // NACK-padded the UCI while the orphaned ACK collided as a separate PUCCH).
+            let key = (pos + slot_len / 2).div_euclid(slot_len);
+            let book = ack_book.remove(&key).map(|(_, _, b)| b);
             let book_nonempty = book.is_some_and(|b| b.iter().any(Option::is_some));
             let ack: Vec<u8> = match t_dai {
                 // DCI 0_1: size the HARQ-ACK codebook from the grant's UL total-DAI,
@@ -2333,6 +2342,17 @@ fn run(cfg: Config) {
                 crnti, ack, beta: BETA_HARQ, tb_bits, pos, now: ul_counter as i64,
             });
             pend_ul.push(pos);
+            // This PUSCH now owns UL slot `key`'s UCI. An ACK whose decode drains AFTER
+            // this point (k1 and k2 grants often sit in the SAME DL slot, and the decode
+            // pipeline is ~1-2 slots deep) must NOT go out as a standalone PUCCH — it
+            // would overlap this PUSCH's samples in the injection table and garble both
+            // (the recurring first-PUSCH sinr −24 dB KO). The bit was NACK-padded into
+            // the PUSCH UCI, so the gNB simply retransmits that TB (the retx paths make
+            // that cheap); the late ACK entry is dropped by the due-loop below.
+            uci_claimed.push_back(key);
+            if uci_claimed.len() > 8 {
+                uci_claimed.pop_front();
+            }
         }
         // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
         // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
@@ -2340,9 +2360,14 @@ fn run(cfg: Config) {
         // ordered by C-DAI, so the gNB reads the exact harq_bit_len bits it expects.
         // Modulate ACKs whose UL slot is within ~3 slots of T0's own progress (their contributing
         // DL PDSCHs are decoded by then); the radio thread serves them at their absolute position.
-        let due: Vec<i64> = ack_book.keys().copied().filter(|&pos| pos <= slot_start_ul + 3 * slot_len).collect();
-        for pos in due {
-            let (slot_mod20, book) = ack_book.remove(&pos).unwrap();
+        let due: Vec<i64> = ack_book.iter().filter(|(_, &(_, pos, _))| pos <= slot_start_ul + 3 * slot_len).map(|(&k, _)| k).collect();
+        for key in due {
+            let (slot_mod20, pos, book) = ack_book.remove(&key).unwrap();
+            // A PUSCH already owns this UL slot's UCI (see uci_claimed above): drop the
+            // late-drained ACK instead of colliding a standalone PUCCH into that slot.
+            if uci_claimed.contains(&key) {
+                continue;
+            }
             let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
             if size == 0 {
                 continue;
@@ -2362,7 +2387,7 @@ fn run(cfg: Config) {
                 let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
                 let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                 for s in &mut aw { *s *= amp / pk; }
-                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw }, ul_counter as i64);
+                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw, tag: "ack" }, ul_counter as i64);
                 pend_acks.push(pos);
             } else {
                 ack_qfull += 1;

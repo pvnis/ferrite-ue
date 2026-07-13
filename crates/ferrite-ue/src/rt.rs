@@ -31,6 +31,8 @@ pub struct SlotRx {
 pub struct ReadyWaveform {
     pub pos: i64,
     pub samples: Vec<Complex32>,
+    /// What this waveform is (PUSCH / ACK / SR / …) — audit-mode overlap reports only.
+    pub tag: &'static str,
 }
 
 /// Collects ready uplink waveforms (produced asynchronously, possibly out of order) and
@@ -41,13 +43,16 @@ pub struct ReadyWaveform {
 /// counter when it arrives has missed its deadline and is counted (and dropped).
 #[derive(Default)]
 pub struct InjectionTable {
-    pending: Vec<ReadyWaveform>,
+    pending: Vec<(ReadyWaveform, usize)>,
     misses: u64,
+    audit: bool,
+    /// Recently retired waveform spans (pos, len, tag) — for overlap detection in audit mode.
+    retired: Vec<(i64, usize, &'static str)>,
 }
 
 impl InjectionTable {
     pub fn new() -> Self {
-        Self::default()
+        Self { audit: std::env::var_os("FERRITE_DRIFT").is_some(), ..Self::default() }
     }
 
     /// Queue a waveform for injection. `now` is the current uplink counter; if the
@@ -58,7 +63,30 @@ impl InjectionTable {
         if wf.pos + wf.samples.len() as i64 <= now {
             self.misses += 1;
         }
-        self.pending.push(wf);
+        if self.audit {
+            if wf.pos < now {
+                // Already partially behind the serve: the head of this waveform can never
+                // be placed — the exact signature of a "partial waveform" at the receiver.
+                eprintln!("[inj] LATE push pos={} len={} now={} behind={} samples", wf.pos, wf.samples.len(), now, now - wf.pos);
+            }
+            // Overlap check against everything still pending and recently retired: two
+            // waveforms sharing samples garble each other at the receiver (last write wins
+            // per sample) — the collision signature behind low-SINR CRC-KO uplinks.
+            let (s, e) = (wf.pos, wf.pos + wf.samples.len() as i64);
+            for (other, _) in &self.pending {
+                let (os, oe) = (other.pos, other.pos + other.samples.len() as i64);
+                if s < oe && os < e {
+                    eprintln!("[inj] OVERLAP push {} [{s},{e}) vs pending {} [{os},{oe})", wf.tag, other.tag);
+                }
+            }
+            for &(os, ol, otag) in &self.retired {
+                let oe = os + ol as i64;
+                if s < oe && os < e {
+                    eprintln!("[inj] OVERLAP push {} [{s},{e}) vs RETIRED {} [{os},{oe}) (span already served)", wf.tag, otag);
+                }
+            }
+        }
+        self.pending.push((wf, 0));
     }
 
     /// Place any queued samples that overlap the block `[base, base + block.len())` into
@@ -66,16 +94,33 @@ impl InjectionTable {
     /// this or any later block (the base only advances). Mirrors `run()`'s `place`.
     pub fn fill(&mut self, base: i64, block: &mut [Complex32]) {
         let end = base + block.len() as i64;
-        for wf in &self.pending {
+        for (wf, placed) in &mut self.pending {
             for (i, &s) in wf.samples.iter().enumerate() {
                 let abs = wf.pos + i as i64;
                 if abs >= base && abs < end {
                     block[(abs - base) as usize] = s;
+                    *placed += 1;
                 }
             }
         }
         // A waveform is spent once its last sample is before the next block's base.
-        self.pending.retain(|wf| wf.pos + wf.samples.len() as i64 > end);
+        let audit = self.audit;
+        let retired = &mut self.retired;
+        self.pending.retain(|(wf, placed)| {
+            let live = wf.pos + wf.samples.len() as i64 > end;
+            if !live && audit {
+                if *placed < wf.samples.len() {
+                    // Retiring a waveform that was only partially served: the receiver saw a
+                    // truncated burst (low SINR / CRC KO). Says how many samples made it.
+                    eprintln!("[inj] PARTIAL serve {} pos={} len={} placed={}", wf.tag, wf.pos, wf.samples.len(), placed);
+                }
+                retired.push((wf.pos, wf.samples.len(), wf.tag));
+                if retired.len() > 16 {
+                    retired.remove(0);
+                }
+            }
+            live
+        });
     }
 
     /// Number of waveforms that arrived after their injection window had already passed.
@@ -110,7 +155,7 @@ mod tests {
     use super::*;
 
     fn wf(pos: i64, vals: &[f32]) -> ReadyWaveform {
-        ReadyWaveform { pos, samples: vals.iter().map(|&v| Complex32::new(v, 0.0)).collect() }
+        ReadyWaveform { pos, samples: vals.iter().map(|&v| Complex32::new(v, 0.0)).collect(), tag: "test" }
     }
 
     /// A waveform lands exactly at its absolute position, split across two blocks if it
