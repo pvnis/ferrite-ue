@@ -122,6 +122,29 @@ depth** (kept shallow so bursts drop instead of stalling), and the PDSCH
 time-domain shape must come from the **DCI's TDRA bit**, not the slot index
 (HARQ retransmissions of a short-slot TB keep the short shape in normal slots).
 
+### Protocol stack (L2 / L3)
+
+There are no separate `mac`/`rlc`/`pdcp`/`sdap` modules. Ferrite targets exactly
+one bearer configuration (the one the gNB signals in RRCReconfiguration — SRB1 on
+RLC-AM, one DRB on RLC-UM, no SDAP header, PDCP NEA0), so L2 is a set of byte-exact
+**framing functions** rather than general stateful layer objects. The *state*
+(sequence numbers, reassemblers, HARQ) lives in `main.rs`'s `run()` loop; the
+framing is split by plane across two files, each citing the relevant TS inline:
+
+- **`src/userplane.rs`** — user plane (DRB 1 / LCID 4): SDAP (absent — the raw IP
+  packet *is* the SDAP SDU), PDCP 18-bit Data PDU (`pdcp_data_pdu`), RLC-UM with
+  segmentation + reassembly (`rlc_um_segment`, `RlcUmReassembler`), MAC subheader
+  framing (`drb_mac_wrap`). TS 38.323/38.322/38.321.
+- **`src/rrc.rs`** — control plane (SRB1 / LCID 1): PDCP with the 128-NIA2 MAC-I
+  (`srb1_msg5_pdu`, `parse_srb1_dl_pdcp`), RLC-AM headers + reassembly + STATUS
+  (`parse_rlc_am_header`, `RlcReassembler`, `rlc_status_mac_pdu`), MAC CEs
+  (`mac_short_bsr`) and the shared DL MAC-PDU parser (`parse_dl_mac_pdu`).
+
+RRC (TS 38.331) and NAS (TS 24.501) message coding sit above these, in `src/rrc.rs`
+and `src/nas.rs`; 5G-AKA / key derivation is in `src/milenage.rs`. The MAC
+scheduler proper — UL-grant handling, the HARQ-ACK codebook, retransmission
+soft-combining — is the T0 loop + RX-PHY worker in `main.rs`, not a framing helper.
+
 ## Workspace layout
 
 ```
@@ -131,9 +154,11 @@ crates/
                    PDSCH/PUSCH, PUCCH, PRACH, CSI, LDPC/polar coding
   ferrite-radio    radio HAL (SampleSource/SampleSink): file, SoapySDR [feature],
                    ZMQ [feature] backends
-  ferrite-ue       the UE: entry point `ferrite-ue` (attach + data plane) plus
-                   milestone/debug harnesses (ssb-scan, sync-track, sib1,
-                   pdsch-*, prach-*, rar-rx, msg3-grid, …)
+  ferrite-ue       the UE: entry point `ferrite-ue` (main.rs = timeline + MAC
+                   scheduler + HARQ). Modules: rrc (RRC + SRB1 PDCP/RLC-AM/MAC),
+                   userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), nas, milenage,
+                   sync, rt (pipeline), stream, tun. Plus milestone/debug
+                   harnesses (ssb-scan, sync-track, sib1, pdsch-*, prach-*, …)
 ```
 
 ## Roadmap
