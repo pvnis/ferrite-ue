@@ -1323,6 +1323,12 @@ fn run(cfg: Config) {
         }).expect("spawn txbuild thread");
     }
 
+    // Cell timing configuration from SIB1, decoded live during the RA phase: the TDD
+    // UL/DL pattern drives the slot gates (DL dispatch, Msg4 monitoring, PUCCH slot
+    // choice) and the pusch-TimeDomainAllocationList maps each UL grant's TDRA field
+    // to its k2. Until SIB1 parses (or if an exotic cell defeats the parser), the
+    // `map_or` fallbacks at each use site keep the transcribed bring-up constants.
+    let mut sib1_cfg: Option<ferrite_ue::sib1::Sib1Params> = None;
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
@@ -1750,7 +1756,15 @@ fn run(cfg: Config) {
                         let t_dai: Option<u8> = is_0_1
                             .then(|| bits[25..27].iter().fold(0u8, |a, &b| a << 1 | b));
                         let (qm, r) = mcs_params(mcs);
-                        let m5_slot = slot_idx as i64 + 4; // k2 = 4 → PUSCH at slot 7
+                        // k2 from the DCI's TDRA field via the SIB1 pusch-TimeDomain-
+                        // AllocationList (this cell: rows [4,5,6,7,11] — row 0's k2=4 is
+                        // the old hardcoded constant; other rows appear when the granting
+                        // DL slot sits further from the UL slots, and matter for any
+                        // shorter TDD pattern). DCI 0_0 carries 4 TDRA bits, 0_1 three.
+                        let tdra_hi = if is_0_1 { 13 } else { 14 };
+                        let tdra = bits[10..tdra_hi].iter().fold(0usize, |a, &b| a << 1 | b as usize);
+                        let k2 = sib1_cfg.as_ref().map_or(4, |s| s.k2_for_row(tdra)) as i64;
+                        let m5_slot = slot_idx as i64 + k2;
                         let n_data_sym = 14 - 3;
                         let e = g_nrb * 12 * n_data_sym * qm as usize;
                         let tbs = tbs_from_nre(g_nrb * 12 * n_data_sym, r, qm as usize);
@@ -1849,6 +1863,55 @@ fn run(cfg: Config) {
         // PRACH is off (no RAR can arrive), so skip the equalize + blind DCI decode + Msg2
         // PDSCH demod entirely — ~90 µs/slot of pure waste in steady state.
         if connected.is_none() {
+        // Decode SIB1 once (SI-RNTI in the Type0 common search space): the TDD pattern
+        // and the k2 table configure the slot logic for the rest of the attach. SIB1
+        // repeats every 20 ms, so this searches each pre-connect DL slot until it parses.
+        if sib1_cfg.is_none() {
+            const SI_RNTI: u16 = 0xFFFF;
+            let mut si_bits = None;
+            for cand in ferrite_phy::pdcch::type0_candidates(coreset.n_cce()) {
+                let mut m = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &cand);
+                pdcch_descramble_llr(&mut m, u32::from(acq.cell_id));
+                if let Some(b) = dci_decode(&m, SI_RNTI, a_len) {
+                    si_bits = Some(b);
+                    break;
+                }
+            }
+            if let Some(b) = si_bits {
+                let riv_bits = usize::BITS as usize - ((coreset.n_rb * (coreset.n_rb + 1) / 2) - 1).leading_zeros() as usize;
+                let riv = b[..riv_bits].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
+                let mcs = b[riv_bits + 5..riv_bits + 10].iter().fold(0u8, |a, &x| a << 1 | x);
+                let (qm, r) = mcs_params(mcs);
+                if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
+                    // SIB1 PDSCH: TDRA row 1 → [2,14) type A, DM-RS {2,7,11}, l,k' order.
+                    let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, n_bwp: 0, nof_cdm_groups: 2 };
+                    let px = extract_pdsch(&grids, sc_to_bin, &alloc, acq.cell_id, slot_idx, 0, SI_RNTI, acq.cell_id, true);
+                    if px.dmrs_metric > 0.9 {
+                        let mut llr = px.llrs;
+                        descramble_llrs(&mut llr, pdsch_scramble_c_init(SI_RNTI, acq.cell_id));
+                        use ferrite_phy::pdsch_params::{ndmrs_per_prb, transport_block_size};
+                        let tbs = transport_block_size(12 * 12 - ndmrs_per_prb(3), nrb, qm, r, 1);
+                        if let Some(tbb) = dlsch_decode_single(&llr, tbs, r, qm as usize, 0, 10) {
+                            let tb: Vec<u8> = tbb.chunks(8).map(|c| c.iter().fold(0u8, |a, &x| a << 1 | x)).collect();
+                            if let Some(p) = ferrite_ue::sib1::parse_sib1(&tb) {
+                                println!(
+                                    "SIB1: PLMN {}{}{}-{}, TAC {}, band n{}, TDD {}: {} slots = {}D + special({}dl/{}ul sym) + {}U{}; k2 rows {:?}; prach idx {}",
+                                    p.mcc[0], p.mcc[1], p.mcc[2],
+                                    p.mnc.iter().map(|d| d.to_string()).collect::<String>(),
+                                    p.tac, p.band, if p.tdd_pattern2.is_some() { "p1+p2" } else { "p1" },
+                                    p.tdd_period_slots(), p.tdd.dl_slots, p.tdd.dl_symbols, p.tdd.ul_symbols, p.tdd.ul_slots,
+                                    p.tdd_pattern2.map(|q| format!(" | p2 {}D+{}U", q.dl_slots, q.ul_slots)).unwrap_or_default(),
+                                    p.pusch_tdra.iter().map(|t| t.k).collect::<Vec<_>>(),
+                                    p.prach_config_index,
+                                );
+                                sib1_cfg = Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut llrs = equalize_candidate(&cgrids, |sc: usize| sc_to_bin(sc as i32), &coreset, acq.cell_id, slot_idx, &ra_cand);
         pdcch_descramble_llr(&mut llrs, u32::from(acq.cell_id));
         if let Some(bits) = dci_decode(&llrs, ra_rnti, a_len) {
@@ -1873,22 +1936,30 @@ fn run(cfg: Config) {
                             // (dwell has settled) so its TA precisely corrects Msg3.
                             let settled = sweep == 0 || frames_at_offset >= 3;
                             if settled && pend.is_none() && connected.is_none() {
-                                println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] (offset {offset})", m_rb0 + m_nrb);
+                                // Msg3 timing (TS 38.213 §8.3 / 38.214 §6.1.2.1): the RAR UL
+                                // grant's 4-bit PUSCH time-resource field indexes the SIB1
+                                // k2 list; Msg3 goes at n + k2 + Δ with Δ=3 for µ=1. On this
+                                // cell row 0 (k2=4) gives the old constant 7; the DDDSU cell
+                                // signals row 1 (k2=6 → 9). Fallback: the --msg3-delay CLI.
+                                let time_row = ((grant >> 8) & 0xf) as usize;
+                                let msg3_del = sib1_cfg
+                                    .as_ref()
+                                    .map_or(msg3_delay, |s| s.k2_for_row(time_row) as i64 + 3);
+                                println!("RAR: TA={ta} grant={grant:#x} TC-RNTI={tc:#06x} → Msg3 RB[{m_rb0},{}] slot +{msg3_del} (offset {offset})", m_rb0 + m_nrb);
                                 sweep = 0; // freeze the aligned offset
                                 last_ta = ta as i64;
-                                let _ = grant;
                                 // carrier RB0 = point A (CRB0), so the DM-RS gold sequence
                                 // is referenced directly to the carrier RB (crb_offset 0).
                                 let m_alloc = PuschAlloc { rb_start: m_rb0, n_rb: m_nrb, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb, crb_offset: 0 };
                                 let tb3 = bytes_to_bits(&msg3_mac_pdu(&ccch_sdu, 11));
                                 let ulsch = dlsch_encode_single(&tb3, pusch_e_len(&m_alloc), 0.117, 2, 0);
-                                let msg3_slot = slot_idx as i64 + msg3_delay;
+                                let msg3_slot = slot_idx as i64 + msg3_del;
                                 let dmrs_slot = msg3_slot % 20;
                                 // §5.4 phase compensation at the carrier centre (center_hz):
                                 // the gNB's OFDM demod removes it, so an uncompensated UL
                                 // decorrelates the DM-RS across symbols. Critical for decode.
                                 let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, dmrs_slot as u32, (msg3_slot % 2) as usize, tc, center_hz, fs);
-                                let pos0 = slot_start_ul + msg3_delay * slot_len + offset - ta as i64 * 4;
+                                let pos0 = slot_start_ul + msg3_del * slot_len + offset - ta as i64 * 4;
                                 let toff = locked_toff.unwrap_or_else(|| toffs[attempt % toffs.len()]);
                                 let mut wave = if fshift != 0.0 {
                                     freq_shift(&wave0, fshift * df, fs, (pos0 + toff) as usize)
@@ -1931,9 +2002,11 @@ fn run(cfg: Config) {
         // the result is picked up below, a few slots later.
         perf_ra_ns += perf_ra.elapsed().as_nanos() as u64;
         let perf_drain = std::time::Instant::now();
-        // Dispatch every slot with DL symbols: 0-5 (full D) AND 6 (the TDD special slot,
-        // 8 DL symbols — the gNB schedules PDSCH there too, e.g. the RRC SMC).
-        if connected.is_some() && srb1_sn >= 1 && matches!(slot_idx % 10, 0..=6) {
+        // Dispatch every slot that can carry a PDSCH for us, per the SIB1 TDD pattern
+        // (full-DL slots plus a special slot with ≥8 DL symbols — the gNB schedules
+        // PDSCH there too, e.g. the RRC SMC). Fallback: the bring-up cell's slots 0-6.
+        let slot_has_pdsch = sib1_cfg.as_ref().map_or(matches!(slot_idx % 10, 0..=6), |s| s.has_pdsch(slot_idx));
+        if connected.is_some() && srb1_sn >= 1 && slot_has_pdsch {
             let crnti = connected.unwrap();
             if dl_job_tx.try_send(DlJob { slot_idx, slot_start_ul, frame_even: (slot_start_ul / slot_len / 20) % 2 == 0, crnti, dl_dci, tf_hint: msg4_tf, fsh: fsh.clone() }).is_err() {
                 job_drops += 1; // queue full: the worker is behind — this DL slot is never decoded
@@ -2186,7 +2259,7 @@ fn run(cfg: Config) {
         // Msg4 lands at DL slots ≡ {1,5} (mod 10) for this TDD pattern. The DM-RS
         // is cell-specific (tc-independent), so measure the 21-RB PDSCH DM-RS once;
         // only if a real PDSCH is present do we run the per-TC LDPC decode.
-        if matches!(slot_idx % 10, 1 | 5) && !recent_tc.is_empty() {
+        if sib1_cfg.as_ref().map_or(matches!(slot_idx % 10, 1 | 5), |s| s.has_pdsch(slot_idx)) && !recent_tc.is_empty() {
             if let Some(grids) = demod_slot(&ofdm, &fsh, 0, slot_idx as usize % 2, 1) {
                 let probe = PdschAlloc { rb_start: 0, n_rb: 21, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm: 2, n_bwp: 0 , nof_cdm_groups: 2};
                 let metric = extract_pdsch(&grids, sc_to_bin, &probe, acq.cell_id, slot_idx, 0, 0, acq.cell_id, false).dmrs_metric;
@@ -2206,9 +2279,15 @@ fn run(cfg: Config) {
                             // HARQ-ACK the Msg4 on PUCCH F1 at the next UL slot
                             // (7 for a DL slot ≤5, else 17). Same UL timing as Msg3.
                             if pend_pucch.is_none() {
-                                let pucch_slot = if slot_idx < 10 { 7 } else { 17 };
+                                // The next full-UL slot per the SIB1 TDD pattern (fallback:
+                                // this cell's UL slots 7-9/17-19). May exceed the frame —
+                                // the position delta uses the raw value, the modulation the
+                                // slot-in-frame.
+                                let pucch_slot = sib1_cfg
+                                    .as_ref()
+                                    .map_or(if slot_idx < 10 { 7 } else { 17 }, |s| s.next_ul_slot_after(slot_idx));
                                 let mut pw = ferrite_phy::pucch::pucch_f1_modulate_slot(
-                                    &ofdm, &pucch_cfg, &[1], pucch_slot as u32, center_hz, fs);
+                                    &ofdm, &pucch_cfg, &[1], pucch_slot % 20, center_hz, fs);
                                 let pk = pw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                                 for s in &mut pw { *s *= amp / pk; }
                                 let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
@@ -2229,13 +2308,21 @@ fn run(cfg: Config) {
             }
         }
 
-        // Send a Scheduling Request each frame at slot 7 whenever an SRB1 PDU is
-        // queued (RRCSetupComplete, then the AuthenticationResponse) to solicit
-        // a UL grant. Stops once the queue drains so we don't over-request.
+        // Send a Scheduling Request each frame whenever an SRB1 PDU is queued
+        // (RRCSetupComplete, then the AuthenticationResponse) to solicit a UL grant.
+        // Stops once the queue drains so we don't over-request. The SR occasion slot
+        // is the FIRST full-UL slot of the frame: OCUDU's auto-derived SR resource
+        // keeps the same PUCCH F1 (PRB 0, cs 6, occ 3) across TDD patterns and moves
+        // only the slot (verified: slot 7 on the 5 ms 6D+3U cell, slot 4 on the
+        // 2.5 ms DDDSU cell). This mirrors the gNB's dedicated RRCSetup config until
+        // ferrite parses masterCellGroup for real.
         let want_ping = tun.is_none() && drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
         let want_drb = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
         if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb) && slot_idx == 0 && pend_sr.is_none() {
-            let sr_slot = 7i64;
+            let sr_slot = sib1_cfg
+                .as_ref()
+                .and_then(|s| (0..20).find(|&t| s.has_full_ul(t)))
+                .unwrap_or(7) as i64;
             let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
                 + offset + locked_toff.unwrap_or(0) - last_ta * 4;
             // SR kept in T0: cheap (one PUCCH F1/frame) and latency-critical (drives grants).
@@ -2247,13 +2334,19 @@ fn run(cfg: Config) {
         }
 
         // Periodic CSI report: send the measured CQI on the PUCCH F2 (PRB 23, symb
-        // [0,2)) at slot 8. Queue it at slot 6 (2 slots ahead) once the frame's
-        // CSI-RS has been measured (slots 2-4). pending_cqi is Some only in frames
-        // where a valid CSI-RS was seen (even frames), which is exactly when the gNB
-        // reads the slot-8 report — so no SFN parity check is needed.
-        if connected.is_some() && slot_idx == 6 && pend_csi.is_none() {
+        // [0,2)) at the SECOND full-UL slot of the frame — OCUDU's auto-derived CSI
+        // report resource, like the SR one, keeps the F2 resource fixed and moves the
+        // slot with the TDD pattern (slot 8 on the 5 ms cell, slot 9 on DDDSU).
+        // Queue it 2 slots ahead, once the frame's CSI-RS has been measured.
+        // pending_cqi is Some only in frames where a valid CSI-RS was seen (even
+        // frames), which is exactly when the gNB reads the report — no SFN parity
+        // check is needed.
+        let csi_slot = sib1_cfg
+            .as_ref()
+            .and_then(|s| (0..20).filter(|&t| s.has_full_ul(t)).nth(1))
+            .unwrap_or(8) as i64;
+        if connected.is_some() && slot_idx as i64 == csi_slot - 2 && pend_csi.is_none() {
             if let Some(cqi) = pending_cqi.take() {
-                let csi_slot = 8i64;
                 let cfg = ferrite_phy::pucch::PucchF2 {
                     prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2,
                     rnti: connected.unwrap(), n_id: acq.cell_id, n_id0: acq.cell_id, carrier_rb,
