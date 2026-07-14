@@ -90,6 +90,10 @@ pub struct CellGroupParams {
     pub zp_csi_rs: Vec<CsiRsRes>,
     /// Periodic CSI report: (periodicity slots, offset, PUCCH resource id).
     pub csi_report: Option<(u16, u16, u8)>,
+    /// uci-OnPUSCH betaOffsetCSI-Part1-Index1 (semi-static, or dynamic set 0).
+    pub beta_csi1_index: Option<u8>,
+    /// uci-OnPUSCH scaling α: ENUM{f0p5, f0p65, f0p8, f1} as the raw index 0..3.
+    pub uci_scaling: u8,
 }
 
 /// Parse a DL-CCCH RRCSetup message (the RRC PDU bytes from the Msg4 MAC SDU).
@@ -1419,14 +1423,19 @@ fn parse_pusch_config_dedicated(r: &mut Bits, out: &mut CellGroupParams) -> Opti
             let has_beta = r.bit()?;
             if has_beta {
                 if !r.bit()? {
-                    for _ in 0..4 {
-                        parse_beta_offsets(r)?;
+                    // dynamic: 4 sets, DCI-indexed — keep set 0's CSI-part-1 offset.
+                    for i in 0..4 {
+                        let b = parse_beta_offsets(r)?;
+                        if i == 0 {
+                            out.beta_csi1_index = b;
+                        }
                     }
                 } else {
-                    parse_beta_offsets(r)?;
+                    out.beta_csi1_index = parse_beta_offsets(r)?;
                 }
             }
-            r.enu(4)?;
+            out.uci_scaling = r.enu(4)? as u8;
+            trace!("uci-OnPUSCH: beta_csi1_idx={:?} scaling={}", out.beta_csi1_index, out.uci_scaling);
         }
     }
     // o[16] tp-pi2BPSK: presence is the value
@@ -1436,7 +1445,8 @@ fn parse_pusch_config_dedicated(r: &mut Bits, out: &mut CellGroupParams) -> Opti
     Some(())
 }
 
-fn parse_beta_offsets(r: &mut Bits) -> Option<()> {
+/// Returns betaOffsetCSI-Part1-Index1 when present.
+fn parse_beta_offsets(r: &mut Bits) -> Option<Option<u8>> {
     // BetaOffsets ::= SEQUENCE { [betaOffsetACK-Index1 (0..31)], [Index2], [Index3],
     // [betaOffsetCSI-Part1-Index1 (0..31)], [Index2], [betaOffsetCSI-Part2-Index1],
     // [Index2] }
@@ -1444,12 +1454,16 @@ fn parse_beta_offsets(r: &mut Bits) -> Option<()> {
     for f in o.iter_mut() {
         *f = r.bit()?;
     }
-    for &p in &o {
+    let mut csi1 = None;
+    for (i, &p) in o.iter().enumerate() {
         if p {
-            r.int(0, 31)?;
+            let v = r.int(0, 31)? as u8;
+            if i == 3 {
+                csi1 = Some(v);
+            }
         }
     }
-    Some(())
+    Some(csi1)
 }
 
 /// Returns dmrs-AdditionalPosition (2 = default when absent).

@@ -744,6 +744,10 @@ enum TxReq {
     Pusch {
         ulsch: Vec<u8>, alloc: PuschAlloc, slot_mod20: u32, slot_parity: usize,
         crnti: u16, ack: Vec<u8>, beta: f32, tb_bits: usize, pos: i64, now: i64,
+        /// CSI part 1 (wideband CQI) bits + their RE placement — non-empty when this
+        /// PUSCH lands on a CSI-report occasion (the gNB reserves the REs; the ulsch
+        /// is already encoded to the reduced E).
+        csi: Vec<u8>, csi_res: Vec<(usize, usize)>,
     },
 }
 
@@ -1295,7 +1299,12 @@ fn run(cfg: Config) {
     // valid CSI-RS is seen (high SINR); the CSI-RS is transmitted in even frames slots
     // 2-4, so this is Some exactly in the frames whose slot-8 report the gNB reads —
     // which is why gating the report on it needs no SFN tracking.
-    let mut pending_cqi: Option<u8> = None;
+    // The measured wideband CQI + the slot position it drained at: CSI-report occasions
+    // share the CSI-RS's 40-slot grid, so a measurement is only a valid "this frame is
+    // a report occasion" witness within its own frame (~17 slots). A stale value
+    // leaking into an off-parity frame made the UE multiplex CSI onto a PUSCH whose
+    // grant reserved no CSI REs — data-E mismatch, crc=KO at full SNR.
+    let mut pending_cqi: Option<(u8, i64)> = None;
     // Dynamic HARQ-ACK codebook: accumulate per UL-slot ACK bits keyed by the ABSOLUTE
     // UL SLOT INDEX (slot_start_ul / slot_len + k1); each entry holds (slot-in-frame,
     // [ACK bit per C-DAI 0..3]). Several DL PDSCHs (e.g. the two segments of one DL SDU)
@@ -1328,7 +1337,15 @@ fn run(cfg: Config) {
     // UL T-DAI). The T-DAI is Some(0..=3) for a DCI 0_1 grant (it carries the 2-bit
     // total-DAI that sizes the UCI HARQ-ACK codebook even if the UE dropped the PDSCH),
     // None for a DCI 0_0 fallback grant (no DAI field).
-    let mut pending_pusch: Option<(i64, i64, Vec<u8>, PuschAlloc, usize, Option<u8>)> = None;
+    let mut pending_pusch: Option<(i64, i64, Vec<u8>, PuschAlloc, usize, Option<u8>, Vec<u8>, Vec<(usize, usize)>)> = None;
+    // UL HARQ awareness: h_id → (NDI, TBS bytes, MAC PDU) of the last transport block
+    // sent on that process. A grant whose NDI is UNCHANGED (and TBS matches) is a
+    // retransmission request — the gNB soft-combines it with its stored LLRs, so the UE
+    // must resend the SAME bits (rate-matched at the grant's rv), not the next queued
+    // content. Sending fresh content on a retx grant poisons the process: the combined
+    // buffer decodes to garbage at any SNR until the gNB gives up (seen as an unbounded
+    // crc=KO chain on one h_id under the warm-grant load).
+    let mut ul_harq: std::collections::HashMap<u8, (u8, usize, Vec<u8>)> = std::collections::HashMap::new();
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -1387,8 +1404,8 @@ fn run(cfg: Config) {
                     TxReq::PucchF2 { cfg, bits, slot_mod20, pos, now } => {
                         (ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, slot_mod20, center_hz, fs), pos, now, "tx-csi")
                     }
-                    TxReq::Pusch { ulsch, alloc, slot_mod20, slot_parity, crnti, ack, beta, tb_bits, pos, now } => {
-                        (ferrite_phy::pusch::pusch_modulate_slot_uci(&ofdm, &ulsch, &alloc, cell_id, slot_mod20, slot_parity, crnti, center_hz, fs, &ack, beta, tb_bits), pos, now, "pusch")
+                    TxReq::Pusch { ulsch, alloc, slot_mod20, slot_parity, crnti, ack, beta, tb_bits, pos, now, csi, csi_res } => {
+                        (ferrite_phy::pusch::pusch_modulate_slot_uci_csi(&ofdm, &ulsch, &alloc, cell_id, slot_mod20, slot_parity, crnti, center_hz, fs, &ack, beta, tb_bits, &csi, &csi_res), pos, now, "pusch")
                     }
                 };
                 norm(&mut wave);
@@ -1442,6 +1459,17 @@ fn run(cfg: Config) {
     let mut drb_up = false; // RRCReconfiguration (DRB) applied
     let mut ue_ip = ue_ip; // assigned IP: from --ue-ip, else the PDU Session Accept
     let mut ping_seq: u16 = 0; // ICMP echo sequence number
+    // Built-in ping as an RTT probe: send times per seq, and the 1 Hz send gate.
+    let mut ping_sent_at: Vec<std::time::Instant> = Vec::new();
+    let mut next_ping_at = std::time::Instant::now();
+    // Warm-grant window: while user-plane traffic is active (a packet moved within
+    // the last second), idle grants report a small non-zero BSR instead of 0, so the
+    // gNB keeps granting every UL occasion and the next packet rides an
+    // already-issued grant (~k2 + pipeline) instead of paying the SR round-trip
+    // (up to a full SR period + grant latency). Padding fills do NOT refresh the
+    // window, so an idle UE goes quiet after 1 s.
+    let mut last_up_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let up_active = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(1);
     let mut pdcp_tx_sn: u32 = 0; // DRB uplink PDCP SN
     let mut ping_acked = false; // an echo reply was received
     let mut drb_reasm = ferrite_ue::userplane::RlcUmReassembler::new();
@@ -1693,7 +1721,10 @@ fn run(cfg: Config) {
             let mut buf = [0u8; 2048];
             for _ in 0..16 {
                 match tun.read(&mut buf) {
-                    Ok(n) if n > 0 => tun_ul.push_back(buf[..n].to_vec()),
+                    Ok(n) if n > 0 => {
+                        tun_ul.push_back(buf[..n].to_vec());
+                        last_up_activity = std::time::Instant::now();
+                    }
                     _ => break, // WouldBlock or EOF
                 }
             }
@@ -1764,6 +1795,29 @@ fn run(cfg: Config) {
         let w_k1 = cg_cfg.as_ref().map_or(3, |c| bitw(c.k1_list.len()));
         let dci_0_1_size = 33 + w_ul;
         let dci_1_1_size = 36 + w_dl + w_k1;
+        // The SR / CSI-report occasion slots, from the parsed dedicated config; fallback =
+        // the first/second-full-UL-slot heuristics, then the transcribed slots 7/8. (The
+        // configured periods can be 40 slots; serving every frame is harmless — the gNB
+        // simply doesn't monitor the off-period frames.) Hoisted here because the HARQ-ACK
+        // drain below multiplexes SR/CSI onto a PUCCH F2 when the occasions coincide with
+        // an ACK slot (routine on a TDD pattern with one UL slot, e.g. DDDSU).
+        let sr_slot = cg_cfg
+            .as_ref()
+            .and_then(|c| c.sr)
+            .map(|(_, o, _)| i64::from(o % 20))
+            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).find(|&t| s.has_full_ul(t))).map(i64::from))
+            .unwrap_or(7);
+        // SR occasions repeat every `sr_period` slots (capped at the frame — a 40-slot
+        // period served every frame just means the gNB ignores the off-parity ones).
+        // A short configured period (e.g. 10 slots = 5 ms) gives several occasions per
+        // frame; serving all of them is what cuts the idle-UE grant latency.
+        let sr_period = cg_cfg.as_ref().and_then(|c| c.sr).map_or(20, |(p, _, _)| i64::from(p).min(20));
+        let csi_slot = cg_cfg
+            .as_ref()
+            .and_then(|c| c.csi_report)
+            .map(|(_, o, _)| i64::from(o % 20))
+            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).filter(|&t| s.has_full_ul(t)).nth(1)).map(i64::from))
+            .unwrap_or(8);
         // The DL assignment found by T0's blind search this slot, shipped to the RX-PHY
         // worker in its DlJob: (rb0, nrb, mcs, k1, C-DAI, rv, h_id, TDRA-row SLIV, ndi).
         let mut dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, u8, u8)> = None;
@@ -1811,12 +1865,23 @@ fn run(cfg: Config) {
                 // Coherence-gated; with CQI feedback the gNB uses AL1 at Y=0 CCEs the
                 // rnti-hashed USS wouldn't cover, so all AL1/2/4/8 candidates are tried.
                 if ul_bits.is_none() || dl_dci.is_none() {
+                    let dbg_slot = std::env::var("FERRITE_DBG_T0SLOT").ok().and_then(|v| v.parse::<u32>().ok()) == Some(slot_idx);
+                    let mut dbg_power = 0.0f32;
+                    if dbg_slot {
+                        dbg_power = cgrids.iter().flat_map(|g| g.iter()).map(|c| c.norm_sqr()).sum();
+                        let pt: f32 = fsh.iter().map(|c| c.norm_sqr()).sum();
+                        eprintln!("[t0dbg] slot={slot_idx} coreset-power={dbg_power:.1} slot-power={pt:.1}");
+                    }
                     let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
                     for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
                         if ul_bits.is_some() && dl_dci.is_some() {
                             break;
                         }
-                        if coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb) < 0.5 {
+                        let coh = coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb);
+                        if dbg_slot {
+                            eprintln!("[t0dbg] slot={slot_idx} cand al={} cce0={} coh={coh:.2}", cand.agg_level, cand.cces[0]);
+                        }
+                        if coh < 0.5 {
                             continue;
                         }
                         let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
@@ -1857,6 +1922,17 @@ fn run(cfg: Config) {
                             }
                         }
                     }
+                    if dbg_slot && dbg_power > 1.0 && ul_bits.is_none() && dl_dci.is_none()
+                        && !std::path::Path::new("/tmp/ferrite_nodci.bin").exists()
+                    {
+                        eprintln!("[t0dbg] slot={slot_idx} POWER BUT NO DCI — dumping /tmp/ferrite_nodci.bin");
+                        let mut bts = Vec::with_capacity(36 + fsh.len() * 8);
+                        for v in [slot_idx, crnti as u32, 0, 0, 0, 0, 0, 0, sc_to_bin(0) as u32] {
+                            bts.extend_from_slice(&v.to_le_bytes());
+                        }
+                        for sm in &fsh { bts.extend_from_slice(&sm.re.to_le_bytes()); bts.extend_from_slice(&sm.im.to_le_bytes()); }
+                        let _ = std::fs::write("/tmp/ferrite_nodci.bin", &bts);
+                    }
                 }
             }
             // Fill the UL grant (queue-bounded: the gNB grants back-to-back to drain
@@ -1875,6 +1951,9 @@ fn run(cfg: Config) {
                         let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
                         let mcs = bits[mcs_lo..mcs_lo + 5].iter().fold(0u8, |a, &b| a << 1 | b);
                         let ndi = bits[mcs_lo + 5];
+                        // rv(2) and harq-process(4) follow the NDI in both formats.
+                        let g_rv = bits[mcs_lo + 6..mcs_lo + 8].iter().fold(0u8, |a, &b| a << 1 | b);
+                        let g_hid = bits[mcs_lo + 8..mcs_lo + 12].iter().fold(0u8, |a, &b| a << 1 | b);
                         // DCI 0_1 layout: id(1) fdra(9) tdra(w_ul) mcs(5) ndi(1) rv(2)
                         // harq(4) → 1st-DAI (2 bits) at 22 + w_ul. This UL total-DAI
                         // = (HARQ-ACK bit count − 1) mod 4, so it lets us size the
@@ -1903,7 +1982,32 @@ fn run(cfg: Config) {
                         // +MAC-I(4) = 10 bytes of overhead. If it doesn't fit the grant
                         // (the gNB grants a minimal TB after an SR and waits for a BSR),
                         // send a Short BSR to solicit a larger grant instead.
-                        let (mac, kind) = if let Some(ack) = pending_status {
+                        // A PUSCH on a CSI-report occasion carries the CSI part 1
+                        // (TS 38.212 §6.2.7): the gNB reserves Q'_CSI REs on it and
+                        // rate-matches the UL-SCH around them. The occasion parity
+                        // rides on pending_cqi: the worker only measures CQI in the
+                        // frames where the (same 40-slot grid) CSI-RS is present, so a
+                        // report is available exactly when the gNB expects one here.
+                        let cqi_fresh = pending_cqi.is_some_and(|(_, t)| slot_start_ul - t < 17 * slot_len);
+                        let csi_bits: Vec<u8> = if connected.is_some()
+                            && m5_slot.rem_euclid(20) == csi_slot
+                            && cqi_fresh
+                            && cg_cfg.as_ref().is_some_and(|c| c.beta_csi1_index.is_some())
+                        {
+                            let (cqi, _) = pending_cqi.take().unwrap();
+                            vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]
+                        } else {
+                            Vec::new()
+                        };
+                        let beta_csi = cg_cfg.as_ref()
+                            .and_then(|c| c.beta_csi1_index)
+                            .map_or(6.25, ferrite_phy::pusch::beta_offset_csi);
+                        let is_retx = ul_harq.get(&g_hid).is_some_and(|(n, t, _)| *n == ndi && *t == tbs_bytes);
+                        let (mac, kind) = if is_retx {
+                            // Retransmission grant: resend the process's stored TB at the
+                            // grant's rv so the gNB's soft-combine converges.
+                            (ul_harq[&g_hid].2.clone(), format!("UL retx h{g_hid} rv{g_rv}"))
+                        } else if let Some(ack) = pending_status {
                             // Acknowledge received DL RLC SDUs so the gNB stops
                             // retransmitting and delivers the next one.
                             pending_status = None;
@@ -1931,6 +2035,7 @@ fn run(cfg: Config) {
                                 um_sn = um_sn.wrapping_add(1);
                             }
                             let (pdcp, off, sn) = um_tx.take().unwrap();
+                            last_up_activity = std::time::Instant::now();
                             let remaining = pdcp.len() - off;
                             // Bytes queued behind this packet (each still needs PDCP+RLC+MAC).
                             let queued: usize = tun_ul.iter().map(|p| p.len() + 8).sum();
@@ -1954,34 +2059,54 @@ fn run(cfg: Config) {
                                 }
                                 (m, s)
                             }
-                        } else if let (true, true, false, Some(uip)) = (tun.is_none(), drb_up, ping_acked, ue_ip) {
-                            if ping_seq < 20 {
-                                // User plane: send an ICMP echo on DRB 1 (LCID 4) and
-                                // await the reply. Resend on each grant until acked.
-                                let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
-                                let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
-                                pdcp_tx_sn += 1;
-                                let s = format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
-                                    ping_target[0], ping_target[1], ping_target[2], ping_target[3]);
-                                ping_seq += 1;
-                                (m, s)
-                            } else {
-                                (mac_short_bsr(0, tbs_bytes), String::new())
-                            }
+                        } else if let (true, true, Some(uip), true) =
+                            (tun.is_none(), drb_up, ue_ip, ping_seq < 20 && std::time::Instant::now() >= next_ping_at)
+                        {
+                            // Built-in ping as a 1 Hz RTT probe: 20 echoes, one per
+                            // second, each sent ONCE (the reply handler prints the RTT).
+                            // The warm-grant window keeps grants flowing between sends.
+                            let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
+                            let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
+                            pdcp_tx_sn += 1;
+                            let s = format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
+                                ping_target[0], ping_target[1], ping_target[2], ping_target[3]);
+                            ping_sent_at.push(std::time::Instant::now());
+                            next_ping_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                            last_up_activity = std::time::Instant::now();
+                            ping_seq += 1;
+                            (m, s)
+                        } else if up_active(&last_up_activity) {
+                            // Warm grant: traffic moved within the last second — report a
+                            // small non-zero buffer so the gNB keeps granting every UL
+                            // occasion (the next packet rides one instead of paying the
+                            // SR round-trip). Padding does not refresh the window.
+                            (mac_short_bsr(220, tbs_bytes), String::new())
                         } else {
                             // Idle grant: a valid, decodable PDU that reports an empty
                             // buffer so the gNB stops granting (and no crc=KO).
                             (mac_short_bsr(0, tbs_bytes), String::new())
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
-                        let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, 0);
+                        ul_harq.insert(g_hid, (ndi, tbs_bytes, mac.clone()));
+                        // CSI-on-PUSCH shrinks the data rate-match length (the TBS is
+                        // unaffected — like the DL CSI-RS rule, N'_RE ignores the UCI).
+                        // Q'_CSI uses ΣK_r = the LDPC code-block sizes INCLUDING filler.
+                        let csi_res: Vec<(usize, usize)> = if csi_bits.is_empty() { Vec::new() } else {
+                            let sp = ferrite_phy::coding::dlsch::seg_params(tbs, r);
+                            ferrite_phy::pusch::csi1_pusch_res(&m5_alloc.dmrs_symbols, g_nrb, csi_bits.len(), beta_csi, 1.0, sp.c * sp.k)
+                        };
+                        let e = e - 2 * csi_res.len();
+                        let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, g_rv);
+                        if std::env::var_os("FERRITE_ULDBG").is_some() {
+                            eprintln!("[uldbg] slot={m5_slot} rb[{g_rb0},+{g_nrb}) mcs={mcs} tbs={tbs_bytes} e={e} rv={g_rv} h{g_hid}/n{ndi} csi={} retx={is_retx} kind={kind}", csi_res.len());
+                        }
                         let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
                         if !kind.is_empty() {
                             println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
                         }
                         // Modulate after the DL decode (below), so a co-scheduled HARQ-ACK
                         // can be multiplexed onto this PUSCH.
-                        pending_pusch = Some((pos, m5_slot, ulsch, m5_alloc, tbs_bytes * 8, t_dai));
+                        pending_pusch = Some((pos, m5_slot, ulsch, m5_alloc, tbs_bytes * 8, t_dai, csi_bits, csi_res));
                     }
                 }
             }
@@ -2150,8 +2275,8 @@ fn run(cfg: Config) {
         // targets that slot's n+k1 (the other timeline params are constant in steady state).
         // `for … in Option` yields the one decoded TB, keeping the body's `break`s valid.
         while let Ok(res) = dl_res_rx.try_recv() {
-            if res.cqi.is_some() {
-                pending_cqi = res.cqi;
+            if let Some(q) = res.cqi {
+                pending_cqi = Some((q, res.slot_start_ul));
             }
             let (r_slot_idx, r_slot_start_ul) = (res.slot_idx, res.slot_start_ul);
             // Absolute dispatch→drain lag in slots (slot_start_ul is monotonic; the old
@@ -2209,9 +2334,15 @@ fn run(cfg: Config) {
                                         // Hand the packet to the OS via the TUN interface.
                                         let _ = tun.write(&ip);
                                     } else if let Some(r) = ferrite_ue::userplane::parse_ipv4_icmp_echo_reply(&ip) {
+                                        if !ping_acked {
+                                            println!("🏓 PING REPLY from {}.{}.{}.{} id={:#06x} seq={} — END-TO-END PING WORKS",
+                                                r.src[0], r.src[1], r.src[2], r.src[3], r.id, r.seq);
+                                        }
                                         ping_acked = true;
-                                        println!("🏓 PING REPLY from {}.{}.{}.{} id={:#06x} seq={} — END-TO-END PING WORKS",
-                                            r.src[0], r.src[1], r.src[2], r.src[3], r.id, r.seq);
+                                        last_up_activity = std::time::Instant::now();
+                                        if let Some(t0) = ping_sent_at.get(r.seq as usize) {
+                                            println!("🏓 seq={} time={:.1} ms", r.seq, t0.elapsed().as_secs_f64() * 1e3);
+                                        }
                                     } else {
                                         println!("   DRB DL IP packet ({} B): {}", ip.len(),
                                             ip.iter().take(20).map(|b| format!("{b:02x}")).collect::<String>());
@@ -2480,33 +2611,10 @@ fn run(cfg: Config) {
         // only the slot (verified: slot 7 on the 5 ms 6D+3U cell, slot 4 on the
         // 2.5 ms DDDSU cell). This mirrors the gNB's dedicated RRCSetup config until
         // ferrite parses masterCellGroup for real.
-        let want_ping = tun.is_none() && drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
+        let want_ping = tun.is_none() && drb_up && ue_ip.is_some() && ping_seq < 20;
         let want_drb = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
         let want_sr = connected.is_some()
             && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb);
-        // The SR / CSI-report occasion slots, from the parsed dedicated config; fallback =
-        // the first/second-full-UL-slot heuristics, then the transcribed slots 7/8. (The
-        // configured periods can be 40 slots; serving every frame is harmless — the gNB
-        // simply doesn't monitor the off-period frames.) Hoisted here because the HARQ-ACK
-        // drain below multiplexes SR/CSI onto a PUCCH F2 when the occasions coincide with
-        // an ACK slot (routine on a TDD pattern with one UL slot, e.g. DDDSU).
-        let sr_slot = cg_cfg
-            .as_ref()
-            .and_then(|c| c.sr)
-            .map(|(_, o, _)| i64::from(o % 20))
-            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).find(|&t| s.has_full_ul(t))).map(i64::from))
-            .unwrap_or(7);
-        // SR occasions repeat every `sr_period` slots (capped at the frame — a 40-slot
-        // period served every frame just means the gNB ignores the off-parity ones).
-        // A short configured period (e.g. 10 slots = 5 ms) gives several occasions per
-        // frame; serving all of them is what cuts the idle-UE grant latency.
-        let sr_period = cg_cfg.as_ref().and_then(|c| c.sr).map_or(20, |(p, _, _)| i64::from(p).min(20));
-        let csi_slot = cg_cfg
-            .as_ref()
-            .and_then(|c| c.csi_report)
-            .map(|(_, o, _)| i64::from(o % 20))
-            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).filter(|&t| s.has_full_ul(t)).nth(1)).map(i64::from))
-            .unwrap_or(8);
         // Fire the standalone SR 3 slots before its occasion (late enough that any HARQ-ACK
         // book for that slot has formed): if the slot's UCI is already owned by an ACK book
         // (the F2 below carries the SR bit) or a PUSCH (BSR carries the buffer state), the
@@ -2541,14 +2649,14 @@ fn run(cfg: Config) {
         // an ACK book (the HARQ-ACK F2 below appends the CQI) or a PUSCH, skip — a
         // second waveform would overlap theirs in the injection table.
         if connected.is_some() && (csi_slot - slot_idx as i64).rem_euclid(20) == 2 && pend_csi.is_none()
-            && pending_cqi.is_some()
+            && pending_cqi.is_some_and(|(_, t)| slot_start_ul - t < 17 * slot_len)
         {
             let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4
                 + slot_len / 2).div_euclid(slot_len);
             let msg4ack_owns = pend_pucch.as_ref()
                 .is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == ckey);
             if !ack_book.contains_key(&ckey) && !uci_claimed.contains(&ckey) && !msg4ack_owns {
-                let cqi = pending_cqi.take().unwrap();
+                let (cqi, _) = pending_cqi.take().unwrap();
                 let f2 = cg_cfg.as_ref().and_then(|c| {
                     let (_, _, rid) = c.csi_report?;
                     c.pucch_resources.iter().find(|r| r.id == rid).copied()
@@ -2611,7 +2719,7 @@ fn run(cfg: Config) {
         // HARQ-ACK is due at this PUSCH's UL slot, multiplex it onto the PUSCH
         // (UCI-on-PUSCH) — the gNB expects it there, not on the PUCCH — and remove it
         // from the codebook so it isn't also sent on a PUCCH.
-        if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits, t_dai)) = pending_pusch.take() {
+        if let Some((pos, m5_slot, ulsch, m5_alloc, tb_bits, t_dai, csi, csi_res)) = pending_pusch.take() {
             // The codebook lookup is by the nearest-slot rounding of the position, not
             // the exact position — last_ta can change between the DL decode that
             // inserted the ACK and this grant, aliasing the two apart (the missed lookup
@@ -2645,6 +2753,7 @@ fn run(cfg: Config) {
             let _ = tx_req_tx.try_send(TxReq::Pusch {
                 ulsch, alloc: m5_alloc, slot_mod20: (m5_slot % 20) as u32, slot_parity: (m5_slot % 2) as usize,
                 crnti, ack, beta: BETA_HARQ, tb_bits, pos, now: ul_counter as i64,
+                csi, csi_res,
             });
             pend_ul.push(pos);
             // This PUSCH now owns UL slot `key`'s UCI. An ACK whose decode drains AFTER
@@ -2701,14 +2810,15 @@ fn run(cfg: Config) {
             // 4-bit CQI if it's the CSI one. Routine on a one-UL-slot TDD pattern
             // (DDDSU: the gNB reads ack+sr+csi off one F2 and DTXes anything else).
             let sr_here = i64::from(slot_mod20) == sr_slot;
-            let csi_here = i64::from(slot_mod20) == csi_slot && pending_cqi.is_some();
+            let csi_here = i64::from(slot_mod20) == csi_slot
+                && pending_cqi.is_some_and(|(_, t)| (pos - t).abs() < 17 * slot_len);
             let mut wave = if bits.len() > 2 || csi_here {
                 if sr_here {
                     bits.push(u8::from(want_sr));
                     pend_sr = Some(pos); // the F2 carries this occasion's SR
                 }
                 if csi_here {
-                    let cqi = pending_cqi.take().unwrap();
+                    let (cqi, _) = pending_cqi.take().unwrap();
                     bits.extend([(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]);
                 }
                 // OCUDU's resource set 1 (>2 UCI bits) = the F2 resources, ids 8..15,

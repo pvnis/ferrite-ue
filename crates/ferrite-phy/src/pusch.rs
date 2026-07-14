@@ -81,29 +81,69 @@ pub fn pusch_modulate_slot_uci(
     beta_harq: f32,
     tb_bits: usize,
 ) -> Vec<Complex32> {
+    pusch_modulate_slot_uci_csi(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, tc_rnti, center_freq_hz, fs, harq_ack, beta_harq, tb_bits, &[], &[])
+}
+
+/// As `pusch_modulate_slot_uci`, additionally multiplexing a CSI part 1 report
+/// (TS 38.212 §6.2.7): the CSI REs (see `csi1_pusch_res`, β = `beta_csi`, α = 1) carry
+/// the RM(32,O)-coded report, and the UL-SCH data is RATE-MATCHED around them — the
+/// caller must have encoded `ulsch` to `E − 2·Q'_CSI` bits. Scrambling is indexed by
+/// RE position (the gNB descrambles the multiplexed stream in mapping order), which
+/// reduces to the plain stream scrambling when no CSI is present.
+#[allow(clippy::too_many_arguments)]
+pub fn pusch_modulate_slot_uci_csi(
+    ofdm: &Ofdm,
+    ulsch: &[u8],
+    alloc: &PuschAlloc,
+    cell_id: u16,
+    slot_in_frame: u32,
+    slot_in_subframe: usize,
+    tc_rnti: u16,
+    center_freq_hz: f64,
+    fs: f64,
+    harq_ack: &[u8],
+    beta_harq: f32,
+    tb_bits: usize,
+    csi1: &[u8],
+    csi_res: &[(usize, usize)],
+) -> Vec<Complex32> {
     let n = ofdm.fft_size();
     let center = alloc.carrier_rb * 6; // DC subcarrier index of the UL carrier
     let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
 
-    // Scramble (§6.3.1.1): c_init = n_RNTI·2^15 + n_ID (n_RNTI = TC-RNTI, n_ID = PCI).
-    let c = gold_sequence(pdsch_scramble_c_init(tc_rnti, cell_id), ulsch.len());
-    let g: Vec<u8> = ulsch.iter().zip(&c).map(|(a, b)| a ^ b).collect();
-    let data: Vec<Complex32> = g.chunks_exact(2).map(|p| qpsk(p[0], p[1])).collect();
-
     let dmrs_set: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
     let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs_set.contains(l)).collect();
+    let n_sc = 12 * alloc.n_rb;
+    let n_re = data_syms.len() * n_sc;
+
+    // CSI part 1 REs by map index (k'-first-then-l order) → coded-bit-pair index.
+    let mut csi_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let rm_csi = if !csi1.is_empty() {
+        for (ci, &(l, sc_a)) in csi_res.iter().enumerate() {
+            let sym_pos = data_syms.iter().position(|&x| x == l).unwrap();
+            csi_at.insert(sym_pos * n_sc + sc_a, ci);
+        }
+        rm_encode(csi1, csi_res.len() * 2)
+    } else {
+        Vec::new()
+    };
+
+    // Scramble (§6.3.1.1): c_init = n_RNTI·2^15 + n_ID (n_RNTI = TC-RNTI, n_ID = PCI).
+    // Indexed by RE position over the whole mapping (identical to the plain stream
+    // scrambling when the data occupies every RE).
+    let c = gold_sequence(pdsch_scramble_c_init(tc_rnti, cell_id), 2 * n_re);
 
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
-    // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l.
-    // i.e. fill a whole OFDM symbol across subcarriers before moving to the next.
-    let mut di = 0;
-    for &l in &data_syms {
-        for kp in 0..(12 * alloc.n_rb) {
-            let sc = 12 * alloc.rb_start + kp;
-            if di < data.len() {
-                grids[l][bin(sc)] = data[di];
-                di += 1;
-            }
+    // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l,
+    // skipping the CSI REs (the UL-SCH is rate-matched around them).
+    let mut src = 0usize; // next UL-SCH bit
+    for (di, (&l, kp)) in data_syms.iter().flat_map(|l| (0..n_sc).map(move |kp| (l, kp))).enumerate() {
+        let sc = 12 * alloc.rb_start + kp;
+        if let Some(&ci) = csi_at.get(&di) {
+            grids[l][bin(sc)] = qpsk(rm_csi[2 * ci] ^ c[2 * di], rm_csi[2 * ci + 1] ^ c[2 * di + 1]);
+        } else if src + 1 < ulsch.len() {
+            grids[l][bin(sc)] = qpsk(ulsch[src] ^ c[2 * di], ulsch[src + 1] ^ c[2 * di + 1]);
+            src += 2;
         }
     }
     // DM-RS (config type 1, CDM group 0: even subcarriers). Sequence referenced
@@ -273,6 +313,49 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_ack: usize, beta: f
             ack_placed += cnt2;
         }
         if ack_placed >= q_ack {
+            break;
+        }
+    }
+    res
+}
+
+/// β_offset for CSI part 1/2 on PUSCH by betaOffsetCSI-Part-Index (TS 38.213
+/// Table 9.3-2; normative constants).
+pub fn beta_offset_csi(index: u8) -> f32 {
+    const T: [f32; 19] = [1.125, 1.25, 1.375, 1.625, 1.75, 2.0, 2.25, 2.5, 2.875,
+        3.125, 3.5, 4.0, 5.0, 6.25, 8.0, 10.0, 12.625, 15.875, 20.0];
+    *T.get(index as usize).unwrap_or(&6.25)
+}
+
+/// CSI-part-1-on-PUSCH RE placement (TS 38.212 §6.3.2.4.1.2 count, §6.2.7 mapping,
+/// matching OCUDU's `ulsch_demultiplex`): Q'_CSI = min(⌈O·β·M_uci/ΣK_r⌉, ⌈α·M_uci⌉),
+/// placed strided per symbol over ALL non-DM-RS symbols from the slot start (unlike
+/// HARQ-ACK, which starts after the first DM-RS). `sum_kr` is the UL-SCH's ΣK_r —
+/// the LDPC code-block sizes INCLUDING filler (C·K from `seg_params`), NOT TBS+CRC
+/// (one RE of difference shifts the whole data map). The UL-SCH is RATE-MATCHED
+/// around these REs — the caller must shrink its data E by 2·len() and the mapper
+/// must skip them. Returns each CSI RE as `(symbol, subcarrier-within-alloc)`.
+pub fn csi1_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_csi: usize, beta: f32, alpha: f32, sum_kr: usize) -> Vec<(usize, usize)> {
+    let n_sc = 12 * n_rb;
+    let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
+    let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs.contains(l)).collect();
+    let nof_re_uci = data_syms.len() * n_sc;
+    let sum_cb = sum_kr as f32;
+    let q_csi = (((o_csi as f32) * beta * nof_re_uci as f32 / sum_cb).ceil() as usize)
+        .min((alpha * nof_re_uci as f32).ceil() as usize)
+        .max(1);
+    let mut res = Vec::new();
+    let mut placed = 0usize;
+    for &l in &data_syms {
+        let rem = q_csi - placed;
+        if rem > 0 {
+            let (d, cnt) = if rem < n_sc { (n_sc / rem, rem) } else { (1, n_sc) };
+            for i in 0..cnt {
+                res.push((l, i * d));
+            }
+            placed += cnt;
+        }
+        if placed >= q_csi {
             break;
         }
     }
