@@ -139,6 +139,11 @@ framing is split by plane across two files, each citing the relevant TS inline:
   (`srb1_msg5_pdu`, `parse_srb1_dl_pdcp`), RLC-AM headers + reassembly + STATUS
   (`parse_rlc_am_header`, `RlcReassembler`, `rlc_status_mac_pdu`), MAC CEs
   (`mac_short_bsr`) and the shared DL MAC-PDU parser (`parse_dl_mac_pdu`).
+- **`src/sib1.rs`** — hand-rolled UPER (X.691) decode of SIB1 (TS 38.331): the cell's
+  TDD UL/DL pattern, the PUSCH k2 / PDSCH SLIV time-domain allocation lists, PRACH
+  and PUCCH common config. Decoded live during the RA phase; drives the slot gates
+  (DL dispatch, Msg4 monitoring, Msg3/PUCCH/SR/CSI timing) and per-grant k2, so the
+  UE follows the broadcast TDD configuration instead of transcribed constants.
 
 RRC (TS 38.331) and NAS (TS 24.501) message coding sit above these, in `src/rrc.rs`
 and `src/nas.rs`; 5G-AKA / key derivation is in `src/milenage.rs`. The MAC
