@@ -349,38 +349,108 @@ fn parse_ta_command_ce(tb: &[u8]) -> Option<u8> {
     None
 }
 
-/// Time-domain shape of a connected-mode DL PDSCH: (sym_start, n_sym, DM-RS symbols),
-/// selected by the DCI's 1-bit time-domain-resource-assignment (the cell's TDA list has
-/// exactly two rows). Row 0 = the full [2,14) with DM-RS {2,7,11}; row 1 = [2,8) with
-/// DM-RS {2,7} (both from the gNB's scheduler log dl_dmrs_symb_pos). The short row is
-/// used in the TDD special slot (slot 6 — only 8 DL symbols) for FIRST transmissions,
-/// but HARQ retransmissions of such a TB keep the short shape in NORMAL slots too (same
-/// TBS ⇒ same allocation), so the shape must come from the DCI, not the slot index:
-/// inferring it from the slot wedged the attach whenever the slot-6 first TX was missed
-/// (every retx then extracted as 12-symbol and could never CRC → registration timeout).
-fn dl_pdsch_shape(short: bool) -> (usize, usize, Vec<usize>) {
-    if short {
-        (2, 6, vec![2, 7])
-    } else {
-        (2, 12, vec![2, 7, 11])
+/// The SLIV of the full [2,14) type-A allocation — the fallback shape (DCI 1_0's
+/// default-table row 0, and any DL before the TDRA lists are known).
+const SLIV_FULL: u8 = 53;
+/// The SLIV of the bring-up cell's short [2,8) row (row 1 of its SIB1 list).
+const SLIV_SHORT: u8 = 72;
+
+/// Time-domain shape of a connected-mode DL PDSCH: (sym_start, n_sym, DM-RS symbols)
+/// from the scheduled row's SLIV. The row comes from the DCI's TDRA field via the
+/// configured pdsch-TimeDomainAllocationList (dedicated, else SIB1) — short rows are
+/// used in the TDD special slot for FIRST transmissions, but HARQ retransmissions of
+/// such a TB keep the short shape in NORMAL slots too (same TBS ⇒ same allocation), so
+/// the shape must come from the DCI, not the slot index: inferring it from the slot
+/// wedged the attach whenever the special-slot first TX was missed (every retx then
+/// extracted as 12-symbol and could never CRC → registration timeout).
+/// DM-RS: TS 38.211 Table 7.4.1.1.2-3, single-symbol, mapping type A (ld = S + L),
+/// typeA-position = pos2, dmrs-AdditionalPosition = pos2 — the OCUDU defaults; live
+/// anchors: ld 8 → {2,7} (bring-up cell), ld 10 → {2,6,9} (DDDSU cell, gNB dmrs_mask),
+/// ld 14 → {2,7,11}.
+fn dl_pdsch_shape(sliv: u8) -> (usize, usize, Vec<usize>) {
+    let (s, l) = ferrite_ue::sib1::sliv_to_sl(sliv);
+    let dmrs: &[usize] = match s + l {
+        ..=7 => &[2],
+        8 | 9 => &[2, 7],
+        10 => &[2, 6, 9],
+        11 => &[2, 7, 10],
+        _ => &[2, 7, 11],
+    };
+    (s, l, dmrs.to_vec())
+}
+
+/// The cell's periodic CSI-RS geometry (TS 38.211 §7.4.1.5): which REs the gNB
+/// rate-matches connected-mode PDSCH around (TS 38.214 §5.1.4), which slots have any
+/// CSI-RS, and where to measure the TRS for the CQI report. Built from the parsed
+/// masterCellGroup NZP/ZP resource lists (`CSI_RM`, set once at Msg4); until then the
+/// transcribed pattern of the bring-up cell applies (`DEFAULT_CSI_RM`). Slot keys are
+/// `offset_slots % 20` — the resources are 40-slot periodic and the caller's CSI
+/// frame-parity anchor handles the other 20 (see `csi_parity` in `decode_dl`).
+struct CsiRm {
+    /// (slot-in-frame, OFDM symbol, 12-bit per-RB subcarrier mask) per CSI-RS symbol
+    /// instance, NZP and ZP — the PDSCH rate-match pattern. The resources span the
+    /// whole BWP, so the per-RB mask repeats across RBs.
+    res: Vec<(u32, usize, u16)>,
+    /// The CQI measurement instances: (slot, symbol, k0) of each density-3 row-1 TRS —
+    /// a full {k0, k0+4, k0+8} comb (single-RE rows mix PDSCH data into the measurement
+    /// and can't anchor the frame parity).
+    meas: Vec<(u32, usize, usize)>,
+}
+
+impl CsiRm {
+    /// Translate the parsed NZP + ZP resource lists (TS 38.211 Table 7.4.1.5.3-1 rows
+    /// 1, 2 and 4 — the ones OCUDU emits) into per-slot RE masks.
+    fn from_cellgroup(cg: &ferrite_ue::cellgroup::CellGroupParams) -> Self {
+        let mut rm = CsiRm { res: Vec::new(), meas: Vec::new() };
+        for r in cg.nzp_csi_rs.iter().chain(cg.zp_csi_rs.iter()) {
+            let slot = u32::from(r.offset_slots) % 20;
+            let bit = r.freq_bits.trailing_zeros() as usize; // lowest set bit = k0/group
+            let mask: u16 = match r.row {
+                // Row 1 (density 3): k ∈ {k0, k0+4, k0+8}.
+                1 => 0b_0001_0001_0001 << bit,
+                // Row 2: the single subcarrier k0.
+                2 => 1 << bit,
+                // Row 4: a group of 4 subcarriers starting at 4·j.
+                4 => 0b1111 << (4 * bit),
+                _ => continue,
+            };
+            for sym in std::iter::once(r.symbol).chain(r.symbol2) {
+                rm.res.push((slot, sym as usize, mask));
+                if r.row == 1 && r.density == 3 {
+                    rm.meas.push((slot, sym as usize, bit));
+                }
+            }
+        }
+        rm
+    }
+
+    fn has_slot(&self, slot: u32) -> bool {
+        self.res.iter().any(|&(s, _, _)| s == slot)
     }
 }
 
-/// REs occupied by this cell's periodic CSI-RS resources (TS 38.211 §7.4.1.5), which the
-/// gNB rate-matches connected-mode PDSCH around (TS 38.214 §5.1.4). Pattern read live from
-/// the gNB's FAPI debug output (values only), 20 ms periodic — the caller gates on the
-/// CSI frame parity (see the anchor in `decode_dl`):
-///   slots 2,3: TRS, row 1, density 3, k0=1 → k ∈ {1,5,9} at symbols 4 AND 8;
-///   slot 4:    NZP row 2, density 1, k0=1 → k=1 at symbol 4;
-///              ZP row 4 (4 REs) at symbol 8 → k ∈ {4..8} (k0=4).
-/// `k` is the subcarrier within the RB (the resources span the whole 24-RB BWP, so the
-/// per-RB pattern repeats). SIB1 (slot 1) and RAR (slot 10) never land in these slots.
+/// Set once from the parsed masterCellGroup at Msg4 (read by the RX-PHY worker).
+static CSI_RM: std::sync::OnceLock<CsiRm> = std::sync::OnceLock::new();
+/// The bring-up cell's pattern, read live from the gNB's FAPI debug output (values
+/// only): slots 2,3 = TRS row 1 density 3 k0=1 (k ∈ {1,5,9}) at symbols 4 and 8;
+/// slot 4 = NZP row 2 k=1 at symbol 4 + ZP row 4 k ∈ {4..8} at symbol 8. SIB1
+/// (slot 1) and RAR (slot 10) never land in these slots.
+static DEFAULT_CSI_RM: std::sync::LazyLock<CsiRm> = std::sync::LazyLock::new(|| CsiRm {
+    res: vec![
+        (2, 4, 0b_0010_0010_0010), (2, 8, 0b_0010_0010_0010),
+        (3, 4, 0b_0010_0010_0010), (3, 8, 0b_0010_0010_0010),
+        (4, 4, 0b_0000_0000_0010), (4, 8, 0b_0000_1111_0000),
+    ],
+    meas: vec![(2, 4, 1), (3, 4, 1)],
+});
+
+fn csi_rm() -> &'static CsiRm {
+    CSI_RM.get().unwrap_or(&DEFAULT_CSI_RM)
+}
+
+/// Is (slot, symbol, subcarrier-in-RB) a CSI-RS RE the PDSCH rate-matches around?
 fn csi_rs_rm_re(slot: u32, l: usize, k: usize) -> bool {
-    match slot {
-        2 | 3 => (l == 4 || l == 8) && k % 4 == 1,
-        4 => (l == 4 && k == 1) || (l == 8 && (4..8).contains(&k)),
-        _ => false,
-    }
+    csi_rm().res.iter().any(|&(s, sym, mask)| s == slot && sym == l && mask >> (k % 12) & 1 == 1)
 }
 
 /// The pure per-layout PDSCH work: extract at one (CDM-groups, time-first) layout,
@@ -401,25 +471,25 @@ fn pdsch_standalone(
     rv: u8,
     cdm: usize,
     time_first: bool,
-    short: bool,
+    sliv: u8,
     rm_csi: bool,
-    tb_shape: (u8, usize, bool),
+    tb_shape: (u8, usize, u8),
 ) -> (Vec<f32>, usize, Option<Vec<u8>>) {
     use ferrite_phy::coding::dlsch::dlsch_decode_single_bits;
-    let (sym_start, n_sym, dmrs) = dl_pdsch_shape(short);
+    let (sym_start, n_sym, dmrs) = dl_pdsch_shape(sliv);
     // TBS and base graph follow the TB's INITIAL transmission (TS 38.214 §5.1.3.2):
-    // `tb_shape` = (mcs, n_rb, short) of the first transmission of this HARQ process's
+    // `tb_shape` = (mcs, n_rb, sliv) of the first transmission of this HARQ process's
     // TB. A retransmission may arrive with an ADAPTED (lower) MCS — the gNB's link
     // adaptation reacts to the NACK — and a different allocation, but the TB keeps its
     // original size. Recomputing TBS from the retx DCI (the old behaviour) made every
     // adapted retx undecodable (wrong info length, e.g. true TBS 42 B computed as 11 B),
     // which turned any first NACK into an unrecoverable retx storm. For a first
-    // transmission the caller passes this DCI's own (mcs, n_rb, short) — identical maths.
+    // transmission the caller passes this DCI's own (mcs, n_rb, sliv) — identical maths.
     // NOTE: the CSI-RS rate matching below does NOT reduce the TBS RE count — TS 38.214's
     // N'_RE ignores CSI-RS; only the extracted (rate-matched) LLR length E shrinks.
-    let (i_mcs, i_nrb, i_short) = tb_shape;
+    let (i_mcs, i_nrb, i_sliv) = tb_shape;
     let (i_qm, i_r) = mcs_params(i_mcs);
-    let (_, i_nsym, i_dmrs) = dl_pdsch_shape(i_short);
+    let (_, i_nsym, i_dmrs) = dl_pdsch_shape(i_sliv);
     let n_re = i_nrb * ((i_nsym - i_dmrs.len()) * 12 + if cdm == 1 { i_dmrs.len() * 6 } else { 0 });
     let tbs = tbs_from_nre(n_re, i_r, i_qm as usize);
     let _ = r;
@@ -438,7 +508,7 @@ fn pdsch_standalone(
     let (bits, _c, crc) = dlsch_decode_single_bits(&llr, tbs, i_r, qm, rv, 10);
     let tb = crc.then(|| pack_bits(&bits));
     if std::env::var("FERRITE_DBG_SLOT").ok().and_then(|v| v.parse::<u32>().ok()) == Some(slot_idx) {
-        eprintln!("[std] slot={slot_idx} rb[{rb_start},+{n_rb}) qm={qm} rv={rv} cdm={cdm} tf={time_first} short={short} shape={tb_shape:?} tbs={tbs} e={} crc={crc}", llr.len());
+        eprintln!("[std] slot={slot_idx} rb[{rb_start},+{n_rb}) qm={qm} rv={rv} cdm={cdm} tf={time_first} sliv={sliv} shape={tb_shape:?} tbs={tbs} e={} crc={crc}", llr.len());
     }
     (llr, tbs, tb)
 }
@@ -461,11 +531,11 @@ fn try_decode_dl_srb1(
     mcs: u8,
     rv: u8,
     h_id: u8,
-    short: bool,
+    sliv: u8,
     rm_csi: bool,
-    // (mcs, n_rb, short) of this TB's INITIAL transmission (= this DCI's own values for a
+    // (mcs, n_rb, sliv) of this TB's INITIAL transmission (= this DCI's own values for a
     // first transmission) — TBS/base-graph follow it, not the retx DCI. See pdsch_standalone.
-    tb_shape: (u8, usize, bool),
+    tb_shape: (u8, usize, u8),
     // NDI unchanged vs the last DCI on this HARQ process ⇒ this is a retransmission.
     is_retx: bool,
     // Cell-fixed time-first order proven by the Msg4 decode — halves the pre-lock sweep.
@@ -474,7 +544,7 @@ fn try_decode_dl_srb1(
     hyp_mcs: u8,
     lock: &mut Option<(usize, bool)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
-) -> Option<(Vec<u8>, bool, (u8, usize, bool))> {
+) -> Option<(Vec<u8>, bool, (u8, usize, u8))> {
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
     use ferrite_phy::coding::dlsch::{dlsch_cb_llr, dlsch_decode_cb};
@@ -505,7 +575,7 @@ fn try_decode_dl_srb1(
     // the sum IS this transmission alone, so nothing is lost vs the standalone attempt.
     let retx_combine_only = is_retx && h_id != 0xff && lock0.is_some();
     let hit = if retx_combine_only { None } else { layouts.par_iter().find_map_any(|&(cdm, time_first)| {
-        let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short, rm_csi, tb_shape);
+        let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, sliv, rm_csi, tb_shape);
         let tb = tb?;
         // Deliverable PDU (DRB IP / SRB1 RRC) on the right layout → lock it and deliver up the
         // stack. A CRC-pass on the already-locked layout that isn't a recognizable PDU (a MAC CE
@@ -533,7 +603,7 @@ fn try_decode_dl_srb1(
     // Only reached on retx, which the fast first-transmission path above should keep rare.
     if h_id != 0xff {
         if let Some((lcdm, ltf)) = lock0 {
-            let (llr, tbs, _tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, lcdm, ltf, short, rm_csi, tb_shape);
+            let (llr, tbs, _tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, lcdm, ltf, sliv, rm_csi, tb_shape);
             let cb = dlsch_cb_llr(&llr, tbs, r, qm, rv);
             if !cb.is_empty() {
                 let e = harq_dl.entry(h_id).or_insert_with(|| HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
@@ -574,7 +644,7 @@ fn try_decode_dl_srb1(
     // Each extra attempt is one standalone sweep; on success the caller re-records the
     // shape that decoded, so the process returns to the fast blind-ACK/combine paths.
     if h_id != 0xff {
-        let mut shapes: Vec<(u8, usize, bool)> = Vec::new();
+        let mut shapes: Vec<(u8, usize, u8)> = Vec::new();
         // The combine-only fast path above skipped the standalone sweep AND its combine
         // extraction trusts the locked layout — which is per-grant-wrong when the CDM
         // group count differs (observed live: a cdm=1 retx never decodes against a cdm=2
@@ -582,17 +652,17 @@ fn try_decode_dl_srb1(
         if retx_combine_only {
             shapes.push(tb_shape);
         }
-        let dci_shape = (mcs, n_rb, short);
+        let dci_shape = (mcs, n_rb, sliv);
         if dci_shape != tb_shape {
             shapes.push(dci_shape);
         }
-        let hyp = (hyp_mcs, n_rb, short);
+        let hyp = (hyp_mcs, n_rb, sliv);
         if tb_shape.0 < hyp_mcs && hyp != dci_shape {
             shapes.push(hyp);
         }
         for cand_shape in shapes {
             let hyp_hit = layouts.par_iter().find_map_any(|&(cdm, time_first)| {
-                let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, short, rm_csi, cand_shape);
+                let (_llr, _tbs, tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, cdm, time_first, sliv, rm_csi, cand_shape);
                 let tb = tb?;
                 if plausible_dl_tb(&tb) {
                     Some((cdm, time_first, tb, true))
@@ -637,10 +707,10 @@ struct DlJob {
     frame_even: bool,
     crnti: u16,
     /// The DL assignment T0's blind search found in this slot's PDCCH (rb0, nrb, mcs, k1,
-    /// C-DAI, rv, h_id, short-TDRA, ndi) — T0 searches the CORESETs once per slot for its
+    /// C-DAI, rv, h_id, TDRA-row SLIV, ndi) — T0 searches the CORESETs once per slot for its
     /// UL grant anyway, so the worker reuses the result instead of repeating the ~200µs
     /// search (which was the margin that blew its 500µs budget under a retx flood).
-    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)>,
+    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, u8, u8)>,
     /// The cell-fixed time-first RE order proven by the Msg4 decode (see `msg4_tf`).
     tf_hint: Option<bool>,
     fsh: Vec<Complex32>,
@@ -702,16 +772,16 @@ fn decode_dl(
     slot_idx: u32,
     // The DL assignment T0's per-slot blind search found (T0 searches for its UL grant
     // anyway; the worker reusing it removes a duplicate ~200µs search from its budget).
-    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)>,
+    dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, u8, u8)>,
     harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
     // Per-HARQ-process delivered state: h_id → NDI of the last TB this process CRC-OK'd.
     // A later DCI with the same (h_id, NDI) is a retransmission of that TB → ACK from the
     // DCI alone, no decode (see the short-circuit below).
     harq_done: &mut std::collections::HashMap<u8, u8>,
-    // Per-HARQ-process INITIAL-transmission shape: h_id → (ndi, mcs, n_rb, short) recorded
+    // Per-HARQ-process INITIAL-transmission shape: h_id → (ndi, mcs, n_rb, sliv) recorded
     // at first sight of each new TB. A retransmission (same NDI) keeps the TB's original
     // TBS even when the gNB adapts the MCS/allocation down — decode with the stored shape.
-    harq_init: &mut std::collections::HashMap<u8, (u8, u8, usize, bool)>,
+    harq_init: &mut std::collections::HashMap<u8, (u8, u8, usize, u8)>,
     // CSI-RS frame-parity anchor: the cell's CSI-RS/TRS are 20 ms periodic (every OTHER
     // frame) but slot_idx only spans one frame, so PDSCH-around-CSI-RS rate matching
     // (see `csi_rs_rm_re`) applies only when this slot's frame parity matches the parity
@@ -728,10 +798,10 @@ fn decode_dl(
     backlog: bool,
 ) -> (Option<DlDecoded>, Option<u8>) {
     // (rb_start, n_rb, MCS, k1 (0xff = don't ACK), C-DAI, RV, HARQ id (0xff = fallback),
-    //  short time allocation — the DCI's 1-bit TDRA row: false = symb [2,14), true = [2,8) —
+    //  the TDRA row's SLIV (the time-domain shape; SLIV_FULL = the [2,14) fallback) —
     //  and NDI, the 1-bit new-data indicator that distinguishes a retransmission from a
     //  fresh TB on the same HARQ process). From T0's blind search (in the DlJob).
-    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8, bool, u8)> = Vec::new();
+    let mut allocs: Vec<(usize, usize, u8, u8, u8, u8, u8, u8, u8)> = Vec::new();
     if let Some(a) = dl_dci {
         allocs.push(a);
     }
@@ -746,7 +816,7 @@ fn decode_dl(
     if allocs.is_empty() && !backlog && dl_dmrs_lock.is_none() && std::env::var_os("FERRITE_FB").is_some() {
         for &nrb in &[2usize, 5, 13, 17, 18, 24] {
             for mcs in [0u8, 1, 2] {
-                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff, false, 0));
+                allocs.push((0, nrb, mcs, 0xff, 0, 0, 0xff, SLIV_FULL, 0));
             }
         }
     }
@@ -802,18 +872,17 @@ fn decode_dl(
         return (None, None);
     };
     let t_pdsch = std::time::Instant::now();
-    // NZP-CSI-RS measurement (row 1, k0=1, symbol 4) → wideband CQI, only in the even-frame
-    // slots 2-4 where the CSI-RS is present (a high SINR gates it, no SFN tracking needed).
+    // NZP-CSI-RS (TRS) measurement → wideband CQI, at the config's TRS instances (a high
+    // SINR gates it, no SFN tracking needed). Only the density-3 row-1 TRS combs anchor
+    // the CSI frame parity — a single-RE row mixes PDSCH data into the measurement and
+    // can't be trusted as a detector.
     let mut cqi = None;
     let mut rm_csi = false;
-    if matches!(slot_idx, 2..=4) {
-        let sinr = ferrite_phy::csi::measure_csi_rs_sinr(&grids[4], |sc: usize| sc_to_bin(sc as i32), cell_id, slot_idx, 4, carrier_rb, 1);
-        if sinr > 15.0 {
-            cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
-            // Anchor the CSI frame parity on the solid TRS slots (2, 3 — full {1,5,9}
-            // pattern at symbol 4; slot 4 has only 1 CSI RE there so its measurement
-            // mixes PDSCH data and can't be trusted as a detector).
-            if slot_idx != 4 {
+    if csi_rm().has_slot(slot_idx) {
+        if let Some(&(_, sym, k0)) = csi_rm().meas.iter().find(|m| m.0 == slot_idx) {
+            let sinr = ferrite_phy::csi::measure_csi_rs_sinr(&grids[sym], |sc: usize| sc_to_bin(sc as i32), cell_id, slot_idx, sym as u32, carrier_rb, k0);
+            if sinr > 15.0 {
+                cqi = Some(ferrite_phy::csi::sinr_to_cqi(sinr));
                 *csi_parity = Some(frame_even);
             }
         }
@@ -821,13 +890,13 @@ fn decode_dl(
         rm_csi = csi_parity.is_some_and(|p| p == frame_even);
     }
     // Cheap presence gate: every connected DL PDSCH starts at RB 0. Probe with the DM-RS
-    // symbols COMMON to both time allocations ({2,7} — the [2,8) shape's full set, a subset
-    // of [2,14)'s {2,7,11}) so a short PDSCH in any slot still passes.
-    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 6, dmrs_symbols: vec![2, 7], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
+    // symbol COMMON to every type-A shape (the front-loaded l0 = 2 — additional positions
+    // move with the allocation length, e.g. {2,7} vs {2,6,9}) so any shape still passes.
+    let present = extract_pdsch(&grids, sc_to_bin, &PdschAlloc { rb_start: 0, n_rb: 2, sym_start: 2, n_sym: 6, dmrs_symbols: vec![2], qm: 2, n_bwp: 0, nof_cdm_groups: 1 }, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9;
     if !present {
         if diag && !allocs.is_empty() {
-            let (rb0, nrb, _, _, _, rv, h_id, short, ndi) = allocs[0];
-            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) short={short} PRESENT-GATE FAIL", rb0 + nrb);
+            let (rb0, nrb, _, _, _, rv, h_id, sliv, ndi) = allocs[0];
+            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) sliv={sliv} PRESENT-GATE FAIL", rb0 + nrb);
         }
         PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         return (None, cqi);
@@ -835,29 +904,29 @@ fn decode_dl(
     if allocs.len() == 1 {
         // Steady state (a DCI decoded): one allocation — probe, then decode with the layout
         // sweep parallelized inside try_decode_dl_srb1 (HARQ combining included).
-        let (rb0, nrb, mcs, k1, dai, rv, h_id, short, ndi) = allocs[0];
+        let (rb0, nrb, mcs, k1, dai, rv, h_id, sliv, ndi) = allocs[0];
         // First sight of a new TB (NDI toggled or unknown process) → record its shape;
         // NDI unchanged → a retransmission: TBS follows the RECORDED initial shape (the
         // gNB adapts MCS down after a NACK but the TB keeps its size — recomputing TBS
         // from the retx DCI made every adapted retx undecodable and storms unrecoverable).
-        let mut tb_shape = (mcs, nrb, short);
+        let mut tb_shape = (mcs, nrb, sliv);
         let mut is_retx = false;
         if h_id != 0xff {
             match harq_init.get(&h_id) {
-                Some(&(i_ndi, i_mcs, i_nrb, i_short)) if i_ndi == ndi => {
+                Some(&(i_ndi, i_mcs, i_nrb, i_sliv)) if i_ndi == ndi => {
                     is_retx = true;
-                    tb_shape = (i_mcs, i_nrb, i_short);
+                    tb_shape = (i_mcs, i_nrb, i_sliv);
                 }
                 _ => {
-                    harq_init.insert(h_id, (ndi, mcs, nrb, short));
+                    harq_init.insert(h_id, (ndi, mcs, nrb, sliv));
                 }
             }
         }
         let (qm, _) = mcs_params(mcs);
-        let (p_start, p_nsym, p_dmrs) = dl_pdsch_shape(short);
+        let (p_start, p_nsym, p_dmrs) = dl_pdsch_shape(sliv);
         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: p_start, n_sym: p_nsym, dmrs_symbols: p_dmrs, qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
-            if let Some((tb, deliver, shape_used)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, short, rm_csi, tb_shape, is_retx, tf_hint, *init_mcs_typ, dl_dmrs_lock, harq_dl) {
+            if let Some((tb, deliver, shape_used)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, sliv, rm_csi, tb_shape, is_retx, tf_hint, *init_mcs_typ, dl_dmrs_lock, harq_dl) {
                 if h_id != 0xff {
                     // Mark (h_id, NDI) delivered so its retransmissions ACK without decode,
                     // and record the shape that actually decoded (the hypothesis may have
@@ -872,12 +941,12 @@ fn decode_dl(
                 PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
             } else if diag {
-                eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} short={short} DECODE FAIL", rb0 + nrb);
+                eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} sliv={sliv} DECODE FAIL", rb0 + nrb);
                 // One-shot: dump the failing slot's samples + params for offline analysis
                 // (crates/ferrite-ue/src/bin — the pdsch_fail tool).
                 if !std::path::Path::new("/tmp/ferrite_fail.bin").exists() {
                     let mut b = Vec::with_capacity(28 + fsh.len() * 8);
-                    for v in [slot_idx, crnti as u32, rb0 as u32, nrb as u32, mcs as u32, rv as u32, h_id as u32, u32::from(short), sc_to_bin(0) as u32] {
+                    for v in [slot_idx, crnti as u32, rb0 as u32, nrb as u32, mcs as u32, rv as u32, h_id as u32, u32::from(sliv), sc_to_bin(0) as u32] {
                         b.extend_from_slice(&v.to_le_bytes());
                     }
                     for s in fsh { b.extend_from_slice(&s.re.to_le_bytes()); b.extend_from_slice(&s.im.to_le_bytes()); }
@@ -886,7 +955,7 @@ fn decode_dl(
                 }
             }
         } else if diag {
-            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) short={short} PROBE FAIL", rb0 + nrb);
+            eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) sliv={sliv} PROBE FAIL", rb0 + nrb);
         }
     } else {
         if diag && allocs.is_empty() {
@@ -912,7 +981,7 @@ fn decode_dl(
             if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric <= 0.9 {
                 return None;
             }
-            let (_llr, _tbs, tb) = pdsch_standalone(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, qm as usize, r, 0, cdm, tf, false, rm_csi, (mcs, nrb, false));
+            let (_llr, _tbs, tb) = pdsch_standalone(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, qm as usize, r, 0, cdm, tf, SLIV_FULL, rm_csi, (mcs, nrb, SLIV_FULL));
             let tb = tb?;
             if plausible_dl_tb(&tb) {
                 return Some((tb, true, Some((cdm, tf))));
@@ -1245,6 +1314,11 @@ fn run(cfg: Config) {
     // phase-offset, so index-derived keys disagreed by one between sites. The entry
     // stores its insert-time position (a ±20-sample TA skew is well inside the CP).
     let mut ack_book: std::collections::HashMap<i64, (u32, i64, [Option<u8>; 4])> = std::collections::HashMap::new();
+    // The PUCCH-resource-indicator of the last DL DCI targeting each ACK slot (same
+    // nearest-slot key as ack_book): picks the set-1 F2 resource when that slot's
+    // HARQ-ACK codebook exceeds 2 bits (TS 38.213 §9.2.3). Recorded at the DCI parse
+    // (T0 owns both); pruned alongside the books.
+    let mut pri_book: std::collections::HashMap<i64, u8> = std::collections::HashMap::new();
     // Absolute UL slots whose UCI a PUSCH has already claimed — an ACK draining later
     // for such a slot must be dropped, not sent as a standalone (colliding) PUCCH.
     let mut uci_claimed: VecDeque<i64> = VecDeque::new();
@@ -1329,6 +1403,11 @@ fn run(cfg: Config) {
     // to its k2. Until SIB1 parses (or if an exotic cell defeats the parser), the
     // `map_or` fallbacks at each use site keep the transcribed bring-up constants.
     let mut sib1_cfg: Option<ferrite_ue::sib1::Sib1Params> = None;
+    // Dedicated config from the RRCSetup masterCellGroup (parsed at the Msg4 win):
+    // the k1 (dl-DataToUL-ACK) list, the DCI 0_1/1_1 field geometry, the SR and
+    // CSI-report occasions and the CSI-RS rate-match pattern. Same fallback rule
+    // as sib1_cfg: every use site keeps the transcribed constant when None.
+    let mut cg_cfg: Option<ferrite_ue::cellgroup::CellGroupParams> = None;
     // Once contention resolution is won, drive the connected UE: send an SR to
     // request a grant for Msg5 (RRCSetupComplete). Stop new RA once connected.
     let mut connected: Option<u16> = None;
@@ -1411,7 +1490,7 @@ fn run(cfg: Config) {
                 let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
                 let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
                 let mut harq_done: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
-                let mut harq_init: std::collections::HashMap<u8, (u8, u8, usize, bool)> = std::collections::HashMap::new();
+                let mut harq_init: std::collections::HashMap<u8, (u8, u8, usize, u8)> = std::collections::HashMap::new();
                 let mut csi_parity: Option<bool> = None;
                 let mut init_mcs_typ: u8 = 9; // the gNB's observed first-tx MCS at top CQI
                 let mut dl_dmrs_lock: Option<(usize, bool)> = None;
@@ -1461,7 +1540,7 @@ fn run(cfg: Config) {
                                 .iter().flat_map(|&(nrb, mcs)| [(nrb, mcs, 1usize), (nrb, mcs, 2)]).collect();
                             shapes.par_iter().for_each(|&(nrb, mcs, cdm)| {
                                 let (qm, r) = mcs_params(mcs);
-                                let _ = pdsch_standalone(&grids, sc_to_bin, w_cell, 2, 0x4601, 0, nrb, qm as usize, r, 0, cdm, true, false, false, (mcs, nrb, false));
+                                let _ = pdsch_standalone(&grids, sc_to_bin, w_cell, 2, 0x4601, 0, nrb, qm as usize, r, 0, cdm, true, SLIV_FULL, false, (mcs, nrb, SLIV_FULL));
                             });
                         });
                     }
@@ -1662,15 +1741,32 @@ fn run(cfg: Config) {
         // PDU on the granted PUSCH, k2 slots later. The gNB grants the FIRST UL
         // (RRCSetupComplete) via a CORESET0 fallback DCI 0_0 (AL4 CCE0), then moves
         // to the UE-specific search space (CORESET1, DCI 0_1) for everything after.
-        // DCI 0_0 (37b) and 0_1 (36b) share their leading fields — id(1) freq-RIV
+        // DCI 0_0 (37b) and 0_1 share their leading fields — id(1) freq-RIV
         // (9,N=24) time(4) hop(1) mcs(5) ndi(1) — so one parser handles both; only
         // the payload size and the search space differ. CORESET1 spans the whole
         // BWP (CRB0-23) like CORESET0 here, so it reuses cgrids/sc_to_bin.
-        const DCI_0_1_SIZE: usize = 36;
-        const DCI_1_1_SIZE: usize = 40;
+        //
+        // DCI 0_1/1_1 field geometry derives from the configured lists (TS 38.212
+        // §7.3.1): the TDRA field is ceil(log2(rows)) bits over the dedicated TDRA
+        // list when present, else the SIB1 common one; the PDSCH-to-HARQ-timing
+        // field is ceil(log2(len(dl-DataToUL-ACK))). Every field after the TDRA
+        // shifts with its width, and the total payload sizes gate the blind decode
+        // — THE thing that breaks on a different TDD pattern with transcribed
+        // constants. Fallback = this bring-up cell's geometry (3-bit UL TDRA,
+        // 1-bit DL TDRA, 3-bit k1 → 36/40 bits).
+        let bitw = |n: usize| (usize::BITS - (n.max(2) - 1).leading_zeros()) as usize;
+        let w_ul = cg_cfg.as_ref().map(|c| c.pusch_tdra.len()).filter(|&n| n > 0)
+            .or_else(|| sib1_cfg.as_ref().map(|s| s.pusch_tdra.len()).filter(|&n| n > 0))
+            .map_or(3, bitw);
+        let w_dl = cg_cfg.as_ref().map(|c| c.pdsch_tdra.len()).filter(|&n| n > 0)
+            .or_else(|| sib1_cfg.as_ref().map(|s| s.pdsch_tdra.len()).filter(|&n| n > 0))
+            .map_or(1, bitw);
+        let w_k1 = cg_cfg.as_ref().map_or(3, |c| bitw(c.k1_list.len()));
+        let dci_0_1_size = 33 + w_ul;
+        let dci_1_1_size = 36 + w_dl + w_k1;
         // The DL assignment found by T0's blind search this slot, shipped to the RX-PHY
-        // worker in its DlJob: (rb0, nrb, mcs, k1, C-DAI, rv, h_id, short-TDRA, ndi).
-        let mut dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, bool, u8)> = None;
+        // worker in its DlJob: (rb0, nrb, mcs, k1, C-DAI, rv, h_id, TDRA-row SLIV, ndi).
+        let mut dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, u8, u8)> = None;
         if let Some(crnti) = connected {
             // ONE blind search covers BOTH directions: the UL grant (DCI 0_0/0_1, acted
             // on below — an unfilled grant decodes as noise (crc=KO) and a burst of KOs
@@ -1690,10 +1786,24 @@ fn run(cfg: Config) {
                         ul_bits = Some(b);
                     } else {
                         // DL 1_0: always the full [2,14) shape (4-bit default-table TDRA
-                        // row 0 in this cell), k1 = 3-bit field + 1, NDI at b[20].
+                        // row 0 in this cell), k1 = 3-bit field + 1, NDI at b[20],
+                        // PUCCH-resource-indicator (3 bits) at b[31..34].
                         let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                         let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
-                        dl_dci = Some((rb0, nrb, bits5(&b, 15, 5), bits5(&b, 34, 3) + 1, bits5(&b, 27, 2), bits5(&b, 21, 2), bits5(&b, 23, 4), false, b[20]));
+                        let k1 = bits5(&b, 34, 3) + 1;
+                        let dai = bits5(&b, 27, 2);
+                        let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                        let akey = (apos + slot_len / 2).div_euclid(slot_len);
+                        pri_book.insert(akey, bits5(&b, 31, 3));
+                        // Pre-book a NACK at this PDSCH's C-DAI position: if its decode
+                        // fails (or drains too late), the occasion still transmits a
+                        // correctly-sized codebook — the gNB reads total DTX (no PUCCH at
+                        // all) as rv=0 forever, while a NACK keeps the other TBs' ACK
+                        // positions aligned and lets rv cycle. The decode drain upgrades
+                        // this entry to an ACK.
+                        let e = ack_book.entry(akey).or_insert((((slot_idx as i64 + k1 as i64) % 20) as u32, apos, [None; 4]));
+                        e.2[(dai & 3) as usize].get_or_insert(0);
+                        dl_dci = Some((rb0, nrb, bits5(&b, 15, 5), k1, dai, bits5(&b, 21, 2), bits5(&b, 23, 4), SLIV_FULL, b[20]));
                     }
                 }
                 // CORESET1 USS sweep for whichever direction is still missing: DCI 0_1
@@ -1712,20 +1822,38 @@ fn run(cfg: Config) {
                         let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
                         pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
                         if ul_bits.is_none() {
-                            if let Some(b) = dci_decode(&mm, crnti, DCI_0_1_SIZE).filter(|b| b[0] == 0) {
+                            if let Some(b) = dci_decode(&mm, crnti, dci_0_1_size).filter(|b| b[0] == 0) {
                                 ul_bits = Some(b);
                                 continue;
                             }
                         }
                         if dl_dci.is_none() {
-                            if let Some(b) = dci_decode(&mm, crnti, DCI_1_1_SIZE).filter(|b| b[0] == 1) {
-                                // DL 1_1: b[10] = 1-bit TDRA (row 1 = the short [2,8)
-                                // allocation, kept by HARQ retx of a TB first sent there),
-                                // k1 from the dl-DataToUL-ACK list, NDI at b[16].
-                                const K1: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
+                            if let Some(b) = dci_decode(&mm, crnti, dci_1_1_size).filter(|b| b[0] == 1) {
+                                // DL 1_1 layout: id(1) fdra(9) tdra(w_dl) mcs(5) ndi(1)
+                                // rv(2) harq(4) dai(2) tpc(2) pucch-res(3) k1(w_k1) —
+                                // everything after bit 10 shifts with the TDRA width.
+                                // The row's SLIV gives the time shape (a HARQ retx of a
+                                // short-shape TB keeps the short row in normal slots);
+                                // k1 indexes the dl-DataToUL-ACK list.
+                                const K1_FB: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
                                 let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                                 let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                                dl_dci = Some((rb0, nrb, bits5(&b, 11, 5), K1[(bits5(&b, 30, 3) & 7) as usize], bits5(&b, 23, 2), bits5(&b, 17, 2), bits5(&b, 19, 4), b[10] == 1, b[16]));
+                                let row = b[10..10 + w_dl].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                                let k1_idx = bits5(&b, 29 + w_dl, w_k1) as usize;
+                                let k1 = cg_cfg.as_ref().and_then(|c| c.k1_list.get(k1_idx)).copied()
+                                    .unwrap_or(K1_FB[k1_idx & 7]);
+                                let sliv = cg_cfg.as_ref().map(|c| &c.pdsch_tdra).filter(|l| !l.is_empty())
+                                    .or_else(|| sib1_cfg.as_ref().map(|s| &s.pdsch_tdra))
+                                    .and_then(|l| l.get(row))
+                                    .map_or(if row == 1 { SLIV_SHORT } else { SLIV_FULL }, |r| r.sliv);
+                                let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                                let akey = (apos + slot_len / 2).div_euclid(slot_len);
+                                pri_book.insert(akey, bits5(&b, 26 + w_dl, 3));
+                                let dai = bits5(&b, 22 + w_dl, 2);
+                                // NACK pre-booking — see the DCI 1_0 site above.
+                                let e = ack_book.entry(akey).or_insert((((slot_idx as i64 + k1 as i64) % 20) as u32, apos, [None; 4]));
+                                e.2[(dai & 3) as usize].get_or_insert(0);
+                                dl_dci = Some((rb0, nrb, bits5(&b, 10 + w_dl, 5), k1, dai, bits5(&b, 16 + w_dl, 2), bits5(&b, 18 + w_dl, 4), sliv, b[15 + w_dl]));
                             }
                         }
                     }
@@ -1741,27 +1869,29 @@ fn run(cfg: Config) {
                     // hop flag, so its MCS/NDI sit 2 bits earlier. Verified live vs the
                     // gNB's scheduled grant (MCS/RV/HARQ aligned).
                     {
-                        let is_0_1 = bits.len() == DCI_0_1_SIZE;
-                        let mcs_lo = if is_0_1 { 13 } else { 15 };
+                        let is_0_1 = bits.len() == dci_0_1_size;
+                        let mcs_lo = if is_0_1 { 10 + w_ul } else { 15 };
                         let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
                         let mcs = bits[mcs_lo..mcs_lo + 5].iter().fold(0u8, |a, &b| a << 1 | b);
                         let ndi = bits[mcs_lo + 5];
-                        // DCI 0_1 layout: id(1) fdra(9) tdra(3) mcs(5) ndi(1) rv(2)
-                        // harq(4) → 1st-DAI (2 bits) at bits[25..27]. This UL total-DAI
+                        // DCI 0_1 layout: id(1) fdra(9) tdra(w_ul) mcs(5) ndi(1) rv(2)
+                        // harq(4) → 1st-DAI (2 bits) at 22 + w_ul. This UL total-DAI
                         // = (HARQ-ACK bit count − 1) mod 4, so it lets us size the
                         // UCI-on-PUSCH codebook (below) from the grant itself — robust to
                         // a dropped DL PDSCH (we NACK-pad) instead of sizing purely from
-                        // our own decode. DCI 0_0 has no DAI field.
+                        // our own decode. DCI 0_0 has no DAI field. (Reading this at a
+                        // fixed 25 on a 2-bit-TDRA cell grabbed [dai LSB, tpc] → phantom
+                        // ACK bits punctured the PUSCH → every DRB PUSCH crc=KO at 50 dB.)
                         let t_dai: Option<u8> = is_0_1
-                            .then(|| bits[25..27].iter().fold(0u8, |a, &b| a << 1 | b));
+                            .then(|| bits[22 + w_ul..24 + w_ul].iter().fold(0u8, |a, &b| a << 1 | b));
                         let (qm, r) = mcs_params(mcs);
                         // k2 from the DCI's TDRA field via the SIB1 pusch-TimeDomain-
                         // AllocationList (this cell: rows [4,5,6,7,11] — row 0's k2=4 is
                         // the old hardcoded constant; other rows appear when the granting
                         // DL slot sits further from the UL slots, and matter for any
-                        // shorter TDD pattern). DCI 0_0 carries 4 TDRA bits, 0_1 three.
-                        let tdra_hi = if is_0_1 { 13 } else { 14 };
+                        // shorter TDD pattern). DCI 0_0 carries 4 TDRA bits, 0_1 w_ul.
+                        let tdra_hi = if is_0_1 { 10 + w_ul } else { 14 };
                         let tdra = bits[10..tdra_hi].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let k2 = sib1_cfg.as_ref().map_or(4, |s| s.k2_for_row(tdra)) as i64;
                         let m5_slot = slot_idx as i64 + k2;
@@ -2266,7 +2396,28 @@ fn run(cfg: Config) {
                 if metric > 0.9 {
                     let cands: Vec<(u16, i64)> = recent_tc.iter().rev().copied().collect();
                     for (tcx, toffx) in cands {
-                        if let Some((_tb4, tf4)) = try_decode_msg4(&grids, sc_to_bin, acq.cell_id, slot_idx, tcx, &ccch_sdu) {
+                        if let Some((tb4, tf4)) = try_decode_msg4(&grids, sc_to_bin, acq.cell_id, slot_idx, tcx, &ccch_sdu) {
+                            // Parse the RRCSetup masterCellGroup (the dedicated config):
+                            // k1 list, DCI 0_1/1_1 geometry, SR/CSI occasions, CSI-RS
+                            // rate-match pattern. On failure every use site falls back
+                            // to the transcribed bring-up constants, exactly as pre-parse.
+                            if cg_cfg.is_none() {
+                                for s in parse_dl_mac_pdu(&tb4) {
+                                    if s.lcid != 0 {
+                                        continue;
+                                    }
+                                    match ferrite_ue::cellgroup::parse_rrc_setup(&s.payload) {
+                                        Some(cg) => {
+                                            println!("   masterCellGroup: k1={:?} pucch-res={} sr={:?} csi-report={:?} nzp-csi-rs={} zp-csi-rs={}",
+                                                cg.k1_list, cg.pucch_resources.len(), cg.sr, cg.csi_report,
+                                                cg.nzp_csi_rs.len(), cg.zp_csi_rs.len());
+                                            let _ = CSI_RM.set(CsiRm::from_cellgroup(&cg));
+                                            cg_cfg = Some(cg);
+                                        }
+                                        None => println!("   masterCellGroup parse FAILED — keeping transcribed constants"),
+                                    }
+                                }
+                            }
                             // The data RE-mapping order (time-first) is cell-fixed: seed the
                             // RX-PHY worker's layout sweep with the one Msg4 just proved.
                             msg4_tf = Some(tf4);
@@ -2318,19 +2469,41 @@ fn run(cfg: Config) {
         // ferrite parses masterCellGroup for real.
         let want_ping = tun.is_none() && drb_up && !ping_acked && ue_ip.is_some() && ping_seq < 20;
         let want_drb = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
-        if connected.is_some() && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb) && slot_idx == 0 && pend_sr.is_none() {
-            let sr_slot = sib1_cfg
-                .as_ref()
-                .and_then(|s| (0..20).find(|&t| s.has_full_ul(t)))
-                .unwrap_or(7) as i64;
-            let pos = slot_start_ul + (sr_slot - slot_idx as i64) * slot_len
-                + offset + locked_toff.unwrap_or(0) - last_ta * 4;
-            // SR kept in T0: cheap (one PUCCH F1/frame) and latency-critical (drives grants).
-            let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
-            let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-            for s in &mut sw { *s *= amp / pk; }
-            inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw, tag: "sr" }, ul_counter as i64);
-            pend_sr = Some(pos);
+        let want_sr = connected.is_some()
+            && (!ul_queue.is_empty() || pending_status.is_some() || want_ping || want_drb);
+        // The SR / CSI-report occasion slots, from the parsed dedicated config; fallback =
+        // the first/second-full-UL-slot heuristics, then the transcribed slots 7/8. (The
+        // configured periods can be 40 slots; serving every frame is harmless — the gNB
+        // simply doesn't monitor the off-period frames.) Hoisted here because the HARQ-ACK
+        // drain below multiplexes SR/CSI onto a PUCCH F2 when the occasions coincide with
+        // an ACK slot (routine on a TDD pattern with one UL slot, e.g. DDDSU).
+        let sr_slot = cg_cfg
+            .as_ref()
+            .and_then(|c| c.sr)
+            .map(|(_, o, _)| i64::from(o % 20))
+            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).find(|&t| s.has_full_ul(t))).map(i64::from))
+            .unwrap_or(7);
+        let csi_slot = cg_cfg
+            .as_ref()
+            .and_then(|c| c.csi_report)
+            .map(|(_, o, _)| i64::from(o % 20))
+            .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).filter(|&t| s.has_full_ul(t)).nth(1)).map(i64::from))
+            .unwrap_or(8);
+        // Fire the standalone SR 3 slots before its occasion (late enough that any HARQ-ACK
+        // book for that slot has formed): if the slot's UCI is already owned by an ACK book
+        // (the F2 below carries the SR bit) or a PUSCH (BSR carries the buffer state), the
+        // standalone F1 would overlap their samples in the injection table — skip it.
+        if want_sr && (sr_slot - slot_idx as i64).rem_euclid(20) == 3 && pend_sr.is_none() {
+            let pos = slot_start_ul + 3 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+            let key = (pos + slot_len / 2).div_euclid(slot_len);
+            if !ack_book.contains_key(&key) && !uci_claimed.contains(&key) {
+                // SR kept in T0: cheap (one PUCCH F1/frame) and latency-critical (drives grants).
+                let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
+                let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                for s in &mut sw { *s *= amp / pk; }
+                inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw, tag: "sr" }, ul_counter as i64);
+                pend_sr = Some(pos);
+            }
         }
 
         // Periodic CSI report: send the measured CQI on the PUCCH F2 (PRB 23, symb
@@ -2341,19 +2514,31 @@ fn run(cfg: Config) {
         // pending_cqi is Some only in frames where a valid CSI-RS was seen (even
         // frames), which is exactly when the gNB reads the report — no SFN parity
         // check is needed.
-        let csi_slot = sib1_cfg
-            .as_ref()
-            .and_then(|s| (0..20).filter(|&t| s.has_full_ul(t)).nth(1))
-            .unwrap_or(8) as i64;
-        if connected.is_some() && slot_idx as i64 == csi_slot - 2 && pend_csi.is_none() {
-            if let Some(cqi) = pending_cqi.take() {
+        // Standalone periodic CSI report on its PUCCH F2 resource (the parsed
+        // CSI-ReportConfig, see csi_slot above). If the occasion slot's UCI is owned by
+        // an ACK book (the HARQ-ACK F2 below appends the CQI) or a PUSCH, skip — a
+        // second waveform would overlap theirs in the injection table.
+        if connected.is_some() && (csi_slot - slot_idx as i64).rem_euclid(20) == 2 && pend_csi.is_none()
+            && pending_cqi.is_some()
+        {
+            let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4
+                + slot_len / 2).div_euclid(slot_len);
+            if !ack_book.contains_key(&ckey) && !uci_claimed.contains(&ckey) {
+                let cqi = pending_cqi.take().unwrap();
+                let f2 = cg_cfg.as_ref().and_then(|c| {
+                    let (_, _, rid) = c.csi_report?;
+                    c.pucch_resources.iter().find(|r| r.id == rid).copied()
+                });
                 let cfg = ferrite_phy::pucch::PucchF2 {
-                    prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2,
+                    prb_start: f2.map_or(23, |r| r.prb as usize),
+                    nof_prb: f2.map_or(1, |r| r.cs_or_prbs as usize),
+                    start_symbol: f2.map_or(0, |r| r.start_symbol as usize),
+                    nof_symbols: f2.map_or(2, |r| r.n_symbols as usize),
                     rnti: connected.unwrap(), n_id: acq.cell_id, n_id0: acq.cell_id, carrier_rb,
                 };
                 // 4-bit wideband CQI, MSB first.
                 let bits = vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1];
-                let pos = slot_start_ul + (csi_slot - slot_idx as i64) * slot_len
+                let pos = slot_start_ul + 2 * slot_len
                     + offset + locked_toff.unwrap_or(0) - last_ta * 4;
                 let _ = tx_req_tx.try_send(TxReq::PucchF2 { cfg, bits, slot_mod20: csi_slot as u32, pos, now: ul_counter as i64 });
                 pend_csi = Some(pos);
@@ -2362,6 +2547,9 @@ fn run(cfg: Config) {
 
         slot_idx = (slot_idx + 1) % 20;
         if slot_idx == 0 {
+            // Orphaned PRI entries (DCIs whose PDSCH never decoded → no ACK book to
+            // consume them): drop anything a frame behind the serve.
+            pri_book.retain(|&k, _| k * slot_len >= ul_counter as i64 - 20 * slot_len);
             frames_at_offset += 1;
             // Dwell ≥5 frames per offset so the RAR round-trip (~1.5 frames)
             // returns for THIS offset before stepping on.
@@ -2456,6 +2644,7 @@ fn run(cfg: Config) {
         let due: Vec<i64> = ack_book.iter().filter(|(_, &(_, pos, _))| pos <= slot_start_ul + 3 * slot_len).map(|(&k, _)| k).collect();
         for key in due {
             let (slot_mod20, pos, book) = ack_book.remove(&key).unwrap();
+            let pri = pri_book.remove(&key).unwrap_or(0) as usize;
             // A PUSCH already owns this UL slot's UCI (see uci_claimed above): drop the
             // late-drained ACK instead of colliding a standalone PUCCH into that slot.
             if uci_claimed.contains(&key) {
@@ -2473,18 +2662,54 @@ fn run(cfg: Config) {
                         pos - ul_counter as i64, (pos - slot_start_ul) / slot_len, (last_ta * 4) / slot_len);
                 }
             }
-            let bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();
-            if pend_acks.len() < 12 {
+            let mut bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();
+            if pend_acks.len() >= 12 {
+                ack_qfull += 1;
+                continue;
+            }
+            // UCI multiplexing (TS 38.213 §9.2.5, the OCUDU-shaped subset): a >2-bit
+            // codebook — or any codebook sharing its slot with the CSI occasion — moves
+            // to the set-1 PUCCH F2 resource picked by the DCI's PUCCH-resource
+            // indicator, appending the SR bit if this slot is the SR occasion and the
+            // 4-bit CQI if it's the CSI one. Routine on a one-UL-slot TDD pattern
+            // (DDDSU: the gNB reads ack+sr+csi off one F2 and DTXes anything else).
+            let sr_here = i64::from(slot_mod20) == sr_slot;
+            let csi_here = i64::from(slot_mod20) == csi_slot && pending_cqi.is_some();
+            let mut wave = if bits.len() > 2 || csi_here {
+                if sr_here {
+                    bits.push(u8::from(want_sr));
+                    pend_sr = Some(pos); // the F2 carries this occasion's SR
+                }
+                if csi_here {
+                    let cqi = pending_cqi.take().unwrap();
+                    bits.extend([(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]);
+                }
+                // OCUDU's resource set 1 (>2 UCI bits) = the F2 resources, ids 8..15,
+                // indexed by the PRI. Fallback: the layout both live cells share
+                // (PRB 1, 2 symbols starting at 2·PRI).
+                let f2 = cg_cfg.as_ref().and_then(|c| c.pucch_resources.iter().find(|r| r.format == 2 && usize::from(r.id) == 8 + pri).copied());
+                let cfg = ferrite_phy::pucch::PucchF2 {
+                    prb_start: f2.map_or(1, |r| r.prb as usize),
+                    nof_prb: f2.map_or(1, |r| r.cs_or_prbs as usize),
+                    start_symbol: f2.map_or(2 * pri, |r| r.start_symbol as usize),
+                    nof_symbols: f2.map_or(2, |r| r.n_symbols as usize),
+                    rnti: connected.unwrap_or(0), n_id: acq.cell_id, n_id0: acq.cell_id, carrier_rb,
+                };
+                ferrite_phy::pucch::pucch_f2_modulate_slot(&ofdm, &cfg, &bits, slot_mod20, center_hz, fs)
+            } else if sr_here && want_sr {
+                // 1-2 ACK bits + positive SR: transmit the ACK on the SR's F1 resource —
+                // the gNB reads the resource choice itself as the SR (§9.2.5.1).
+                pend_sr = Some(pos);
+                ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &bits, slot_mod20, center_hz, fs)
+            } else {
                 // HARQ-ACK kept in T0: cheap (1-2 bit PUCCH F1) and the most latency-critical UL
                 // (a TX-thread hop delays it past its k1 window). Modulate + inject inline.
-                let mut aw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs);
-                let pk = aw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                for s in &mut aw { *s *= amp / pk; }
-                inj.lock().unwrap().push(ReadyWaveform { pos, samples: aw, tag: "ack" }, ul_counter as i64);
-                pend_acks.push(pos);
-            } else {
-                ack_qfull += 1;
-            }
+                ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &harq_cfg, &bits, slot_mod20, center_hz, fs)
+            };
+            let pk = wave.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+            for s in &mut wave { *s *= amp / pk; }
+            inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave, tag: "ack" }, ul_counter as i64);
+            pend_acks.push(pos);
         }
         // Drop HARQ-ACK and PUSCH position trackers whose UL window has passed (the actual
         // waveforms are dropped by the InjectionTable once served); a PUCCH/PUSCH spans one slot.

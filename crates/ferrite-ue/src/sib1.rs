@@ -18,6 +18,8 @@
 //!
 //! Set `FERRITE_SIB1_TRACE=1` for a per-field dump.
 
+use crate::uper::Bits;
+
 /// One TDD-UL-DL-Pattern (TS 38.331): `periodicity` in slots at the reference SCS,
 /// leading full-DL slots, a special slot with `dl_symbols`/`ul_symbols`, trailing
 /// full-UL slots.
@@ -90,6 +92,18 @@ pub struct TdraRow {
     pub type_a: bool,
     /// startSymbolAndLength (SLIV).
     pub sliv: u8,
+}
+
+/// Decode a SLIV into (start symbol S, length L) — TS 38.214 §5.1.2.1: for
+/// (L−1) ≤ 7, SLIV = 14(L−1) + S, else SLIV = 14(14−L+1) + (14−1−S).
+/// (Live check: 53 → (2,12) = the [2,14) shape; 72 → (2,6) = the short [2,8).)
+pub fn sliv_to_sl(sliv: u8) -> (usize, usize) {
+    let (mut l, mut s) = (sliv as usize / 14 + 1, sliv as usize % 14);
+    if s + l > 14 {
+        l = 14 + 2 - l;
+        s = 14 - 1 - s;
+    }
+    (s, l)
 }
 
 /// Everything this parser extracts from SIB1.
@@ -173,108 +187,6 @@ impl Sib1Params {
     /// default of 4 to stay attachable).
     pub fn k2_for_row(&self, row: usize) -> u8 {
         self.pusch_tdra.get(row).map(|r| r.k).unwrap_or(4)
-    }
-}
-
-/// X.691 unaligned-PER bit reader. Every read returns `None` past the end, which
-/// propagates as a parse failure (`?`).
-struct Bits<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0 }
-    }
-
-    fn bit(&mut self) -> Option<bool> {
-        let byte = *self.b.get(self.pos / 8)?;
-        let v = (byte >> (7 - self.pos % 8)) & 1;
-        self.pos += 1;
-        Some(v == 1)
-    }
-
-    fn bits(&mut self, n: u32) -> Option<u64> {
-        let mut v = 0u64;
-        for _ in 0..n {
-            v = (v << 1) | self.bit()? as u64;
-        }
-        Some(v)
-    }
-
-    /// Constrained whole number in `lo..=hi` (§10.5): ⌈log2(range)⌉ bits, offset `lo`.
-    fn int(&mut self, lo: i64, hi: i64) -> Option<i64> {
-        let range = (hi - lo + 1) as u64;
-        if range <= 1 {
-            return Some(lo);
-        }
-        let n = 64 - (range - 1).leading_zeros();
-        Some(lo + self.bits(n)? as i64)
-    }
-
-    /// Non-extensible ENUMERATED with `n` root values.
-    fn enu(&mut self, n: u32) -> Option<u32> {
-        Some(self.int(0, n as i64 - 1)? as u32)
-    }
-
-    /// Extensible ENUMERATED: extension bit then the root index (extension values
-    /// are read as a normally-small number).
-    fn enu_ext(&mut self, n_root: u32) -> Option<u32> {
-        if self.bit()? {
-            // Extended value: normally-small number; the actual identity is unknown
-            // to us, return a sentinel beyond the root range.
-            let _ = self.normally_small()?;
-            return Some(n_root);
-        }
-        self.enu(n_root)
-    }
-
-    /// Normally-small non-negative whole number (§10.6): '0' + 6 bits, else a
-    /// length-prefixed unconstrained number (not needed beyond 63 here).
-    fn normally_small(&mut self) -> Option<u64> {
-        if !self.bit()? {
-            self.bits(6)
-        } else {
-            let len = self.len_det()?;
-            self.bits((len * 8).min(64) as u32)
-        }
-    }
-
-    /// General length determinant (§10.9, unaligned): '0'+7 bits (<128) or
-    /// '10'+14 bits (<16384). Fragmentation ('11') unsupported (never hit in SIB1).
-    fn len_det(&mut self) -> Option<usize> {
-        if !self.bit()? {
-            Some(self.bits(7)? as usize)
-        } else if !self.bit()? {
-            Some(self.bits(14)? as usize)
-        } else {
-            None
-        }
-    }
-
-    /// Skip one open-type value (length determinant counts OCTETS).
-    fn skip_open(&mut self) -> Option<()> {
-        let len = self.len_det()?;
-        self.pos += len * 8;
-        (self.pos <= self.b.len() * 8).then_some(())
-    }
-
-    /// Skip a SEQUENCE's extension additions (call when its extension bit was 1):
-    /// a normally-small count-1, that many presence bits, then each present
-    /// addition as an open type.
-    fn skip_ext_additions(&mut self) -> Option<()> {
-        let n = self.normally_small()? + 1;
-        let mut present = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            present.push(self.bit()?);
-        }
-        for p in present {
-            if p {
-                self.skip_open()?;
-            }
-        }
-        Some(())
     }
 }
 
@@ -661,7 +573,7 @@ fn parse_pdcch_config_common(r: &mut Bits) -> Option<()> {
     if o[3] {
         let n = r.int(1, 4)?;
         for _ in 0..n {
-            parse_search_space(r)?;
+            parse_search_space_pub(r)?;
         }
     }
     for _ in o[4..8].iter().filter(|&&p| p) {
@@ -673,7 +585,8 @@ fn parse_pdcch_config_common(r: &mut Bits) -> Option<()> {
     Some(())
 }
 
-fn parse_search_space(r: &mut Bits) -> Option<()> {
+/// Also used by the masterCellGroup parser (dedicated searchSpacesToAddModList).
+pub(crate) fn parse_search_space_pub(r: &mut Bits) -> Option<()> {
     // SearchSpace ::= SEQUENCE { searchSpaceId INTEGER(0..39),
     // [controlResourceSetId INTEGER(0..11)], [monitoringSlotPeriodicityAndOffset
     // CHOICE15], [duration INTEGER(2..2559)], [monitoringSymbolsWithinSlot BIT
