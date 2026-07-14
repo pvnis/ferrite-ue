@@ -69,9 +69,18 @@ cell_cfg:
  pusch:
   mcs_table: qam64
   max_ue_mcs: 9
- # NOTE: leave PUCCH at default so the gNB auto-reduces PUCCH resources for the narrow TDD BWP
- # (the auto-reduction only applies when the user PUCCH config is left default; see
- #  du_high_config_translators.cpp ~line 835).
+ # PUCCH: replicate the values the gNB would auto-reduce to for this narrow (10 MHz TDD)
+ # BWP — the auto-reduction only fires when the whole pucch section is left default
+ # (du_high_config_translators.cpp ~line 797), and setting sr_period_ms alone would
+ # otherwise switch the cell to the full-width PUCCH layout. sr_period_ms 5 (10 slots)
+ # cuts the SR wait from 20 ms to 5 ms — the dominant term in the idle-UE ping RTT.
+ pucch:
+  sr_period_ms: 5
+  resource_set_size: 7
+  nof_cell_res_set_configs: 1
+  nof_cell_sr_res: 7
+  nof_cell_csi_res: 7
+  f1_enable_occ: true
  prach:
   prach_config_index: 159
 

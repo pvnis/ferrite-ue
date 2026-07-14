@@ -2427,6 +2427,10 @@ fn run(cfg: Config) {
                                 sweep = 0;
                                 println!("  ⇒ toff LOCKED at {toffx} (Msg3 now reliable); Msg4 wins={msg4_wins}");
                             }
+                            // Contention is won: any still-queued Msg3 pre-injections are
+                            // stale, and their waveforms would garble whatever lands in
+                            // their slots (the injection fill is last-write-wins).
+                            inj.lock().unwrap().retract("msg3");
                             // HARQ-ACK the Msg4 on PUCCH F1 at the next UL slot
                             // (7 for a DL slot ≤5, else 17). Same UL timing as Msg3.
                             if pend_pucch.is_none() {
@@ -2437,15 +2441,24 @@ fn run(cfg: Config) {
                                 let pucch_slot = sib1_cfg
                                     .as_ref()
                                     .map_or(if slot_idx < 10 { 7 } else { 17 }, |s| s.next_ul_slot_after(slot_idx));
-                                let mut pw = ferrite_phy::pucch::pucch_f1_modulate_slot(
-                                    &ofdm, &pucch_cfg, &[1], pucch_slot % 20, center_hz, fs);
-                                let pk = pw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-                                for s in &mut pw { *s *= amp / pk; }
                                 let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
                                     + offset + toffx - last_ta * 4;
-                                println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
-                                inj.lock().unwrap().push(ReadyWaveform { pos, samples: pw.clone(), tag: "msg4ack" }, ul_counter as i64);
-                                pend_pucch = Some((pos, pw));
+                                let key = (pos + slot_len / 2).div_euclid(slot_len);
+                                if let Some(e) = ack_book.get_mut(&key) {
+                                    // Connected-mode T0 already saw this Msg4 retx's DCI 1_0
+                                    // and pre-booked a NACK: upgrade it — the codebook drain
+                                    // sends the ACK, and a second (msg4ack) waveform in the
+                                    // same slot would overwrite it sample-for-sample.
+                                    e.2[0] = Some(1);
+                                } else if !uci_claimed.contains(&key) {
+                                    let mut pw = ferrite_phy::pucch::pucch_f1_modulate_slot(
+                                        &ofdm, &pucch_cfg, &[1], pucch_slot % 20, center_hz, fs);
+                                    let pk = pw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+                                    for s in &mut pw { *s *= amp / pk; }
+                                    println!("  → PUCCH ACK for TC-RNTI={tcx:#06x} at ul {pos} (slot {pucch_slot})");
+                                    inj.lock().unwrap().push(ReadyWaveform { pos, samples: pw.clone(), tag: "msg4ack" }, ul_counter as i64);
+                                    pend_pucch = Some((pos, pw));
+                                }
                             }
                             if connected.is_none() {
                                 connected = Some(tcx);
@@ -2483,6 +2496,11 @@ fn run(cfg: Config) {
             .map(|(_, o, _)| i64::from(o % 20))
             .or_else(|| sib1_cfg.as_ref().and_then(|s| (0..20).find(|&t| s.has_full_ul(t))).map(i64::from))
             .unwrap_or(7);
+        // SR occasions repeat every `sr_period` slots (capped at the frame — a 40-slot
+        // period served every frame just means the gNB ignores the off-parity ones).
+        // A short configured period (e.g. 10 slots = 5 ms) gives several occasions per
+        // frame; serving all of them is what cuts the idle-UE grant latency.
+        let sr_period = cg_cfg.as_ref().and_then(|c| c.sr).map_or(20, |(p, _, _)| i64::from(p).min(20));
         let csi_slot = cg_cfg
             .as_ref()
             .and_then(|c| c.csi_report)
@@ -2493,12 +2511,16 @@ fn run(cfg: Config) {
         // book for that slot has formed): if the slot's UCI is already owned by an ACK book
         // (the F2 below carries the SR bit) or a PUSCH (BSR carries the buffer state), the
         // standalone F1 would overlap their samples in the injection table — skip it.
-        if want_sr && (sr_slot - slot_idx as i64).rem_euclid(20) == 3 && pend_sr.is_none() {
+        let sr_target = (slot_idx as i64 + 3) % 20;
+        if want_sr && (sr_target - sr_slot).rem_euclid(sr_period) == 0 && pend_sr.is_none() {
             let pos = slot_start_ul + 3 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
             let key = (pos + slot_len / 2).div_euclid(slot_len);
-            if !ack_book.contains_key(&key) && !uci_claimed.contains(&key) {
-                // SR kept in T0: cheap (one PUCCH F1/frame) and latency-critical (drives grants).
-                let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_slot as u32, center_hz, fs);
+            let msg4ack_owns = pend_pucch.as_ref()
+                .is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == key);
+            if !ack_book.contains_key(&key) && !uci_claimed.contains(&key) && !msg4ack_owns {
+                // SR kept in T0: cheap (one PUCCH F1/occasion) and latency-critical (drives
+                // grants). Modulated for the occasion slot (the base sequence is per-slot).
+                let mut sw = ferrite_phy::pucch::pucch_f1_modulate_slot(&ofdm, &sr_cfg, &[], sr_target as u32, center_hz, fs);
                 let pk = sw.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
                 for s in &mut sw { *s *= amp / pk; }
                 inj.lock().unwrap().push(ReadyWaveform { pos, samples: sw, tag: "sr" }, ul_counter as i64);
@@ -2523,7 +2545,9 @@ fn run(cfg: Config) {
         {
             let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4
                 + slot_len / 2).div_euclid(slot_len);
-            if !ack_book.contains_key(&ckey) && !uci_claimed.contains(&ckey) {
+            let msg4ack_owns = pend_pucch.as_ref()
+                .is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == ckey);
+            if !ack_book.contains_key(&ckey) && !uci_claimed.contains(&ckey) && !msg4ack_owns {
                 let cqi = pending_cqi.take().unwrap();
                 let f2 = cg_cfg.as_ref().and_then(|c| {
                     let (_, _, rid) = c.csi_report?;
@@ -2645,9 +2669,12 @@ fn run(cfg: Config) {
         for key in due {
             let (slot_mod20, pos, book) = ack_book.remove(&key).unwrap();
             let pri = pri_book.remove(&key).unwrap_or(0) as usize;
-            // A PUSCH already owns this UL slot's UCI (see uci_claimed above): drop the
-            // late-drained ACK instead of colliding a standalone PUCCH into that slot.
-            if uci_claimed.contains(&key) {
+            // A PUSCH already owns this UL slot's UCI (see uci_claimed above), or a
+            // Msg4-ACK PUCCH is already queued there: drop the late-drained ACK instead
+            // of colliding a second waveform into that slot.
+            if uci_claimed.contains(&key)
+                || pend_pucch.as_ref().is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == key)
+            {
                 continue;
             }
             let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
@@ -2710,6 +2737,13 @@ fn run(cfg: Config) {
             for s in &mut wave { *s *= amp / pk; }
             inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave, tag: "ack" }, ul_counter as i64);
             pend_acks.push(pos);
+            // This waveform now owns the slot: a book that re-forms for the same key
+            // (a late DCI inside the ≤3-slot drain window) must be dropped, not pushed
+            // over this one — the fill is last-write-wins and would garble the slot.
+            uci_claimed.push_back(key);
+            if uci_claimed.len() > 8 {
+                uci_claimed.pop_front();
+            }
         }
         // Drop HARQ-ACK and PUSCH position trackers whose UL window has passed (the actual
         // waveforms are dropped by the InjectionTable once served); a PUCCH/PUSCH spans one slot.

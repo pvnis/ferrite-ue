@@ -89,6 +89,14 @@ impl InjectionTable {
         self.pending.push((wf, 0));
     }
 
+    /// Remove every pending waveform with `tag` — for waveforms that became stale after
+    /// being queued (e.g. Msg3 pre-injections once contention resolution is won): an
+    /// already-pushed waveform can't otherwise be unqueued, and it would garble whatever
+    /// else lands in its slot (the fill is last-write-wins).
+    pub fn retract(&mut self, tag: &str) {
+        self.pending.retain(|(wf, _)| wf.tag != tag);
+    }
+
     /// Place any queued samples that overlap the block `[base, base + block.len())` into
     /// `block` (indexed from `base`), then drop waveforms that can no longer contribute to
     /// this or any later block (the base only advances). Mirrors `run()`'s `place`.
