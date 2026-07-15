@@ -1047,18 +1047,32 @@ fn run(cfg: Config) {
     let frame_len = sync.frame_len();
     let ofdm = Ofdm::new(fft);
     let ra_rnti: u16 = 0x10b;
-    let carrier_rb = 24usize;
+    // Initial DL/UL BWP (= carrier) RB count and the gNB's auto-selected PRACH RB
+    // offset (msg1-FrequencyStart), keyed by the FFT (= channel bandwidth) at µ=1 /
+    // 30 kHz SCS. CORESET0 stays 24 RB either way (it comes from the MIB index); this
+    // is the WIDER connected-mode BWP, used for the DCI RIV decode and PUCCH/PUSCH/CSI.
+    // 10 MHz → 24 RB / PRACH start 5; 20 MHz → 51 RB / PRACH start 11.
+    let (carrier_rb, msg1_freq_start) = match fft {
+        1024 => (51usize, 11usize),
+        _ => (24usize, 5usize),
+    };
 
-    // PRACH preamble waveform.
+    // PRACH preamble waveform. Sample counts (FFT, CP) scale with the sample rate;
+    // k_start = 12·msg1-FrequencyStart + k_bar (k_bar = 2 for the short L_ra=139
+    // formats) = the PRACH's first occupied subcarrier in the initial UL BWP grid.
+    let scale = (fft / 512) as i64;
+    // Timing-advance command T_A → uplink samples: N_TA = T_A · 16 · 64 / 2^µ · T_c,
+    // which at µ=1 is T_A · 4 samples at 15.36 MHz and scales with the sample rate.
+    let ta_samp = 4 * scale;
     let x_uv = prach_preamble_seq(1, preamble, prach_ncs_unrestricted(PrachScs::Short, 0).unwrap(), PrachSeqLen::Short);
-    let occ = PrachOccasion { fft_size: 512, grid_size: carrier_rb * 12, k_start: 62, cp_samples: 310, nof_symbols: 1 };
+    let occ = PrachOccasion { fft_size: fft, grid_size: carrier_rb * 12, k_start: 12 * msg1_freq_start + 2, cp_samples: 310 * fft / 512, nof_symbols: 1 };
     let mut prach = prach_occasion_waveform(&x_uv, &occ);
     let peak = prach.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
     for s in &mut prach {
         *s *= amp / peak;
     }
     let prach_len = prach.len() as i64;
-    let occ_off = (fs * 9.5e-3).round() as i64 + (44 + 512) + (36 + 512);
+    let occ_off = (fs * 9.5e-3).round() as i64 + ((44 + 512) + (36 + 512)) * scale;
 
     let block_len = 1920usize;
     let slot_len = (frame_len / 20) as i64;
@@ -1846,7 +1860,7 @@ fn run(cfg: Config) {
                         let (rb0, nrb) = riv_decode(riv, coreset.n_rb);
                         let k1 = bits5(&b, 34, 3) + 1;
                         let dai = bits5(&b, 27, 2);
-                        let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                        let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                         let akey = (apos + slot_len / 2).div_euclid(slot_len);
                         pri_book.insert(akey, bits5(&b, 31, 3));
                         // Pre-book a NACK at this PDSCH's C-DAI position: if its decode
@@ -1911,7 +1925,7 @@ fn run(cfg: Config) {
                                     .or_else(|| sib1_cfg.as_ref().map(|s| &s.pdsch_tdra))
                                     .and_then(|l| l.get(row))
                                     .map_or(if row == 1 { SLIV_SHORT } else { SLIV_FULL }, |r| r.sliv);
-                                let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                                let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                                 let akey = (apos + slot_len / 2).div_euclid(slot_len);
                                 pri_book.insert(akey, bits5(&b, 26 + w_dl, 3));
                                 let dai = bits5(&b, 22 + w_dl, 2);
@@ -2109,7 +2123,7 @@ fn run(cfg: Config) {
                         if std::env::var_os("FERRITE_ULDBG").is_some() {
                             eprintln!("[uldbg] slot={m5_slot} rb[{g_rb0},+{g_nrb}) mcs={mcs} tbs={tbs_bytes} e={e} rv={g_rv} h{g_hid}/n{ndi} csi={} retx={is_retx} kind={kind}", csi_res.len());
                         }
-                        let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                        let pos = slot_start_ul + (m5_slot - slot_idx as i64) * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                         if !kind.is_empty() {
                             println!("  → {kind}: grant RB[{g_rb0},{}) MCS{mcs} ndi={ndi} tbs={tbs_bytes} at ul {pos} (slot {m5_slot})", g_rb0 + g_nrb);
                         }
@@ -2223,7 +2237,7 @@ fn run(cfg: Config) {
                                 // the gNB's OFDM demod removes it, so an uncompensated UL
                                 // decorrelates the DM-RS across symbols. Critical for decode.
                                 let wave0 = pusch_modulate_slot(&ofdm, &ulsch, &m_alloc, acq.cell_id, dmrs_slot as u32, (msg3_slot % 2) as usize, tc, center_hz, fs);
-                                let pos0 = slot_start_ul + msg3_del * slot_len + offset - ta as i64 * 4;
+                                let pos0 = slot_start_ul + msg3_del * slot_len + offset - ta as i64 * ta_samp;
                                 let toff = locked_toff.unwrap_or_else(|| toffs[attempt % toffs.len()]);
                                 let mut wave = if fshift != 0.0 {
                                     freq_shift(&wave0, fshift * df, fs, (pos0 + toff) as usize)
@@ -2242,6 +2256,10 @@ fn run(cfg: Config) {
                                 // PRACH offset can sit anywhere in the wide detection window).
                                 attempt += 1;
                                 let pos = pos0 + toff;
+                                if std::env::var_os("FERRITE_MSG3DBG").is_some() {
+                                    eprintln!("[msg3dbg] slot_start_ul={slot_start_ul} t0_pos={} ul_counter={ul_counter} pos={pos} pos-ul={} pos-ss={}",
+                                        t0_pos.load(Rlx), pos - ul_counter as i64, pos - slot_start_ul);
+                                }
                                 inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave.clone(), tag: "msg3" }, ul_counter as i64);
                                 pend = Some((pos, wave));
                                 recent_tc.push_back((tc, toff));
@@ -2309,7 +2327,7 @@ fn run(cfg: Config) {
                                 if k1 != 0xff {
                                     let k1a = k1 as i64; // already the actual k1 in slots
                                     let ack_slot = slot_idx as i64 + k1a;
-                                    let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                                    let pos = slot_start_ul + k1a * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                                     // Key by the nearest-slot rounding (TA-proof; see ack_book).
                                     let key = (pos + slot_len / 2).div_euclid(slot_len);
                                     let e = ack_book.entry(key).or_insert(((ack_slot % 20) as u32, pos, [None; 4]));
@@ -2582,7 +2600,7 @@ fn run(cfg: Config) {
                                     .as_ref()
                                     .map_or(if slot_idx < 10 { 7 } else { 17 }, |s| s.next_ul_slot_after(slot_idx));
                                 let pos = slot_start_ul + (pucch_slot as i64 - slot_idx as i64) * slot_len
-                                    + offset + toffx - last_ta * 4;
+                                    + offset + toffx - last_ta * ta_samp;
                                 let key = (pos + slot_len / 2).div_euclid(slot_len);
                                 if let Some(e) = ack_book.get_mut(&key) {
                                     // Connected-mode T0 already saw this Msg4 retx's DCI 1_0
@@ -2630,7 +2648,7 @@ fn run(cfg: Config) {
         // standalone F1 would overlap their samples in the injection table — skip it.
         let sr_target = (slot_idx as i64 + 3) % 20;
         if want_sr && (sr_target - sr_slot).rem_euclid(sr_period) == 0 && pend_sr.is_none() {
-            let pos = slot_start_ul + 3 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+            let pos = slot_start_ul + 3 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
             let key = (pos + slot_len / 2).div_euclid(slot_len);
             let msg4ack_owns = pend_pucch.as_ref()
                 .is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == key);
@@ -2667,7 +2685,7 @@ fn run(cfg: Config) {
         if connected.is_some() && (csi_slot - slot_idx as i64).rem_euclid(20) == 2 && pend_csi.is_none()
             && csi_occ_f2 && pending_cqi.is_some()
         {
-            let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4
+            let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp
                 + slot_len / 2).div_euclid(slot_len);
             let msg4ack_owns = pend_pucch.as_ref()
                 .is_some_and(|(p, _)| (p + slot_len / 2).div_euclid(slot_len) == ckey);
@@ -2687,7 +2705,7 @@ fn run(cfg: Config) {
                 // 4-bit wideband CQI, MSB first.
                 let bits = vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1];
                 let pos = slot_start_ul + 2 * slot_len
-                    + offset + locked_toff.unwrap_or(0) - last_ta * 4;
+                    + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                 let _ = tx_req_tx.try_send(TxReq::PucchF2 { cfg, bits, slot_mod20: csi_slot as u32, pos, now: ul_counter as i64 });
                 pend_csi = Some(pos);
             }
@@ -2811,7 +2829,7 @@ fn run(cfg: Config) {
                 ack_late += 1; // its UL block was already served — can never be injected
                 if std::env::var_os("FERRITE_DRIFT").is_some() && ack_late < 16 {
                     eprintln!("[ack-late] pos={pos} serving={ul_counter} pos-serving={} pos-t0(slots)={} last_ta={last_ta} ta*4(slots)={}",
-                        pos - ul_counter as i64, (pos - slot_start_ul) / slot_len, (last_ta * 4) / slot_len);
+                        pos - ul_counter as i64, (pos - slot_start_ul) / slot_len, (last_ta * ta_samp) / slot_len);
                 }
             }
             let mut bits: Vec<u8> = (0..size).map(|i| book[i].unwrap_or(0)).collect();

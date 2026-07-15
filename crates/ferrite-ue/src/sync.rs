@@ -196,8 +196,13 @@ pub fn gscn_scan(
     const GSCN_STEP_HZ: f64 = 1.44e6;
     const SSB_HALF_BW_HZ: f64 = 3.6e6;
 
-    let n_lo = ((center_hz - SSB_HALF_BW_HZ * 1.2 - 3.0e9) / GSCN_STEP_HZ).ceil() as i64;
-    let n_hi = ((center_hz + SSB_HALF_BW_HZ * 1.2 - 3.0e9) / GSCN_STEP_HZ).floor() as i64;
+    // Search the whole sampled band: the SSB can sit anywhere its 20 RB still fit inside
+    // ±fs/2 of the carrier centre. On a narrow carrier that's ~the SSB bandwidth, but on
+    // a wide one (e.g. 20 MHz) the SSB is several MHz off centre — well outside its own
+    // bandwidth — so a fixed ±SSB_BW window misses it and locks a spurious PSS peak.
+    let half_search = (fs / 2.0 - SSB_HALF_BW_HZ).max(SSB_HALF_BW_HZ * 1.2);
+    let n_lo = ((center_hz - half_search - 3.0e9) / GSCN_STEP_HZ).ceil() as i64;
+    let n_hi = ((center_hz + half_search - 3.0e9) / GSCN_STEP_HZ).floor() as i64;
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = (n_lo..=n_hi)
