@@ -1820,6 +1820,9 @@ fn run(cfg: Config) {
         // BWP-sized frequency field: 33+w_ul = 24 + 9 + w_ul, 36+w_dl+w_k1 = 27 + 9 + …
         let dci_0_1_size = 24 + ul_freq_bits + w_ul;
         let dci_1_1_size = 27 + ul_freq_bits + w_dl + w_k1;
+        if std::env::var_os("FERRITE_DLDBG").is_some() && connected.is_some() && slot_idx == 0 {
+            eprintln!("[dldbg] sizes: 0_0(a_len)={a_len} 0_1={dci_0_1_size} 1_1={dci_1_1_size} ul_freq_bits={ul_freq_bits} w_ul={w_ul} w_dl={w_dl} w_k1={w_k1}");
+        }
         // The SR / CSI-report occasion slots, from the parsed dedicated config; fallback =
         // the first/second-full-UL-slot heuristics, then the transcribed slots 7/8. (The
         // configured periods can be 40 slots; serving every frame is harmless — the gNB
@@ -1897,19 +1900,36 @@ fn run(cfg: Config) {
                         let pt: f32 = fsh.iter().map(|c| c.norm_sqr()).sum();
                         eprintln!("[t0dbg] slot={slot_idx} coreset-power={dbg_power:.1} slot-power={pt:.1}");
                     }
-                    let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, coreset.n_symb, acq.cell_id, slot_idx);
-                    for cand in all_candidates(coreset.n_cce(), &[1, 2, 4, 8]) {
+                    // CORESET1 geometry from the parsed dedicated config. The search
+                    // originally assumed CORESET0's 24 RB / 2 symb / 8 CCE; at 20 MHz
+                    // CORESET1 spans 48 RB (8 six-RB groups) → 16 CCE. n_cce =
+                    // popcount·duration (= n_rb·n_symb/6, n_rb = popcount·6). It is
+                    // contiguous from CRB 0 on both cells, so sc_to_bin and the DM-RS
+                    // estimate over carrier_rb (a superset) are unchanged.
+                    let (c1_n_symb, c1_n_cce) = cg_cfg.as_ref().map_or(
+                        (coreset.n_symb, coreset.n_cce()),
+                        |c| (c.coreset1_duration as usize,
+                             c.coreset1_freq_bits.count_ones() as usize * c.coreset1_duration as usize));
+                    let h_reg = estimate_coreset_c1(&cgrids, |sc: usize| sc_to_bin(sc as i32), carrier_rb, c1_n_symb, acq.cell_id, slot_idx);
+                    for cand in all_candidates(c1_n_cce, &[1, 2, 4, 8]) {
                         if ul_bits.is_some() && dl_dci.is_some() {
                             break;
                         }
-                        let coh = coreset_candidate_coherence(&h_reg, &cand, coreset.n_symb);
+                        let coh = coreset_candidate_coherence(&h_reg, &cand, c1_n_symb);
                         if dbg_slot {
                             eprintln!("[t0dbg] slot={slot_idx} cand al={} cce0={} coh={coh:.2}", cand.agg_level, cand.cces[0]);
                         }
-                        if coh < 0.5 {
+                        // Coherence gate (skip equalize+decode for empty candidates). A
+                        // real PDCCH reads ~1 on a narrow CORESET but lower on the wide
+                        // 20 MHz CORESET1 (48 RB): the −df DL shift + residual timing put a
+                        // phase ramp across the band, so the cross-REG coherence drops even
+                        // though the per-RB equalizer still recovers the bits. 0.3 stays
+                        // above the AL1 noise floor (~1/6) while catching those. Overridable.
+                        let coh_gate: f32 = std::env::var("FERRITE_COHGATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1);
+                        if coh < coh_gate {
                             continue;
                         }
-                        let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), coreset.n_symb, &cand, &h_reg);
+                        let mut mm = equalize_candidate_c1_cached(&cgrids, |sc: usize| sc_to_bin(sc as i32), c1_n_symb, &cand, &h_reg);
                         pdcch_descramble_llr(&mut mm, u32::from(acq.cell_id));
                         if ul_bits.is_none() {
                             if let Some(b) = dci_decode(&mm, crnti, dci_0_1_size).filter(|b| b[0] == 0) {
@@ -1948,6 +1968,9 @@ fn run(cfg: Config) {
                                 // NACK pre-booking — see the DCI 1_0 site above.
                                 let e = ack_book.entry(akey).or_insert((((slot_idx as i64 + k1 as i64) % 20) as u32, apos, [None; 4]));
                                 e.2[(dai & 3) as usize].get_or_insert(0);
+                                if std::env::var_os("FERRITE_DLDBG").is_some() {
+                                    eprintln!("[dldbg] slot={slot_idx} DCI 1_1 found: rb[{rb0},{}) mcs={} k1={k1} sliv={sliv} ndi={}", rb0 + nrb, bits5(&b, 1 + f + w_dl, 5), b[6 + f + w_dl]);
+                                }
                                 dl_dci = Some((rb0, nrb, bits5(&b, 1 + f + w_dl, 5), k1, dai, bits5(&b, 7 + f + w_dl, 2), bits5(&b, 9 + f + w_dl, 4), sliv, b[6 + f + w_dl]));
                             }
                         }
@@ -2610,6 +2633,9 @@ fn run(cfg: Config) {
                                             if let Some(r) = cg.pucch_resources.iter().find(|r| r.id == 0 && r.format == 1) {
                                                 harq_cfg = to_f1(r);
                                             }
+                                            println!("   CORESET1: freq={:#014x} dur={} interleaved={} popcount={}",
+                                                cg.coreset1_freq_bits, cg.coreset1_duration, cg.coreset1_interleaved,
+                                                cg.coreset1_freq_bits.count_ones());
                                             let _ = CSI_RM.set(CsiRm::from_cellgroup(&cg));
                                             cg_cfg = Some(cg);
                                         }
