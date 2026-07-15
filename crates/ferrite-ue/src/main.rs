@@ -1984,14 +1984,23 @@ fn run(cfg: Config) {
                         // send a Short BSR to solicit a larger grant instead.
                         // A PUSCH on a CSI-report occasion carries the CSI part 1
                         // (TS 38.212 §6.2.7): the gNB reserves Q'_CSI REs on it and
-                        // rate-matches the UL-SCH around them. The occasion parity
-                        // rides on pending_cqi: the worker only measures CQI in the
-                        // frames where the (same 40-slot grid) CSI-RS is present, so a
-                        // report is available exactly when the gNB expects one here.
-                        let cqi_fresh = pending_cqi.is_some_and(|(_, t)| slot_start_ul - t < 17 * slot_len);
+                        // rate-matches the UL-SCH around them. The occasion is EXACT in
+                        // absolute (gNB SFN) slots: (SFN·20 + slot) mod period == offset.
+                        // The UE knows the true SFN — the stream was frame-aligned to
+                        // acq.next_sfn at slot 0 — so `csi_occasion` matches the gNB's
+                        // reservation frame-for-frame. (Matching only slot-in-frame
+                        // mod 20 fires on BOTH frame parities of the 40-slot grid; on the
+                        // off parity the gNB reserves NO CSI REs (FAPI ocsi1=0) and the
+                        // multiplexed CSI shifts the data → crc=KO at any SNR — that
+                        // corrupted every off-parity AuthenticationResponse (re)tx →
+                        // registration timeout.)
+                        let pusch_abs_slot = slot_start_ul / slot_len + (m5_slot - slot_idx as i64);
+                        let csi_occasion = cg_cfg.as_ref().and_then(|c| c.csi_report).is_some_and(|(p, o, _)| {
+                            (acq.next_sfn as i64 * 20 + pusch_abs_slot).rem_euclid(p as i64) == o as i64
+                        });
                         let csi_bits: Vec<u8> = if connected.is_some()
-                            && m5_slot.rem_euclid(20) == csi_slot
-                            && cqi_fresh
+                            && csi_occasion
+                            && pending_cqi.is_some()
                             && cg_cfg.as_ref().is_some_and(|c| c.beta_csi1_index.is_some())
                         {
                             let (cqi, _) = pending_cqi.take().unwrap();
@@ -2648,8 +2657,15 @@ fn run(cfg: Config) {
         // CSI-ReportConfig, see csi_slot above). If the occasion slot's UCI is owned by
         // an ACK book (the HARQ-ACK F2 below appends the CQI) or a PUSCH, skip — a
         // second waveform would overlap theirs in the injection table.
+        // Same exact-SFN occasion grid as the CSI-on-PUSCH path above (target slot = 2
+        // ahead): the report only lands where the gNB expects it. Firing on the off
+        // parity sends a report the gNB isn't reading (wasted F2).
+        let csi_tgt_abs = slot_start_ul / slot_len + 2;
+        let csi_occ_f2 = cg_cfg.as_ref().and_then(|c| c.csi_report).is_some_and(|(p, o, _)| {
+            (acq.next_sfn as i64 * 20 + csi_tgt_abs).rem_euclid(p as i64) == o as i64
+        });
         if connected.is_some() && (csi_slot - slot_idx as i64).rem_euclid(20) == 2 && pend_csi.is_none()
-            && pending_cqi.is_some_and(|(_, t)| slot_start_ul - t < 17 * slot_len)
+            && csi_occ_f2 && pending_cqi.is_some()
         {
             let ckey = (slot_start_ul + 2 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * 4
                 + slot_len / 2).div_euclid(slot_len);
@@ -2810,8 +2826,11 @@ fn run(cfg: Config) {
             // 4-bit CQI if it's the CSI one. Routine on a one-UL-slot TDD pattern
             // (DDDSU: the gNB reads ack+sr+csi off one F2 and DTXes anything else).
             let sr_here = i64::from(slot_mod20) == sr_slot;
-            let csi_here = i64::from(slot_mod20) == csi_slot
-                && pending_cqi.is_some_and(|(_, t)| (pos - t).abs() < 17 * slot_len);
+            // Exact-SFN occasion (`key` is this ACK's absolute slot): only append the
+            // CQI when this slot is a real CSI-report occasion the gNB reads.
+            let csi_here = cg_cfg.as_ref().and_then(|c| c.csi_report).is_some_and(|(p, o, _)| {
+                (acq.next_sfn as i64 * 20 + key).rem_euclid(p as i64) == o as i64
+            }) && pending_cqi.is_some();
             let mut wave = if bits.len() > 2 || csi_here {
                 if sr_here {
                     bits.push(u8::from(want_sr));
