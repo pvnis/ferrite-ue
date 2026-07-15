@@ -2257,8 +2257,8 @@ fn run(cfg: Config) {
                                 attempt += 1;
                                 let pos = pos0 + toff;
                                 if std::env::var_os("FERRITE_MSG3DBG").is_some() {
-                                    eprintln!("[msg3dbg] slot_start_ul={slot_start_ul} t0_pos={} ul_counter={ul_counter} pos={pos} pos-ul={} pos-ss={}",
-                                        t0_pos.load(Rlx), pos - ul_counter as i64, pos - slot_start_ul);
+                                    eprintln!("[msg3dbg] slot_idx={slot_idx} msg3_slot={msg3_slot} dmrs_slot={dmrs_slot} par={} rb0={m_rb0} pos-ul={} pos-ss={}",
+                                        msg3_slot % 2, pos - ul_counter as i64, pos - slot_start_ul);
                                 }
                                 inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave.clone(), tag: "msg3" }, ul_counter as i64);
                                 pend = Some((pos, wave));
