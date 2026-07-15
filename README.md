@@ -15,10 +15,13 @@ is **~12 ms**.
 
 The cell configuration is **decoded live, not transcribed**: the TDD UL/DL
 pattern and timing tables come from SIB1, and the dedicated radio-bearer config
-(k1 list, DCI field widths, PUCCH/SR/CSI resources, CSI-RS layout) from the
-RRCSetup `masterCellGroup`. Ferrite attaches against different TDD patterns
-without code changes — validated on both a 5 ms `6D+S+3U` cell and a 2.5 ms
-`DDDSU` cell.
+(k1 list, DCI field widths, PUCCH/SR/CSI resources, CSI-RS layout, CORESET#1
+geometry) from the RRCSetup `masterCellGroup`. Ferrite attaches against
+different TDD patterns and channel bandwidths without code changes — validated
+on 5 ms `6D+S+3U` and 2.5 ms `DDDSU` cells, and at both **10 MHz and 20 MHz**
+(the wider BWP's DCI/PUCCH/CORESET widths all derive from the parsed config).
+For 20 MHz, point the gNB at `test/gnb_zmq_20mhz.yml` and run the UE with
+`--srate 30.72e6`; end-to-end ping works the same as 10 MHz.
 
 ## Target configuration
 
@@ -27,7 +30,7 @@ without code changes — validated on both a 5 ms `6D+S+3U` cell and a 2.5 ms
 | Mode         | 5G SA (standalone)                                 |
 | Frequency    | FR1, band **n78**, TDD (pattern read live from SIB1) |
 | Numerology   | `mu = 1` → 30 kHz SCS, 500 µs slot                 |
-| Bandwidth    | 10 MHz (24 PRB), sample rate 15.36 MHz             |
+| Bandwidth    | 10 MHz (24 PRB, 15.36 MHz) or 20 MHz (51 PRB, 30.72 MHz) |
 | Transport    | ZMQ IQ (`complex<f32>` blocks), no-RF bring-up     |
 | Radio (OTA)  | LiteX-M2SDR / BladeRF via SoapySDR *(next)*         |
 
