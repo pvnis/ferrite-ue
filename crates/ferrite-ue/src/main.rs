@@ -202,34 +202,36 @@ fn try_decode_msg4(
     tc: u16,
     ccch_sdu: &[u8; 6],
 ) -> Option<(Vec<u8>, bool)> {
-    // Msg4 allocation (fallback DCI 1_0 defaults): PRB[0,21), symbols[2,14),
-    // QPSK MCS7 (Qm2, R=526/1024), 2 CDM groups, non-interleaved VRB-to-PRB.
-    let (rb0, nrb, qm, r) = (0usize, 21usize, 2usize, 526.0 / 1024.0);
-    let n_re = nrb * 12 * (12 - 3);
-    let tbs = tbs_from_nre(n_re, r, qm);
-    let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0 , nof_cdm_groups: 2};
-    // CORESET0 RB0 = CRB0 here (base 0, confirmed by the SIB1 sanity). Data RE
-    // mapping order is l,k' (time_first) for these common PDSCHs; try both. The
-    // winning tf is returned — it's CELL-FIXED, so it seeds the connected-mode
-    // worker's DM-RS layout sweep (halving its cold first-decode cost).
+    // Msg4 allocation (fallback DCI 1_0): PRB[0,N), symbols[2,14), QPSK MCS7
+    // (Qm2, R=526/1024), 2 CDM groups, non-interleaved VRB-to-PRB. The gNB sizes N
+    // to fit the RRCSetup within CORESET0 — 21 RB on the 10 MHz cell, 22 on the 20 MHz
+    // cell — so sweep the plausible widths (LDPC+CRC rejects the wrong ones). CORESET0
+    // RB0 = CRB0 here (base 0). The winning tf/data-mapping is CELL-FIXED, so it seeds
+    // the connected-mode worker's DM-RS layout sweep (halving its cold first-decode cost).
+    let (rb0, qm, r) = (0usize, 2usize, 526.0 / 1024.0);
     let dbg = std::env::var("MSG4DBG").is_ok();
-    let (tb, tf_won) = [true, false].into_iter().find_map(|time_first| {
-        let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, tc, cell_id, time_first);
-        let mut llr = px.llrs.clone();
-        descramble_llrs(&mut llr, pdsch_scramble_c_init(tc, cell_id));
-        let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 10);
-        if dbg {
-            eprintln!("  [msg4] tc={tc:#06x} slot {slot_idx} tf={time_first} dmrs={:.2} conv={conv} crc={crc}", px.dmrs_metric);
-        }
-        if !crc {
-            return None;
-        }
-        let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-        if tb.iter().all(|&b| b == 0) {
-            None
-        } else {
-            Some((tb, time_first))
-        }
+    let (tb, tf_won) = [21usize, 22, 20, 23, 24, 18].into_iter().find_map(|nrb| {
+        let n_re = nrb * 12 * (12 - 3);
+        let tbs = tbs_from_nre(n_re, r, qm);
+        let alloc = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: 2, n_sym: 12, dmrs_symbols: vec![2, 7, 11], qm, n_bwp: 0, nof_cdm_groups: 2 };
+        [true, false].into_iter().find_map(|time_first| {
+            let px = extract_pdsch(grids, sc_to_bin, &alloc, cell_id, slot_idx, 0, tc, cell_id, time_first);
+            let mut llr = px.llrs.clone();
+            descramble_llrs(&mut llr, pdsch_scramble_c_init(tc, cell_id));
+            let (bits, conv, crc) = ferrite_phy::coding::dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 10);
+            if dbg {
+                eprintln!("  [msg4] tc={tc:#06x} slot {slot_idx} nrb={nrb} tf={time_first} dmrs={:.2} conv={conv} crc={crc}", px.dmrs_metric);
+            }
+            if !crc {
+                return None;
+            }
+            let tb: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+            if tb.iter().all(|&b| b == 0) {
+                None
+            } else {
+                Some((tb, time_first))
+            }
+        })
     })?;
     let subs = parse_dl_mac_pdu(&tb);
     println!("  · Msg4 PDSCH crc=OK (non-zero!) tc={tc:#06x} slot {slot_idx} lcids={:?} head={}",
@@ -1061,6 +1063,11 @@ fn run(cfg: Config) {
     // k_start = 12·msg1-FrequencyStart + k_bar (k_bar = 2 for the short L_ra=139
     // formats) = the PRACH's first occupied subcarrier in the initial UL BWP grid.
     let scale = (fft / 512) as i64;
+    // DCI type-1 frequency-domain RIV field width for the initial UL BWP (TS 38.212
+    // §7.3.1.1): ceil(log2(N·(N+1)/2)). 9 bits at 24 RB (10 MHz), 11 at 51 RB (20 MHz).
+    // The fallback DCI 0_0's frequency field (and thus every field after it) widens with
+    // the BWP, so it can't be hardcoded to 9.
+    let ul_freq_bits = (0usize..).find(|&b| (1usize << b) >= carrier_rb * (carrier_rb + 1) / 2).unwrap();
     // Timing-advance command T_A → uplink samples: N_TA = T_A · 16 · 64 / 2^µ · T_c,
     // which at µ=1 is T_A · 4 samples at 15.36 MHz and scales with the sample rate.
     let ta_samp = 4 * scale;
@@ -1367,13 +1374,15 @@ fn run(cfg: Config) {
     // Connected-mode HARQ-ACK uses the DEDICATED PUCCH F1 resource: prb0, cs0,
     // occ0, symb[0,14), NO intra-slot hop (prb2=prb1) — unlike the common Msg4
     // resource above which hops to prb23.
-    let harq_cfg = ferrite_phy::pucch::PucchF1 {
+    let mut harq_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 0, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
     };
-    // SR PUCCH resource (from the RRCSetup dedicated config): F1, PRB 0 (no hop),
-    // cs 6, occ 3, symb[0,14), monitored at slot 7. A positive SR = tx this (d=1).
-    let sr_cfg = ferrite_phy::pucch::PucchF1 {
+    // SR PUCCH resource. The hardcode is the 10 MHz auto-config (PRB 0, cs 6, occ 3);
+    // it is overwritten from the parsed masterCellGroup SR resource at the Msg4 win,
+    // which matters on the wider 20 MHz BWP (full-width PUCCH layout puts the SR at
+    // e.g. PRB 4, cs 0, occ 0). A positive SR = tx this (d=1).
+    let mut sr_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 0, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 6, occ_index: 3, n_id: acq.cell_id, carrier_rb,
     };
@@ -1807,8 +1816,10 @@ fn run(cfg: Config) {
             .or_else(|| sib1_cfg.as_ref().map(|s| s.pdsch_tdra.len()).filter(|&n| n > 0))
             .map_or(1, bitw);
         let w_k1 = cg_cfg.as_ref().map_or(3, |c| bitw(c.k1_list.len()));
-        let dci_0_1_size = 33 + w_ul;
-        let dci_1_1_size = 36 + w_dl + w_k1;
+        // Sizes generalise from the 10 MHz (24 RB → 9 freq bits) empirical widths by the
+        // BWP-sized frequency field: 33+w_ul = 24 + 9 + w_ul, 36+w_dl+w_k1 = 27 + 9 + …
+        let dci_0_1_size = 24 + ul_freq_bits + w_ul;
+        let dci_1_1_size = 27 + ul_freq_bits + w_dl + w_k1;
         // The SR / CSI-report occasion slots, from the parsed dedicated config; fallback =
         // the first/second-full-UL-slot heuristics, then the transcribed slots 7/8. (The
         // configured periods can be 40 slots; serving every frame is harmless — the gNB
@@ -1915,10 +1926,15 @@ fn run(cfg: Config) {
                                 // short-shape TB keeps the short row in normal slots);
                                 // k1 indexes the dl-DataToUL-ACK list.
                                 const K1_FB: [u8; 8] = [4, 5, 6, 7, 8, 9, 11, 12];
-                                let riv = b[1..10].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                                // DCI 1_1: id(1) freq(F) tdra(w_dl) mcs(5) ndi(1) rv(2)
+                                // harq(4) dai(2) tpc(2) pucch-res(3) k1(w_k1). F = the
+                                // BWP-sized freq field (9 bits @24 RB, 11 @51 RB), so every
+                                // field is anchored at 1+F, not the hardcoded 10.
+                                let f = ul_freq_bits;
+                                let riv = b[1..1 + f].iter().fold(0usize, |a, &x| a << 1 | x as usize);
                                 let (rb0, nrb) = riv_decode(riv, carrier_rb);
-                                let row = b[10..10 + w_dl].iter().fold(0usize, |a, &x| a << 1 | x as usize);
-                                let k1_idx = bits5(&b, 29 + w_dl, w_k1) as usize;
+                                let row = b[1 + f..1 + f + w_dl].iter().fold(0usize, |a, &x| a << 1 | x as usize);
+                                let k1_idx = bits5(&b, 20 + f + w_dl, w_k1) as usize;
                                 let k1 = cg_cfg.as_ref().and_then(|c| c.k1_list.get(k1_idx)).copied()
                                     .unwrap_or(K1_FB[k1_idx & 7]);
                                 let sliv = cg_cfg.as_ref().map(|c| &c.pdsch_tdra).filter(|l| !l.is_empty())
@@ -1927,12 +1943,12 @@ fn run(cfg: Config) {
                                     .map_or(if row == 1 { SLIV_SHORT } else { SLIV_FULL }, |r| r.sliv);
                                 let apos = slot_start_ul + k1 as i64 * slot_len + offset + locked_toff.unwrap_or(0) - last_ta * ta_samp;
                                 let akey = (apos + slot_len / 2).div_euclid(slot_len);
-                                pri_book.insert(akey, bits5(&b, 26 + w_dl, 3));
-                                let dai = bits5(&b, 22 + w_dl, 2);
+                                pri_book.insert(akey, bits5(&b, 17 + f + w_dl, 3));
+                                let dai = bits5(&b, 13 + f + w_dl, 2);
                                 // NACK pre-booking — see the DCI 1_0 site above.
                                 let e = ack_book.entry(akey).or_insert((((slot_idx as i64 + k1 as i64) % 20) as u32, apos, [None; 4]));
                                 e.2[(dai & 3) as usize].get_or_insert(0);
-                                dl_dci = Some((rb0, nrb, bits5(&b, 10 + w_dl, 5), k1, dai, bits5(&b, 16 + w_dl, 2), bits5(&b, 18 + w_dl, 4), sliv, b[15 + w_dl]));
+                                dl_dci = Some((rb0, nrb, bits5(&b, 1 + f + w_dl, 5), k1, dai, bits5(&b, 7 + f + w_dl, 2), bits5(&b, 9 + f + w_dl, 4), sliv, b[6 + f + w_dl]));
                             }
                         }
                     }
@@ -1960,8 +1976,10 @@ fn run(cfg: Config) {
                     // gNB's scheduled grant (MCS/RV/HARQ aligned).
                     {
                         let is_0_1 = bits.len() == dci_0_1_size;
-                        let mcs_lo = if is_0_1 { 10 + w_ul } else { 15 };
-                        let riv = bits[1..10].iter().fold(0usize, |a, &b| a << 1 | b as usize);
+                        // DCI 0_0: id(1) freq(F) time(4) hop(1) mcs(5)…; DCI 0_1:
+                        // id(1) freq(F) tdra(w_ul) mcs(5)… — F = ul_freq_bits (BWP-sized).
+                        let mcs_lo = if is_0_1 { 1 + ul_freq_bits + w_ul } else { 6 + ul_freq_bits };
+                        let riv = bits[1..1 + ul_freq_bits].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let (g_rb0, g_nrb) = riv_decode(riv, carrier_rb);
                         let mcs = bits[mcs_lo..mcs_lo + 5].iter().fold(0u8, |a, &b| a << 1 | b);
                         let ndi = bits[mcs_lo + 5];
@@ -1977,15 +1995,16 @@ fn run(cfg: Config) {
                         // fixed 25 on a 2-bit-TDRA cell grabbed [dai LSB, tpc] → phantom
                         // ACK bits punctured the PUSCH → every DRB PUSCH crc=KO at 50 dB.)
                         let t_dai: Option<u8> = is_0_1
-                            .then(|| bits[22 + w_ul..24 + w_ul].iter().fold(0u8, |a, &b| a << 1 | b));
+                            .then(|| bits[13 + ul_freq_bits + w_ul..15 + ul_freq_bits + w_ul].iter().fold(0u8, |a, &b| a << 1 | b));
                         let (qm, r) = mcs_params(mcs);
                         // k2 from the DCI's TDRA field via the SIB1 pusch-TimeDomain-
                         // AllocationList (this cell: rows [4,5,6,7,11] — row 0's k2=4 is
                         // the old hardcoded constant; other rows appear when the granting
                         // DL slot sits further from the UL slots, and matter for any
                         // shorter TDD pattern). DCI 0_0 carries 4 TDRA bits, 0_1 w_ul.
-                        let tdra_hi = if is_0_1 { 10 + w_ul } else { 14 };
-                        let tdra = bits[10..tdra_hi].iter().fold(0usize, |a, &b| a << 1 | b as usize);
+                        let tdra_lo = 1 + ul_freq_bits;
+                        let tdra_hi = if is_0_1 { tdra_lo + w_ul } else { tdra_lo + 4 };
+                        let tdra = bits[tdra_lo..tdra_hi].iter().fold(0usize, |a, &b| a << 1 | b as usize);
                         let k2 = sib1_cfg.as_ref().map_or(4, |s| s.k2_for_row(tdra)) as i64;
                         let m5_slot = slot_idx as i64 + k2;
                         let n_data_sym = 14 - 3;
@@ -2569,6 +2588,28 @@ fn run(cfg: Config) {
                                             println!("   masterCellGroup: k1={:?} pucch-res={} sr={:?} csi-report={:?} nzp-csi-rs={} zp-csi-rs={}",
                                                 cg.k1_list, cg.pucch_resources.len(), cg.sr, cg.csi_report,
                                                 cg.nzp_csi_rs.len(), cg.zp_csi_rs.len());
+                                            // Wire the connected-mode PUCCH F1 configs from the parsed
+                                            // resources (the hardcodes are 10 MHz auto-config; the wider
+                                            // 20 MHz BWP uses different PRBs/shifts). SR = its own
+                                            // resource; HARQ-ACK = resource-set-0 resource 0 (id 0).
+                                            let to_f1 = |r: &ferrite_ue::cellgroup::PucchResource| ferrite_phy::pucch::PucchF1 {
+                                                prb1: r.prb as usize,
+                                                prb2: r.second_hop_prb.unwrap_or(r.prb) as usize,
+                                                start_symbol: r.start_symbol as usize,
+                                                nof_symbols: r.n_symbols as usize,
+                                                init_cyclic_shift: r.cs_or_prbs as usize,
+                                                occ_index: r.occ as usize,
+                                                n_id: acq.cell_id, carrier_rb,
+                                            };
+                                            if let Some((_, _, srid)) = cg.sr {
+                                                if let Some(r) = cg.pucch_resources.iter().find(|r| r.id == srid) {
+                                                    sr_cfg = to_f1(r);
+                                                    println!("   SR PUCCH ← res {srid}: prb{} cs{} occ{}", r.prb, r.cs_or_prbs, r.occ);
+                                                }
+                                            }
+                                            if let Some(r) = cg.pucch_resources.iter().find(|r| r.id == 0 && r.format == 1) {
+                                                harq_cfg = to_f1(r);
+                                            }
                                             let _ = CSI_RM.set(CsiRm::from_cellgroup(&cg));
                                             cg_cfg = Some(cg);
                                         }

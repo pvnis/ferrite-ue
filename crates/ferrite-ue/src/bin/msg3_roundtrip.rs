@@ -35,6 +35,19 @@ fn main() {
     let tbs = tb.len();
 
     let wave = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell, slot, (slot % 2) as usize, tc, center_hz, fs);
+
+    // `msg3-roundtrip <fft> <out.f32>` emits the raw slot waveform (interleaved f32
+    // re,im) for cross-correlating against a gNB RX dump, instead of self-decoding.
+    if let Some(path) = std::env::args().nth(2) {
+        let mut bytes = Vec::with_capacity(wave.len() * 8);
+        for s in &wave {
+            bytes.extend_from_slice(&s.re.to_le_bytes());
+            bytes.extend_from_slice(&s.im.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!("wrote {} samples to {path}", wave.len());
+        return;
+    }
     println!("fft={fft} fs={fs:.0} carrier_rb={carrier_rb} rb[{rb_start},{}) wave={} samples (slot_len {})",
         rb_start + n_rb, wave.len(), fft * 14 + (0..14).map(|l| ofdm.cp_len((slot % 2) as usize * 14 + l, 1)).sum::<usize>());
 
