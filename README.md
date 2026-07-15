@@ -10,14 +10,22 @@ constant tables / reference vectors from the specs is the only thing lifted.)
 attach over a ZMQ IQ transport against an OCUDU/qcore network — cell search →
 PRACH/RACH → 5G-AKA → NAS + AS security → registration → PDU session → DRB — and
 carries live IP traffic (ping through qcore's UPF) at the **real-time μ=1 slot
-rate (500 µs/slot, 2000 slots/s), 0 % packet loss**.
+rate (500 µs/slot, 2000 slots/s), 0 % packet loss**. Active-traffic round-trip
+is **~12 ms**.
+
+The cell configuration is **decoded live, not transcribed**: the TDD UL/DL
+pattern and timing tables come from SIB1, and the dedicated radio-bearer config
+(k1 list, DCI field widths, PUCCH/SR/CSI resources, CSI-RS layout) from the
+RRCSetup `masterCellGroup`. Ferrite attaches against different TDD patterns
+without code changes — validated on both a 5 ms `6D+S+3U` cell and a 2.5 ms
+`DDDSU` cell.
 
 ## Target configuration
 
 | Parameter    | Value                                              |
 |--------------|----------------------------------------------------|
 | Mode         | 5G SA (standalone)                                 |
-| Frequency    | FR1, band **n78**, TDD (pattern DDDDDDSUUU)        |
+| Frequency    | FR1, band **n78**, TDD (pattern read live from SIB1) |
 | Numerology   | `mu = 1` → 30 kHz SCS, 500 µs slot                 |
 | Bandwidth    | 10 MHz (24 PRB), sample rate 15.36 MHz             |
 | Transport    | ZMQ IQ (`complex<f32>` blocks), no-RF bring-up     |
@@ -40,11 +48,16 @@ cargo build --release -p ferrite-ue --bin ferrite-ue
 ```
 
 *Built-in ping* (no privileges — sends ICMP over the DRB internally, using the
-IP the network assigns in the PDU Session Accept):
+IP the network assigns in the PDU Session Accept). Doubles as an RTT probe: it
+sends 20 echoes at 1 Hz and prints each round-trip time:
 
 ```sh
 ./target/release/ferrite-ue
+# 🏓 seq=0 time=12.4 ms
 ```
+
+To attach against a different TDD pattern, point the gNB at the bundled DDDSU
+config (`test/gnb_zmq_dddsu.yml`) instead; the UE needs no flags to follow it.
 
 *Real TUN interface* (host traffic over the air; needs root for the interface).
 Ferrite creates the TUN, extracts its assigned IP, and configures it — then any
@@ -144,6 +157,13 @@ framing is split by plane across two files, each citing the relevant TS inline:
   and PUCCH common config. Decoded live during the RA phase; drives the slot gates
   (DL dispatch, Msg4 monitoring, Msg3/PUCCH/SR/CSI timing) and per-grant k2, so the
   UE follows the broadcast TDD configuration instead of transcribed constants.
+- **`src/cellgroup.rs`** — hand-rolled UPER decode of the RRCSetup `masterCellGroup`
+  (`CellGroupConfig`, TS 38.331): the dedicated config that a shorter TDD pattern
+  needs. Extracts the dl-DataToUL-ACK (k1) list, the dedicated PUCCH resources + SR
+  config, the CSI-RS / CSI-report resources, and the TDRA-list sizes that set the
+  **DCI 0_1 / 1_1 field widths**. Parsed at the Msg4 win; drives the connected-mode
+  blind decode geometry, the HARQ-ACK / SR / CSI resource choice, and the CSI report.
+  `src/uper.rs` is the shared bit reader.
 
 RRC (TS 38.331) and NAS (TS 24.501) message coding sit above these, in `src/rrc.rs`
 and `src/nas.rs`; 5G-AKA / key derivation is in `src/milenage.rs`. The MAC
@@ -161,7 +181,8 @@ crates/
                    ZMQ [feature] backends
   ferrite-ue       the UE: entry point `ferrite-ue` (main.rs = timeline + MAC
                    scheduler + HARQ). Modules: rrc (RRC + SRB1 PDCP/RLC-AM/MAC),
-                   userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), nas, milenage,
+                   userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), sib1 + cellgroup +
+                   uper (UPER decode of SIB1 / masterCellGroup), nas, milenage,
                    sync, rt (pipeline), stream, tun. Plus milestone/debug
                    harnesses (ssb-scan, sync-track, sib1, pdsch-*, prach-*, …)
 ```
@@ -180,8 +201,11 @@ blind decode; SIB1 PDSCH LDPC decode (CRC OK) — all live against an OCUDU SA g
 **Milestone 3 — full SA attach & data plane** ✅
 PRACH/RACH → RAR → Msg3/Msg4 contention resolution → RRC setup → 5G-AKA
 (Milenage) → NAS + AS security → registration → PDU session → DRB. Uplink PUSCH,
-PUCCH (HARQ-ACK / SR / CSI), HARQ soft-combining. **End-to-end ping through
-qcore's UPF, at real-time 500 µs/slot, 0 % loss, repeatable.**
+PUCCH (HARQ-ACK / SR / CSI) and UCI-on-PUSCH (HARQ-ACK + CSI part 1), HARQ
+soft-combining both directions. Cell config decoded live (SIB1 + masterCellGroup),
+so attach is TDD-pattern-agnostic — validated on `6D+S+3U` and `DDDSU` cells.
+**End-to-end ping through qcore's UPF, at real-time 500 µs/slot, ~12 ms RTT,
+0 % loss, repeatable.**
 
 **Milestone 4 — over the air** *(next)*
 SoapySDR backend (LiteX-M2SDR / BladeRF); the ZMQ lockstep's coordination jitter
