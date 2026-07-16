@@ -11,9 +11,11 @@
 //! entity (which drives *when* these PDUs are built) is layered on top.
 
 pub mod ce;
+pub mod harq;
 pub mod pdu;
 
 pub use ce::{bsr_index, mac_short_bsr, parse_ta_command_ce, plausible_mac_pdu};
+pub use harq::{DlHarq, UlHarq};
 pub use pdu::{
     drb_mac_wrap, drb_mac_wrap_bsr, msg3_mac_pdu, parse_dl_mac_pdu, sdu_subpdu, DlSubPdu,
 };

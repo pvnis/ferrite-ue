@@ -264,17 +264,6 @@ fn try_decode_msg4(
 /// from the DCI 1_1 assignment; the MCS is brute-forced (LDPC+CRC rejects wrong
 /// guesses), covering the gNB's varying allocations. 1 CDM group, 12 symbols.
 /// Returns the raw MAC TB on success.
-/// Per-HARQ-process DL soft-combining buffer: the accumulated circular-buffer LLRs
-/// for the transport block currently in flight on this HARQ process, plus the code
-/// parameters they were built with (a change ⇒ the gNB reused the process for a new
-/// TB, so the buffer is reset).
-struct HarqDl {
-    tbs: usize,
-    qm: usize,
-    acc: Vec<f32>,
-    n_rx: usize,
-}
-
 /// Pack MSB-first bits into bytes.
 fn pack_bits(bits: &[u8]) -> Vec<u8> {
     bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect()
@@ -488,7 +477,7 @@ fn try_decode_dl_srb1(
     // The gNB's typical first-transmission MCS (feeds the shape hypothesis below).
     hyp_mcs: u8,
     lock: &mut Option<(usize, bool)>,
-    harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
+    dlharq: &mut ferrite_mac::DlHarq,
 ) -> Option<(Vec<u8>, bool, (u8, usize, u8))> {
     let (qm, r) = mcs_params(mcs);
     let (qm, r) = (qm as usize, r);
@@ -539,7 +528,7 @@ fn try_decode_dl_srb1(
         if deliver {
             *lock = Some((cdm, time_first));
         }
-        harq_dl.remove(&h_id); // HARQ process delivered / faithfully received
+        dlharq.clear_process(h_id); // HARQ process delivered / faithfully received
         return Some((tb, deliver, tb_shape));
     }
     // SLOW PATH — no standalone success, i.e. a retransmission that needs HARQ soft-combining.
@@ -551,25 +540,19 @@ fn try_decode_dl_srb1(
             let (llr, tbs, _tb) = pdsch_standalone(grids, sc_to_bin, cell_id, slot_idx, crnti, rb_start, n_rb, qm, r, rv, lcdm, ltf, sliv, rm_csi, tb_shape);
             let cb = dlsch_cb_llr(&llr, tbs, r, qm, rv);
             if !cb.is_empty() {
-                let e = harq_dl.entry(h_id).or_insert_with(|| HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
-                if e.tbs != tbs || e.qm != qm || e.acc.len() != cb.len() || rv == 0 {
-                    *e = HarqDl { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 };
-                }
-                for (a, &c) in e.acc.iter_mut().zip(&cb) {
-                    *a += c;
-                }
-                e.n_rx += 1;
+                let n_rx = dlharq.accumulate(h_id, tbs, qm, rv, &cb);
                 // Combine-only retx path: always attempt the sum (n_rx==1 means the rv=0
                 // was dropped and the sum IS this transmission — the standalone attempt
                 // this path replaced). Sweep-first path: only from the 2nd reception on
                 // (the 1st already failed standalone above; re-decoding the same LLRs
                 // alone would just burn another max_iter).
-                if e.n_rx >= 2 || retx_combine_only {
-                    let (cbits, _c, ccrc) = dlsch_decode_cb(&e.acc, tbs, r, 10);
+                if n_rx >= 2 || retx_combine_only {
+                    let acc = dlharq.combined(h_id).expect("accumulate just inserted it");
+                    let (cbits, _c, ccrc) = dlsch_decode_cb(acc, tbs, r, 10);
                     if ccrc {
                         let tb = pack_bits(&cbits);
                         let deliver = plausible_dl_tb(&tb);
-                        harq_dl.remove(&h_id);
+                        dlharq.clear_process(h_id);
                         return Some((tb, deliver, tb_shape));
                     }
                 }
@@ -621,7 +604,7 @@ fn try_decode_dl_srb1(
                 if deliver {
                     *lock = Some((cdm, time_first));
                 }
-                harq_dl.remove(&h_id);
+                dlharq.clear_process(h_id);
                 return Some((tb, deliver, cand_shape));
             }
         }
@@ -722,15 +705,11 @@ fn decode_dl(
     // The DL assignment T0's per-slot blind search found (T0 searches for its UL grant
     // anyway; the worker reusing it removes a duplicate ~200µs search from its budget).
     dl_dci: Option<(usize, usize, u8, u8, u8, u8, u8, u8, u8)>,
-    harq_dl: &mut std::collections::HashMap<u8, HarqDl>,
-    // Per-HARQ-process delivered state: h_id → NDI of the last TB this process CRC-OK'd.
-    // A later DCI with the same (h_id, NDI) is a retransmission of that TB → ACK from the
-    // DCI alone, no decode (see the short-circuit below).
-    harq_done: &mut std::collections::HashMap<u8, u8>,
-    // Per-HARQ-process INITIAL-transmission shape: h_id → (ndi, mcs, n_rb, sliv) recorded
-    // at first sight of each new TB. A retransmission (same NDI) keeps the TB's original
-    // TBS even when the gNB adapts the MCS/allocation down — decode with the stored shape.
-    harq_init: &mut std::collections::HashMap<u8, (u8, u8, usize, u8)>,
+    // DL HARQ entity: per-process soft-combine buffers plus the delivered-NDI and
+    // first-transmission-shape bookkeeping. A later DCI with the same (h_id, NDI) is a
+    // retransmission → ACK from the DCI alone (delivered); a retx keeps its TB's original
+    // TBS even when the gNB adapts the MCS/allocation down (recorded shape).
+    dlharq: &mut ferrite_mac::DlHarq,
     // CSI-RS frame-parity anchor: the cell's CSI-RS/TRS are 20 ms periodic (every OTHER
     // frame) but slot_idx only spans one frame, so PDSCH-around-CSI-RS rate matching
     // (see `csi_rs_rm_re`) applies only when this slot's frame parity matches the parity
@@ -785,7 +764,7 @@ fn decode_dl(
     // true retx costs ~300µs we have; of a misclassified new TB, it DELIVERS it.
     if backlog {
         if let [(.., k1, dai, _, h_id, _, ndi)] = allocs[..] {
-            if h_id != 0xff && harq_done.get(&h_id) == Some(&ndi) {
+            if h_id != 0xff && dlharq.delivered_ndi(h_id) == Some(ndi) {
                 if diag {
                     eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} k1={k1} blind-ACK (retx of delivered TB)");
                 }
@@ -861,13 +840,13 @@ fn decode_dl(
         let mut tb_shape = (mcs, nrb, sliv);
         let mut is_retx = false;
         if h_id != 0xff {
-            match harq_init.get(&h_id) {
-                Some(&(i_ndi, i_mcs, i_nrb, i_sliv)) if i_ndi == ndi => {
+            match dlharq.recorded(h_id) {
+                Some((i_ndi, i_mcs, i_nrb, i_sliv)) if i_ndi == ndi => {
                     is_retx = true;
                     tb_shape = (i_mcs, i_nrb, i_sliv);
                 }
                 _ => {
-                    harq_init.insert(h_id, (ndi, mcs, nrb, sliv));
+                    dlharq.record_first_tx(h_id, ndi, mcs, nrb, sliv);
                 }
             }
         }
@@ -875,13 +854,12 @@ fn decode_dl(
         let (p_start, p_nsym, p_dmrs) = dl_pdsch_shape(sliv);
         let probe = PdschAlloc { rb_start: rb0, n_rb: nrb, sym_start: p_start, n_sym: p_nsym, dmrs_symbols: p_dmrs, qm: qm as usize, n_bwp: 0, nof_cdm_groups: 1 };
         if extract_pdsch(&grids, sc_to_bin, &probe, cell_id, slot_idx, 0, 0, cell_id, false).dmrs_metric > 0.9 {
-            if let Some((tb, deliver, shape_used)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, sliv, rm_csi, tb_shape, is_retx, tf_hint, *init_mcs_typ, dl_dmrs_lock, harq_dl) {
+            if let Some((tb, deliver, shape_used)) = try_decode_dl_srb1(&grids, sc_to_bin, cell_id, slot_idx, crnti, rb0, nrb, mcs, rv, h_id, sliv, rm_csi, tb_shape, is_retx, tf_hint, *init_mcs_typ, dl_dmrs_lock, dlharq) {
                 if h_id != 0xff {
                     // Mark (h_id, NDI) delivered so its retransmissions ACK without decode,
                     // and record the shape that actually decoded (the hypothesis may have
                     // corrected a wrong first-sight-at-retx shape).
-                    harq_done.insert(h_id, ndi);
-                    harq_init.insert(h_id, (ndi, shape_used.0, shape_used.1, shape_used.2));
+                    dlharq.mark_delivered(h_id, ndi, shape_used.0, shape_used.1, shape_used.2);
                     // Learn the gNB's first-transmission MCS from genuine first decodes.
                     if !is_retx && shape_used == tb_shape && mcs >= 4 {
                         *init_mcs_typ = mcs;
@@ -1310,7 +1288,7 @@ fn run(cfg: Config) {
     // content. Sending fresh content on a retx grant poisons the process: the combined
     // buffer decodes to garbage at any SNR until the gNB gives up (seen as an unbounded
     // crc=KO chain on one h_id under the warm-grant load).
-    let mut ul_harq: std::collections::HashMap<u8, (u8, usize, Vec<u8>)> = std::collections::HashMap::new();
+    let mut ulharq = ferrite_mac::UlHarq::default();
     let pucch_cfg = ferrite_phy::pucch::PucchF1 {
         prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
         init_cyclic_shift: 0, occ_index: 0, n_id: acq.cell_id, carrier_rb,
@@ -1484,9 +1462,7 @@ fn run(cfg: Config) {
                 let pool = ferrite_ue::rt::rayon_pool(4);
                 let ofdm = Ofdm::new(fft);
                 let sc_to_bin = move |sc: i32| (w_firstsc + sc).rem_euclid(fft as i32) as usize;
-                let mut harq_dl: std::collections::HashMap<u8, HarqDl> = std::collections::HashMap::new();
-                let mut harq_done: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
-                let mut harq_init: std::collections::HashMap<u8, (u8, u8, usize, u8)> = std::collections::HashMap::new();
+                let mut dlharq = ferrite_mac::DlHarq::default();
                 let mut csi_parity: Option<bool> = None;
                 let mut init_mcs_typ: u8 = 9; // the gNB's observed first-tx MCS at top CQI
                 let mut dl_dmrs_lock: Option<(usize, bool)> = None;
@@ -1521,7 +1497,7 @@ fn run(cfg: Config) {
                         Complex32::new((seed >> 16) as f32 / 65536.0 - 0.5, (seed & 0xffff) as f32 / 65536.0 - 0.5) * 0.02
                     }).collect();
                     for warm_slot in [2u32, 7, 11] {
-                        let _ = pool.install(|| decode_dl(&noise, &ofdm, w_cell, w_carrier, sc_to_bin, 0x4601, warm_slot, None, &mut harq_dl, &mut harq_done, &mut harq_init, true, &mut csi_parity, None, &mut init_mcs_typ, &mut dl_dmrs_lock, false));
+                        let _ = pool.install(|| decode_dl(&noise, &ofdm, w_cell, w_carrier, sc_to_bin, 0x4601, warm_slot, None, &mut dlharq, true, &mut csi_parity, None, &mut init_mcs_typ, &mut dl_dmrs_lock, false));
                     }
                     // The gates above never reach the real PDSCH path on noise (no DCI, no
                     // DM-RS), so run pdsch_standalone directly at the shapes the attach
@@ -1541,9 +1517,7 @@ fn run(cfg: Config) {
                         });
                     }
                     // The warm-up must leave no decode state behind.
-                    harq_dl.clear();
-                    harq_done.clear();
-                    harq_init.clear();
+                    dlharq.reset();
                     csi_parity = None;
                     dl_dmrs_lock = None;
                     if std::env::var_os("FERRITE_PERF").is_some() {
@@ -1567,7 +1541,7 @@ fn run(cfg: Config) {
                     let DlJob { slot_idx, slot_start_ul, frame_even, crnti, dl_dci, tf_hint, fsh } = job;
                     let t = std::time::Instant::now();
                     let backlog = !dl_job_rx.is_empty(); // jobs waiting → shed the opportunistic work
-                    let (decoded, cqi) = pool.install(|| decode_dl(&fsh, &ofdm, w_cell, w_carrier, sc_to_bin, crnti, slot_idx, dl_dci, &mut harq_dl, &mut harq_done, &mut harq_init, frame_even, &mut csi_parity, tf_hint, &mut init_mcs_typ, &mut dl_dmrs_lock, backlog));
+                    let (decoded, cqi) = pool.install(|| decode_dl(&fsh, &ofdm, w_cell, w_carrier, sc_to_bin, crnti, slot_idx, dl_dci, &mut dlharq, frame_even, &mut csi_parity, tf_hint, &mut init_mcs_typ, &mut dl_dmrs_lock, backlog));
                     let job_ns = t.elapsed().as_nanos() as u64;
                     w_decode_ns += job_ns;
                     w_max_ns = w_max_ns.max(job_ns);
@@ -2026,11 +2000,11 @@ fn run(cfg: Config) {
                         let beta_csi = cg_cfg.as_ref()
                             .and_then(|c| c.beta_csi1_index)
                             .map_or(6.25, ferrite_phy::pusch::beta_offset_csi);
-                        let is_retx = ul_harq.get(&g_hid).is_some_and(|(n, t, _)| *n == ndi && *t == tbs_bytes);
+                        let is_retx = ulharq.is_retx(g_hid, ndi, tbs_bytes);
                         let (mac, kind) = if is_retx {
                             // Retransmission grant: resend the process's stored TB at the
                             // grant's rv so the gNB's soft-combine converges.
-                            (ul_harq[&g_hid].2.clone(), format!("UL retx h{g_hid} rv{g_rv}"))
+                            (ulharq.stored(g_hid).unwrap().to_vec(), format!("UL retx h{g_hid} rv{g_rv}"))
                         } else if let Some(ack) = pending_status {
                             // Acknowledge received DL RLC SDUs so the gNB stops
                             // retransmitting and delivers the next one.
@@ -2117,7 +2091,7 @@ fn run(cfg: Config) {
                             (mac_short_bsr(0, tbs_bytes), String::new())
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
-                        ul_harq.insert(g_hid, (ndi, tbs_bytes, mac.clone()));
+                        ulharq.store(g_hid, ndi, tbs_bytes, mac.clone());
                         // CSI-on-PUSCH shrinks the data rate-match length (the TBS is
                         // unaffected — like the DL CSI-RS rule, N'_RE ignores the UCI).
                         // Q'_CSI uses ΣK_r = the LDPC code-block sizes INCLUDING filler.
