@@ -94,6 +94,10 @@ pub struct CellGroupParams {
     pub beta_csi1_index: Option<u8>,
     /// uci-OnPUSCH scaling α: ENUM{f0p5, f0p65, f0p8, f1} as the raw index 0..3.
     pub uci_scaling: u8,
+    /// PUCCH resource set 0 (≤2-bit HARQ-ACK): the resourceList (PRI → resource id).
+    pub pucch_res_set0: Vec<u8>,
+    /// PUCCH resource set 1 (>2-bit HARQ-ACK): the resourceList (PRI → resource id).
+    pub pucch_res_set1: Vec<u8>,
 }
 
 /// Parse a DL-CCCH RRCSetup message (the RRC PDU bytes from the Msg4 MAC SDU).
@@ -1138,13 +1142,21 @@ fn parse_pucch_config(r: &mut Bits, out: &mut CellGroupParams) -> Option<()> {
             // PUCCH-ResourceSet ::= SEQ { pucch-ResourceSetId (0..3),
             // resourceList SEQ(1..32) OF (0..127), [maxPayloadMinus1 (4..256)] }
             let has_max = r.bit()?;
-            r.int(0, 3)?;
+            let set_id = r.int(0, 3)?;
             let m = r.int(1, 32)?;
+            let mut list = Vec::with_capacity(m as usize);
             for _ in 0..m {
-                r.int(0, 127)?;
+                list.push(r.int(0, 127)? as u8);
             }
             if has_max {
                 r.int(4, 256)?;
+            }
+            // Set 0 carries ≤2-bit HARQ-ACK (PUCCH F0/F1); set 1 carries >2-bit
+            // (F2/F3/F4). The DCI PRI indexes into the matching set's resourceList.
+            match set_id {
+                0 => out.pucch_res_set0 = list,
+                1 => out.pucch_res_set1 = list,
+                _ => {}
             }
         }
     }

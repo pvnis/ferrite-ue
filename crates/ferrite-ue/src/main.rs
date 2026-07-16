@@ -10,7 +10,7 @@
 //! The gNB (radio/PHY config) and qcore (5G core) must be up first.
 
 use ferrite_phy::coding::dci::{dci_1_0_si_size, dci_decode, pdcch_descramble_llr};
-use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
+use ferrite_phy::coding::dlsch::{dlsch_decode_single, dlsch_encode, dlsch_encode_single};
 use ferrite_phy::pdcch::{all_candidates, coreset_candidate_coherence, equalize_candidate, equalize_candidate_c1_cached, estimate_coreset_c1, Candidate, Coreset0};
 use ferrite_phy::pdsch::{demod_slot, descramble_llrs, extract_pdsch, extract_pdsch_rm, pdsch_scramble_c_init, PdschAlloc};
 use ferrite_phy::pdsch_params::mcs_params;
@@ -79,6 +79,11 @@ struct Config {
     tun: Option<String>,
     netns: Option<String>,
     tun_mtu: u32,
+    /// Built-in ping load: number of echoes and the send interval (ms). Defaults
+    /// (20 @ 1000 ms) are a light RTT probe; a short interval + high count drives
+    /// sustained DL load to exercise the HARQ-ACK-under-load path without a TUN.
+    ping_count: u32,
+    ping_interval_ms: u64,
 }
 
 impl Config {
@@ -105,6 +110,8 @@ impl Config {
             tun: arg_opt("--tun"),
             netns: arg_opt("--netns"),
             tun_mtu: arg("--tun-mtu", "1400").parse().unwrap(),
+            ping_count: arg("--ping-count", "20").parse().unwrap(),
+            ping_interval_ms: arg("--ping-interval-ms", "1000").parse().unwrap(),
         }
     }
 }
@@ -947,7 +954,8 @@ fn decode_dl(
                 PERF_PDSCH_NS.fetch_add(t_pdsch.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return (Some(DlDecoded { k1, dai, bytes: tb, deliver }), cqi);
             } else if diag {
-                eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} sliv={sliv} DECODE FAIL", rb0 + nrb);
+                eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} sliv={sliv} csi_slot={} rm_csi={rm_csi} DECODE FAIL",
+                    rb0 + nrb, csi_rm().has_slot(slot_idx));
                 // One-shot: dump the failing slot's samples + params for offline analysis
                 // (crates/ferrite-ue/src/bin — the pdsch_fail tool).
                 if !std::path::Path::new("/tmp/ferrite_fail.bin").exists() {
@@ -1040,7 +1048,7 @@ fn run(cfg: Config) {
     let Config {
         tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
         toff_lo, toff_hi, toff_step, imsi, ki, opc, snn, ue_ip, ping_target,
-        tun, netns, tun_mtu,
+        tun, netns, tun_mtu, ping_count, ping_interval_ms,
     } = cfg;
 
     let fft = (fs / 30_000.0).round() as usize;
@@ -1495,6 +1503,7 @@ fn run(cfg: Config) {
     let up_active = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(1);
     let mut pdcp_tx_sn: u32 = 0; // DRB uplink PDCP SN
     let mut ping_acked = false; // an echo reply was received
+    let mut ping_recv: u32 = 0; // count of echo replies (high-rate load mode)
     let mut drb_reasm = ferrite_ue::userplane::RlcUmReassembler::new();
     const PING_ID: u16 = 0xfe11;
     // TUN mode: shuttle real host IP packets over the DRB. `tun_ul` queues packets
@@ -1668,12 +1677,18 @@ fn run(cfg: Config) {
     let (mut perf_last, mut perf_have_last) = (std::time::Instant::now(), false);
     let (mut perf_n, mut perf_period_ns, mut perf_io_ns, mut perf_demod_ns) = (0u64, 0u64, 0u64, 0u64);
     let (mut perf_fs_ns, mut perf_ulgrant_ns, mut perf_ra_ns, mut perf_drain_ns) = (0u64, 0u64, 0u64, 0u64);
+    let (mut perf_dstack_ns, mut perf_dpusch_ns, mut perf_dpucch_ns) = (0u64, 0u64, 0u64);
     let mut perf_fill_ns = 0u64; // DL-read (fill_dl) wait — the lockstep round-trip to the gNB
     // [perf] HARQ-ACK injection outcomes (cumulative): total produced, "late" = target UL
     // position already behind ul_counter when produced (its block was already served → the
     // ACK can never be injected → gNB sees DTX), and "qfull" = dropped because pend_acks
     // was full. This is the UE-side deadline-miss counter the InjectionTable would track.
     let (mut ack_total, mut ack_late, mut ack_qfull) = (0u64, 0u64, 0u64);
+    // "empty" = a due ACK slot whose codebook was still all-None at build time (no
+    // contributing DL decode drained yet → no PUCCH sent → gNB DTX); "nackpad" = bits
+    // sent as 0 because that C-DAI position was unfilled. Both = the PUCCH built ahead
+    // of the decode under load.
+    let (mut ack_empty, mut ack_nackpad) = (0u64, 0u64);
     // [perf] decode→drain pipeline lag in slots (current slot − decoded slot when drained):
     // this is the depth the HARQ-ACK must beat (needs lag < k1). Sum/max/count per window.
     let (mut lag_sum, mut lag_max, mut lag_n) = (0u64, 0u64, 0u64);
@@ -1790,12 +1805,14 @@ fn run(cfg: Config) {
                 let p = perf_period_ns as f64 / perf_n as f64;
                 eprintln!("[perf-ue-t0] {perf_n} slots: period {:.0}µs ({:.0}/s) = zmq-io {:.0} (fill-dl {:.0} + serve {:.0}) + freqshift {:.0} + coreset-demod {:.0} + ul-grant-pdcch {:.0} + ra-search {:.0} + drain+tx {:.0} µs",
                     p / 1e3, 1e9 / p, a(perf_io_ns), a(perf_fill_ns), a(perf_io_ns.saturating_sub(perf_fill_ns)), a(perf_fs_ns), a(perf_demod_ns), a(perf_ulgrant_ns), a(perf_ra_ns), a(perf_drain_ns));
-                eprintln!("[perf-ue-ack] HARQ-ACK cumulative: produced={ack_total} late(missed-window)={ack_late} qfull-dropped={ack_qfull} job-drops={job_drops}; all-drain-lag avg={:.1} max={lag_max}; DECODED-drain-lag avg={:.1} max={dlag_max} ({dlag_n})",
+                eprintln!("[perf-ue-drain] drain+tx {:.0}µs = stack(DlResult) {:.0} + pusch-build {:.0} + pucch-due {:.0}", a(perf_drain_ns), a(perf_dstack_ns), a(perf_dpusch_ns), a(perf_dpucch_ns));
+                eprintln!("[perf-ue-ack] HARQ-ACK cumulative: produced={ack_total} empty-book(DTX)={ack_empty} nack-padded-bits={ack_nackpad} late(missed-window)={ack_late} qfull-dropped={ack_qfull} job-drops={job_drops}; all-drain-lag avg={:.1} max={lag_max}; DECODED-drain-lag avg={:.1} max={dlag_max} ({dlag_n})",
                     lag_sum as f64 / lag_n.max(1) as f64, dlag_sum as f64 / dlag_n.max(1) as f64);
             }
             lag_sum = 0; lag_max = 0; lag_n = 0; dlag_sum = 0; dlag_max = 0; dlag_n = 0;
             perf_n = 0; perf_period_ns = 0; perf_io_ns = 0; perf_demod_ns = 0;
             perf_fs_ns = 0; perf_ulgrant_ns = 0; perf_ra_ns = 0; perf_drain_ns = 0; perf_fill_ns = 0;
+            perf_dstack_ns = 0; perf_dpusch_ns = 0; perf_dpucch_ns = 0;
         }
         // Connected: decode the C-RNTI UL grant and send the next queued SRB1 RRC
         // PDU on the granted PUSCH, k2 slots later. The gNB grants the FIRST UL
@@ -2131,18 +2148,24 @@ fn run(cfg: Config) {
                                 (m, s)
                             }
                         } else if let (true, true, Some(uip), true) =
-                            (tun.is_none(), drb_up, ue_ip, ping_seq < 20 && std::time::Instant::now() >= next_ping_at)
+                            (tun.is_none(), drb_up, ue_ip, (ping_seq as u32) < ping_count && std::time::Instant::now() >= next_ping_at)
                         {
-                            // Built-in ping as a 1 Hz RTT probe: 20 echoes, one per
-                            // second, each sent ONCE (the reply handler prints the RTT).
-                            // The warm-grant window keeps grants flowing between sends.
+                            // Built-in ping RTT probe: `ping_count` echoes at
+                            // `ping_interval_ms` spacing, each sent ONCE (the reply handler
+                            // prints the RTT). Defaults (20 @ 1 Hz) are a light probe; a
+                            // short interval + high count sustains DL load (each reply is a
+                            // DL PDSCH) to exercise the HARQ-ACK-under-load path.
                             let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
                             let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
                             pdcp_tx_sn += 1;
-                            let s = format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
-                                ping_target[0], ping_target[1], ping_target[2], ping_target[3]);
+                            let s = if ping_count <= 40 {
+                                format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
+                                    ping_target[0], ping_target[1], ping_target[2], ping_target[3])
+                            } else {
+                                String::new() // high-rate load mode: don't flood stdout
+                            };
                             ping_sent_at.push(std::time::Instant::now());
-                            next_ping_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                            next_ping_at = std::time::Instant::now() + std::time::Duration::from_millis(ping_interval_ms);
                             last_up_activity = std::time::Instant::now();
                             ping_seq += 1;
                             (m, s)
@@ -2167,7 +2190,10 @@ fn run(cfg: Config) {
                             ferrite_phy::pusch::csi1_pusch_res(&m5_alloc.dmrs_symbols, g_nrb, csi_bits.len(), beta_csi, 1.0, sp.c * sp.k)
                         };
                         let e = e - 2 * csi_res.len();
-                        let ulsch = dlsch_encode_single(&bytes_to_bits(&mac), e, r, qm as usize, g_rv);
+                        // Multi-CB-aware: a wide UL grant (e.g. under sustained load) can
+                        // produce a TB that segments into >1 LDPC code block; the single-CB
+                        // helper panics on that. dlsch_encode is byte-identical for c==1.
+                        let ulsch = dlsch_encode(&bytes_to_bits(&mac), e, r, qm as usize, g_rv);
                         if std::env::var_os("FERRITE_ULDBG").is_some() {
                             eprintln!("[uldbg] slot={m5_slot} rb[{g_rb0},+{g_nrb}) mcs={mcs} tbs={tbs_bytes} e={e} rv={g_rv} h{g_hid}/n{ndi} csi={} retx={is_retx} kind={kind}", csi_res.len());
                         }
@@ -2415,8 +2441,16 @@ fn run(cfg: Config) {
                                         }
                                         ping_acked = true;
                                         last_up_activity = std::time::Instant::now();
+                                        ping_recv += 1;
                                         if let Some(t0) = ping_sent_at.get(r.seq as usize) {
-                                            println!("🏓 seq={} time={:.1} ms", r.seq, t0.elapsed().as_secs_f64() * 1e3);
+                                            // High-rate load mode: summarise every 100 replies
+                                            // instead of one line each (stdout flooding steals
+                                            // the very CPU time we're trying to measure).
+                                            if ping_count <= 40 {
+                                                println!("🏓 seq={} time={:.1} ms", r.seq, t0.elapsed().as_secs_f64() * 1e3);
+                                            } else if ping_recv % 100 == 0 {
+                                                println!("🏓 {ping_recv}/{ping_seq} replies, last seq={} rtt={:.1} ms", r.seq, t0.elapsed().as_secs_f64() * 1e3);
+                                            }
                                         }
                                     } else {
                                         println!("   DRB DL IP packet ({} B): {}", ip.len(),
@@ -2617,6 +2651,7 @@ fn run(cfg: Config) {
                                             println!("   masterCellGroup: k1={:?} pucch-res={} sr={:?} csi-report={:?} nzp-csi-rs={} zp-csi-rs={}",
                                                 cg.k1_list, cg.pucch_resources.len(), cg.sr, cg.csi_report,
                                                 cg.nzp_csi_rs.len(), cg.zp_csi_rs.len());
+                                            println!("   PUCCH res-set0={:?} res-set1={:?}", cg.pucch_res_set0, cg.pucch_res_set1);
                                             // Wire the connected-mode PUCCH F1 configs from the parsed
                                             // resources (the hardcodes are 10 MHz auto-config; the wider
                                             // 20 MHz BWP uses different PRBs/shifts). SR = its own
@@ -2822,6 +2857,8 @@ fn run(cfg: Config) {
                 pend_csi = None;
             }
         }
+        perf_dstack_ns += perf_drain.elapsed().as_nanos() as u64;
+        let perf_d2 = std::time::Instant::now();
         // Build the UL grant's PUSCH now that the DL codebook is populated. If a
         // HARQ-ACK is due at this PUSCH's UL slot, multiplex it onto the PUSCH
         // (UCI-on-PUSCH) — the gNB expects it there, not on the PUCCH — and remove it
@@ -2875,12 +2912,19 @@ fn run(cfg: Config) {
                 uci_claimed.pop_front();
             }
         }
-        // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching
-        // (a couple slots out, so all their contributing DL PDSCHs have been decoded).
-        // The bundle is sized by the highest C-DAI seen (missing positions → NACK bit 0),
-        // ordered by C-DAI, so the gNB reads the exact harq_bit_len bits it expects.
-        // Modulate ACKs whose UL slot is within ~3 slots of T0's own progress (their contributing
-        // DL PDSCHs are decoded by then); the radio thread serves them at their absolute position.
+        // Modulate + queue any HARQ-ACK codebook entries whose UL slot is approaching.
+        // Gate on the SERVING position (ul_counter, real time) + 3 slots, NOT on T0's
+        // read-ahead DL position (slot_start_ul): under load T0 buffers several slots
+        // ahead, so `slot_start_ul + 3` builds the standalone PUCCH many slots early —
+        // BEFORE (a) the contributing DL PDSCH has decoded and filled the codebook
+        // (→ empty/NACK-padded book) and (b) the data PUSCH for that same UL slot has
+        // been built and claimed it via uci_claimed (→ the PUCCH collides with the
+        // PUSCH in the injection table → gNB DTX). Building 3 slots ahead of the served
+        // position lets the decode catch up and lets the PUSCH claim the slot first
+        // (the ACK then muxes onto the PUSCH, which the gNB reads reliably), while still
+        // leaving 3 slots of margin to modulate + inject before serving reaches `pos`.
+        perf_dpusch_ns += perf_d2.elapsed().as_nanos() as u64;
+        let perf_d3 = std::time::Instant::now();
         let due: Vec<i64> = ack_book.iter().filter(|(_, &(_, pos, _))| pos <= slot_start_ul + 3 * slot_len).map(|(&k, _)| k).collect();
         for key in due {
             let (slot_mod20, pos, book) = ack_book.remove(&key).unwrap();
@@ -2895,8 +2939,10 @@ fn run(cfg: Config) {
             }
             let size = book.iter().rposition(Option::is_some).map(|i| i + 1).unwrap_or(0);
             if size == 0 {
+                ack_empty += 1;
                 continue;
             }
+            ack_nackpad += book[..size].iter().filter(|b| b.is_none()).count() as u64;
             ack_total += 1;
             if pos < ul_counter as i64 {
                 ack_late += 1; // its UL block was already served — can never be injected
@@ -2931,10 +2977,16 @@ fn run(cfg: Config) {
                     let (cqi, _) = pending_cqi.take().unwrap();
                     bits.extend([(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]);
                 }
-                // OCUDU's resource set 1 (>2 UCI bits) = the F2 resources, ids 8..15,
-                // indexed by the PRI. Fallback: the layout both live cells share
-                // (PRB 1, 2 symbols starting at 2·PRI).
-                let f2 = cg_cfg.as_ref().and_then(|c| c.pucch_resources.iter().find(|r| r.format == 2 && usize::from(r.id) == 8 + pri).copied());
+                // Resource set 1 (>2 UCI bits): the DCI's PUCCH-resource indicator (PRI)
+                // indexes resource-set-1's resourceList → the actual resource id, then
+                // that id's PUCCH-Resource gives the PRB/symbols. The id renumbers with
+                // BWP width (at 20 MHz id 8 is the F1 SR, not an F2), so the resourceList
+                // mapping — not `id == 8 + pri` — is authoritative. Fallback: the layout
+                // both live cells share (PRB 1, 2 symbols starting at 2·PRI).
+                let f2 = cg_cfg.as_ref().and_then(|c| {
+                    let id = *c.pucch_res_set1.get(pri).or_else(|| c.pucch_res_set1.last())?;
+                    c.pucch_resources.iter().find(|r| r.id == id && r.format == 2).copied()
+                });
                 let cfg = ferrite_phy::pucch::PucchF2 {
                     prb_start: f2.map_or(1, |r| r.prb as usize),
                     nof_prb: f2.map_or(1, |r| r.cs_or_prbs as usize),
@@ -2969,6 +3021,9 @@ fn run(cfg: Config) {
         // waveforms are dropped by the InjectionTable once served); a PUCCH/PUSCH spans one slot.
         pend_acks.retain(|&pos| (ul_counter as i64) <= pos + 2 * slot_len);
         pend_ul.retain(|&pos| (ul_counter as i64) <= pos + 2 * slot_len);
+        // Drop ACK codebook entries whose UL slot is already served (can never inject).
+        ack_book.retain(|_, &mut (_, pos, _)| pos + 2 * slot_len >= ul_counter as i64);
+        perf_dpucch_ns += perf_d3.elapsed().as_nanos() as u64;
         perf_drain_ns += perf_drain.elapsed().as_nanos() as u64;
     }
 }

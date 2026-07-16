@@ -187,30 +187,66 @@ fn de_rate_match_cb(f: &[f32], filler: &[bool], ncb: usize, k0: usize, qm: usize
     cb
 }
 
-/// Encode one transport block to `E` DL-SCH bits (single code block; for tests
-/// and loopback). `qm` modulation order, `rv` redundancy version.
-pub fn dlsch_encode_single(tb: &[u8], e_len: usize, r: f64, qm: usize, rv: u8) -> Vec<u8> {
-    let p = seg_params(tb.len(), r);
-    assert_eq!(p.c, 1, "single-CB helper");
-    // b = tb || TB-CRC (CRC16 for A<=3824, else CRC24A)
-    let b = tb_crc(tb.len()).attach(tb);
-    // code block c: b then filler (NULL modeled as 0 here; excluded via mask)
+/// Encode ONE code block: `cb_bits` are the `K'` populated bits (info + any
+/// CB-CRC), padded with filler to `K`, LDPC-encoded, punctured (drop the first
+/// `2·Zc` systematic), and rate-matched to `e_r` bits at this RV.
+fn encode_cb(cb_bits: &[u8], p: &SegParams, e_r: usize, rv: u8, qm: usize) -> Vec<u8> {
+    // code block: cb_bits then filler (NULL modeled as 0 here; excluded via mask)
     let mut cb = vec![0u8; p.k];
-    cb[..b.len()].copy_from_slice(&b);
+    cb[..cb_bits.len()].copy_from_slice(cb_bits);
     let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
     let code = g.encode(&cb); // full 52·Zc (or 68·Zc) codeword
     // d = codeword minus first 2·Zc punctured systematic bits.
     let d = &code[2 * p.zc..];
     let ncb = d.len();
     // filler mask over the circular buffer (d-index): systematic filler bits at
-    // codeword positions [b.len(), K) → d-index [b.len()-2Zc, K-2Zc).
+    // codeword positions [K', K) → d-index [K'-2Zc, K-2Zc).
     let mut filler = vec![false; ncb];
-    let fstart = b.len().saturating_sub(2 * p.zc);
+    let fstart = cb_bits.len().saturating_sub(2 * p.zc);
     for f in fstart..(p.k - 2 * p.zc) {
         filler[f] = true;
     }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
-    rate_match_cb(d, &filler, e_len, k0, qm)
+    rate_match_cb(d, &filler, e_r, k0, qm)
+}
+
+/// Encode one transport block to `E` DL-SCH bits (single code block; for tests
+/// and loopback). `qm` modulation order, `rv` redundancy version. Panics if the
+/// TB would segment into multiple code blocks — use [`dlsch_encode`] for those.
+pub fn dlsch_encode_single(tb: &[u8], e_len: usize, r: f64, qm: usize, rv: u8) -> Vec<u8> {
+    let p = seg_params(tb.len(), r);
+    assert_eq!(p.c, 1, "single-CB helper");
+    // b = tb || TB-CRC (CRC16 for A<=3824, else CRC24A)
+    let b = tb_crc(tb.len()).attach(tb);
+    encode_cb(&b, &p, e_len, rv, qm)
+}
+
+/// Encode one transport block to `E` (UL/DL)-SCH bits, segmenting into multiple
+/// LDPC code blocks when `B = A + TB-CRC` exceeds the base graph's max block size
+/// (§5.2.2, §5.4.2.1). Single-CB TBs give byte-identical output to
+/// [`dlsch_encode_single`]. `qm` modulation order, `rv` redundancy version.
+pub fn dlsch_encode(tb: &[u8], e_len: usize, r: f64, qm: usize, rv: u8) -> Vec<u8> {
+    let p = seg_params(tb.len(), r);
+    // b = tb || TB-CRC (CRC24A for A>3824 — always the case once C>1).
+    let b = tb_crc(tb.len()).attach(tb);
+    if p.c == 1 {
+        return encode_cb(&b, &p, e_len, rv, qm);
+    }
+    // Multi-CB: split `b` into C blocks of `k_info` info bits, each closed with a
+    // CRC24B (§5.2.2), then distribute the grant's E bits across the blocks
+    // (§5.4.2.1, Nl = 1 layer): the first `C - (G/Qm mod C)` blocks get the floor
+    // length, the rest get one more Qm-group. Concatenate the rate-matched blocks.
+    let g_by = e_len / qm; // G / (Nl·Qm), Nl = 1
+    let base = g_by / p.c;
+    let rem = g_by % p.c;
+    let mut out = Vec::with_capacity(e_len);
+    for j in 0..p.c {
+        let e_r = if j < p.c - rem { base * qm } else { (base + 1) * qm };
+        let info = &b[j * p.k_info..(j + 1) * p.k_info];
+        let cb_bits = CRC24B.attach(info); // k_info info + 24 CB-CRC = K'
+        out.extend(encode_cb(&cb_bits, &p, e_r, rv, qm));
+    }
+    out
 }
 
 /// Decode `E` DL-SCH soft bits (positive ⇒ 0) into the transport block of
@@ -299,6 +335,9 @@ pub fn dlsch_decode_single_bits(
     max_iter: usize,
 ) -> (Vec<u8>, bool, bool) {
     let p = seg_params(tbs, r);
+    if p.c > 1 {
+        return dlsch_decode_multi(f, tbs, qm, rv, max_iter, &p);
+    }
     let b_len = tbs + tb_crc(tbs).width();
     let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
     let ncb = g.n() - 2 * p.zc;
@@ -314,6 +353,53 @@ pub fn dlsch_decode_single_bits(
     let (info, converged) = g.decode(&full, max_iter, 0.75);
     let b = &info[..b_len];
     (b[..tbs].to_vec(), converged, tb_crc(tbs).check(b))
+}
+
+/// Decode a multi-code-block TB (§5.2.2, §5.4.2.1): split the `E` soft bits back
+/// across the `C` code blocks (same allocation as [`dlsch_encode`]), LDPC-decode
+/// each, strip its CB-CRC24B, concatenate the info bits into `b = tb || TB-CRC`,
+/// and verify the TB-CRC. Returns `(tb_bits, all_converged, crc_ok)`. Symmetric
+/// to the encoder so a wide grant that segments into >1 block still decodes
+/// instead of panicking / silently failing on the single-CB assumption.
+fn dlsch_decode_multi(
+    f: &[f32],
+    tbs: usize,
+    qm: usize,
+    rv: u8,
+    max_iter: usize,
+    p: &SegParams,
+) -> (Vec<u8>, bool, bool) {
+    let g_by = f.len() / qm;
+    let base = g_by / p.c;
+    let rem = g_by % p.c;
+    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    let ncb = g.n() - 2 * p.zc;
+    let k_prime = p.k_info + p.l; // K' = info + CB-CRC (24)
+    let mut filler = vec![false; ncb];
+    let fstart = k_prime.saturating_sub(2 * p.zc);
+    for fi in fstart..(p.k - 2 * p.zc) {
+        filler[fi] = true;
+    }
+    let k0 = k0_of(rv, p.bg, ncb, p.zc);
+    let mut b = Vec::with_capacity(p.c * p.k_info);
+    let mut all_conv = true;
+    let mut off = 0;
+    for j in 0..p.c {
+        let e_r = if j < p.c - rem { base * qm } else { (base + 1) * qm };
+        if off + e_r > f.len() {
+            return (vec![0u8; tbs], false, false); // malformed E length → NACK, don't panic
+        }
+        let cb_llr = de_rate_match_cb(&f[off..off + e_r], &filler, ncb, k0, qm);
+        off += e_r;
+        let mut full = vec![0f32; g.n()];
+        full[2 * p.zc..].copy_from_slice(&cb_llr);
+        let (info, conv) = g.decode(&full, max_iter, 0.75);
+        all_conv &= conv;
+        b.extend_from_slice(&info[..p.k_info]); // drop the per-CB CRC24B
+    }
+    // b = tb || TB-CRC. The TB-CRC over the concatenated info catches any CB error.
+    let crc_ok = tb_crc(tbs).check(&b);
+    (b[..tbs].to_vec(), all_conv, crc_ok)
 }
 
 /// Verify a multi-CB block's per-CB CRC24B (helper for future multi-CB support).
@@ -365,6 +451,11 @@ pub fn dlsch_cb_llr(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> Vec<f32
 /// decode succeed once enough redundancy has accumulated.
 pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<u8>, bool, bool) {
     let p = seg_params(tbs, r);
+    if p.c > 1 {
+        // Multi-CB soft-combining isn't accumulated here (dlsch_cb_llr returns empty
+        // for c>1); guard so a stray call can't index past the single-CB info length.
+        return (vec![0u8; tbs], false, false);
+    }
     let b_len = tbs + tb_crc(tbs).width();
     let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
     let ncb = g.n() - 2 * p.zc;
@@ -556,6 +647,60 @@ mod tests {
             .collect();
         let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 60).expect("CRC failed (E<Ncb)");
         assert_eq!(dec, tb);
+    }
+
+    /// `dlsch_encode` is byte-identical to the single-CB helper when the TB fits
+    /// one code block (the common case — no behaviour change there).
+    #[test]
+    fn dlsch_encode_single_cb_equiv() {
+        let mut rng = Rng(0xD15C_5011);
+        for &(tbs, r) in &[(776usize, 0.2f64), (808, 0.37), (1800, 0.5), (300, 0.88)] {
+            let qm = 2usize;
+            let e_len = ((tbs + 24) as f64 / r) as usize / qm * qm;
+            let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+            assert_eq!(seg_params(tbs, r).c, 1, "expected single CB for tbs={tbs}");
+            for rv in 0..4u8 {
+                assert_eq!(
+                    dlsch_encode(&tb, e_len, r, qm, rv),
+                    dlsch_encode_single(&tb, e_len, r, qm, rv),
+                    "tbs={tbs} r={r} rv={rv}"
+                );
+            }
+        }
+    }
+
+    /// A TB large enough to segment into >1 LDPC code block encodes without
+    /// panicking (the crash the single-CB helper hit under load) and produces
+    /// exactly `E` bits, split across the code blocks per §5.4.2.1.
+    #[test]
+    fn dlsch_encode_multi_cb() {
+        let mut rng = Rng(0xD15C_C0DE);
+        let (tbs, qm, r) = (9000usize, 2usize, 0.5f64); // B = 9024 > 8448 (BG1) → C = 2
+        let e_len = ((tbs + 24) as f64 / r) as usize / qm * qm;
+        let p = seg_params(tbs, r);
+        assert!(p.c > 1, "expected multi-CB, got c={}", p.c);
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        for rv in 0..4u8 {
+            let e = dlsch_encode(&tb, e_len, r, qm, rv);
+            assert_eq!(e.len(), e_len, "multi-CB E length rv={rv}");
+        }
+    }
+
+    /// Full multi-CB round trip: encode a >1-code-block TB, then decode it back
+    /// through the (now multi-CB-aware) receive path on a clean channel.
+    #[test]
+    fn dlsch_multi_cb_roundtrip() {
+        let mut rng = Rng(0xD15C_2CB0);
+        let (tbs, qm, r) = (9000usize, 2usize, 0.5f64);
+        let e_len = ((tbs + 24) as f64 / r) as usize / qm * qm;
+        assert!(seg_params(tbs, r).c > 1);
+        let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
+        // rv0 self-decodes on a clean channel (LLR sign: positive ⇒ 0).
+        let f_bits = dlsch_encode(&tb, e_len, r, qm, 0);
+        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 12.0 } else { -12.0 }).collect();
+        let (bits, _conv, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
+        assert!(crc, "multi-CB CRC failed");
+        assert_eq!(bits, tb, "multi-CB bits mismatch");
     }
 
     /// Same E<Ncb regime but noiseless with *uniform* LLR magnitudes (what a

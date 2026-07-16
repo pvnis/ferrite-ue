@@ -243,7 +243,65 @@ pub fn extract_pdsch_rm(
         }
         best.0
     } else if dmrs_syms.len() == 2 {
-        (sym_phase[1] - sym_phase[0]) / (dmrs_syms[1] as f32 - dmrs_syms[0] as f32)
+        // Two DM-RS symbols pin the CFO slope only modulo the alias `k·2π/gap`:
+        // a wideband residual CFO (seen at 20 MHz, where the SSB sits far off the
+        // carrier centre, so the −df baseband shift leaves a residual) exceeds ±π
+        // over the DM-RS gap and wraps, so the raw difference picks the wrong
+        // alias — de-rotating the data by that wrong slope leaves alternating
+        // OFDM symbols rotated ~45° and the TB never decodes (only the short,
+        // 2-DM-RS shapes are hit; the 3-DM-RS case above disambiguates by
+        // collinearity). Pick the alias whose de-rotation minimises the
+        // data-symbol EVM: on a clean channel the true slope gives EVM≈0 and the
+        // aliases ≈0.44. At 10 MHz the residual is ~0, so k=0 wins — unchanged.
+        let gap = dmrs_syms[1] as f32 - dmrs_syms[0] as f32;
+        let base = (sym_phase[1] - sym_phase[0]) / gap;
+        let data_evm = |slope: f32| -> f32 {
+            let mut ha = vec![Complex32::new(0.0, 0.0); n_rb];
+            for (si, &ls) in dmrs_syms.iter().enumerate() {
+                let d = Complex32::from_polar(1.0, -slope * ls as f32);
+                for rb in 0..n_rb {
+                    ha[rb] += h[si][rb] * d;
+                }
+            }
+            for hr in &mut ha {
+                *hr /= 2.0;
+            }
+            let (mut e, mut n) = (0f32, 0usize);
+            for l in alloc.sym_start..alloc.sym_start + alloc.n_sym {
+                let is_dmrs = dmrs_syms.contains(&l);
+                for kp in 0..(12 * n_rb) {
+                    let kir = kp % 12;
+                    let is_data = if rm_skip.is_some_and(|f| f(l, kir)) {
+                        false
+                    } else if !is_dmrs {
+                        true
+                    } else {
+                        alloc.nof_cdm_groups == 1 && kir % 2 == 1
+                    };
+                    if !is_data {
+                        continue;
+                    }
+                    let rb = kp / 12;
+                    let k = (12 * prb[rb] + kir) as i32;
+                    let chan = ha[rb] * Complex32::from_polar(1.0, slope * l as f32);
+                    let z = grids[l][sc_to_bin(k)] * chan.conj();
+                    let m = z.norm().max(1e-12);
+                    let near = Complex32::new(z.re.signum(), z.im.signum()) * FRAC_1_SQRT_2;
+                    e += (z / m - near).norm_sqr();
+                    n += 1;
+                }
+            }
+            (e / n.max(1) as f32).sqrt()
+        };
+        let mut best = (base, f32::MAX);
+        for k in -3..=3 {
+            let s = base + k as f32 * TAU / gap;
+            let e = data_evm(s);
+            if e < best.1 {
+                best = (s, e);
+            }
+        }
+        best.0
     } else {
         0.0
     };
