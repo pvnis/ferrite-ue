@@ -255,7 +255,7 @@ pub fn parse_srb1_dl_nas(mac_pdu: &[u8]) -> Option<Vec<u8>> {
 /// MAC-I (4 octets). The payload is plaintext RRC (NEA0); a non-null AS cipher
 /// would require deciphering the PDCP payload first. Also returns the RLC SN.
 pub fn parse_srb1_dl_rrc_sn(mac_pdu: &[u8]) -> Option<(u16, Vec<u8>)> {
-    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+    for s in ferrite_mac::parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
         let rlc = &s.payload;
         // RLC AM DATA PDU: D/C must be 1 (skip STATUS); 12-bit SN ⇒ 2-octet header.
         if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
@@ -357,7 +357,7 @@ impl RlcReassembler {
 /// `(rlc_sn, Option<rrc>)`: the RLC SN (for STATUS reporting) and, once a full SDU
 /// reassembles, the RRC PDU (PDCP header + trailing MAC-I stripped; NEA0 plaintext).
 pub fn srb1_dl_rrc_reasm(reasm: &mut RlcReassembler, mac_pdu: &[u8]) -> Option<(u16, Option<Vec<u8>>)> {
-    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+    for s in ferrite_mac::parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
         let h = parse_rlc_am_header(&s.payload)?; // None = STATUS PDU, skip
         let rrc = reasm.push(&s.payload).and_then(|pdcp| {
             (pdcp.len() >= 2 + 4).then(|| pdcp[2..pdcp.len() - 4].to_vec())
@@ -371,7 +371,7 @@ pub fn srb1_dl_rrc_reasm(reasm: &mut RlcReassembler, mac_pdu: &[u8]) -> Option<(
 /// integrity verification: `pdcp_msg` = PDCP header || RRC (the 128-NIA2 input),
 /// `mac_i` the received 4-octet MAC-I. The RRC PDU is `pdcp_msg[2..]`.
 pub fn parse_srb1_dl_pdcp(mac_pdu: &[u8]) -> Option<(u16, Vec<u8>, [u8; 4])> {
-    for s in parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
+    for s in ferrite_mac::parse_dl_mac_pdu(mac_pdu).iter().filter(|s| s.lcid == 1) {
         let rlc = &s.payload;
         if rlc.len() < 2 || (rlc[0] & 0x80) == 0 {
             continue;
@@ -465,16 +465,9 @@ pub fn rrc_setup_complete(transaction_id: u8, plmn: u8, nas: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// MAC (TS 38.321)
+// SRB1 UL framing: RRC → PDCP → RLC AM → MAC (the MAC subPDU framing lives in
+// the `ferrite-mac` crate; these compose it with the SRB PDCP/RLC layers).
 // ---------------------------------------------------------------------------
-
-/// UL-SCH LCID values (TS 38.321 Table 6.2.1-2).
-pub const LCID_UL_CCCH48: u8 = 52; // 48-bit CCCH SDU, no length field
-pub const LCID_PADDING: u8 = 63;
-
-/// DL-SCH LCID values (TS 38.321 Table 6.2.1-1).
-pub const LCID_DL_CCCH: u8 = 0; // DL CCCH SDU (has length field)
-pub const LCID_DL_CON_RES: u8 = 62; // UE Contention Resolution Identity CE (6 bytes)
 
 /// Frame an RRC message for SRB1 into a UL-SCH MAC PDU (Msg5). Stacks:
 /// PDCP Data PDU (SRB, 12-bit SN + 4-octet MAC-I, TS 38.323) → RLC AM Data PDU
@@ -500,26 +493,11 @@ pub fn srb1_msg5_pdu(rrc: &[u8], rlc_sn: u16, pdcp_sn: u16, tbs: usize, k_rrcint
     rlc.push((rlc_sn & 0xff) as u8);
     rlc.extend_from_slice(&pdcp);
 
-    // MAC subPDU: subheader (LCID 1, with L field) + the RLC PDU.
-    let mut mac = Vec::with_capacity(tbs);
-    if rlc.len() < 256 {
-        mac.push(0x01); // R=0, F=0 (8-bit L), LCID=1
-        mac.push(rlc.len() as u8);
-    } else {
-        mac.push(0x41); // R=0, F=1 (16-bit L), LCID=1
-        mac.push((rlc.len() >> 8) as u8);
-        mac.push((rlc.len() & 0xff) as u8);
-    }
-    mac.extend_from_slice(&rlc);
-    if mac.len() < tbs {
-        mac.push(LCID_PADDING);
-        mac.resize(tbs, 0);
-    }
+    // MAC subPDU: subheader (LCID 1 = SRB1, with L field) + the RLC PDU, padded.
+    let mut mac = ferrite_mac::sdu_subpdu(ferrite_mac::LCID_SRB1, &rlc);
+    ferrite_mac::pdu::pad_to(&mut mac, tbs);
     mac
 }
-
-/// UL-SCH LCID for a Short BSR MAC CE (TS 38.321 Table 6.2.1-2).
-pub const LCID_SHORT_BSR: u8 = 61;
 
 /// Build a UL-SCH MAC PDU carrying an RLC AM STATUS PDU (TS 38.322 §6.2.3.2,
 /// 12-bit SN) that acknowledges all DL RLC SDUs below `ack_sn` (D/C=0, CPT=0,
@@ -532,112 +510,9 @@ pub fn rlc_status_mac_pdu(ack_sn: u16, tbs: usize) -> Vec<u8> {
         (ack_sn & 0xff) as u8,        // ACK_SN[7:0]
         0x00,                         // E1=0, padding
     ];
-    let mut mac = Vec::with_capacity(tbs);
-    mac.push(0x01); // R/F=0, LCID=1 (DCCH), 8-bit L
-    mac.push(status.len() as u8);
-    mac.extend_from_slice(&status);
-    if mac.len() < tbs {
-        mac.push(LCID_PADDING);
-        mac.resize(tbs, 0);
-    }
+    let mut mac = ferrite_mac::sdu_subpdu(ferrite_mac::LCID_SRB1, &status);
+    ferrite_mac::pdu::pad_to(&mut mac, tbs);
     mac
-}
-
-/// Build a UL-SCH MAC PDU carrying a Short BSR MAC CE (TS 38.321 §6.1.3.1) that
-/// reports `buf_bytes` pending on logical-channel group 0, padded to `tbs`
-/// bytes. Sent in a minimal grant to solicit a larger one when the queued SRB1
-/// PDU doesn't fit. The 5-bit buffer-size index is the smallest level whose
-/// upper bound ≥ `buf_bytes` (Table 6.1.3.1-1).
-/// TS 38.321 Table 6.1.3.1-1: map a buffer occupancy (bytes) to the 5-bit Short BSR
-/// buffer-size index (LCG 0).
-pub fn bsr_index(buf_bytes: usize) -> u8 {
-    const LEVELS: [usize; 32] = [
-        0, 10, 14, 20, 28, 38, 53, 74, 102, 142, 198, 276, 384, 528, 726, 1010,
-        1420, 1983, 2765, 3839, 5446, 7594, 10570, 14099, 19468, 26971, 38326,
-        49759, 65726, 86677, 114069, usize::MAX,
-    ];
-    LEVELS.iter().position(|&l| l >= buf_bytes).unwrap_or(31) as u8 & 0x1f
-}
-
-pub fn mac_short_bsr(buf_bytes: usize, tbs: usize) -> Vec<u8> {
-    let mut mac = Vec::with_capacity(tbs);
-    mac.push(LCID_SHORT_BSR); // R/R/LCID (fixed-size CE, no L field)
-    mac.push(bsr_index(buf_bytes)); // LCG-ID (bits 7..5) = 0 | buffer-size index (bits 4..0)
-    if mac.len() < tbs {
-        mac.push(LCID_PADDING);
-        mac.resize(tbs, 0);
-    }
-    mac
-}
-
-/// Build the Msg3 MAC PDU: one CCCH48 subPDU carrying `ccch_sdu` (the 6-byte
-/// RRCSetupRequest) followed by padding, sized to `tbs` bytes.
-pub fn msg3_mac_pdu(ccch_sdu: &[u8; 6], tbs: usize) -> Vec<u8> {
-    assert!(tbs >= 7, "TBS too small for CCCH48 subPDU");
-    let mut pdu = Vec::with_capacity(tbs);
-    pdu.push(LCID_UL_CCCH48); // R|R|LCID; CCCH has no length field
-    pdu.extend_from_slice(ccch_sdu);
-    if pdu.len() < tbs {
-        pdu.push(LCID_PADDING); // padding subheader; zeros follow
-        pdu.resize(tbs, 0);
-    }
-    pdu
-}
-
-/// One subPDU of a DL-SCH MAC PDU.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DlSubPdu {
-    pub lcid: u8,
-    pub payload: Vec<u8>,
-}
-
-/// Parse a DL-SCH MAC PDU (TS 38.321 §6.1.2) into subPDUs. Handles the
-/// fixed-size CEs the UE cares about (contention resolution), SDUs with 8/16-bit
-/// L fields, and stops at padding.
-pub fn parse_dl_mac_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < pdu.len() {
-        let hdr = pdu[i];
-        let lcid = hdr & 0x3f;
-        let f = (hdr >> 6) & 1; // 16-bit L field flag
-        i += 1;
-        if lcid == LCID_PADDING {
-            break;
-        }
-        // Fixed-size MAC CEs (no L field).
-        let fixed: Option<usize> = match lcid {
-            LCID_DL_CON_RES => Some(6), // UE Contention Resolution Identity
-            61 => Some(1),              // Timing Advance Command
-            _ => None,
-        };
-        let len = if let Some(n) = fixed {
-            n
-        } else {
-            // SDU (or variable CE): L field, 8 or 16 bits.
-            if i >= pdu.len() {
-                break;
-            }
-            if f == 1 {
-                if i + 1 >= pdu.len() {
-                    break;
-                }
-                let l = ((pdu[i] as usize) << 8) | pdu[i + 1] as usize;
-                i += 2;
-                l
-            } else {
-                let l = pdu[i] as usize;
-                i += 1;
-                l
-            }
-        };
-        if i + len > pdu.len() {
-            break;
-        }
-        out.push(DlSubPdu { lcid, payload: pdu[i..i + len].to_vec() });
-        i += len;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -676,7 +551,7 @@ mod tests {
     #[test]
     fn msg3_pdu_framing() {
         let sdu = [1, 2, 3, 4, 5, 6];
-        let pdu = msg3_mac_pdu(&sdu, 11);
+        let pdu = ferrite_mac::msg3_mac_pdu(&sdu, 11);
         assert_eq!(pdu.len(), 11);
         assert_eq!(pdu[0], 52);
         assert_eq!(&pdu[1..7], &sdu);
@@ -688,7 +563,7 @@ mod tests {
     fn dl_pdu_parse_con_res_plus_ccch() {
         // ConRes CE (62, 6B) + DL-CCCH SDU (0, L=3) + padding
         let pdu = [62, 9, 8, 7, 6, 5, 4, 0, 3, 0xaa, 0xbb, 0xcc, 63, 0, 0];
-        let subs = parse_dl_mac_pdu(&pdu);
+        let subs = ferrite_mac::parse_dl_mac_pdu(&pdu);
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].lcid, 62);
         assert_eq!(subs[0].payload, vec![9, 8, 7, 6, 5, 4]);

@@ -210,6 +210,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-mac"
+version = "0.0.1"
+dependencies = [
+ "ferrite-common",
+]
+
+[[package]]
 name = "ferrite-phy"
 version = "0.0.1"
 dependencies = [
@@ -236,6 +243,7 @@ dependencies = [
  "cmac",
  "crossbeam-channel",
  "ferrite-common",
+ "ferrite-mac",
  "ferrite-phy",
  "ferrite-radio",
  "hmac",

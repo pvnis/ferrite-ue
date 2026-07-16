@@ -10,6 +10,7 @@ default-run = "ferrite-ue"
 [dependencies]
 ferrite-common.workspace = true
 ferrite-phy.workspace = true
+ferrite-mac.workspace = true
 ferrite-radio = { workspace = true, features = ["zmq"] }
 num-complex.workspace = true
 crossbeam-channel.workspace = true

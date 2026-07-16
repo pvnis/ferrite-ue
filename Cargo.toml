@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ferrite-common",
     "crates/ferrite-phy",
+    "crates/ferrite-mac",
     "crates/ferrite-radio",
     "crates/ferrite-ue",
 ]
@@ -22,6 +23,7 @@ rayon = "1"
 
 ferrite-common = { path = "crates/ferrite-common" }
 ferrite-phy = { path = "crates/ferrite-phy" }
+ferrite-mac = { path = "crates/ferrite-mac" }
 ferrite-radio = { path = "crates/ferrite-radio" }
 ferrite-ue = { path = "crates/ferrite-ue" }
 

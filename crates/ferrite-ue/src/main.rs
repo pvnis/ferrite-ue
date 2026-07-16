@@ -26,8 +26,9 @@ use ferrite_ue::stream::BufferedStream;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed as Rlx};
 use std::sync::{Arc, Mutex};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
-use ferrite_ue::userplane::{drb_mac_wrap_bsr, drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
-use ferrite_ue::rrc::{dl_dcch_type, mac_short_bsr, msg3_mac_pdu, parse_dl_dcch_nas, parse_dl_mac_pdu, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING, LCID_DL_CON_RES};
+use ferrite_mac::{drb_mac_wrap_bsr, mac_short_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_ta_command_ce, plausible_mac_pdu, LCID_DL_CON_RES};
+use ferrite_ue::userplane::{drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
+use ferrite_ue::rrc::{dl_dcch_type, parse_dl_dcch_nas, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
 use ferrite_ue::tun::{configure_tun, open_tun};
 use num_complex::Complex32;
@@ -279,44 +280,6 @@ fn pack_bits(bits: &[u8]) -> Vec<u8> {
     bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect()
 }
 
-/// Structurally valid DL-SCH MAC PDU: a subheader chain of known LCIDs whose lengths
-/// exactly tile the TB (padding closes it). This accepts TBs that carry an RLC
-/// SEGMENT — mid-reassembly pieces the gNB produces when its post-NACK link
-/// adaptation shrinks the grants — which `plausible_dl_tb` (full-PDU check) rejects.
-/// Without it a genuinely-decoded segment TB is discarded as a suspected false CRC
-/// pass on an unverified layout, NACKs forever, and the retx flood wedges the attach.
-/// Used only to allow an ACK (deliver=false), never to deliver content or move the
-/// layout lock, so a residual CRC16-collision false accept costs one RLC retx at most.
-fn plausible_mac_pdu(tb: &[u8]) -> bool {
-    let mut i = 0;
-    let mut subpdus = 0usize;
-    while i < tb.len() {
-        let (lcid, f) = (tb[i] & 0x3f, (tb[i] >> 6) & 1);
-        match lcid {
-            63 => return subpdus > 0, // padding: rest of the TB
-            61 => i += 2,             // TA Command CE
-            60 | 59 => i += 1,        // (Long) DRX Command
-            62 => i += 1 + 6,         // Contention Resolution Identity
-            1..=32 => {
-                let (len, hdr) = if f == 1 {
-                    let (Some(&h), Some(&l)) = (tb.get(i + 1), tb.get(i + 2)) else { return false };
-                    (((h as usize) << 8) | l as usize, 3)
-                } else {
-                    let Some(&l) = tb.get(i + 1) else { return false };
-                    (l as usize, 2)
-                };
-                i += hdr + len;
-            }
-            _ => return false,
-        }
-        if i > tb.len() {
-            return false;
-        }
-        subpdus += 1;
-    }
-    subpdus > 0
-}
-
 /// Accept a decoded TB only if it is a plausible DRB IP packet or a known DL-DCCH RRC
 /// PDU — rejects a wrong (mcs, cdm) guess that slips the CRC on a retransmission.
 fn plausible_dl_tb(tb: &[u8]) -> bool {
@@ -329,33 +292,6 @@ fn plausible_dl_tb(tb: &[u8]) -> bool {
         Some(0 | 2 | 4 | 6) => true, // rrcReconfig / rrcRelease / securityModeCommand / ueCapabilityEnquiry
         _ => false,
     }
-}
-
-/// Extract the 6-bit Timing Advance Command from a DL-SCH MAC PDU's TA Command MAC CE
-/// (38.321: LCID 61, one payload octet = 2-bit TAG id + 6-bit T_A), if present. Walks
-/// the subPDU subheaders in order and stops at padding; returns None if there is no TA
-/// command or the layout isn't understood.
-fn parse_ta_command_ce(tb: &[u8]) -> Option<u8> {
-    let mut i = 0;
-    while i < tb.len() {
-        let (lcid, f) = (tb[i] & 0x3f, (tb[i] >> 6) & 1);
-        match lcid {
-            63 => return None,                             // padding: rest is padding
-            61 => return tb.get(i + 1).map(|&v| v & 0x3f), // TA Command CE: 1-octet payload
-            60 | 59 => i += 1,                             // (Long) DRX Command: 0-octet payload
-            62 => i += 1 + 6,                              // Contention Resolution Identity: 6 octets
-            1..=32 => {                                    // logical-channel SDU: R/F/LCID + L(+SDU)
-                let (len, hdr) = if f == 1 {
-                    (((*tb.get(i + 1)? as usize) << 8) | *tb.get(i + 2)? as usize, 3)
-                } else {
-                    (*tb.get(i + 1)? as usize, 2)
-                };
-                i += hdr + len;
-            }
-            _ => return None, // unknown subheader: bail safely
-        }
-    }
-    None
 }
 
 /// The SLIV of the full [2,14) type-A allocation — the fallback shape (DCI 1_0's

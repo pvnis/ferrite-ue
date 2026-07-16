@@ -3,10 +3,7 @@
 //! (from the gNB's RRCReconfiguration): DRB 1 = LCID 4, SDAP headers absent,
 //! PDCP 18-bit SN (NEA0, no integrity), RLC UM 12-bit SN. See TS 38.323/38.322/38.321.
 
-use crate::rrc::{bsr_index, parse_dl_mac_pdu, LCID_PADDING, LCID_SHORT_BSR};
-
-/// DRB logical channel identity (from the masterCellGroup RLC-BearerConfig).
-pub const LCID_DRB1: u8 = 4;
+use ferrite_mac::{drb_mac_wrap, parse_dl_mac_pdu, LCID_DRB1};
 
 /// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian words.
 pub fn internet_checksum(data: &[u8]) -> u16 {
@@ -99,53 +96,6 @@ pub fn pdcp_data_pdu(pdcp_sn: u32, ip_packet: &[u8]) -> Vec<u8> {
     pdcp.push(pdcp_sn as u8);
     pdcp.extend_from_slice(ip_packet);
     pdcp
-}
-
-/// Wrap one RLC PDU in a UL-SCH MAC subPDU for DRB 1 (LCID 4) and pad to `tbs`.
-pub fn drb_mac_wrap(rlc: &[u8], tbs: usize) -> Vec<u8> {
-    let mut mac = Vec::with_capacity(tbs);
-    if rlc.len() < 256 {
-        mac.push(LCID_DRB1); // R=0, F=0 (8-bit L), LCID=4
-        mac.push(rlc.len() as u8);
-    } else {
-        mac.push(0x40 | LCID_DRB1); // F=1 (16-bit L)
-        mac.push((rlc.len() >> 8) as u8);
-        mac.push((rlc.len() & 0xff) as u8);
-    }
-    mac.extend_from_slice(rlc);
-    if mac.len() < tbs {
-        mac.push(LCID_PADDING);
-        mac.resize(tbs, 0);
-    }
-    mac
-}
-
-/// Wrap one RLC PDU in a UL-SCH MAC subPDU for DRB 1 (LCID 4), and — when `bsr_bytes > 0`
-/// (more DRB data is still buffered) — piggyback a Short BSR CE reporting the total
-/// remaining buffer, then pad to `tbs`. The BSR keeps the gNB granting continuously to
-/// drain the whole queue instead of the UE having to SR/BSR once per packet (which serialises
-/// the queue behind the ~1-frame SR period and caps DRB throughput). Order per TS 38.321
-/// §6.1.2: SDU subPDU, then the CE subPDU, then padding.
-pub fn drb_mac_wrap_bsr(rlc: &[u8], bsr_bytes: usize, tbs: usize) -> Vec<u8> {
-    let mut mac = Vec::with_capacity(tbs);
-    if rlc.len() < 256 {
-        mac.push(LCID_DRB1);
-        mac.push(rlc.len() as u8);
-    } else {
-        mac.push(0x40 | LCID_DRB1);
-        mac.push((rlc.len() >> 8) as u8);
-        mac.push((rlc.len() & 0xff) as u8);
-    }
-    mac.extend_from_slice(rlc);
-    if bsr_bytes > 0 && mac.len() + 2 <= tbs {
-        mac.push(LCID_SHORT_BSR);
-        mac.push(bsr_index(bsr_bytes));
-    }
-    if mac.len() < tbs {
-        mac.push(LCID_PADDING);
-        mac.resize(tbs, 0);
-    }
-    mac
 }
 
 /// Frame a complete IP packet for uplink on DRB 1: PDCP 18-bit Data PDU → RLC UM
