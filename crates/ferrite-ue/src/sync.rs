@@ -221,6 +221,51 @@ pub fn gscn_scan(
     })
 }
 
+/// Fixed-`shift_hz` mixer with a precomputed per-sample phasor table, for the
+/// timeline thread's hot path. [`freq_shift`]'s serial phasor recurrence can't
+/// vectorise (each sample depends on the previous phasor); at 20 MHz that's ~400 µs
+/// of the 500 µs slot. Here the constant table `e^{j·dph·n}` (n = 0..len) is built
+/// once, so each slot is `out[n] = in[n] · table[n] · e^{j·dph·start}` — two
+/// element-wise complex multiplies with no cross-iteration dependency, which the
+/// compiler auto-vectorises. `start` is the slot's absolute sample index (kept
+/// phase-continuous across slots via the scalar `e^{j·dph·start}`).
+pub struct FreqShifter {
+    table: Vec<Complex32>,
+    dph: f64,
+    fs: f64,
+    shift_hz: f64,
+}
+
+impl FreqShifter {
+    pub fn new(shift_hz: f64, fs: f64, len: usize) -> Self {
+        use std::f64::consts::TAU;
+        let dph = (TAU * shift_hz / fs).rem_euclid(TAU);
+        let (sr, si) = (dph.cos(), dph.sin());
+        let (mut rr, mut ri) = (1.0f64, 0.0f64);
+        let mut table = Vec::with_capacity(len);
+        for _ in 0..len {
+            table.push(Complex32::new(rr as f32, ri as f32));
+            let nr = rr * sr - ri * si;
+            ri = rr * si + ri * sr;
+            rr = nr;
+        }
+        Self { table, dph, fs, shift_hz }
+    }
+
+    /// Shift `samples` (len ≤ table len) starting at absolute `start`, into `out`
+    /// (cleared and refilled — the buffer is reused across slots, no per-slot alloc).
+    pub fn shift_into(&self, samples: &[Complex32], start: usize, out: &mut Vec<Complex32>) {
+        use std::f64::consts::TAU;
+        let ph0 = (TAU * self.shift_hz * start as f64 / self.fs).rem_euclid(TAU);
+        let ps = Complex32::new(ph0.cos() as f32, ph0.sin() as f32);
+        out.clear();
+        out.reserve(samples.len());
+        for (s, t) in samples.iter().zip(&self.table) {
+            out.push(s * t * ps);
+        }
+    }
+}
+
 /// Mix `samples` by `shift_hz` (positive = shift spectrum up), with the phase
 /// reference at absolute sample index `start_index` so successive buffers of a
 /// stream stay phase-continuous.

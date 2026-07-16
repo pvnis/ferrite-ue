@@ -1694,6 +1694,12 @@ fn run(cfg: Config) {
     let mut t0_n = 0u64;
     let t0_pace: f64 = std::env::var("FERRITE_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0) * 1e-6;
 
+    // Precomputed-phasor mixer for the per-slot DL frequency shift (the constant
+    // −df to baseband the SSB). Vectorises the hot path that the serial recurrence
+    // of `freq_shift` could not — the dominant T0 cost at 20 MHz (~400 µs → ~100 µs).
+    let fsh_shifter = ferrite_ue::sync::FreqShifter::new(-df, fs, slot_len as usize);
+    let mut fsh: Vec<Complex32> = Vec::with_capacity(slot_len as usize);
+
     loop {
         if perf_pad_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(perf_pad_us));
@@ -1765,7 +1771,7 @@ fn run(cfg: Config) {
 
         // Decode this slot's RA search space.
         let perf_fs = std::time::Instant::now();
-        let fsh = freq_shift(&slot_buf, -df, fs, slot_start_ul as usize);
+        fsh_shifter.shift_into(&slot_buf, slot_start_ul as usize, &mut fsh);
         perf_fs_ns += perf_fs.elapsed().as_nanos() as u64;
         let perf_dm = std::time::Instant::now();
         let mut cgrids = Vec::new();
