@@ -26,7 +26,7 @@ use ferrite_ue::stream::BufferedStream;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed as Rlx};
 use std::sync::{Arc, Mutex};
 use ferrite_ue::nas::{auth_response, nas_msg_type, nas_protect, nas_transport_payload, parse_auth_request, registration_complete, registration_request, security_mode_complete, strip_security_header, ul_nas_transport_pdu_session};
-use ferrite_mac::{drb_mac_wrap_bsr, mac_short_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_ta_command_ce, plausible_mac_pdu, LCID_DL_CON_RES};
+use ferrite_mac::{drb_mac_wrap_bsr, msg3_mac_pdu, parse_dl_mac_pdu, parse_ta_command_ce, plausible_mac_pdu, LCID_DL_CON_RES};
 use ferrite_ue::userplane::{drb_ul_pdu, ipv4_icmp_echo_request, pdcp_data_pdu, rlc_um_segment};
 use ferrite_ue::rrc::{dl_dcch_type, parse_dl_dcch_nas, parse_srb1_dl_rrc, rlc_status_mac_pdu, rrc_reconfiguration_complete, rrc_security_mode_complete, rrc_setup_complete, rrc_ue_capability_information, rrc_setup_request, rrc_ul_information_transfer, srb1_dl_rrc_reasm, srb1_msg5_pdu, RlcReassembler, CAUSE_MO_SIGNALLING};
 use ferrite_ue::sync::{freq_shift, gscn_scan, FrameSync};
@@ -1413,8 +1413,7 @@ fn run(cfg: Config) {
     // already-issued grant (~k2 + pipeline) instead of paying the SR round-trip
     // (up to a full SR period + grant latency). Padding fills do NOT refresh the
     // window, so an idle UE goes quiet after 1 s.
-    let mut last_up_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
-    let up_active = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(1);
+    let mut ulsched = ferrite_mac::MacUlScheduler::new();
     let mut pdcp_tx_sn: u32 = 0; // DRB uplink PDCP SN
     let mut ping_acked = false; // an echo reply was received
     let mut ping_recv: u32 = 0; // count of echo replies (high-rate load mode)
@@ -1677,7 +1676,7 @@ fn run(cfg: Config) {
                 match tun.read(&mut buf) {
                     Ok(n) if n > 0 => {
                         tun_ul.push_back(buf[..n].to_vec());
-                        last_up_activity = std::time::Instant::now();
+                        ulsched.note_activity();
                     }
                     _ => break, // WouldBlock or EOF
                 }
@@ -2016,7 +2015,7 @@ fn run(cfg: Config) {
                             // MCS drops under the (lossless-channel) KO noise, so a
                             // truthful ~52B report yields sub-52B grants that never fit
                             // the SRB1 PDU. A big report forces a wide grant we can pad.
-                            (mac_short_bsr(need.max(220), tbs_bytes), format!("Short BSR (need {need}B)"))
+                            (ulsched.solicit_pdu(need, tbs_bytes), format!("Short BSR (need {need}B)"))
                         } else if !ul_queue.is_empty() {
                             let rrc = ul_queue.pop_front().unwrap();
                             let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
@@ -2033,7 +2032,7 @@ fn run(cfg: Config) {
                                 um_sn = um_sn.wrapping_add(1);
                             }
                             let (pdcp, off, sn) = um_tx.take().unwrap();
-                            last_up_activity = std::time::Instant::now();
+                            ulsched.note_activity();
                             let remaining = pdcp.len() - off;
                             // Bytes queued behind this packet (each still needs PDCP+RLC+MAC).
                             let queued: usize = tun_ul.iter().map(|p| p.len() + 8).sum();
@@ -2041,7 +2040,7 @@ fn run(cfg: Config) {
                                 // Grant too small for meaningful progress → solicit a bigger one,
                                 // reporting the WHOLE DRB buffer so the gNB grants enough at once.
                                 um_tx = Some((pdcp, off, sn));
-                                (mac_short_bsr((remaining + queued + 3).max(220), tbs_bytes), format!("DRB BSR (need {}B)", remaining + queued))
+                                (ulsched.solicit_pdu(remaining + queued + 3, tbs_bytes), format!("DRB BSR (need {}B)", remaining + queued))
                             } else {
                                 // Reserve 2 bytes for a piggyback BSR whenever more data remains
                                 // (this packet's tail or other queued packets) so the gNB keeps
@@ -2076,19 +2075,16 @@ fn run(cfg: Config) {
                             };
                             ping_sent_at.push(std::time::Instant::now());
                             next_ping_at = std::time::Instant::now() + std::time::Duration::from_millis(ping_interval_ms);
-                            last_up_activity = std::time::Instant::now();
+                            ulsched.note_activity();
                             ping_seq += 1;
                             (m, s)
-                        } else if up_active(&last_up_activity) {
-                            // Warm grant: traffic moved within the last second — report a
-                            // small non-zero buffer so the gNB keeps granting every UL
-                            // occasion (the next packet rides one instead of paying the
-                            // SR round-trip). Padding does not refresh the window.
-                            (mac_short_bsr(220, tbs_bytes), String::new())
                         } else {
-                            // Idle grant: a valid, decodable PDU that reports an empty
-                            // buffer so the gNB stops granting (and no crc=KO).
-                            (mac_short_bsr(0, tbs_bytes), String::new())
+                            // No logical-channel data: fall back to the MAC scheduler's
+                            // keep-alive BSR — a warm non-zero buffer while traffic is
+                            // recent (keeps the gNB granting so the next packet rides a
+                            // grant instead of an SR round-trip), else an idle empty-buffer
+                            // report that lets it stop. Both are valid, decodable PDUs.
+                            (ulsched.fallback_pdu(tbs_bytes), String::new())
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
                         ulharq.store(g_hid, ndi, tbs_bytes, mac.clone());
@@ -2350,7 +2346,7 @@ fn run(cfg: Config) {
                                                 r.src[0], r.src[1], r.src[2], r.src[3], r.id, r.seq);
                                         }
                                         ping_acked = true;
-                                        last_up_activity = std::time::Instant::now();
+                                        ulsched.note_activity();
                                         ping_recv += 1;
                                         if let Some(t0) = ping_sent_at.get(r.seq as usize) {
                                             // High-rate load mode: summarise every 100 replies
