@@ -2849,7 +2849,16 @@ fn run(cfg: Config) {
         // leaving 3 slots of margin to modulate + inject before serving reaches `pos`.
         perf_dpusch_ns += perf_d2.elapsed().as_nanos() as u64;
         let perf_d3 = std::time::Instant::now();
-        let due: Vec<i64> = ack_book.iter().filter(|(_, &(_, pos, _))| pos <= slot_start_ul + 3 * slot_len).map(|(&k, _)| k).collect();
+        // Build the PUCCH only 1 slot ahead of T0's read position, not 3: the
+        // contributing DL decode drains ~1.3-2 slots after T0 reads its slot, so a
+        // 3-slot lead modulated the ACK BEFORE the decode had drained — for the
+        // gNB's minimum k1=4 the pre-booked NACK (line ~1819) went out unupgraded
+        // → the gNB retransmitted (the ~70% DL nok). A 1-slot lead lets the decode
+        // upgrade the codebook first, and — being relative to slot_start_ul (the
+        // read position, which keeps advancing even when serving stalls under load,
+        // unlike ul_counter) — cannot stall the ACK path into a non-recovering
+        // wedge. Injection margin stays ≥ 1 + read-ahead slots.
+        let due: Vec<i64> = ack_book.iter().filter(|(_, &(_, pos, _))| pos <= slot_start_ul + 2 * slot_len).map(|(&k, _)| k).collect();
         for key in due {
             let (slot_mod20, pos, book) = ack_book.remove(&key).unwrap();
             let pri = pri_book.remove(&key).unwrap_or(0) as usize;
@@ -2931,6 +2940,10 @@ fn run(cfg: Config) {
             };
             let pk = wave.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
             for s in &mut wave { *s *= amp / pk; }
+            if std::env::var_os("FERRITE_ACKDBG").is_some() {
+                eprintln!("[ackdbg] key={key} slot_mod20={slot_mod20} bits={bits:?} pos={pos} pos-serving={} pos-abs-slot={}",
+                    pos - ul_counter as i64, pos / slot_len);
+            }
             inj.lock().unwrap().push(ReadyWaveform { pos, samples: wave, tag: "ack" }, ul_counter as i64);
             pend_acks.push(pos);
             // This waveform now owns the slot: a book that re-forms for the same key
