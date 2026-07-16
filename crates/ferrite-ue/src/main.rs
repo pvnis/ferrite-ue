@@ -2000,91 +2000,109 @@ fn run(cfg: Config) {
                             .and_then(|c| c.beta_csi1_index)
                             .map_or(6.25, ferrite_phy::pusch::beta_offset_csi);
                         let is_retx = ulharq.is_retx(g_hid, ndi, tbs_bytes);
-                        let (mac, kind) = if is_retx {
-                            // Retransmission grant: resend the process's stored TB at the
-                            // grant's rv so the gNB's soft-combine converges.
-                            (ulharq.stored(g_hid).unwrap().to_vec(), format!("UL retx h{g_hid} rv{g_rv}"))
-                        } else if let Some(ack) = pending_status {
-                            // Acknowledge received DL RLC SDUs so the gNB stops
-                            // retransmitting and delivers the next one.
-                            pending_status = None;
-                            (rlc_status_mac_pdu(ack, tbs_bytes), format!("RLC STATUS ack={ack}"))
-                        } else if !ul_queue.is_empty() && ul_queue.front().unwrap().len() + 10 > tbs_bytes {
-                            let need = ul_queue.front().unwrap().len() + 10;
-                            // Over-report the buffer so the gNB grants MORE RBs — its UL
-                            // MCS drops under the (lossless-channel) KO noise, so a
-                            // truthful ~52B report yields sub-52B grants that never fit
-                            // the SRB1 PDU. A big report forces a wide grant we can pad.
-                            (ulsched.solicit_pdu(need, tbs_bytes), format!("Short BSR (need {need}B)"))
-                        } else if !ul_queue.is_empty() {
-                            let rrc = ul_queue.pop_front().unwrap();
-                            let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
-                            let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
-                            srb1_sn += 1;
-                            (m, k)
-                        } else if drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty()) {
-                            // TUN mode: carry a real host IP packet over the DRB (LCID 4),
-                            // segmenting it across UL grants (RLC UM) if it doesn't fit one.
-                            if um_tx.is_none() {
-                                let ip = tun_ul.pop_front().unwrap();
-                                um_tx = Some((pdcp_data_pdu(pdcp_tx_sn, &ip), 0, um_sn));
-                                pdcp_tx_sn += 1;
-                                um_sn = um_sn.wrapping_add(1);
+                        // Logical channels' buffer status (the framing for each stays with
+                        // its bearer layer; the MAC scheduler only prioritises). SRB1 = the
+                        // RRC UL queue; DRB = either real TUN traffic mid-flight/queued, or
+                        // the built-in ping being due.
+                        let srb1_has = !ul_queue.is_empty();
+                        let drb_tun = drb_up && tun_fd.is_some() && (um_tx.is_some() || !tun_ul.is_empty());
+                        let ping_ready = tun.is_none()
+                            && drb_up
+                            && ue_ip.is_some()
+                            && (ping_seq as u32) < ping_count
+                            && std::time::Instant::now() >= next_ping_at;
+                        let (mac, kind) = match ulsched.select(is_retx, pending_status.is_some(), srb1_has, drb_tun || ping_ready) {
+                            ferrite_mac::UlLch::Retx => {
+                                // Retransmission grant: resend the process's stored TB at the
+                                // grant's rv so the gNB's soft-combine converges.
+                                (ulharq.stored(g_hid).unwrap().to_vec(), format!("UL retx h{g_hid} rv{g_rv}"))
                             }
-                            let (pdcp, off, sn) = um_tx.take().unwrap();
-                            ulsched.note_activity();
-                            let remaining = pdcp.len() - off;
-                            // Bytes queued behind this packet (each still needs PDCP+RLC+MAC).
-                            let queued: usize = tun_ul.iter().map(|p| p.len() + 8).sum();
-                            if tbs_bytes < remaining + 3 && tbs_bytes < 100 {
-                                // Grant too small for meaningful progress → solicit a bigger one,
-                                // reporting the WHOLE DRB buffer so the gNB grants enough at once.
-                                um_tx = Some((pdcp, off, sn));
-                                (ulsched.solicit_pdu(remaining + queued + 3, tbs_bytes), format!("DRB BSR (need {}B)", remaining + queued))
-                            } else {
-                                // Reserve 2 bytes for a piggyback BSR whenever more data remains
-                                // (this packet's tail or other queued packets) so the gNB keeps
-                                // granting continuously instead of one grant per SR/BSR round-trip.
-                                let more = (remaining > tbs_bytes.saturating_sub(3)) || queued > 0 || !tun_ul.is_empty();
-                                let rsv = if more { 5 } else { 3 }; // MAC subheader (3) + BSR (2)
-                                let (rlc, new_off) = rlc_um_segment(&pdcp, off, sn, tbs_bytes.saturating_sub(rsv));
-                                let after = pdcp.len() - new_off + queued; // total still buffered
-                                let m = drb_mac_wrap_bsr(&rlc, if after > 0 { after + 3 } else { 0 }, tbs_bytes);
-                                let s = format!("DRB UL {new_off}/{} B (sn {sn}, buf {after})", pdcp.len());
-                                if new_off < pdcp.len() {
-                                    um_tx = Some((pdcp, new_off, sn));
+                            ferrite_mac::UlLch::RlcStatus => {
+                                // Acknowledge received DL RLC SDUs so the gNB stops
+                                // retransmitting and delivers the next one.
+                                let ack = pending_status.take().unwrap();
+                                (rlc_status_mac_pdu(ack, tbs_bytes), format!("RLC STATUS ack={ack}"))
+                            }
+                            ferrite_mac::UlLch::Srb1 => {
+                                if ul_queue.front().unwrap().len() + 10 > tbs_bytes {
+                                    let need = ul_queue.front().unwrap().len() + 10;
+                                    // Over-report the buffer so the gNB grants MORE RBs — its UL
+                                    // MCS drops under the (lossless-channel) KO noise, so a
+                                    // truthful ~52B report yields sub-52B grants that never fit
+                                    // the SRB1 PDU. A big report forces a wide grant we can pad.
+                                    (ulsched.solicit_pdu(need, tbs_bytes), format!("Short BSR (need {need}B)"))
+                                } else {
+                                    let rrc = ul_queue.pop_front().unwrap();
+                                    let m = srb1_msg5_pdu(&rrc, srb1_sn, srb1_sn, tbs_bytes, k_rrcint.as_ref());
+                                    let k = if srb1_sn == 0 { "RRCSetupComplete".into() } else { format!("UL-DCCH(NAS) SN{srb1_sn}") };
+                                    srb1_sn += 1;
+                                    (m, k)
                                 }
+                            }
+                            ferrite_mac::UlLch::Drb if drb_tun => {
+                                // TUN mode: carry a real host IP packet over the DRB (LCID 4),
+                                // segmenting it across UL grants (RLC UM) if it doesn't fit one.
+                                if um_tx.is_none() {
+                                    let ip = tun_ul.pop_front().unwrap();
+                                    um_tx = Some((pdcp_data_pdu(pdcp_tx_sn, &ip), 0, um_sn));
+                                    pdcp_tx_sn += 1;
+                                    um_sn = um_sn.wrapping_add(1);
+                                }
+                                let (pdcp, off, sn) = um_tx.take().unwrap();
+                                ulsched.note_activity();
+                                let remaining = pdcp.len() - off;
+                                // Bytes queued behind this packet (each still needs PDCP+RLC+MAC).
+                                let queued: usize = tun_ul.iter().map(|p| p.len() + 8).sum();
+                                if tbs_bytes < remaining + 3 && tbs_bytes < 100 {
+                                    // Grant too small for meaningful progress → solicit a bigger one,
+                                    // reporting the WHOLE DRB buffer so the gNB grants enough at once.
+                                    um_tx = Some((pdcp, off, sn));
+                                    (ulsched.solicit_pdu(remaining + queued + 3, tbs_bytes), format!("DRB BSR (need {}B)", remaining + queued))
+                                } else {
+                                    // Reserve 2 bytes for a piggyback BSR whenever more data remains
+                                    // (this packet's tail or other queued packets) so the gNB keeps
+                                    // granting continuously instead of one grant per SR/BSR round-trip.
+                                    let more = (remaining > tbs_bytes.saturating_sub(3)) || queued > 0 || !tun_ul.is_empty();
+                                    let rsv = if more { 5 } else { 3 }; // MAC subheader (3) + BSR (2)
+                                    let (rlc, new_off) = rlc_um_segment(&pdcp, off, sn, tbs_bytes.saturating_sub(rsv));
+                                    let after = pdcp.len() - new_off + queued; // total still buffered
+                                    let m = drb_mac_wrap_bsr(&rlc, if after > 0 { after + 3 } else { 0 }, tbs_bytes);
+                                    let s = format!("DRB UL {new_off}/{} B (sn {sn}, buf {after})", pdcp.len());
+                                    if new_off < pdcp.len() {
+                                        um_tx = Some((pdcp, new_off, sn));
+                                    }
+                                    (m, s)
+                                }
+                            }
+                            ferrite_mac::UlLch::Drb => {
+                                // Built-in ping RTT probe (no TUN): `ping_count` echoes at
+                                // `ping_interval_ms` spacing, each sent ONCE (the reply handler
+                                // prints the RTT). Defaults (20 @ 1 Hz) are a light probe; a
+                                // short interval + high count sustains DL load (each reply is a
+                                // DL PDSCH) to exercise the HARQ-ACK-under-load path.
+                                let uip = ue_ip.expect("ping_ready ⇒ ue_ip is set");
+                                let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
+                                let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
+                                pdcp_tx_sn += 1;
+                                let s = if ping_count <= 40 {
+                                    format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
+                                        ping_target[0], ping_target[1], ping_target[2], ping_target[3])
+                                } else {
+                                    String::new() // high-rate load mode: don't flood stdout
+                                };
+                                ping_sent_at.push(std::time::Instant::now());
+                                next_ping_at = std::time::Instant::now() + std::time::Duration::from_millis(ping_interval_ms);
+                                ulsched.note_activity();
+                                ping_seq += 1;
                                 (m, s)
                             }
-                        } else if let (true, true, Some(uip), true) =
-                            (tun.is_none(), drb_up, ue_ip, (ping_seq as u32) < ping_count && std::time::Instant::now() >= next_ping_at)
-                        {
-                            // Built-in ping RTT probe: `ping_count` echoes at
-                            // `ping_interval_ms` spacing, each sent ONCE (the reply handler
-                            // prints the RTT). Defaults (20 @ 1 Hz) are a light probe; a
-                            // short interval + high count sustains DL load (each reply is a
-                            // DL PDSCH) to exercise the HARQ-ACK-under-load path.
-                            let ip = ipv4_icmp_echo_request(uip, ping_target, PING_ID, ping_seq, b"ferrite-ping");
-                            let m = drb_ul_pdu(pdcp_tx_sn, &ip, tbs_bytes);
-                            pdcp_tx_sn += 1;
-                            let s = if ping_count <= 40 {
-                                format!("ICMP echo req seq {ping_seq} → {}.{}.{}.{}",
-                                    ping_target[0], ping_target[1], ping_target[2], ping_target[3])
-                            } else {
-                                String::new() // high-rate load mode: don't flood stdout
-                            };
-                            ping_sent_at.push(std::time::Instant::now());
-                            next_ping_at = std::time::Instant::now() + std::time::Duration::from_millis(ping_interval_ms);
-                            ulsched.note_activity();
-                            ping_seq += 1;
-                            (m, s)
-                        } else {
-                            // No logical-channel data: fall back to the MAC scheduler's
-                            // keep-alive BSR — a warm non-zero buffer while traffic is
-                            // recent (keeps the gNB granting so the next packet rides a
-                            // grant instead of an SR round-trip), else an idle empty-buffer
-                            // report that lets it stop. Both are valid, decodable PDUs.
-                            (ulsched.fallback_pdu(tbs_bytes), String::new())
+                            ferrite_mac::UlLch::KeepAlive => {
+                                // No logical-channel data: the MAC scheduler's keep-alive BSR —
+                                // a warm non-zero buffer while traffic is recent (keeps the gNB
+                                // granting so the next packet rides a grant instead of an SR
+                                // round-trip), else an idle empty-buffer report that lets it stop.
+                                (ulsched.fallback_pdu(tbs_bytes), String::new())
+                            }
                         };
                         let m5_alloc = PuschAlloc { rb_start: g_rb0, n_rb: g_nrb, dmrs_symbols: vec![2, 7, 11], qm: qm as usize, carrier_rb, crb_offset: 0 };
                         ulharq.store(g_hid, ndi, tbs_bytes, mac.clone());

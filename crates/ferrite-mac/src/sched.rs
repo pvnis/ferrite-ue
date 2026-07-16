@@ -12,6 +12,26 @@
 use crate::ce::mac_short_bsr;
 use std::time::{Duration, Instant};
 
+/// The logical channel selected to fill a UL grant, in the UE's priority order
+/// (TS 38.321 §5.4.3.1, the subset the UE uses). The caller frames the chosen
+/// channel's PDU (the RLC/PDCP framing stays with the bearer layers).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UlLch {
+    /// Resend the stored TB on a HARQ retransmission grant (the gNB is
+    /// soft-combining it, so it must go first and unchanged).
+    Retx,
+    /// An RLC AM STATUS report is pending — send it before new data so the gNB's
+    /// DL RLC window advances and it stops retransmitting.
+    RlcStatus,
+    /// Signalling radio bearer (SRB1) has a queued RRC PDU.
+    Srb1,
+    /// The data radio bearer (DRB) has user data to send (real TUN traffic or the
+    /// built-in ping).
+    Drb,
+    /// Nothing to send: answer with the scheduler's keep-alive / idle BSR.
+    KeepAlive,
+}
+
 /// Buffer occupancy (bytes) reported by the "warm" keep-alive BSR: a small
 /// non-zero value that keeps the gNB granting every UL occasion (so the next
 /// packet rides a grant instead of paying an SR round-trip) without over-
@@ -59,6 +79,25 @@ impl MacUlScheduler {
     pub fn solicit_pdu(&self, need: usize, tbs: usize) -> Vec<u8> {
         mac_short_bsr(need.max(WARM_BSR_BYTES), tbs)
     }
+
+    /// Logical-channel prioritisation for a UL grant: pick the highest-priority
+    /// channel with something to send. HARQ retransmissions first (the gNB is
+    /// combining the stored TB), then the RLC STATUS that unblocks the DL, then
+    /// signalling (SRB1) over user data (DRB); if none has data the caller sends
+    /// a keep-alive BSR ([`Self::fallback_pdu`]).
+    pub fn select(&self, retx: bool, rlc_status: bool, srb1_has: bool, drb_has: bool) -> UlLch {
+        if retx {
+            UlLch::Retx
+        } else if rlc_status {
+            UlLch::RlcStatus
+        } else if srb1_has {
+            UlLch::Srb1
+        } else if drb_has {
+            UlLch::Drb
+        } else {
+            UlLch::KeepAlive
+        }
+    }
 }
 
 impl Default for MacUlScheduler {
@@ -81,6 +120,20 @@ mod tests {
         assert!(s.is_warm());
         // Warm fallback reports the 220 B level (a non-zero BSR index).
         assert_ne!(s.fallback_pdu(4)[1], 0);
+    }
+
+    #[test]
+    fn lcp_priority_order() {
+        let s = MacUlScheduler::new();
+        // retx beats everything.
+        assert_eq!(s.select(true, true, true, true), UlLch::Retx);
+        // then RLC STATUS.
+        assert_eq!(s.select(false, true, true, true), UlLch::RlcStatus);
+        // then SRB1 (signalling) over DRB (data).
+        assert_eq!(s.select(false, false, true, true), UlLch::Srb1);
+        assert_eq!(s.select(false, false, false, true), UlLch::Drb);
+        // nothing pending → keep-alive.
+        assert_eq!(s.select(false, false, false, false), UlLch::KeepAlive);
     }
 
     #[test]
