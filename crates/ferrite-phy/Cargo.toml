@@ -11,3 +11,7 @@ rustfft.workspace = true
 
 [dev-dependencies]
 ferrite-radio.workspace = true
+
+[[bench]]
+name = "ldpc_decode"
+harness = false

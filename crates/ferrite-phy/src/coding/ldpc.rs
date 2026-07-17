@@ -255,7 +255,31 @@ impl LdpcGraph {
     /// Decode `llr` (length `n()`, positive ⇒ bit 0; punctured positions 0),
     /// returning the information bits and whether all checks are satisfied.
     /// Normalized min-sum, `max_iter` iterations, scaling `alpha`.
+    /// Normalised min-sum belief-propagation decode. Dispatches to a hand-written AVX2
+    /// path at runtime when the CPU supports it, otherwise runs the portable scalar
+    /// decoder — which is also the clean-room reference the AVX2 path is checked against
+    /// (see the `avx2_matches_scalar` test).
     pub fn decode(&self, llr: &[f32], max_iter: usize, alpha: f32) -> (Vec<u8>, bool) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::sync::OnceLock;
+            // Cached once: AVX2 present AND not disabled. `FERRITE_NO_AVX2=1` forces the
+            // scalar path — for A/B against the reference and non-AVX2 debugging.
+            static AVX2: OnceLock<bool> = OnceLock::new();
+            let use_avx2 = *AVX2.get_or_init(|| {
+                std::is_x86_feature_detected!("avx2")
+                    && std::env::var_os("FERRITE_NO_AVX2").is_none()
+            });
+            if use_avx2 {
+                // SAFETY: taken only when the CPU reports AVX2 support.
+                return unsafe { self.decode_avx2(llr, max_iter, alpha) };
+            }
+        }
+        self.decode_scalar(llr, max_iter, alpha)
+    }
+
+    /// Portable scalar reference decoder (see [`LdpcGraph::decode`]).
+    pub fn decode_scalar(&self, llr: &[f32], max_iter: usize, alpha: f32) -> (Vec<u8>, bool) {
         assert_eq!(llr.len(), self.n());
         let zc = self.zc;
         // Flat check->var message store, indexed [(edge_off[m] + e)·Zc + z]: one
@@ -333,6 +357,173 @@ impl LdpcGraph {
         }
         (hard[..self.k()].to_vec(), self.is_codeword(&hard))
     }
+
+    /// AVX2 normalised min-sum decode: vectorises the check-/variable-node updates 8
+    /// lifted-equation offsets (`zc_off`) at a time. Algorithmically equivalent to
+    /// [`LdpcGraph::decode_scalar`] (same normalised min-sum, same per-iteration syndrome
+    /// early-exit); the only intentional difference is check-node tie handling (the vector
+    /// path picks the second-minimum by `|v|==min1` rather than a strict first argmin),
+    /// which does not affect which codeword it converges to.
+    ///
+    /// The cyclic shift `z = (zc_off + s) mod Zc` is materialised by rotating each node
+    /// block into a contiguous scratch (two `copy_from_slice`s) so the hot loops are plain
+    /// contiguous vector loads/stores rather than gathers.
+    ///
+    /// # Safety
+    /// Requires the `avx2` target feature; call only behind `is_x86_feature_detected!`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn decode_avx2(&self, llr: &[f32], max_iter: usize, alpha: f32) -> (Vec<u8>, bool) {
+        use std::arch::x86_64::*;
+        assert_eq!(llr.len(), self.n());
+        let zc = self.zc;
+        let mut edge_off = Vec::with_capacity(self.rows.len());
+        let mut n_edges = 0usize;
+        for row in &self.rows {
+            edge_off.push(n_edges);
+            n_edges += row.len();
+        }
+        let mut msg = vec![0f32; n_edges * zc];
+        let mut total = llr.to_vec();
+        let max_deg = self.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut hard = vec![0u8; self.n()];
+        // Scratch: rotated total blocks for the current row, per-chunk saved `v`,
+        // and a scalar-remainder value buffer.
+        let mut rot = vec![0f32; max_deg * zc];
+        let mut vbuf = vec![0f32; max_deg * 8];
+        let mut svals = vec![0f32; max_deg];
+
+        let signmask = _mm256_set1_ps(f32::from_bits(0x8000_0000));
+        let absmask = _mm256_set1_ps(f32::from_bits(0x7fff_ffff));
+        let alpha8 = _mm256_set1_ps(alpha);
+        let inf8 = _mm256_set1_ps(f32::INFINITY);
+        let nvec = zc / 8; // number of full 8-lane chunks
+        let tail = nvec * 8; // start of the scalar remainder
+
+        for _ in 0..max_iter {
+            // ---- Check-node update (normalised min-sum) ----
+            for (m, row) in self.rows.iter().enumerate() {
+                let base = edge_off[m] * zc;
+                let deg = row.len();
+                // Rotate each edge's `total` node block into `rot` (zc_off frame):
+                // rot[e][zc_off] = total[n·Zc + (zc_off + s) mod Zc].
+                for (e, &(n, s)) in row.iter().enumerate() {
+                    let off = n * zc;
+                    let d = e * zc;
+                    rot[d..d + (zc - s)].copy_from_slice(&total[off + s..off + zc]);
+                    rot[d + (zc - s)..d + zc].copy_from_slice(&total[off..off + s]);
+                }
+                // Vectorised over zc_off, 8 lanes at a time.
+                for c in (0..tail).step_by(8) {
+                    let mut min1 = inf8;
+                    let mut min2 = inf8;
+                    let mut signacc = _mm256_setzero_ps();
+                    for e in 0..deg {
+                        let tv = _mm256_loadu_ps(rot.as_ptr().add(e * zc + c));
+                        let mv = _mm256_loadu_ps(msg.as_ptr().add(base + e * zc + c));
+                        let v = _mm256_sub_ps(tv, mv);
+                        _mm256_storeu_ps(vbuf.as_mut_ptr().add(e * 8), v);
+                        let a = _mm256_and_ps(v, absmask);
+                        signacc = _mm256_xor_ps(signacc, _mm256_and_ps(v, signmask));
+                        let lt = _mm256_cmp_ps::<_CMP_LT_OS>(a, min1);
+                        let mina2 = _mm256_min_ps(min2, a);
+                        min2 = _mm256_blendv_ps(mina2, min1, lt);
+                        min1 = _mm256_min_ps(min1, a);
+                    }
+                    for e in 0..deg {
+                        let v = _mm256_loadu_ps(vbuf.as_ptr().add(e * 8));
+                        let a = _mm256_and_ps(v, absmask);
+                        let is_min = _mm256_cmp_ps::<_CMP_EQ_OQ>(a, min1);
+                        let mag = _mm256_blendv_ps(min1, min2, is_min);
+                        let sbit = _mm256_xor_ps(signacc, _mm256_and_ps(v, signmask));
+                        let out = _mm256_or_ps(_mm256_mul_ps(alpha8, mag), sbit);
+                        _mm256_storeu_ps(msg.as_mut_ptr().add(base + e * zc + c), out);
+                    }
+                }
+                // Scalar remainder for zc_off in tail..zc (bit-faithful to decode_scalar).
+                for zc_off in tail..zc {
+                    let mut sign = 1.0f32;
+                    let mut min1 = f32::INFINITY;
+                    let mut min2 = f32::INFINITY;
+                    let mut argmin = 0usize;
+                    for (e, _) in row.iter().enumerate() {
+                        let v = rot[e * zc + zc_off] - msg[base + e * zc + zc_off];
+                        svals[e] = v;
+                        if v < 0.0 {
+                            sign = -sign;
+                        }
+                        let a = v.abs();
+                        if a < min1 {
+                            min2 = min1;
+                            min1 = a;
+                            argmin = e;
+                        } else if a < min2 {
+                            min2 = a;
+                        }
+                    }
+                    for e in 0..deg {
+                        let v = svals[e];
+                        let mag = if e == argmin { min2 } else { min1 };
+                        let s = if v < 0.0 { -sign } else { sign };
+                        msg[base + e * zc + zc_off] = alpha * s * mag;
+                    }
+                }
+            }
+            // ---- Variable-node update: total = channel + Σ incoming check messages ----
+            total.copy_from_slice(llr);
+            for (m, row) in self.rows.iter().enumerate() {
+                let base = edge_off[m] * zc;
+                for (e, &(n, s)) in row.iter().enumerate() {
+                    let off = n * zc;
+                    let src = base + e * zc;
+                    // total[off+s .. off+Zc] += msg[src .. src+(Zc-s)]
+                    Self::avx2_add_acc(
+                        total.as_mut_ptr().add(off + s),
+                        msg.as_ptr().add(src),
+                        zc - s,
+                    );
+                    // total[off .. off+s] += msg[src+(Zc-s) .. src+Zc]
+                    Self::avx2_add_acc(
+                        total.as_mut_ptr().add(off),
+                        msg.as_ptr().add(src + (zc - s)),
+                        s,
+                    );
+                }
+            }
+            // Hard decision + early exit on a valid codeword.
+            for (h, &l) in hard.iter_mut().zip(&total) {
+                *h = (l < 0.0) as u8;
+            }
+            if self.is_codeword(&hard) {
+                return (hard[..self.k()].to_vec(), true);
+            }
+        }
+        for (h, &l) in hard.iter_mut().zip(&total) {
+            *h = (l < 0.0) as u8;
+        }
+        (hard[..self.k()].to_vec(), self.is_codeword(&hard))
+    }
+
+    /// `dst[0..len] += src[0..len]`, AVX2, unaligned. Disjoint buffers (total vs msg).
+    ///
+    /// # Safety
+    /// Requires `avx2`; `dst`/`src` must be valid for `len` f32 reads/writes.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_add_acc(dst: *mut f32, src: *const f32, len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0usize;
+        while i + 8 <= len {
+            let d = _mm256_loadu_ps(dst.add(i));
+            let s = _mm256_loadu_ps(src.add(i));
+            _mm256_storeu_ps(dst.add(i), _mm256_add_ps(d, s));
+            i += 8;
+        }
+        while i < len {
+            *dst.add(i) += *src.add(i);
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,8 +556,7 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    #[ignore = "timing benchmark; run with --ignored --nocapture"]
+    #[ignore = "quick inline timing; the real benchmark is benches/ldpc_decode.rs (cargo bench)"]
     fn bench_encode_decode() {
         for (bg, zc) in [(BaseGraph::Bg2, 192u16), (BaseGraph::Bg2, 80), (BaseGraph::Bg1, 96)] {
             let g = LdpcGraph::new(bg, zc).unwrap();
@@ -442,5 +632,112 @@ mod tests {
         let (dec, ok) = g.decode(&llr, 40, 0.75);
         assert!(ok, "decoder did not converge");
         assert_eq!(dec, info);
+    }
+
+    /// Lifted-graph construction invariants over EVERY NR lifting size for both base
+    /// graphs (k = info·Zc, n = k + parity, m = checks·Zc), then a full encode→(clean
+    /// channel)→decode round-trip on the smallest Zc of each of the eight lifting sets —
+    /// which covers every distinct iLS shift-folding path. Large-Zc encode (parity-solver
+    /// Gaussian elimination) is a *performance* concern covered by benches/ldpc_decode.rs,
+    /// so it is kept out of this correctness test to keep debug `cargo test` fast.
+    #[test]
+    fn roundtrip_every_lifting_size() {
+        let mut rng = Rng(0x1CDC_0003);
+        let mut sizes: Vec<u16> = LIFTING_SETS.iter().flat_map(|s| s.iter().copied()).collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        // Smallest Zc of each lifting set — one representative per iLS folding path.
+        let decode_set: Vec<u16> = LIFTING_SETS.iter().map(|s| s[0]).collect();
+
+        for bg in [BaseGraph::Bg1, BaseGraph::Bg2] {
+            for &zc in &sizes {
+                let g = LdpcGraph::new(bg, zc).unwrap();
+                assert_eq!(g.k(), bg.info_cols() * zc as usize, "k() for {bg:?} Zc={zc}");
+                assert_eq!(g.n(), g.k() + g.m(), "n = k + parity for {bg:?} Zc={zc}");
+                assert_eq!(g.zc(), zc as usize, "Zc round-trip for {bg:?} Zc={zc}");
+
+                if !decode_set.contains(&zc) {
+                    continue;
+                }
+                let info: Vec<u8> = (0..g.k()).map(|_| rng.bit()).collect();
+                let c = g.encode(&info);
+                assert_eq!(&c[..g.k()], &info[..], "systematic prefix {bg:?} Zc={zc}");
+                assert!(g.is_codeword(&c), "invalid codeword {bg:?} Zc={zc}");
+                // Clean channel: bit 0 -> +L, bit 1 -> -L, first 2·Zc punctured (0 LLR).
+                let mut llr = vec![0f32; g.n()];
+                for i in (2 * g.zc())..g.n() {
+                    llr[i] = if c[i] == 0 { 4.0 } else { -4.0 };
+                }
+                let (dec, ok) = g.decode(&llr, 20, 0.75);
+                assert!(ok, "no convergence {bg:?} Zc={zc}");
+                assert_eq!(dec, info, "wrong message {bg:?} Zc={zc}");
+            }
+        }
+    }
+
+    /// The decoder corrects hard bit-flips (sign errors) up to a moderate count,
+    /// exercising the iterative correction rather than a single clean pass.
+    #[test]
+    fn decode_corrects_bit_flips() {
+        let mut rng = Rng(0x1CDC_0004);
+        let g = LdpcGraph::new(BaseGraph::Bg1, 32).unwrap();
+        let info: Vec<u8> = (0..g.k()).map(|_| rng.bit()).collect();
+        let c = g.encode(&info);
+        let mut llr = vec![0f32; g.n()];
+        for i in (2 * g.zc())..g.n() {
+            llr[i] = if c[i] == 0 { 3.0 } else { -3.0 };
+        }
+        // Flip the sign (and shrink the magnitude) of 20 received soft bits.
+        let span = g.n() - 2 * g.zc();
+        for _ in 0..20 {
+            let i = 2 * g.zc() + ((rng.uniform() * span as f32) as usize).min(span - 1);
+            llr[i] = -0.5 * llr[i];
+        }
+        let (dec, ok) = g.decode(&llr, 40, 0.75);
+        assert!(ok, "decoder failed to correct bit flips");
+        assert_eq!(dec, info);
+    }
+
+    /// The AVX2 decode path must agree with the scalar reference — same recovered message
+    /// and same converged/failed verdict — across base graphs, lifting sizes that are and
+    /// are not multiples of 8 (exercising both the vector body and the scalar remainder),
+    /// and several noise realisations. On a non-AVX2 host this compares scalar to scalar.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_matches_scalar() {
+        let mut rng = Rng(0x1CDC_0005);
+        for (bg, zc) in [
+            (BaseGraph::Bg2, 10u16),
+            (BaseGraph::Bg2, 13),
+            (BaseGraph::Bg2, 96),
+            (BaseGraph::Bg1, 8),
+            (BaseGraph::Bg1, 13),
+            (BaseGraph::Bg1, 64),
+            (BaseGraph::Bg1, 128),
+        ] {
+            let g = LdpcGraph::new(bg, zc).unwrap();
+            for _ in 0..3 {
+                let info: Vec<u8> = (0..g.k()).map(|_| rng.bit()).collect();
+                let c = g.encode(&info);
+                let sigma = 0.7f32;
+                let mut llr = vec![0f32; g.n()];
+                for i in (2 * g.zc())..g.n() {
+                    let s = 1.0 - 2.0 * c[i] as f32;
+                    let r = s + rng.normal() * sigma;
+                    llr[i] = 2.0 * r / (sigma * sigma);
+                }
+                let (scalar, ok_s) = g.decode_scalar(&llr, 25, 0.75);
+                let (avx, ok_a) = if std::is_x86_feature_detected!("avx2") {
+                    unsafe { g.decode_avx2(&llr, 25, 0.75) }
+                } else {
+                    g.decode_scalar(&llr, 25, 0.75)
+                };
+                assert_eq!(ok_s, ok_a, "verdict mismatch {bg:?} Zc={zc}");
+                assert_eq!(scalar, avx, "message mismatch {bg:?} Zc={zc}");
+                if ok_s {
+                    assert_eq!(avx, info, "wrong message {bg:?} Zc={zc}");
+                }
+            }
+        }
     }
 }

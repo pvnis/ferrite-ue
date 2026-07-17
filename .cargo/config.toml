@@ -1,0 +1,8 @@
+# Build for the host CPU: enables AVX2 + FMA (and host tuning) so the compiler can
+# auto-vectorize scalar loops and use fused multiply-add. NOTE: `target-cpu=native`
+# bakes in the build host's ISA — the resulting binary will SIGILL on an older CPU.
+# The LDPC decoder does not rely on this flag (it runtime-detects AVX2 and dispatches
+# to a hand-written path with a portable scalar fallback); this is the free win for
+# everything else. For a portable build, swap to: target-feature=+avx2,+fma
+[build]
+rustflags = ["-C", "target-cpu=native"]
