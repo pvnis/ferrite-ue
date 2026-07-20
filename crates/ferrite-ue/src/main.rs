@@ -152,6 +152,9 @@ struct Config {
     /// Fixed device RX→TX sample offset applied to the uplink timeline (loopback latency,
     /// calibrated once per device). SDR only.
     sdr_rxtx_offset: i64,
+    /// SDR RX / TX front-end gain (dB). SDR only.
+    sdr_rx_gain: f64,
+    sdr_tx_gain: f64,
 }
 
 impl Config {
@@ -182,6 +185,8 @@ impl Config {
             ping_interval_ms: arg("--ping-interval-ms", "1000").parse().unwrap(),
             sdr: arg_opt("--sdr"),
             sdr_rxtx_offset: arg("--sdr-rxtx-offset", "0").parse().unwrap(),
+            sdr_rx_gain: arg("--sdr-rx-gain", "50").parse().unwrap(),
+            sdr_tx_gain: arg("--sdr-tx-gain", "50").parse().unwrap(),
         }
     }
 }
@@ -1032,7 +1037,10 @@ fn run(cfg: Config) {
         tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
         toff_lo, toff_hi, toff_step, imsi, ki, opc, snn, ue_ip, ping_target,
         tun, netns, tun_mtu, ping_count, ping_interval_ms, sdr, sdr_rxtx_offset,
+        sdr_rx_gain, sdr_tx_gain,
     } = cfg;
+    #[cfg(not(feature = "sdr"))]
+    let _ = (sdr_rx_gain, sdr_tx_gain); // consumed only by the SDR backend
 
     let fft = (fs / 30_000.0).round() as usize;
     let searcher = CellSearcher::new(fft, 1);
@@ -1084,6 +1092,8 @@ fn run(cfg: Config) {
                 args: sdr_args.clone(),
                 sample_rate: fs,
                 frequency: center_hz,
+                rx_gain: sdr_rx_gain,
+                tx_gain: sdr_tx_gain,
                 ..Default::default()
             })
             .expect("open SDR");
@@ -1226,6 +1236,11 @@ fn run(cfg: Config) {
     let sc_to_bin = move |sc: i32| (first_sc + sc).rem_euclid(fft as i32) as usize;
     let a_len = dci_1_0_si_size(coreset.n_rb);
     let ra_cand = Candidate { agg_level: 4, cces: (0..4).collect() };
+    println!(
+        "[cfg] MIB sfn={} k_ssb={k_ssb} pdcch_cfg_sib1={:#04x} (coreset0_idx={} ss0_idx={}) → coreset0 {}RB×{}sym off_rb={} first_sc={first_sc} a_len={a_len} fft={fft} carrier_rb={carrier_rb}",
+        acq.mib.sfn, acq.mib.pdcch_config_sib1, acq.mib.pdcch_config_sib1 >> 4, acq.mib.pdcch_config_sib1 & 0xf,
+        coreset.n_rb, coreset.n_symb, coreset.offset_rb,
+    );
     println!("synced PCI {} — RA procedure: PRACH→RAR→Msg3", acq.cell_id);
 
     // Align to the frame boundary.
@@ -1357,6 +1372,8 @@ fn run(cfg: Config) {
     let mut pend: Option<(i64, Vec<Complex32>)> = None;
     let mut slot_buf = vec![Complex32::default(); slot_len as usize];
     let mut frame_fsh = vec![Complex32::default(); frame_len]; // SDR timing diagnostic (freq-shifted frame)
+    let dump_path = std::env::var("FERRITE_DUMP").ok(); // dump aligned freq-shifted frames for offline analysis
+    let mut dump_n = 0u32;
     let track_dbg = std::env::var_os("FERRITE_TRACK").is_some(); // gates the per-frame SDR PSS/SIB1 traces
     let mut slot_idx = 0u32; // 0..20 within the frame
     // Msg3 launch timing: pos0 (below) lands ~1900 samples late (occ_off models the
@@ -1788,26 +1805,44 @@ fn run(cfg: Config) {
     // and read_exact is real-time-paced.
     if is_sdr {
         let flushed = dl_stream.drain_backlog();
+        let pss_off = sync.pss_off();
         // Two frames guarantees a full SSB (period 20 ms) regardless of which frame we land on.
         let mut fbuf = vec![Complex32::default(); 2 * frame_len];
-        for c in fbuf.chunks_mut(block_len) {
-            dl_stream.read_exact(c).expect("dl stream ended");
-        }
-        // fsh_shifter's table is only slot_len long, so use the length-agnostic freq_shift here.
-        let fbuf_sh = ferrite_ue::sync::freq_shift(&fbuf, -df - cfo, fs, 0);
-        let pss_off = sync.pss_off();
-        match searcher.search(&fbuf_sh) {
-            Some(r) if r.cell_id == acq.cell_id => {
-                let skip = (r.timing_index as i64 - pss_off as i64).rem_euclid(frame_len as i64) as usize;
-                let mut sk = skip;
-                while sk > 0 {
-                    let n = sk.min(block_len);
-                    dl_stream.read_exact(&mut blk[..n]).expect("dl stream ended");
-                    sk -= n;
-                }
-                println!("SDR realign: flushed {flushed} samples, PSS@{}/{frame_len} pss_off={pss_off} → skip {skip}", r.timing_index);
+        // Self-correcting realign: skip so the next slot-0 read starts pss_off before the SSB,
+        // then RE-SEARCH to verify the SSB actually landed there. One-shot arithmetic proved
+        // unreliable (a spurious/sidelobe PSS peak, or the mod-frame_len wrap against the 20 ms
+        // SSB period, left the loop 6k+ samples off in some runs → CORESET0 demod on the wrong
+        // symbols). Iterating until the residual error is small removes the run-to-run variance.
+        let mut aligned = false;
+        for attempt in 0..8u32 {
+            for c in fbuf.chunks_mut(block_len) {
+                dl_stream.read_exact(c).expect("dl stream ended");
             }
-            _ => println!("SDR realign: flushed {flushed} samples, but PSS not re-found — proceeding"),
+            // fsh_shifter's table is only slot_len long, so use the length-agnostic freq_shift here.
+            let fbuf_sh = ferrite_ue::sync::freq_shift(&fbuf, -df - cfo, fs, 0);
+            match searcher.search(&fbuf_sh) {
+                Some(r) if r.cell_id == acq.cell_id => {
+                    // Error of the SSB from the desired slot-0 offset, wrapped into ±frame_len/2.
+                    let raw = (r.timing_index as i64 - pss_off as i64).rem_euclid(frame_len as i64);
+                    let err = if raw > frame_len as i64 / 2 { raw - frame_len as i64 } else { raw };
+                    if err.abs() <= 48 {
+                        println!("SDR realign: flushed {flushed}, aligned after {attempt} attempt(s) (PSS@{} err={err} metric={:.2})", r.timing_index, r.pss_metric);
+                        aligned = true;
+                        break;
+                    }
+                    // Skip forward by the positive residual to reach the next slot-0 boundary.
+                    let mut sk = raw as usize;
+                    while sk > 0 {
+                        let n = sk.min(block_len);
+                        dl_stream.read_exact(&mut blk[..n]).expect("dl stream ended");
+                        sk -= n;
+                    }
+                }
+                _ => {} // no PSS in this window (odd frame parity / transient) — read the next
+            }
+        }
+        if !aligned {
+            println!("SDR realign: flushed {flushed}, but did not converge — proceeding");
         }
     }
 
@@ -1898,6 +1933,23 @@ fn run(cfg: Config) {
                         r.cell_id, r.pss_metric, r.timing_index, frame_len, r.cfo_hz, cfo
                     ),
                     None => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in whole frame"),
+                }
+                // Dump the first few aligned freq-shifted frames (raw interleaved f32 IQ) for
+                // offline spectrum/correlation analysis (the fastest way to see whether the SIB1
+                // PDCCH is present and where, without 30 s reruns).
+                if let Some(p) = &dump_path {
+                    if dump_n < 40 {
+                        use std::io::Write;
+                        let mut bytes = Vec::with_capacity(frame_len * 8);
+                        for c in &frame_fsh {
+                            bytes.extend(c.re.to_le_bytes());
+                            bytes.extend(c.im.to_le_bytes());
+                        }
+                        std::fs::OpenOptions::new().create(true).append(true).open(p)
+                            .and_then(|mut f| f.write_all(&bytes)).ok();
+                        dump_n += 1;
+                        eprintln!("[dump] wrote frame {dump_n}/40 to {p}");
+                    }
                 }
             }
         }
@@ -2358,9 +2410,45 @@ fn run(cfg: Config) {
                 }
             }
             if is_sdr && si_bits.is_none() && slot_idx == 0 && track_dbg {
-                let np: usize = cgrids.iter().map(|g| g.len()).sum();
-                let gp: f32 = cgrids.iter().flat_map(|g| g.iter()).map(|c| c.norm_sqr()).sum::<f32>() / np.max(1) as f32;
-                eprintln!("[sib1] slot0: no SI-RNTI DCI; coreset0 avg |g|^2 = {gp:.5} ({} symb, {np} REs)", cgrids.len());
+                // Locate the SIB1 PDCCH by 2D sweep over (start-symbol l0, frequency offset
+                // delta subcarriers): demod symbols 0..8 of slot 0, then for each (l0,delta)
+                // correlate the received CORESET-region grid against the expected PDCCH DMRS
+                // (subcarriers 1,5,9 per RB). A clean peak reveals where the PDCCH really is
+                // and by how far our first_sc/first-symbol assumption is off.
+                let mut sgrids: Vec<Vec<Complex32>> = Vec::new();
+                let mut off = 0usize;
+                for l in 0..8usize {
+                    let cp = ofdm.cp_len((slot_idx as usize % 2) * 14 + l, 1);
+                    sgrids.push(ofdm.demodulate_symbol(&fsh[off..], cp));
+                    off += cp + fft as usize;
+                }
+                let corr_at = |l0: usize, delta: i32| -> f32 {
+                    let mut acc = Complex32::new(0.0, 0.0);
+                    let mut pw = 0f32;
+                    let mut n = 0f32;
+                    for ls in 0..coreset.n_symb {
+                        let refs = ferrite_phy::pdcch::pdcch_dmrs(acq.cell_id, slot_idx, (l0 + ls) as u32, coreset.n_rb);
+                        for rb in 0..coreset.n_rb {
+                            for p in 0..3usize {
+                                let sc = 12 * rb as i32 + 1 + 4 * p as i32 + delta;
+                                let rx = sgrids[l0 + ls][(first_sc + sc).rem_euclid(fft as i32) as usize];
+                                acc += rx * refs[3 * rb + p].conj();
+                                pw += rx.norm_sqr();
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    acc.norm() / (pw.sqrt() * n.sqrt()).max(1e-9)
+                };
+                let mut best = (0usize, 0i32, 0f32);
+                for l0 in 0..(8 - coreset.n_symb + 1) {
+                    for delta in -40i32..=40 {
+                        let c = corr_at(l0, delta);
+                        if c > best.2 { best = (l0, delta, c); }
+                    }
+                }
+                eprintln!("[sib1] slot0 sfn_par={}: no DCI; corr(l0=0,d=0)={:.3}; PEAK corr={:.3} @ l0={} delta={}",
+                    (slot_start_ul / slot_len / 20) % 2, corr_at(0, 0), best.2, best.0, best.1);
             }
             if let Some(b) = si_bits {
                 let riv_bits = usize::BITS as usize - ((coreset.n_rb * (coreset.n_rb + 1) / 2) - 1).leading_zeros() as usize;

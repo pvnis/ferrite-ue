@@ -81,3 +81,7 @@ path = "src/bin/rar_rx.rs"
 [[bin]]
 name = "msg3-grid"
 path = "src/bin/msg3_grid.rs"
+
+[[bin]]
+name = "sdr-analyze"
+path = "src/bin/sdr_analyze.rs"

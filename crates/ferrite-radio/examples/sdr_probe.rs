@@ -39,23 +39,36 @@ fn main() {
     println!("opened OK; sample_rate = {} Hz", radio.sample_rate());
 
     let mut rx = radio.rx().expect("activate RX stream");
-    let want = (cfg.sample_rate * 5e-3) as usize; // ~5 ms
-    let mut buf = vec![num_complex::Complex32::default(); want];
-    let mut got = 0;
+    // Drain continuously for ~200 ms, tolerating transient overruns (the device FIFO fills
+    // while we're not reading; a single-shot read gives an unreliable few-hundred-sample power).
+    let block = 8192;
+    let mut blk = vec![num_complex::Complex32::default(); block];
+    let mut sum_pow = 0.0f64;
+    let mut peak = 0.0f32;
+    let mut got = 0usize;
+    let mut overruns = 0u32;
+    let want = (cfg.sample_rate * 200e-3) as usize; // ~200 ms of good samples
     while got < want {
-        match rx.read(&mut buf[got..]) {
+        match rx.read(&mut blk) {
             Ok(0) => break,
-            Ok(n) => got += n,
-            Err(e) => {
-                eprintln!("read error: {e}");
-                break;
+            Ok(n) => {
+                for c in &blk[..n] {
+                    sum_pow += c.norm_sqr() as f64;
+                    peak = peak.max(c.norm());
+                }
+                got += n;
+            }
+            Err(_) => {
+                overruns += 1;
+                if overruns > 100000 {
+                    break;
+                }
             }
         }
     }
-    let avg_pow = buf[..got].iter().map(|c| c.norm_sqr()).sum::<f32>() / got.max(1) as f32;
-    let peak = buf[..got].iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+    let avg_pow = (sum_pow / got.max(1) as f64) as f32;
     println!(
-        "read {got} samples; avg power {avg_pow:.3e} ({:.1} dBFS), peak {peak:.3}",
+        "read {got} samples ({overruns} overruns); avg power {avg_pow:.3e} ({:.1} dBFS), peak {peak:.3}",
         10.0 * avg_pow.max(1e-30).log10()
     );
 }
