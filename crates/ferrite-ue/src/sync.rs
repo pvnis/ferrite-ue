@@ -89,6 +89,12 @@ impl FrameSync {
         self.frame_len
     }
 
+    /// Offset (samples) from a frame boundary to the SSB PSS (candidate 0), i.e. where the PSS
+    /// sits within an aligned frame. Used to re-align a real-SDR stream to the SSB frame.
+    pub fn pss_off(&self) -> usize {
+        self.pss_off
+    }
+
     /// Acquire from a buffer holding at least one full SSB (with headroom for
     /// the PBCH symbols). The buffer should already be centred on the SSB
     /// frequency (post GSCN shift) — see [`gscn_scan`].

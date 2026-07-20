@@ -1176,15 +1176,31 @@ fn run(cfg: Config) {
     // vs the 20 ms SSB period and the channel adds CFO/noise, so capture ≥ 2 SSB periods and
     // RETRY with fresh captures until the MIB decodes.
     let is_sdr = ul.is_sdr();
+    // For SDR, drain the RX continuously from the START of cell search. gscn_scan is slow, and if
+    // we stop reading the SDR while it runs, the device FIFO overruns and drops samples — so the
+    // frame anchor (skip_to_frame) ends up off by the lost samples (observed: ~248 k, a whole
+    // frame of misalignment → DL decodes nothing). Reading the capture from the buffer keeps the
+    // sample position contiguous. ZMQ keeps the lockstep fill_dl + inline serve (the gNB won't
+    // push DL unless we serve UL).
+    let mut dl = Some(dl);
+    let mut sdr_stream = if is_sdr {
+        Some(BufferedStream::spawn(dl.take().unwrap(), block_len))
+    } else {
+        None
+    };
     let cap_len = if is_sdr { frame_len * 3 } else { frame_len * 6 / 5 };
     let (acq, df) = {
         let mut tries = 0u32;
         loop {
             let mut cap: Vec<Complex32> = Vec::with_capacity(cap_len + block_len);
             while cap.len() < cap_len {
-                fill_dl(&mut dl, &mut blk);
+                if let Some(s) = sdr_stream.as_mut() {
+                    s.read_exact(&mut blk).expect("dl stream ended");
+                } else {
+                    fill_dl(dl.as_mut().unwrap(), &mut blk);
+                    serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+                }
                 cap.extend_from_slice(&blk);
-                serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
             }
             if let Some((df, _r, shifted)) = gscn_scan(&cap, fs, center_hz, &searcher) {
                 if let Some(a) = sync.acquire(&shifted) {
@@ -1215,13 +1231,21 @@ fn run(cfg: Config) {
     // Align to the frame boundary.
     let mut to_skip = acq.skip_to_frame;
     while to_skip >= block_len {
-        fill_dl(&mut dl, &mut blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+        if let Some(s) = sdr_stream.as_mut() {
+            s.read_exact(&mut blk).expect("dl stream ended");
+        } else {
+            fill_dl(dl.as_mut().unwrap(), &mut blk);
+            serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+        }
         to_skip -= block_len;
     }
     if to_skip > 0 {
-        fill_dl(&mut dl, &mut blk[..to_skip]);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+        if let Some(s) = sdr_stream.as_mut() {
+            s.read_exact(&mut blk[..to_skip]).expect("dl stream ended");
+        } else {
+            fill_dl(dl.as_mut().unwrap(), &mut blk[..to_skip]);
+            serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+        }
     }
 
     // Hand the DL socket to a dedicated drain thread and read it read-ahead from here on.
@@ -1231,7 +1255,10 @@ fn run(cfg: Config) {
     // background keeps the gNB producing smoothly, absorbing the per-slot jitter (the srsUE
     // radio↔PHY decoupling that lets it hold ~520µs where the tight read→process→serve loop
     // collapses). The gNB's ~1ms TX lead caps the buffer depth, so it stays bounded.
-    let mut dl_stream = BufferedStream::spawn(dl, block_len);
+    // SDR already drains continuously (sdr_stream); ZMQ hands its DL socket to the drain thread now.
+    let mut dl_stream = sdr_stream
+        .take()
+        .unwrap_or_else(|| BufferedStream::spawn(dl.take().unwrap(), block_len));
 
     let blocks_per_slot = slot_len as usize / block_len; // 4
     let align_ul = ul_counter as i64; // first frame-boundary UL position
@@ -1329,6 +1356,8 @@ fn run(cfg: Config) {
 
     let mut pend: Option<(i64, Vec<Complex32>)> = None;
     let mut slot_buf = vec![Complex32::default(); slot_len as usize];
+    let mut frame_fsh = vec![Complex32::default(); frame_len]; // SDR timing diagnostic (freq-shifted frame)
+    let track_dbg = std::env::var_os("FERRITE_TRACK").is_some(); // gates the per-frame SDR PSS/SIB1 traces
     let mut slot_idx = 0u32; // 0..20 within the frame
     // Msg3 launch timing: pos0 (below) lands ~1900 samples late (occ_off models the
     // PRACH RO ~3.5 symbols late + per-run ZMQ startup skew), and the gNB's decode
@@ -1745,8 +1774,42 @@ fn run(cfg: Config) {
     // Precomputed-phasor mixer for the per-slot DL frequency shift (the constant
     // −df to baseband the SSB). Vectorises the hot path that the serial recurrence
     // of `freq_shift` could not — the dominant T0 cost at 20 MHz (~400 µs → ~100 µs).
-    let fsh_shifter = ferrite_ue::sync::FreqShifter::new(-df, fs, slot_len as usize);
+    // Correct the carrier frequency offset (the BladeRF↔gNB clock error — ~−15 kHz over real
+    // RF, ~0 over ZMQ) together with the SSB frequency offset, in ONE continuous freq-shift so
+    // the phase stays continuous across slots (a per-slot `correct_cfo` would reset it). Tracked
+    // and re-applied below as the clocks drift.
+    let mut cfo = acq.cfo_hz;
+    let mut fsh_shifter = ferrite_ue::sync::FreqShifter::new(-df - cfo, fs, slot_len as usize);
     let mut fsh: Vec<Complex32> = Vec::with_capacity(slot_len as usize);
+    // SDR: the slow cell search (gscn_scan × retries) left a large buffered backlog, so the T0
+    // loop would start far behind real time and its memory pressure stalls the drain thread into
+    // overruns → the frame alignment slips. Flush to real time, then RE-ALIGN the SSB frame with a
+    // fast PSS search (df+cfo already known — no GSCN scan). After this the queue stays near-empty
+    // and read_exact is real-time-paced.
+    if is_sdr {
+        let flushed = dl_stream.drain_backlog();
+        // Two frames guarantees a full SSB (period 20 ms) regardless of which frame we land on.
+        let mut fbuf = vec![Complex32::default(); 2 * frame_len];
+        for c in fbuf.chunks_mut(block_len) {
+            dl_stream.read_exact(c).expect("dl stream ended");
+        }
+        // fsh_shifter's table is only slot_len long, so use the length-agnostic freq_shift here.
+        let fbuf_sh = ferrite_ue::sync::freq_shift(&fbuf, -df - cfo, fs, 0);
+        let pss_off = sync.pss_off();
+        match searcher.search(&fbuf_sh) {
+            Some(r) if r.cell_id == acq.cell_id => {
+                let skip = (r.timing_index as i64 - pss_off as i64).rem_euclid(frame_len as i64) as usize;
+                let mut sk = skip;
+                while sk > 0 {
+                    let n = sk.min(block_len);
+                    dl_stream.read_exact(&mut blk[..n]).expect("dl stream ended");
+                    sk -= n;
+                }
+                println!("SDR realign: flushed {flushed} samples, PSS@{}/{frame_len} pss_off={pss_off} → skip {skip}", r.timing_index);
+            }
+            _ => println!("SDR realign: flushed {flushed} samples, but PSS not re-found — proceeding"),
+        }
+    }
 
     loop {
         if perf_pad_us > 0 {
@@ -1821,6 +1884,23 @@ fn run(cfg: Config) {
         let perf_fs = std::time::Instant::now();
         fsh_shifter.shift_into(&slot_buf, slot_start_ul as usize, &mut fsh);
         perf_fs_ns += perf_fs.elapsed().as_nanos() as u64;
+        // SDR timing diagnostic: accumulate a full freq-shifted frame and locate the PSS in it.
+        // The T0 loop assumes the SSB is in slot 0; searching the whole frame shows WHERE the SSB
+        // actually is → the frame-alignment error. (`timing_index` near 0 = aligned to slot 0.)
+        if is_sdr && connected.is_none() && track_dbg {
+            let so = slot_idx as usize * slot_len as usize;
+            let n = slot_len as usize;
+            frame_fsh[so..so + n].copy_from_slice(&fsh[..n]);
+            if slot_idx == 19 {
+                match searcher.search(&frame_fsh) {
+                    Some(r) => eprintln!(
+                        "[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={}/{} cfo_meas={:.0} (applied cfo={:.0})",
+                        r.cell_id, r.pss_metric, r.timing_index, frame_len, r.cfo_hz, cfo
+                    ),
+                    None => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in whole frame"),
+                }
+            }
+        }
         let perf_dm = std::time::Instant::now();
         let mut cgrids = Vec::new();
         let mut off = 0usize;
@@ -2276,6 +2356,11 @@ fn run(cfg: Config) {
                     si_bits = Some(b);
                     break;
                 }
+            }
+            if is_sdr && si_bits.is_none() && slot_idx == 0 && track_dbg {
+                let np: usize = cgrids.iter().map(|g| g.len()).sum();
+                let gp: f32 = cgrids.iter().flat_map(|g| g.iter()).map(|c| c.norm_sqr()).sum::<f32>() / np.max(1) as f32;
+                eprintln!("[sib1] slot0: no SI-RNTI DCI; coreset0 avg |g|^2 = {gp:.5} ({} symb, {np} REs)", cgrids.len());
             }
             if let Some(b) = si_bits {
                 let riv_bits = usize::BITS as usize - ((coreset.n_rb * (coreset.n_rb + 1) / 2) - 1).leading_zeros() as usize;

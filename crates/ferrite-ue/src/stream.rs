@@ -20,17 +20,37 @@ impl BufferedStream {
     /// Spawn the drain thread over `source`, reading `block` samples per call.
     pub fn spawn<S: SampleSource + Send + 'static>(mut source: S, block: usize) -> Self {
         let (tx, rx) = mpsc::channel::<Vec<Iq>>();
+        let overrun_dbg = std::env::var_os("FERRITE_PERF").is_some();
         std::thread::spawn(move || {
             let mut buf = vec![Iq::default(); block];
+            let mut errs = 0u32;
+            let mut total_errs = 0u64;
+            let mut total_ok = 0u64;
             loop {
                 match source.read(&mut buf) {
-                    Ok(0) => break, // end of stream
+                    Ok(0) => break, // end of stream (file source)
                     Ok(n) => {
+                        errs = 0;
+                        total_ok += n as u64;
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break; // consumer dropped
                         }
                     }
-                    Err(_) => break,
+                    // Transient device error — an SDR RX overrun loses the samples that piled up
+                    // but the stream continues, so DON'T kill the pipeline (a hard break here was
+                    // the `dl stream ended` panic on the first overrun). Skip and retry; the lost
+                    // samples are a timing discontinuity that continuous DL tracking re-aligns.
+                    // Only a long run of consecutive errors (device gone) ends the stream.
+                    Err(_) => {
+                        errs += 1;
+                        total_errs += 1;
+                        if overrun_dbg && total_errs % 50 == 0 {
+                            eprintln!("[sdr-rx] {total_errs} overruns / {total_ok} samples read");
+                        }
+                        if errs > 2000 {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -45,6 +65,22 @@ impl BufferedStream {
     /// Absolute stream index of the next sample `read_exact` will return.
     pub fn position(&self) -> usize {
         self.consumed
+    }
+
+    /// Discard everything currently buffered (non-blocking), returning how many samples were
+    /// flushed. Brings a consumer that fell behind during a slow startup (cell search) back to
+    /// (near) real time — otherwise the huge backlog runs the timeline behind and its memory
+    /// pressure stalls the drain thread into overruns. `consumed` still advances, so `position()`
+    /// remains a true absolute sample count and downstream timing stays consistent.
+    pub fn drain_backlog(&mut self) -> usize {
+        let mut flushed = self.pending.len() - self.pos;
+        self.pending.clear();
+        self.pos = 0;
+        while let Ok(chunk) = self.rx.try_recv() {
+            flushed += chunk.len();
+        }
+        self.consumed += flushed;
+        flushed
     }
 
     /// Read exactly `buf.len()` samples (blocking). Errors if the drain thread
