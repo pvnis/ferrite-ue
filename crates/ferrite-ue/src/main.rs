@@ -36,6 +36,66 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 
+/// Downlink sample source: the ZMQ gNB transport (default), or — with the `sdr` feature —
+/// a real SDR RX stream. Both feed the same `BufferedStream` read-ahead + cell search.
+enum DlSource {
+    Zmq(ZmqSource),
+    #[cfg(feature = "sdr")]
+    Sdr(ferrite_radio::seify::SeifyRx),
+}
+
+impl SampleSource for DlSource {
+    fn sample_rate(&self) -> f64 {
+        match self {
+            DlSource::Zmq(s) => s.sample_rate(),
+            #[cfg(feature = "sdr")]
+            DlSource::Sdr(s) => s.sample_rate(),
+        }
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> ferrite_common::Result<usize> {
+        match self {
+            DlSource::Zmq(s) => s.read(buf),
+            #[cfg(feature = "sdr")]
+            DlSource::Sdr(s) => s.read(buf),
+        }
+    }
+}
+
+/// Uplink sample sink: the ZMQ gNB transport (the gNB PULLS in lockstep) — or, with `sdr`, a
+/// real SDR TX stream we PUSH (its TX FIFO paces us; no artificial pace/gate).
+enum UlSink {
+    Zmq(ZmqSink),
+    #[cfg(feature = "sdr")]
+    Sdr(ferrite_radio::seify::SeifyTx),
+}
+
+impl UlSink {
+    /// Serve one uplink block, advancing `counter` by the samples transmitted, and returning
+    /// whether it made progress. ZMQ ignores `block` (the transport owns the block the gNB
+    /// pulled); the SDR pushes `block` via [`ferrite_radio::serve_push`].
+    #[cfg_attr(not(feature = "sdr"), allow(unused_variables))]
+    fn serve_block(
+        &mut self,
+        counter: &mut u64,
+        block: &mut [Complex32],
+        fill: impl Fn(u64, &mut [Complex32]),
+    ) -> bool {
+        match self {
+            UlSink::Zmq(ul) => ul.serve_with(counter, fill).expect("ul serve"),
+            #[cfg(feature = "sdr")]
+            UlSink::Sdr(tx) => ferrite_radio::serve_push(tx, counter, block, fill).expect("ul serve") > 0,
+        }
+    }
+    /// True for the free-running SDR sink (skip the ZMQ pace/gate — the device FIFO paces).
+    fn is_sdr(&self) -> bool {
+        match self {
+            UlSink::Zmq(_) => false,
+            #[cfg(feature = "sdr")]
+            UlSink::Sdr(_) => true,
+        }
+    }
+}
+
 /// Parse a fixed-length hex string into a byte array.
 fn hexn<const N: usize>(s: &str) -> [u8; N] {
     let mut out = [0u8; N];
@@ -85,6 +145,13 @@ struct Config {
     /// sustained DL load to exercise the HARQ-ACK-under-load path without a TUN.
     ping_count: u32,
     ping_interval_ms: u64,
+    /// Real-SDR radio: `--sdr <seify-args>` (e.g. `"driver=soapy,soapy_driver=bladerf"`)
+    /// selects the free-running SDR backend instead of the ZMQ gNB transport. Requires the
+    /// `sdr` build feature; `None` (no `--sdr`) keeps the default ZMQ path.
+    sdr: Option<String>,
+    /// Fixed device RX→TX sample offset applied to the uplink timeline (loopback latency,
+    /// calibrated once per device). SDR only.
+    sdr_rxtx_offset: i64,
 }
 
 impl Config {
@@ -113,6 +180,8 @@ impl Config {
             tun_mtu: arg("--tun-mtu", "1400").parse().unwrap(),
             ping_count: arg("--ping-count", "20").parse().unwrap(),
             ping_interval_ms: arg("--ping-interval-ms", "1000").parse().unwrap(),
+            sdr: arg_opt("--sdr"),
+            sdr_rxtx_offset: arg("--sdr-rxtx-offset", "0").parse().unwrap(),
         }
     }
 }
@@ -962,7 +1031,7 @@ fn run(cfg: Config) {
     let Config {
         tx, rx, fs, center_hz, preamble, amp, sweep0, msg3_delay, fshift,
         toff_lo, toff_hi, toff_step, imsi, ki, opc, snn, ue_ip, ping_target,
-        tun, netns, tun_mtu, ping_count, ping_interval_ms,
+        tun, netns, tun_mtu, ping_count, ping_interval_ms, sdr, sdr_rxtx_offset,
     } = cfg;
 
     let fft = (fs / 30_000.0).round() as usize;
@@ -1005,12 +1074,37 @@ fn run(cfg: Config) {
 
     let block_len = 1920usize;
     let slot_len = (frame_len / 20) as i64;
-    let mut ul = ZmqSink::bind(&rx, fs, block_len).expect("bind UL");
-    let mut dl = ZmqSource::connect(&tx, fs, 5_000).expect("connect DL");
+    // Radio backend: default ZMQ gNB transport, or a real SDR (`--sdr`, feature `sdr`). The
+    // SDR streamers Arc-clone the device, so `SeifyRadio` can be dropped after handing them out.
+    let (mut dl, mut ul): (DlSource, UlSink) = if let Some(sdr_args) = &sdr {
+        #[cfg(feature = "sdr")]
+        {
+            use ferrite_radio::seify::{SeifyConfig, SeifyRadio};
+            let radio = SeifyRadio::open(&SeifyConfig {
+                args: sdr_args.clone(),
+                sample_rate: fs,
+                frequency: center_hz,
+                ..Default::default()
+            })
+            .expect("open SDR");
+            println!("SDR radio: args={sdr_args:?} rate={fs} Hz freq={center_hz} Hz rxtx_offset={sdr_rxtx_offset}");
+            (DlSource::Sdr(radio.rx().expect("SDR rx")), UlSink::Sdr(radio.tx().expect("SDR tx")))
+        }
+        #[cfg(not(feature = "sdr"))]
+        {
+            let _ = sdr_args;
+            panic!("--sdr given but this binary was not built with --features sdr");
+        }
+    } else {
+        (
+            DlSource::Zmq(ZmqSource::connect(&tx, fs, 5_000).expect("connect DL")),
+            UlSink::Zmq(ZmqSink::bind(&rx, fs, block_len).expect("bind UL")),
+        )
+    };
     let mut ul_counter = 0u64;
     let mut blk = vec![Complex32::default(); block_len];
 
-    let fill_dl = |dl: &mut ZmqSource, blk: &mut [Complex32]| {
+    let fill_dl = |dl: &mut DlSource, blk: &mut [Complex32]| {
         let mut got = 0;
         while got < blk.len() {
             // The ZMQ DL socket is non-blocking: at startup the gNB may not be producing yet
@@ -1029,14 +1123,15 @@ fn run(cfg: Config) {
     // Uplink fill = periodic PRACH (base + offset) + Msg3 burst (`pend`) + PUCCH
     // HARQ-ACK burst (`pend_pucch`). Msg3 (PRB 4-6) and PUCCH (PRB 0/23) never
     // overlap in frequency, so both can be present in the same UL slot.
-    let serve = |ul: &mut ZmqSink,
+    let serve = |ul: &mut UlSink,
                  counter: &mut u64,
                  base: i64,
                  bursts: &[&Option<(i64, Vec<Complex32>)>],
                  acks: &[(i64, Vec<Complex32>)],
                  uls: &[(i64, Vec<Complex32>)]| {
-        loop {
-            let ok = ul.serve_with(counter, |c, block| {
+        let mut sblk = vec![Complex32::default(); block_len];
+        // ZMQ retries until the gNB requests the block; the SDR serves it in one push.
+        while !ul.serve_block(counter, &mut sblk, |c, block| {
                 let (c, bl) = (c as i64, block.len() as i64);
                 let k0 = ((c - prach_len - base).div_euclid(frame_len as i64)).max(0);
                 for kk in k0..=k0 + 1 {
@@ -1072,21 +1167,43 @@ fn run(cfg: Config) {
                 for (pos, wave) in uls {
                     place(*pos, wave, block);
                 }
-            }).expect("ul");
-            if ok { break; }
-        }
+        }) {}
     };
 
     // Sync.
-    let cap_len = frame_len * 6 / 5;
-    let mut cap: Vec<Complex32> = Vec::with_capacity(cap_len + block_len);
-    while cap.len() < cap_len {
-        fill_dl(&mut dl, &mut blk);
-        cap.extend_from_slice(&blk);
-        serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
-    }
-    let (df, _r, shifted) = gscn_scan(&cap, fs, center_hz, &searcher).expect("no SSB");
-    let acq = sync.acquire(&shifted).expect("acquire");
+    // Cell search: capture, then acquire the SSB (PSS/SSS/MIB). Over ZMQ the gNB's DL is
+    // deterministic, so one short capture suffices. Over a real SDR the capture timing is random
+    // vs the 20 ms SSB period and the channel adds CFO/noise, so capture ≥ 2 SSB periods and
+    // RETRY with fresh captures until the MIB decodes.
+    let is_sdr = ul.is_sdr();
+    let cap_len = if is_sdr { frame_len * 3 } else { frame_len * 6 / 5 };
+    let (acq, df) = {
+        let mut tries = 0u32;
+        loop {
+            let mut cap: Vec<Complex32> = Vec::with_capacity(cap_len + block_len);
+            while cap.len() < cap_len {
+                fill_dl(&mut dl, &mut blk);
+                cap.extend_from_slice(&blk);
+                serve(&mut ul, &mut ul_counter, i64::MAX / 2, &[], &[], &[]);
+            }
+            if let Some((df, _r, shifted)) = gscn_scan(&cap, fs, center_hz, &searcher) {
+                if let Some(a) = sync.acquire(&shifted) {
+                    println!("synced PCI {} (SSB df={df:.0} Hz, cfo={:.0} Hz)", a.cell_id, a.cfo_hz);
+                    break (a, df);
+                }
+            }
+            tries += 1;
+            if is_sdr && tries % 8 == 0 {
+                println!("cell search: {tries} attempts (SSB seen but MIB not decoded) — still searching…");
+            }
+            if !is_sdr && tries >= 4 {
+                panic!("no SSB / MIB (ZMQ) after {tries} attempts");
+            }
+            if tries >= 300 {
+                panic!("cell search failed after {tries} attempts");
+            }
+        }
+    };
     let k_ssb = (acq.mib.k_ssb_msb << 4) | acq.mib.ssb_subcarrier_offset;
     let coreset = Coreset0::from_index_30_30_minbw5_10(acq.mib.pdcch_config_sib1 >> 4).expect("coreset0");
     let first_sc = coreset.first_subcarrier_rel_ssb_centre(k_ssb);
@@ -1159,22 +1276,30 @@ fn run(cfg: Config) {
         std::thread::Builder::new().name("ferrite-radio".into()).spawn(move || {
             set_rt_thread(4, 25, "radio");
             let start = std::time::Instant::now();
-            let mut c = align_ul as u64;
+            let mut sblk = vec![Complex32::default(); block_len];
+            let sdr = ul.is_sdr();
+            // SDR uplink timeline = the RX/DL frame shifted by the fixed device RX→TX loopback
+            // latency (a per-device calibration constant); ZMQ is lockstep, no shift.
+            let mut c = (align_ul + if sdr { sdr_rxtx_offset } else { 0 }) as u64;
             loop {
-                // Gate: don't serve a block T0 hasn't reached yet (+lead). This paces the gNB to
-                // T0's DL consumption and keeps the buffer bounded, without T0 doing the serve.
-                while c as i64 > t0_pos_t.load(Rlx) + lead {
-                    std::thread::sleep(std::time::Duration::from_micros(20));
-                }
-                // Pace: never serve faster than the target rate (caps the gNB to ~real time).
-                let served = (c as i64 - align_ul).max(0) as f64;
-                let target = std::time::Duration::from_secs_f64(served / fs * pace_ratio);
-                let el = start.elapsed();
-                if el < target {
-                    std::thread::sleep(target - el);
+                // ZMQ: the gNB is the clock — gate the serve to T0's DL consumption (+lead) and
+                // pace to real time (caps the gNB's rate, keeps its buffer bounded). SDR: the
+                // device TX FIFO is the clock and backpressures serve_block, so NO gate/pace
+                // (stalling here would underflow the device; a slot T0 hasn't produced yet just
+                // serves silence = a deadline miss, the free-running graceful-degradation path).
+                if !sdr {
+                    while c as i64 > t0_pos_t.load(Rlx) + lead {
+                        std::thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                    let served = (c as i64 - align_ul).max(0) as f64;
+                    let target = std::time::Duration::from_secs_f64(served / fs * pace_ratio);
+                    let el = start.elapsed();
+                    if el < target {
+                        std::thread::sleep(target - el);
+                    }
                 }
                 let ok = ul
-                    .serve_with(&mut c, |cc, block| {
+                    .serve_block(&mut c, &mut sblk, |cc, block| {
                         let (cc, bl) = (cc as i64, block.len() as i64);
                         let base = prach_base_t.load(Rlx);
                         if base < i64::MAX / 4 {
@@ -1190,8 +1315,7 @@ fn run(cfg: Config) {
                             }
                         }
                         inj_t.lock().unwrap().fill(cc, block);
-                    })
-                    .expect("ul serve");
+                    });
                 if ok {
                     ul_pos_t.store(c as i64, Rlx);
                 }

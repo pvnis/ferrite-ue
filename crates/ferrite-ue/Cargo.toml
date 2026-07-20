@@ -7,6 +7,11 @@ license.workspace = true
 # are milestone-specific test/debug harnesses.
 default-run = "ferrite-ue"
 
+[features]
+# Real-SDR radio backend (seify → SoapySDR: BladeRF 2.0, USRP, …). Off by default;
+# the UE runs against the ZMQ gNB unless built with `--features sdr` and run with `--sdr`.
+sdr = ["ferrite-radio/seify"]
+
 [dependencies]
 ferrite-common.workspace = true
 ferrite-phy.workspace = true
