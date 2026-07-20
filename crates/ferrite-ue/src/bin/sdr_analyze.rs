@@ -178,19 +178,22 @@ fn main() {
         println!("sc {sc_lo:>5}: {db:6.1} dB {}", "#".repeat(bars));
     }
 
-    // 2) Per-symbol total power over the CORESET0 band, slot 0 & slot 1, frame 0 —
-    //    shows which symbols carry the SSB vs CORESET.
-    println!("\n=== per-symbol power in CORESET0 band (frame 0) ===");
-    for slot in 0..2usize {
+    // 2) Per-slot × per-symbol RMS amplitude in the CORESET0 band (first_sc, 288 sc) for the
+    //    SSB frame — a PDCCH shows as elevated energy at symbols {0..n_symb} of the SIB1 slot.
+    //    If NO slot has CORESET0-band energy in symbols 0-1, the CORESET0 frequency (first_sc)
+    //    is wrong or the monitoring occasion is elsewhere.
+    // Full-carrier band: sc -153..+459 (51 RB centred at the carrier +153), excluding ±3 DC bins
+    // (LO leakage). Shows which (slot,symbol) actually carries a transmission.
+    let carr_amp = |g: &[Complex32], _l: usize| -> f64 {
+        let mut p = 0f64; let mut n = 0u32;
+        for sc in -153i32..459 { if sc.abs() > 3 { p += g[((sc).rem_euclid(fft as i32)) as usize].norm_sqr() as f64; n += 1; } }
+        (p / n.max(1) as f64).sqrt()
+    };
+    println!("\n=== full-carrier RMS amp, SSB frame {fsel}, all 20 slots (sym 0..13) ===");
+    for slot in 0..20usize {
         let g = demod(fr, slot);
-        let mut line = format!("slot {slot}: ");
-        for l in 0..14 {
-            let mut p = 0f64;
-            for sc in 0..(coreset.n_rb * 12) as i32 {
-                p += g[l][sc_to_bin(sc)].norm_sqr() as f64;
-            }
-            line.push_str(&format!("{:5.2} ", (p / (coreset.n_rb * 12) as f64).sqrt()));
-        }
+        let mut line = format!("slot {slot:>2}: ");
+        for l in 0..14 { line.push_str(&format!("{:4.2} ", carr_amp(&g[l], l))); }
         println!("{line}");
     }
 

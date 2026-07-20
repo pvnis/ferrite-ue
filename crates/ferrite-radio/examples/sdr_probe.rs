@@ -71,4 +71,27 @@ fn main() {
         "read {got} samples ({overruns} overruns); avg power {avg_pow:.3e} ({:.1} dBFS), peak {peak:.3}",
         10.0 * avg_pow.max(1e-30).log10()
     );
+
+    // Optional raw record: args[5]=output file, args[6]=seconds (default 1.0). Reads straight into
+    // RAM (no per-block work) so the SDR FIFO doesn't overrun, then writes once — a clean, gap-free
+    // capture for full offline cell-search + SIB1 decode. Interleaved f32 (re,im), no header.
+    if let Some(out) = a.get(5) {
+        use std::io::Write;
+        let secs: f64 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let total = (cfg.sample_rate * secs) as usize;
+        println!("recording {secs}s ({total} samples) to {out} ...");
+        let mut rec: Vec<num_complex::Complex32> = Vec::with_capacity(total + block);
+        let mut ov = 0u64;
+        while rec.len() < total {
+            match rx.read(&mut blk) {
+                Ok(0) => break,
+                Ok(n) => rec.extend_from_slice(&blk[..n]),
+                Err(_) => { ov += 1; if ov > 1_000_000 { break; } }
+            }
+        }
+        let mut bytes = Vec::with_capacity(rec.len() * 8);
+        for c in &rec { bytes.extend(c.re.to_le_bytes()); bytes.extend(c.im.to_le_bytes()); }
+        std::fs::File::create(out).and_then(|mut f| f.write_all(&bytes)).expect("write recording");
+        println!("recorded {} samples ({ov} overruns) -> {out}", rec.len());
+    }
 }
