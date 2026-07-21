@@ -1331,8 +1331,14 @@ fn run(cfg: Config) {
         std::thread::Builder::new().name("ferrite-radio".into()).spawn(move || {
             set_rt_thread(4, 25, "radio");
             let start = std::time::Instant::now();
-            let mut sblk = vec![Complex32::default(); block_len];
             let sdr = ul.is_sdr();
+            // A real USB SDR TX needs large writes: block_len (1920) per SeifyTx::write has too
+            // much per-call overhead to feed 30.72 Msps → the TX FIFO underflows 97% of the time
+            // (garbage on air, gNB sees nothing). Larger blocks keep the DAC fed. ZMQ keeps block_len.
+            let tx_block = if sdr { 16384 } else { block_len };
+            let mut sblk = vec![Complex32::default(); tx_block];
+            let txdbg = std::env::var_os("FERRITE_TXDBG").is_some();
+            let (mut txdbg_ok, mut txdbg_fail) = (0u64, 0u64);
             // SDR uplink timeline = the RX/DL frame shifted by the fixed device RX→TX loopback
             // latency (a per-device calibration constant); ZMQ is lockstep, no shift.
             let mut c = (align_ul + if sdr { sdr_rxtx_offset } else { 0 }) as u64;
@@ -1373,6 +1379,16 @@ fn run(cfg: Config) {
                     });
                 if ok {
                     ul_pos_t.store(c as i64, Rlx);
+                    txdbg_ok += 1;
+                } else {
+                    txdbg_fail += 1;
+                }
+                if txdbg && txdbg_ok + txdbg_fail >= 2000 {
+                    let base = prach_base_t.load(Rlx);
+                    let peak = sblk.iter().map(|s| s.norm()).fold(0.0f32, f32::max);
+                    eprintln!("[tx] c={c} served_ok={txdbg_ok} fail={txdbg_fail} last_block_peak={peak:.3} prach_base={base}");
+                    txdbg_ok = 0;
+                    txdbg_fail = 0;
                 }
             }
         })
