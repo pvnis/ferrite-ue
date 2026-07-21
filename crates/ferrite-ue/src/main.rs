@@ -1193,8 +1193,14 @@ fn run(cfg: Config) {
     // sample position contiguous. ZMQ keeps the lockstep fill_dl + inline serve (the gNB won't
     // push DL unless we serve UL).
     let mut dl = Some(dl);
+    // The SDR drain thread reads this many samples per SeifyRx::read. block_len (1920) is too
+    // small for a real USB SDR — the per-read overhead makes the drain thread fall behind the
+    // 30.72 Msps stream and the device FIFO overruns, dropping samples mid-capture and destroying
+    // PSS coherence (cell search then locks a spurious peak). A larger block keeps it fed. The
+    // consumer still reads at its own granularity (read_exact), so this only affects drain I/O.
+    let sdr_drain_block = 32768usize;
     let mut sdr_stream = if is_sdr {
-        Some(BufferedStream::spawn(dl.take().unwrap(), block_len))
+        Some(BufferedStream::spawn(dl.take().unwrap(), sdr_drain_block))
     } else {
         None
     };
@@ -1202,6 +1208,13 @@ fn run(cfg: Config) {
     let (acq, df) = {
         let mut tries = 0u32;
         loop {
+            // SDR: drain the backlog to real time before each capture. gscn_scan is slow, so while
+            // it runs the unbounded drain queue grows; the memory pressure then stalls the drain
+            // thread into SDR overruns, which drop samples mid-capture and corrupt the SSB (weak
+            // PSS → cell search locks a spurious peak). A fresh drain gives a clean, gap-free window.
+            if let Some(s) = sdr_stream.as_mut() {
+                s.drain_backlog();
+            }
             let mut cap: Vec<Complex32> = Vec::with_capacity(cap_len + block_len);
             while cap.len() < cap_len {
                 if let Some(s) = sdr_stream.as_mut() {
@@ -1374,6 +1387,13 @@ fn run(cfg: Config) {
     let mut frame_fsh = vec![Complex32::default(); frame_len]; // SDR timing diagnostic (freq-shifted frame)
     let dump_path = std::env::var("FERRITE_DUMP").ok(); // dump aligned freq-shifted frames for offline analysis
     let mut dump_n = 0u32;
+    // SDR timing tracking: the BladeRF↔gNB sample-clock offset drifts the frame alignment ~1.3
+    // samples/frame (unbounded). Aligning once at startup then drifting means that by the time
+    // SIB1 arrives (slot 1, every 160 ms) the CORESET timing is ~20 samples off and the PDCCH
+    // won't decode. Re-measure the PSS position each SSB frame and skip the residual so the
+    // alignment stays within a few samples. `pending_skip` is consumed at the next frame boundary.
+    let mut pending_skip: usize = 0;
+    let pss_off_samps = sync.pss_off(); // PSS position within an aligned frame (slot-0 offset)
     let track_dbg = std::env::var_os("FERRITE_TRACK").is_some(); // gates the per-frame SDR PSS/SIB1 traces
     let mut slot_idx = 0u32; // 0..20 within the frame
     // Msg3 launch timing: pos0 (below) lands ~1900 samples late (occ_off models the
@@ -1904,6 +1924,12 @@ fn run(cfg: Config) {
                 }
             }
         }
+        // SDR timing tracking: at the frame boundary, skip the measured PSS drift to re-center
+        // the alignment (keeps the CORESET timing within a few samples over the 160 ms SIB1 period).
+        if is_sdr && slot_idx == 0 && pending_skip > 0 {
+            dl_stream.skip(pending_skip).expect("dl stream ended");
+            pending_skip = 0;
+        }
         // Read one slot of DL, serving UL (PRACH + pending Msg3) in lockstep.
         // PRACH base = first frame boundary + occasion offset + sweep offset.
         let perf_io = std::time::Instant::now();
@@ -1922,17 +1948,32 @@ fn run(cfg: Config) {
         // SDR timing diagnostic: accumulate a full freq-shifted frame and locate the PSS in it.
         // The T0 loop assumes the SSB is in slot 0; searching the whole frame shows WHERE the SSB
         // actually is → the frame-alignment error. (`timing_index` near 0 = aligned to slot 0.)
-        if is_sdr && connected.is_none() && track_dbg {
+        if is_sdr && connected.is_none() {
             let so = slot_idx as usize * slot_len as usize;
             let n = slot_len as usize;
             frame_fsh[so..so + n].copy_from_slice(&fsh[..n]);
             if slot_idx == 19 {
-                match searcher.search(&frame_fsh) {
-                    Some(r) => eprintln!(
-                        "[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={}/{} cfo_meas={:.0} (applied cfo={:.0})",
-                        r.cell_id, r.pss_metric, r.timing_index, frame_len, r.cfo_hz, cfo
-                    ),
-                    None => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in whole frame"),
+                let found = searcher.search(&frame_fsh);
+                // Timing tracking: on a real SSB frame, re-center the alignment by skipping the
+                // positive PSS drift at the next frame boundary (the clock offset only ever pushes
+                // the PSS later, so a forward skip suffices; a small skip is absorbed by the freq-
+                // shifter's constant per-slot phase and by the RACH toff sweep).
+                if let Some(r) = &found {
+                    if r.cell_id == acq.cell_id && r.pss_metric > 0.5 {
+                        let err = r.timing_index as i64 - pss_off_samps as i64;
+                        if (3..slot_len).contains(&err) {
+                            pending_skip = err as usize;
+                        }
+                    }
+                }
+                if track_dbg {
+                    match &found {
+                        Some(r) => eprintln!(
+                            "[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={}/{} cfo_meas={:.0} (applied cfo={:.0}) skip={pending_skip}",
+                            r.cell_id, r.pss_metric, r.timing_index, frame_len, r.cfo_hz, cfo
+                        ),
+                        None => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in whole frame"),
+                    }
                 }
                 // Dump the first few aligned freq-shifted frames (raw interleaved f32 IQ) for
                 // offline spectrum/correlation analysis (the fastest way to see whether the SIB1
@@ -2409,7 +2450,7 @@ fn run(cfg: Config) {
                     break;
                 }
             }
-            if is_sdr && si_bits.is_none() && slot_idx == 0 && track_dbg {
+            if is_sdr && si_bits.is_none() && slot_idx == 1 && track_dbg {
                 // Locate the SIB1 PDCCH by 2D sweep over (start-symbol l0, frequency offset
                 // delta subcarriers): demod symbols 0..8 of slot 0, then for each (l0,delta)
                 // correlate the received CORESET-region grid against the expected PDCCH DMRS
@@ -2447,7 +2488,7 @@ fn run(cfg: Config) {
                         if c > best.2 { best = (l0, delta, c); }
                     }
                 }
-                eprintln!("[sib1] slot0 sfn_par={}: no DCI; corr(l0=0,d=0)={:.3}; PEAK corr={:.3} @ l0={} delta={}",
+                eprintln!("[sib1] slot1 sfn_par={}: no DCI; corr(l0=0,d=0)={:.3}; PEAK corr={:.3} @ l0={} delta={}",
                     (slot_start_ul / slot_len / 20) % 2, corr_at(0, 0), best.2, best.0, best.1);
             }
             if let Some(b) = si_bits {

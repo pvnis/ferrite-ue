@@ -220,10 +220,23 @@ pub fn gscn_scan(
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().unwrap())
-            .max_by(|(_, a, _), (_, b, _)| a.pss_metric.partial_cmp(&b.pss_metric).unwrap())
+        let mut cands: Vec<(f64, CellSearchResult, Vec<Complex32>)> =
+            handles.into_iter().filter_map(|h| h.join().unwrap()).collect();
+        // Strongest PSS peak first.
+        cands.sort_by(|(_, a, _), (_, b, _)| b.pss_metric.partial_cmp(&a.pss_metric).unwrap());
+        // Prefer the strongest candidate whose MIB (PBCH) actually decodes. A spurious PSS peak
+        // (noise / an LO image / an adjacent signal) can out-correlate the real SSB — picking the
+        // max metric alone then locks a df with no decodable cell and cell search never converges.
+        // Verifying the MIB rejects those. Fall back to the strongest peak if none decode (a weak
+        // real SSB whose PBCH is marginal — the caller retries on a fresh capture).
+        if let Some(found) = cands.iter().find(|(_, r, shifted)| {
+            let mut corrected = shifted.clone();
+            correct_cfo(&mut corrected, r.cfo_hz, fs);
+            searcher.decode_mib(&corrected, r).is_some()
+        }) {
+            return Some(found.clone());
+        }
+        cands.into_iter().next()
     })
 }
 
