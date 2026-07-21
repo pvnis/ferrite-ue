@@ -51,10 +51,32 @@ fn main() {
     let slot_len = frame_len / 20;
     let ofdm = Ofdm::new(fft);
 
-    // Cell search on the first ~1.2 frames.
-    let cap = &iq[..(frame_len * 6 / 5).min(iq.len())];
-    let (df, _r, shifted) = gscn_scan(cap, fs, center_hz, &searcher).expect("no SSB");
-    let acq = sync.acquire(&shifted).expect("acquire");
+    // Cell search: find df ONCE with gscn_scan (expensive raster scan), then retry the cheap
+    // acquire() over sliding windows — a single window can clip the SSB or land where
+    // pss_pos < pss_off, both of which make acquire() return None.
+    let cap_len = (frame_len * 6 / 5).min(iq.len());
+    let df_override: f64 = arg("--df", "0").parse().unwrap(); // Hz; nonzero overrides gscn_scan
+    let df = if df_override != 0.0 { df_override } else {
+        let mut df = None;
+        for start in (0..iq.len().saturating_sub(cap_len)).step_by(frame_len).take(8) {
+            if let Some((d, _r, _s)) = gscn_scan(&iq[start..start + cap_len], fs, center_hz, &searcher) { df = Some(d); break; }
+        }
+        df.unwrap_or_else(|| { eprintln!("cell search FAILED: no PSS found in any window"); std::process::exit(2); })
+    };
+    let (acq, cap_start) = {
+        let mut result = None;
+        let mut acq_tries = 0u32;
+        for start in (0..iq.len().saturating_sub(cap_len)).step_by(frame_len / 4).take(60) {
+            acq_tries += 1;
+            let shifted = freq_shift(&iq[start..start + cap_len], -df, fs, 0);
+            if let Some(acq) = sync.acquire(&shifted) { result = Some((acq, start)); break; }
+        }
+        match result {
+            Some(r) => r,
+            None => { eprintln!("cell search FAILED: PSS present (df={df}) but MIB never decoded over {acq_tries} windows"); std::process::exit(2); }
+        }
+    };
+    eprintln!("[cell] acquired from window @ {cap_start} (df={df})");
     let cell_id = acq.cell_id;
     let mib = acq.mib;
     let cfo = acq.cfo_hz;
@@ -110,7 +132,7 @@ fn main() {
     // skip_to_frame is relative to the END of the acquisition buffer `cap`, so the first
     // aligned frame starts at cap.len() + skip_to_frame (cap.len() = frame_len·6/5 = 1 frame +
     // 4 slots; omitting it put the SSB at "slot 4" and offset every slot number by 4).
-    let mut pos = cap.len() + acq.skip_to_frame;
+    let mut pos = cap_start + cap_len + acq.skip_to_frame;
     let mut frame_no = 0usize;
     let mut decoded = 0u32;
     let mut dci_hits = 0u32;
