@@ -107,7 +107,10 @@ fn main() {
     let mut cen = vec![[0f64; 14]; 20];
     let mut cen_n = 0u32;
 
-    let mut pos = acq.skip_to_frame;
+    // skip_to_frame is relative to the END of the acquisition buffer `cap`, so the first
+    // aligned frame starts at cap.len() + skip_to_frame (cap.len() = frame_len·6/5 = 1 frame +
+    // 4 slots; omitting it put the SSB at "slot 4" and offset every slot number by 4).
+    let mut pos = cap.len() + acq.skip_to_frame;
     let mut frame_no = 0usize;
     let mut decoded = 0u32;
     let mut dci_hits = 0u32;
@@ -134,9 +137,13 @@ fn main() {
             continue;
         }
         // Search every slot (fine-timing ±16) for the SI-RNTI DCI.
+        // fine-timing offsets, iterated by increasing |d| so the reported d is the true centre
+        // (SIB1 decodes at d=0 with correct alignment; the sweep just adds drift tolerance).
+        let mut ds: Vec<i64> = (-16i64..=16).step_by(4).collect();
+        ds.sort_by_key(|d| d.abs());
         for slot in 0..20u32 {
             let mut found: Option<(i64, Vec<u8>)> = None;
-            'd: for d in (-16i64..=16).step_by(4) {
+            'd: for &d in &ds {
                 let cg = demod_cs(&fsh, slot as usize, d);
                 for cand in &cands {
                     let mut m = equalize_candidate(&cg, |sc: usize| sc_to_bin(sc as i32), &coreset, cell_id, slot, cand);
