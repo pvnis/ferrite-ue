@@ -83,6 +83,30 @@ fn main() {
         g
     };
 
+    // --census: instead of decoding, accumulate per-(slot,symbol) carrier energy over ALL frames
+    // to map the gNB's complete transmission structure (SSB / CSI-RS / TRS / any PDCCH-PDSCH) and
+    // quantify the SSB-vs-CORESET0 power gap. Full-slot (14-symbol) demod.
+    let census = std::env::args().any(|a| a == "--census");
+    let demod_full = |fsh: &[Complex32], slot: usize| -> Vec<Vec<Complex32>> {
+        let mut off = (slot * slot_len) as i64;
+        let mut g = Vec::new();
+        for l in 0..14 {
+            let cp = ofdm.cp_len((slot % 2) * 14 + l, 1);
+            let s = off.max(0) as usize;
+            g.push(if s + cp + fft <= fsh.len() { ofdm.demodulate_symbol(&fsh[s..], cp) } else { vec![Complex32::default(); fft] });
+            off += (cp + fft) as i64;
+        }
+        g
+    };
+    // mean |g|^2 over the carrier (sc -153..459, excl |sc|<=3 to skip LO/DC leakage).
+    let carrier_pow = |g: &[Complex32]| -> f64 {
+        let mut p = 0f64; let mut n = 0u32;
+        for sc in -153i32..459 { if sc.abs() > 3 { p += g[sc.rem_euclid(fft as i32) as usize].norm_sqr() as f64; n += 1; } }
+        p / n.max(1) as f64
+    };
+    let mut cen = vec![[0f64; 14]; 20];
+    let mut cen_n = 0u32;
+
     let mut pos = acq.skip_to_frame;
     let mut frame_no = 0usize;
     let mut decoded = 0u32;
@@ -93,6 +117,22 @@ fn main() {
         let fsh = freq_shift(frame, -df - cfo, fs, pos);
         let rep = sync.track(&fsh);
         let sfn = rep.as_ref().map(|r| r.sfn);
+        if census {
+            if frame_no < 3 {
+                if let Some(r) = searcher.search(&fsh) {
+                    eprintln!("[census] frame {frame_no}: PSS @ {}/{frame_len} = slot {} (metric {:.2})", r.timing_index, r.timing_index / slot_len, r.pss_metric);
+                }
+            }
+            for slot in 0..20usize {
+                let g = demod_full(&fsh, slot);
+                for l in 0..14 { cen[slot][l] += carrier_pow(&g[l]); }
+            }
+            cen_n += 1;
+            pos = match rep { Some(r) => (pos as i64 + frame_len as i64 + r.timing_err).max(0) as usize, None => pos + frame_len };
+            frame_no += 1;
+            if frame_no >= n_frames { break; }
+            continue;
+        }
         // Search every slot (fine-timing ±16) for the SI-RNTI DCI.
         for slot in 0..20u32 {
             let mut found: Option<(i64, Vec<u8>)> = None;
@@ -146,6 +186,39 @@ fn main() {
         pos = match rep { Some(r) => (pos as i64 + frame_len as i64 + r.timing_err).max(0) as usize, None => pos + frame_len };
         frame_no += 1;
         if frame_no >= n_frames { break; }
+    }
+    if census {
+        // Convert to dB relative to the quietest (slot,symbol) = the noise floor.
+        for c in cen.iter_mut() { for v in c.iter_mut() { *v /= cen_n.max(1) as f64; } }
+        let floor = cen.iter().flatten().cloned().fold(f64::INFINITY, f64::min).max(1e-30);
+        println!("\n=== transmission census over {cen_n} frames: carrier power per (slot,symbol), dB above noise ===");
+        println!("        {}", (0..14).map(|l| format!("s{l:<2}")).collect::<String>());
+        for slot in 0..20 {
+            let row: String = (0..14).map(|l| {
+                let db = 10.0 * (cen[slot][l] / floor).log10();
+                if db < 3.0 { "  . ".to_string() } else { format!("{db:3.0} ") }
+            }).collect();
+            println!("slot {slot:>2}: {row}");
+        }
+        // Auto-detect the SSB slot = the slot with the strongest 4-consecutive-symbol block
+        // (sym s..s+4), then report the SSB vs its own CORESET0 (sym s-2..s) power gap.
+        let ssb_slot = (0..20).max_by(|&a, &b| {
+            let blk = |sl: usize| (0..11).map(|s| (0..4).map(|k| cen[sl][s + k]).sum::<f64>()).fold(0.0, f64::max);
+            blk(a).partial_cmp(&blk(b)).unwrap()
+        }).unwrap();
+        let ssb_sym = (0..11).max_by(|&a, &b| {
+            let e = |s: usize| (0..4).map(|k| cen[ssb_slot][s + k]).sum::<f64>();
+            e(a).partial_cmp(&e(b)).unwrap()
+        }).unwrap();
+        let ssb = (ssb_sym..ssb_sym + 4).map(|l| cen[ssb_slot][l]).sum::<f64>() / 4.0;
+        // CORESET0 is 2 symbols just before the SSB (multiplexing pattern 1, ss0=0).
+        let cs0 = if ssb_sym >= 2 { (ssb_sym - 2..ssb_sym).map(|l| cen[ssb_slot][l]).sum::<f64>() / 2.0 } else { floor };
+        println!("\nSSB detected at slot {ssb_slot}, sym {ssb_sym}-{}: {:.1} dB above noise", ssb_sym + 3, 10.0 * (ssb / floor).log10());
+        println!("CORESET0 (slot {ssb_slot}, sym {}-{}) = {:.1} dB above noise; SSB-to-CORESET0 gap = {:.1} dB",
+            ssb_sym.saturating_sub(2), ssb_sym.saturating_sub(1), 10.0 * (cs0 / floor).log10(), 10.0 * (ssb / cs0.max(floor)).log10());
+        println!("(PDCCH/PDSCH → block of >3 dB cells; CSI-RS/TRS → isolated symbols. A ~equal SSB/CORESET0");
+        println!(" gap would mean the PDCCH is present; a large gap means the SIB1 PDCCH is not transmitted.)");
+        return;
     }
     println!("\nscanned {frame_no} frames: {dci_hits} SI-RNTI DCI hits, {decoded} SIB1 CRC-OK decodes");
     if decoded == 0 { std::process::exit(1); }
