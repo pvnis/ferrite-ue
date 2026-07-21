@@ -1996,19 +1996,23 @@ fn run(cfg: Config) {
         // SSB is in slot 0 every other frame; on no-SSB frames the metric is low and we skip.
         if is_sdr && connected.is_none() {
             if slot_idx == 0 {
-                let a = pss_off_samps.saturating_sub(256);
-                let win = &fsh[a..(a + 2560).min(fsh.len())];
-                if let Some(r) = searcher.search(win) {
-                    if r.cell_id == acq.cell_id && r.pss_metric > 0.5 {
-                        let err = (a + r.timing_index) as i64 - pss_off_samps as i64;
-                        if (3..slot_len).contains(&err) {
-                            pending_skip = err as usize;
+                let a = pss_off_samps.saturating_sub(1024);
+                let win = &fsh[a..(a + 4096).min(fsh.len())];
+                match searcher.search(win) {
+                    Some(r) => {
+                        if r.cell_id == acq.cell_id && r.pss_metric > 0.4 {
+                            let err = (a + r.timing_index) as i64 - pss_off_samps as i64;
+                            if (3..slot_len).contains(&err) {
+                                pending_skip = err as usize;
+                            }
                         }
                         if track_dbg {
-                            eprintln!("[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={} (off {pss_off_samps}) skip={pending_skip}",
-                                r.cell_id, r.pss_metric, a + r.timing_index);
+                            eprintln!("[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pos={} (want {pss_off_samps}) cfo_meas={:.0} (applied {cfo:.0}) skip={pending_skip}",
+                                r.cell_id, r.pss_metric, a + r.timing_index, r.cfo_hz);
                         }
                     }
+                    None if track_dbg => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in slot-0 window"),
+                    None => {}
                 }
             }
             // Whole-frame assembly + dump (offline analysis) only when explicitly requested.
