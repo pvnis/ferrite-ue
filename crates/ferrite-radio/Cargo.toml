@@ -23,3 +23,7 @@ seify = ["dep:seify"]
 [[example]]
 name = "sdr_probe"
 required-features = ["seify"]
+
+[[example]]
+name = "tx_verify"
+required-features = ["seify"]
