@@ -67,6 +67,10 @@ enum UlSink {
     Zmq(ZmqSink),
     #[cfg(feature = "sdr")]
     Sdr(ferrite_radio::seify::SeifyTx),
+    /// SDR TX not yet activated — deferred until the RX drain is running (bringing up TX while
+    /// RX is open-but-idle wedges the BladeRF RX). Replaced by `Sdr` before the radio thread.
+    #[cfg(feature = "sdr")]
+    Pending,
 }
 
 impl UlSink {
@@ -84,6 +88,8 @@ impl UlSink {
             UlSink::Zmq(ul) => ul.serve_with(counter, fill).expect("ul serve"),
             #[cfg(feature = "sdr")]
             UlSink::Sdr(tx) => ferrite_radio::serve_push(tx, counter, block, fill).expect("ul serve") > 0,
+            #[cfg(feature = "sdr")]
+            UlSink::Pending => panic!("SDR TX served before activation"),
         }
     }
     /// True for the free-running SDR sink (skip the ZMQ pace/gate — the device FIFO paces).
@@ -92,6 +98,8 @@ impl UlSink {
             UlSink::Zmq(_) => false,
             #[cfg(feature = "sdr")]
             UlSink::Sdr(_) => true,
+            #[cfg(feature = "sdr")]
+            UlSink::Pending => true,
         }
     }
 }
@@ -1084,6 +1092,10 @@ fn run(cfg: Config) {
     let slot_len = (frame_len / 20) as i64;
     // Radio backend: default ZMQ gNB transport, or a real SDR (`--sdr`, feature `sdr`). The
     // SDR streamers Arc-clone the device, so `SeifyRadio` can be dropped after handing them out.
+    // Kept alive so the SDR TX can be activated LATER (after the RX drain thread is running):
+    // bringing up TX while RX is open-but-idle wedges the BladeRF RX and cell search hangs.
+    #[cfg(feature = "sdr")]
+    let mut sdr_radio: Option<ferrite_radio::seify::SeifyRadio> = None;
     let (mut dl, mut ul): (DlSource, UlSink) = if let Some(sdr_args) = &sdr {
         #[cfg(feature = "sdr")]
         {
@@ -1098,7 +1110,9 @@ fn run(cfg: Config) {
             })
             .expect("open SDR");
             println!("SDR radio: args={sdr_args:?} rate={fs} Hz freq={center_hz} Hz rxtx_offset={sdr_rxtx_offset}");
-            (DlSource::Sdr(radio.rx().expect("SDR rx")), UlSink::Sdr(radio.tx().expect("SDR tx")))
+            let dl = DlSource::Sdr(radio.rx().expect("SDR rx"));
+            sdr_radio = Some(radio); // TX activated after the RX drain starts (see below)
+            (dl, UlSink::Pending)
         }
         #[cfg(not(feature = "sdr"))]
         {
@@ -1204,6 +1218,13 @@ fn run(cfg: Config) {
     } else {
         None
     };
+    // Activate the SDR TX now that the RX drain thread is running (reading continuously). Doing
+    // this earlier, while RX was idle, wedged the BladeRF RX and cell search blocked forever.
+    #[cfg(feature = "sdr")]
+    if let Some(radio) = &sdr_radio {
+        std::thread::sleep(std::time::Duration::from_millis(50)); // let the drain get going
+        ul = UlSink::Sdr(radio.tx().expect("SDR tx"));
+    }
     let cap_len = if is_sdr { frame_len * 3 } else { frame_len * 6 / 5 };
     let (acq, df) = {
         let mut tries = 0u32;
@@ -1335,10 +1356,13 @@ fn run(cfg: Config) {
             // A real USB SDR TX needs large writes: block_len (1920) per SeifyTx::write has too
             // much per-call overhead to feed 30.72 Msps → the TX FIFO underflows 97% of the time
             // (garbage on air, gNB sees nothing). Larger blocks keep the DAC fed. ZMQ keeps block_len.
-            let tx_block = if sdr { 16384 } else { block_len };
+            let tx_block = if sdr {
+                std::env::var("FERRITE_TXBLK").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+            } else { block_len };
             let mut sblk = vec![Complex32::default(); tx_block];
             let txdbg = std::env::var_os("FERRITE_TXDBG").is_some();
             let (mut txdbg_ok, mut txdbg_fail) = (0u64, 0u64);
+            let (mut txdbg_wns, mut txdbg_fns) = (0u128, 0u128);
             // SDR uplink timeline = the RX/DL frame shifted by the fixed device RX→TX loopback
             // latency (a per-device calibration constant); ZMQ is lockstep, no shift.
             let mut c = (align_ul + if sdr { sdr_rxtx_offset } else { 0 }) as u64;
@@ -1359,6 +1383,7 @@ fn run(cfg: Config) {
                         std::thread::sleep(target - el);
                     }
                 }
+                let _tw = std::time::Instant::now();
                 let ok = ul
                     .serve_block(&mut c, &mut sblk, |cc, block| {
                         let (cc, bl) = (cc as i64, block.len() as i64);
@@ -1377,18 +1402,21 @@ fn run(cfg: Config) {
                         }
                         inj_t.lock().unwrap().fill(cc, block);
                     });
+                txdbg_wns += _tw.elapsed().as_nanos();
                 if ok {
                     ul_pos_t.store(c as i64, Rlx);
                     txdbg_ok += 1;
                 } else {
                     txdbg_fail += 1;
                 }
-                if txdbg && txdbg_ok + txdbg_fail >= 2000 {
+                let _ = &mut txdbg_fns;
+                if txdbg && txdbg_ok + txdbg_fail >= 200 {
                     let base = prach_base_t.load(Rlx);
-                    let peak = sblk.iter().map(|s| s.norm()).fold(0.0f32, f32::max);
-                    eprintln!("[tx] c={c} served_ok={txdbg_ok} fail={txdbg_fail} last_block_peak={peak:.3} prach_base={base}");
-                    txdbg_ok = 0;
-                    txdbg_fail = 0;
+                    let n = (txdbg_ok + txdbg_fail).max(1);
+                    let msps = tx_block as f64 * n as f64 / (txdbg_wns as f64 / 1e9) / 1e6;
+                    eprintln!("[tx] c={c} blk={tx_block} calls={n} avg_serve={}us eff_rate={msps:.1}Msps fail={txdbg_fail} base={base}",
+                        (txdbg_wns / n as u128) / 1000);
+                    txdbg_ok = 0; txdbg_fail = 0; txdbg_wns = 0;
                 }
             }
         })
@@ -1961,52 +1989,40 @@ fn run(cfg: Config) {
         let perf_fs = std::time::Instant::now();
         fsh_shifter.shift_into(&slot_buf, slot_start_ul as usize, &mut fsh);
         perf_fs_ns += perf_fs.elapsed().as_nanos() as u64;
-        // SDR timing diagnostic: accumulate a full freq-shifted frame and locate the PSS in it.
-        // The T0 loop assumes the SSB is in slot 0; searching the whole frame shows WHERE the SSB
-        // actually is → the frame-alignment error. (`timing_index` near 0 = aligned to slot 0.)
+        // SDR timing tracking. The BladeRF↔gNB clock drifts the frame alignment; re-measure the
+        // PSS each SSB frame and skip the residual to re-center. CRITICAL: search only a NARROW
+        // window around the expected slot-0 PSS — a full-frame (307200-sample) correlation every
+        // frame on T0 starves the radio thread of CPU and the TX underflows (garbage on air). The
+        // SSB is in slot 0 every other frame; on no-SSB frames the metric is low and we skip.
         if is_sdr && connected.is_none() {
-            let so = slot_idx as usize * slot_len as usize;
-            let n = slot_len as usize;
-            frame_fsh[so..so + n].copy_from_slice(&fsh[..n]);
-            if slot_idx == 19 {
-                let found = searcher.search(&frame_fsh);
-                // Timing tracking: on a real SSB frame, re-center the alignment by skipping the
-                // positive PSS drift at the next frame boundary (the clock offset only ever pushes
-                // the PSS later, so a forward skip suffices; a small skip is absorbed by the freq-
-                // shifter's constant per-slot phase and by the RACH toff sweep).
-                if let Some(r) = &found {
+            if slot_idx == 0 {
+                let a = pss_off_samps.saturating_sub(256);
+                let win = &fsh[a..(a + 2560).min(fsh.len())];
+                if let Some(r) = searcher.search(win) {
                     if r.cell_id == acq.cell_id && r.pss_metric > 0.5 {
-                        let err = r.timing_index as i64 - pss_off_samps as i64;
+                        let err = (a + r.timing_index) as i64 - pss_off_samps as i64;
                         if (3..slot_len).contains(&err) {
                             pending_skip = err as usize;
                         }
-                    }
-                }
-                if track_dbg {
-                    match &found {
-                        Some(r) => eprintln!(
-                            "[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={}/{} cfo_meas={:.0} (applied cfo={:.0}) skip={pending_skip}",
-                            r.cell_id, r.pss_metric, r.timing_index, frame_len, r.cfo_hz, cfo
-                        ),
-                        None => eprintln!("[dl-track] frame@{slot_start_ul}: no PSS in whole frame"),
-                    }
-                }
-                // Dump the first few aligned freq-shifted frames (raw interleaved f32 IQ) for
-                // offline spectrum/correlation analysis (the fastest way to see whether the SIB1
-                // PDCCH is present and where, without 30 s reruns).
-                if let Some(p) = &dump_path {
-                    if dump_n < 40 {
-                        use std::io::Write;
-                        let mut bytes = Vec::with_capacity(frame_len * 8);
-                        for c in &frame_fsh {
-                            bytes.extend(c.re.to_le_bytes());
-                            bytes.extend(c.im.to_le_bytes());
+                        if track_dbg {
+                            eprintln!("[dl-track] frame@{slot_start_ul}: PCI {} pss={:.2} pss_pos={} (off {pss_off_samps}) skip={pending_skip}",
+                                r.cell_id, r.pss_metric, a + r.timing_index);
                         }
-                        std::fs::OpenOptions::new().create(true).append(true).open(p)
-                            .and_then(|mut f| f.write_all(&bytes)).ok();
-                        dump_n += 1;
-                        eprintln!("[dump] wrote frame {dump_n}/40 to {p}");
                     }
+                }
+            }
+            // Whole-frame assembly + dump (offline analysis) only when explicitly requested.
+            if let Some(p) = &dump_path {
+                let so = slot_idx as usize * slot_len as usize;
+                frame_fsh[so..so + slot_len as usize].copy_from_slice(&fsh[..slot_len as usize]);
+                if slot_idx == 19 && dump_n < 40 {
+                    use std::io::Write;
+                    let mut bytes = Vec::with_capacity(frame_len * 8);
+                    for c in &frame_fsh { bytes.extend(c.re.to_le_bytes()); bytes.extend(c.im.to_le_bytes()); }
+                    std::fs::OpenOptions::new().create(true).append(true).open(p)
+                        .and_then(|mut f| f.write_all(&bytes)).ok();
+                    dump_n += 1;
+                    eprintln!("[dump] wrote frame {dump_n}/40 to {p}");
                 }
             }
         }

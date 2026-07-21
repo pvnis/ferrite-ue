@@ -27,3 +27,7 @@ required-features = ["seify"]
 [[example]]
 name = "tx_verify"
 required-features = ["seify"]
+
+[[example]]
+name = "tx_rate"
+required-features = ["seify"]
