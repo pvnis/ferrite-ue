@@ -132,7 +132,7 @@ the DL-decode→HARQ-ACK path beats the 500 µs slot deadline:
   parallel).
 - **TX-build thread**: PUSCH / CSI modulation, off the timeline thread.
 
-See `crates/ferrite-ue/src/rt.rs` for the queue/stage plumbing. Two lessons that
+See `ferrite-ue/src/rt.rs` for the queue/stage plumbing. Two lessons that
 made 500 µs work: the decode→ACK pipeline lag is bounded by the worker **queue
 depth** (kept shallow so bursts drop instead of stalling), and the PDSCH
 time-domain shape must come from the **DCI's TDRA bit**, not the slot index
@@ -176,18 +176,17 @@ soft-combining — is the T0 loop + RX-PHY worker in `main.rs`, not a framing he
 ## Workspace layout
 
 ```
-crates/
-  ferrite-common   shared types, errors, IQ sample type
-  ferrite-phy      physical layer: numerology, sync (PSS/SSS/SSB), PBCH, PDCCH,
-                   PDSCH/PUSCH, PUCCH, PRACH, CSI, LDPC/polar coding
-  ferrite-radio    radio HAL (SampleSource/SampleSink): file, SoapySDR [feature],
-                   ZMQ [feature] backends
-  ferrite-ue       the UE: entry point `ferrite-ue` (main.rs = timeline + MAC
-                   scheduler + HARQ). Modules: rrc (RRC + SRB1 PDCP/RLC-AM/MAC),
-                   userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), sib1 + cellgroup +
-                   uper (UPER decode of SIB1 / masterCellGroup), nas, milenage,
-                   sync, rt (pipeline), stream, tun. Plus milestone/debug
-                   harnesses (ssb-scan, sync-track, sib1, pdsch-*, prach-*, …)
+ferrite-common   shared types, errors, IQ sample type
+ferrite-phy      physical layer: numerology, sync (PSS/SSS/SSB), PBCH, PDCCH,
+                 PDSCH/PUSCH, PUCCH, PRACH, CSI, LDPC/polar coding
+ferrite-radio    radio HAL (SampleSource/SampleSink): file, SoapySDR [feature],
+                 ZMQ [feature] backends
+ferrite-ue       the UE: entry point `ferrite-ue` (main.rs = timeline + MAC
+                 scheduler + HARQ). Modules: rrc (RRC + SRB1 PDCP/RLC-AM/MAC),
+                 userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), sib1 + cellgroup +
+                 uper (UPER decode of SIB1 / masterCellGroup), nas, milenage,
+                 sync, rt (pipeline), stream, tun. Plus milestone/debug
+                 harnesses (ssb-scan, sync-track, sib1, pdsch-*, prach-*, …)
 ```
 
 ## Roadmap

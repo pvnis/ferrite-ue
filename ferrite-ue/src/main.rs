@@ -953,7 +953,7 @@ fn decode_dl(
                 eprintln!("[dl] slot={slot_idx} h{h_id}/n{ndi} rv={rv} rb[{rb0},{}) mcs={mcs} sliv={sliv} csi_slot={} rm_csi={rm_csi} DECODE FAIL",
                     rb0 + nrb, csi_rm().has_slot(slot_idx));
                 // One-shot: dump the failing slot's samples + params for offline analysis
-                // (crates/ferrite-ue/src/bin — the pdsch_fail tool).
+                // (ferrite-ue/src/bin — the pdsch_fail tool).
                 if !std::path::Path::new("/tmp/ferrite_fail.bin").exists() {
                     let mut b = Vec::with_capacity(28 + fsh.len() * 8);
                     for v in [slot_idx, crnti as u32, rb0 as u32, nrb as u32, mcs as u32, rv as u32, h_id as u32, u32::from(sliv), sc_to_bin(0) as u32] {

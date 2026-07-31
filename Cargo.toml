@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ferrite-common",
-    "crates/ferrite-phy",
-    "crates/ferrite-mac",
-    "crates/ferrite-radio",
-    "crates/ferrite-ue",
+    "ferrite-common",
+    "ferrite-phy",
+    "ferrite-mac",
+    "ferrite-radio",
+    "ferrite-ue",
 ]
 
 [workspace.package]
@@ -21,11 +21,11 @@ thiserror = "2"
 crossbeam-channel = "0.5"
 rayon = "1"
 
-ferrite-common = { path = "crates/ferrite-common" }
-ferrite-phy = { path = "crates/ferrite-phy" }
-ferrite-mac = { path = "crates/ferrite-mac" }
-ferrite-radio = { path = "crates/ferrite-radio" }
-ferrite-ue = { path = "crates/ferrite-ue" }
+ferrite-common = { path = "ferrite-common" }
+ferrite-phy = { path = "ferrite-phy" }
+ferrite-mac = { path = "ferrite-mac" }
+ferrite-radio = { path = "ferrite-radio" }
+ferrite-ue = { path = "ferrite-ue" }
 
 # Optimize dependencies even in debug builds; the DSP inner loops are unusably
 # slow otherwise.
