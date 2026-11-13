@@ -39,6 +39,10 @@ impl ZmqSource {
         socket.set_rcvtimeo(recv_timeout_ms).map_err(zerr)?;
         socket.set_sndtimeo(recv_timeout_ms).map_err(zerr)?;
         socket.set_linger(0).map_err(zerr)?;
+        // A REQ socket that timed out waiting for a reply may not send again
+        // (EFSM); relaxed + correlate lets a read retry re-issue the request.
+        socket.set_req_relaxed(true).map_err(zerr)?;
+        socket.set_req_correlate(true).map_err(zerr)?;
         socket.connect(endpoint).map_err(zerr)?;
         Ok(Self {
             socket,
@@ -142,7 +146,7 @@ impl ZmqSink {
     /// Because the gNB requests uplink and transmits downlink in lockstep, the
     /// counter tracks the gNB's receive sample index, letting the caller place a
     /// PRACH occasion at a downlink-derived sample position.
-    pub fn serve_with(&mut self, counter: &mut u64, fill: impl Fn(u64, &mut [Complex32])) -> Result<bool> {
+    pub fn serve_with(&mut self, counter: &mut u64, mut fill: impl FnMut(u64, &mut [Complex32])) -> Result<bool> {
         match self.socket.recv_msg(0) {
             Ok(_) => {
                 let mut block = vec![Complex32::default(); self.block_len];

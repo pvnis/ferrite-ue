@@ -1,0 +1,280 @@
+//! FAPI — the PHY ↔ MAC interface (modelled on the SCF-222 5G FAPI PHY API,
+//! adapted to the UE direction).
+//!
+//! Message families, mirroring FAPI naming:
+//!
+//! | direction | FAPI message | here |
+//! |---|---|---|
+//! | MAC → PHY | CONFIG.request / START.request / STOP.request | [`MacToPhy::Config`], [`MacToPhy::Start`], [`MacToPhy::Stop`] |
+//! | MAC → PHY | UL_TTI.request (PRACH / PUSCH / PUCCH PDUs for one slot) | [`MacToPhy::UlTti`] |
+//! | MAC → PHY | TX_Data.request (the PUSCH transport block payload) | carried inside [`UlTtiPdu::Pusch`] |
+//! | PHY → MAC | SLOT.indication | [`PhyToMac::Slot`] |
+//! | PHY → MAC | DCI (UE-side: the decoded PDCCH, not in gNB FAPI) | [`PhyToMac::Dci`] |
+//! | PHY → MAC | RX_Data.indication + CRC.indication | [`PhyToMac::RxData`] |
+//! | PHY → MAC | UCI/CSI measurement (UE-side CSI report input) | [`PhyToMac::Csi`] |
+//! | PHY → MAC | RACH.indication (UE-side: preamble transmitted) | [`PhyToMac::Rach`] |
+//! | PHY → MAC | ERROR.indication | [`PhyToMac::Error`] |
+//!
+//! Everything MAC receives is tagged with the `SlotPoint` it belongs to; every
+//! transmission MAC wants goes down as a UL_TTI.request for a future slot. The
+//! PHY owns the PHY configuration (CORESETs, search spaces, TDRA tables, k1
+//! lists, PUCCH resources, …) and therefore *resolves* raw DCI fields into
+//! grants (PRBs, symbols, TBS, HARQ info, timing) before handing them to MAC —
+//! MAC never sees DCI bit fields. Sample indices never appear here.
+
+use ferrite_common::{Rnti, RntiKind, SlotPoint};
+
+/// Modulation order and target code rate of a transport block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mcs {
+    pub index: u8,
+    /// Modulation order Qm (2/4/6/8).
+    pub qm: u8,
+    /// Target code rate R × 1024 (`None` for the reserved "retransmission" MCS
+    /// indices, where the TB keeps its original size).
+    pub r_x1024: Option<u16>,
+}
+
+/// Time-domain shape of a PDSCH/PUSCH (TS 38.214 §5.1.2.1 / §6.1.2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeAlloc {
+    pub mapping_type_a: bool,
+    pub start_symbol: u8,
+    pub n_symbols: u8,
+}
+
+/// A DL assignment as MAC sees it (TS 38.212 §7.3.1.2 fields, resolved).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DlGrant {
+    pub rnti: Rnti,
+    pub rnti_kind: RntiKind,
+    /// Slot the PDSCH is in (n + k0).
+    pub pdsch_slot: SlotPoint,
+    pub prb_start: u16,
+    pub n_prb: u16,
+    pub time: TimeAlloc,
+    pub mcs: Mcs,
+    /// Transport block size in bits as derived from this DCI (for a
+    /// retransmission MAC uses the stored size instead).
+    pub tbs_bits: u32,
+    pub harq_id: u8,
+    pub ndi: u8,
+    pub rv: u8,
+    /// Slot the HARQ-ACK is due in (n_pdsch + k1); `None` for SI/RA/P-RNTI.
+    pub ack_slot: Option<SlotPoint>,
+    /// Counter DAI (0..3) from the DCI, for the dynamic HARQ-ACK codebook.
+    pub dai: u8,
+    /// PUCCH resource indicator (0..7).
+    pub pri: u8,
+    /// TPC command for PUCCH (0..3).
+    pub tpc: u8,
+    /// Number of DMRS CDM groups without data (1 or 2).
+    pub cdm_groups_wo_data: u8,
+    /// `dmrs-AdditionalPosition` to use (2 for fallback DCI, else configured).
+    pub dmrs_add_pos: u8,
+    /// VRB-to-PRB mapping bit of the DCI (true = interleaved).
+    pub vrb_to_prb_interleaved: bool,
+    /// `r_PUCCH` for the common PUCCH resource (TS 38.213 §9.2.1:
+    /// ⌊2·n_CCE,0 / N_CCE⌋ + 2·Δ_PRI), used before a dedicated PUCCH config exists.
+    pub r_pucch_common: u8,
+}
+
+/// A UL grant as MAC sees it (TS 38.212 §7.3.1.1 fields, resolved). Also used
+/// for the RAR UL grant (Msg3) with `rnti_kind = Tc`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UlGrant {
+    pub rnti: Rnti,
+    pub rnti_kind: RntiKind,
+    /// Slot the PUSCH is in (n + k2 [+ Δ for Msg3]).
+    pub pusch_slot: SlotPoint,
+    pub prb_start: u16,
+    pub n_prb: u16,
+    pub time: TimeAlloc,
+    pub mcs: Mcs,
+    pub tbs_bits: u32,
+    pub harq_id: u8,
+    pub ndi: u8,
+    pub rv: u8,
+    /// UL total-DAI for the UCI-on-PUSCH codebook (DCI 0_1 only).
+    pub dai: Option<u8>,
+    pub tpc: u8,
+    /// CSI request bitmap (0 = none).
+    pub csi_request: u8,
+    /// True when the DCI carries UL-SCH (data); false for a CSI-only PUSCH.
+    pub ul_sch: bool,
+    /// Number of DMRS CDM groups without data (1 or 2).
+    pub cdm_groups_wo_data: u8,
+    /// `dmrs-AdditionalPosition` to use (2 for fallback DCI / RAR, else configured).
+    pub dmrs_add_pos: u8,
+    /// Frequency hopping requested (unsupported by the modulator: MAC refuses).
+    pub freq_hopping: bool,
+}
+
+/// The payload of a decoded DCI, per format.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Dci {
+    Dl(DlGrant),
+    Ul(UlGrant),
+    /// A DCI the PHY recognised but MAC does not act on (paging short
+    /// messages, SI scheduling for a SIB the UE has not requested, …).
+    Other { format: &'static str },
+}
+
+/// SLOT.indication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotIndication {
+    pub slot: SlotPoint,
+}
+
+/// DCI indication: a CRC-valid DCI found in `slot`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DciIndication {
+    pub slot: SlotPoint,
+    pub dci: Dci,
+}
+
+/// RX_Data.indication + CRC.indication: the decode result of a PDSCH.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RxDataIndication {
+    pub rnti: Rnti,
+    pub rnti_kind: RntiKind,
+    pub harq_id: u8,
+    pub ndi: u8,
+    /// Slot the PDSCH was received in.
+    pub pdsch_slot: SlotPoint,
+    /// `Some(bytes)` when the CRC passed (CRC.indication = OK).
+    pub tb: Option<Vec<u8>>,
+    /// Effective SINR estimate (dB) of the PDSCH, for link monitoring.
+    pub sinr_db: f32,
+}
+
+/// A CSI measurement from the configured NZP-CSI-RS / TRS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CsiIndication {
+    pub slot: SlotPoint,
+    pub sinr_db: f32,
+    pub cqi: u8,
+    /// Wideband RSRP in dBFS (relative to full scale), for cell quality.
+    pub rsrp_dbfs: f32,
+}
+
+/// RACH.indication (UE side): the requested preamble was transmitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RachIndication {
+    pub slot: SlotPoint,
+    pub ra_rnti: Rnti,
+    pub preamble: u8,
+}
+
+/// ERROR.indication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorIndication {
+    /// A UL_TTI PDU for `slot` could not be transmitted (too late / overlap).
+    TxDropped { slot: SlotPoint, pdu: &'static str },
+    /// PSS/SSB not found for several SSB periods: synchronisation lost.
+    SyncLost,
+    /// The radio stream ended or failed.
+    Radio,
+}
+
+/// PHY → MAC messages, delivered in slot order on the PHY's timeline thread.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PhyToMac {
+    Slot(SlotIndication),
+    Dci(DciIndication),
+    RxData(RxDataIndication),
+    Csi(CsiIndication),
+    Rach(RachIndication),
+    Error(ErrorIndication),
+}
+
+/// HARQ-ACK / SR / CSI bits for a PUCCH or for UCI on PUSCH.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UciPayload {
+    /// HARQ-ACK bits in codebook order (1 = ACK), possibly empty.
+    pub harq_ack: Vec<u8>,
+    /// Scheduling request: `None` = no SR occasion here, `Some(true)` = positive.
+    pub sr: Option<bool>,
+    /// CSI part 1 bits (wideband CQI MSB first), possibly empty.
+    pub csi1: Vec<u8>,
+}
+
+/// Which PUCCH resource to use. MAC picks by codebook size / PRI / SR
+/// occasion from the PUCCH configuration; the PHY maps it to PRBs/symbols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PucchResourceRef {
+    /// A dedicated resource by `pucch-ResourceId`.
+    Dedicated(u8),
+    /// The common PUCCH resource (before dedicated config), TS 38.213 §9.2.1:
+    /// `r_PUCCH` (0..15) from the PRI and the CCE index of the scheduling DCI.
+    Common { r_pucch: u8 },
+}
+
+/// A PRACH occasion selected by MAC (TS 38.211 §6.3.3.2 / 38.213 §8.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrachOccasion {
+    /// Slot (at the PUSCH numerology) containing the occasion.
+    pub slot: SlotPoint,
+    pub start_symbol: u8,
+    /// Frequency-domain occasion index (0..msg1-FDM).
+    pub freq_index: u8,
+    /// Time-domain occasion index within the PRACH slot.
+    pub time_index: u8,
+    /// RA-RNTI for this occasion (TS 38.321 §5.1.3).
+    pub ra_rnti: Rnti,
+    /// Start of the occasion within its subframe, in T_c units (TS 38.211 §5.3.2).
+    pub start_tc: u64,
+}
+
+/// One PDU of a UL_TTI.request.
+#[derive(Clone, Debug)]
+pub enum UlTtiPdu {
+    /// Transmit a preamble on an occasion (MAC chose preamble + occasion).
+    Prach { occasion: PrachOccasion, preamble: u8, power_offset_db: f32 },
+    /// Transmit a PUSCH for a grant with the given MAC PDU (TX_Data.request
+    /// payload) and the UCI multiplexed onto it, if any.
+    Pusch { grant: UlGrant, tb: Vec<u8>, uci: UciPayload },
+    /// Transmit a PUCCH on `resource` with `uci`.
+    Pucch { resource: PucchResourceRef, uci: UciPayload },
+}
+
+/// UL_TTI.request: everything MAC wants transmitted in `slot`.
+#[derive(Clone, Debug)]
+pub struct UlTtiRequest {
+    pub slot: SlotPoint,
+    pub pdus: Vec<UlTtiPdu>,
+}
+
+/// MAC → PHY messages.
+#[derive(Clone, Debug)]
+pub enum MacToPhy {
+    /// CONFIG.request: apply a new PHY configuration (cell-common and/or dedicated).
+    Config(Box<crate::config::PhyConfig>),
+    /// START.request: begin (or resume) slot processing / transmissions.
+    Start,
+    /// STOP.request: stop transmitting entirely (RRC idle / RLF).
+    Stop,
+    /// UL_TTI.request (+ TX_Data) for one future slot.
+    UlTti(UlTtiRequest),
+    /// Set the RNTIs the PHY monitors (C-RNTI / TC-RNTI / RA-RNTI). `None` clears.
+    SetRntis { c_rnti: Option<Rnti>, tc_rnti: Option<Rnti>, ra_rnti: Option<Rnti> },
+    /// Absolute N_TA in T_c units (MAC maintains it from the RAR + TA MAC CEs).
+    TimingAdvance { n_ta_tc: i64 },
+}
+
+/// What MAC implements: the PHY calls this on its timeline thread.
+pub trait MacHandler {
+    /// Handle one PHY → MAC message. MAC → PHY messages go through `phy`.
+    fn handle(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink);
+}
+
+/// Where MAC puts its MAC → PHY messages.
+pub trait MacToPhySink {
+    fn send(&mut self, msg: MacToPhy);
+}
+
+impl MacToPhySink for Vec<MacToPhy> {
+    fn send(&mut self, msg: MacToPhy) {
+        self.push(msg);
+    }
+}

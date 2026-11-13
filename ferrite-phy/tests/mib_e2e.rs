@@ -4,6 +4,7 @@
 
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::sync::cfo::correct_cfo;
+use ferrite_phy::sync::pbch::{pbch_dmrs_index, L_MAX_FR1_ABOVE_3GHZ, L_MAX_FR1_BELOW_3GHZ};
 use ferrite_phy::sync::ssb::build_ssb_waveform;
 use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
@@ -27,31 +28,31 @@ impl Rng {
     }
 }
 
-fn run_case(cell_id: u16, i_ssb: u8, sfn: u16, cfo: f32, snr_db: f32, seed: u64) {
+#[allow(clippy::too_many_arguments)]
+fn run_case(mu: u8, l_max: u8, cell_id: u16, i_ssb: u8, half_frame: u8, sfn: u16, cfo: f32, snr_db: f32, seed: u64) {
     const FFT: usize = 256;
-    const MU: u8 = 1;
-    let fs = FFT as f64 * 30_000.0;
+    let fs = FFT as f64 * f64::from(15_000u32 << mu);
     let ofdm = Ofdm::new(FFT);
-    let searcher = CellSearcher::new(FFT, MU);
+    let searcher = CellSearcher::new(FFT, mu, l_max);
     let mut rng = Rng(seed);
 
     let mib = Mib {
         sfn,
-        scs_common_is_30_or_120: true,
+        scs_common_is_30_or_120: mu == 1,
         ssb_subcarrier_offset: 2,
         dmrs_typea_pos3: false,
         pdcch_config_sib1: 0x64,
         cell_barred: false,
         intra_freq_reselection_allowed: true,
-        half_frame: 0,
+        half_frame,
         k_ssb_msb: 0,
     };
 
-    let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, &ofdm, MU);
+    let ssb = build_ssb_waveform(&mib, cell_id, pbch_dmrs_index(i_ssb, half_frame, l_max), l_max, &ofdm, mu);
     let prepad = 333usize;
     let mut sig = vec![Complex32::new(0.0, 0.0); prepad];
     sig.extend_from_slice(&ssb);
-    sig.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(200));
+    sig.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 200));
 
     // Flat channel, CFO, AWGN.
     let h = Complex32::from_polar(0.8, -1.9);
@@ -68,22 +69,23 @@ fn run_case(cell_id: u16, i_ssb: u8, sfn: u16, cfo: f32, snr_db: f32, seed: u64)
 
     let mut corrected = sig.clone();
     correct_cfo(&mut corrected, found.cfo_hz, fs);
-    let (dec_mib, dec_i_ssb) = searcher
+    let dec = searcher
         .decode_mib(&corrected, &found)
         .expect("MIB decode failed");
 
-    assert_eq!(dec_i_ssb, i_ssb, "wrong SSB index");
-    assert_eq!(dec_mib, mib, "wrong MIB");
+    assert_eq!(dec.i_ssb, i_ssb, "wrong SSB index");
+    assert_eq!(dec.half_frame, half_frame, "wrong half frame");
+    assert_eq!(dec.mib, mib, "wrong MIB");
 }
 
 #[test]
 fn recovers_mib_clean() {
-    run_case(623, 3, 0x155, 0.0, 40.0, 0xA0_0001);
+    run_case(1, L_MAX_FR1_ABOVE_3GHZ, 623, 3, 0, 0x155, 0.0, 40.0, 0xA0_0001);
 }
 
 #[test]
 fn recovers_mib_with_cfo_and_noise() {
-    run_case(101, 6, 0x2BC, 1_700.0, 12.0, 0xA0_0002);
+    run_case(1, L_MAX_FR1_ABOVE_3GHZ, 101, 6, 1, 0x2BC, 1_700.0, 12.0, 0xA0_0002);
 }
 
 #[test]
@@ -92,6 +94,18 @@ fn recovers_mib_various_cells() {
         .iter()
         .enumerate()
     {
-        run_case(pci, issb, sfn, 600.0, 20.0, 0xB000 + i as u64);
+        run_case(1, L_MAX_FR1_ABOVE_3GHZ, pci, issb, 0, sfn, 600.0, 20.0, 0xB000 + i as u64);
+    }
+}
+
+/// 15 kHz SSB (Case A) below 3 GHz: `L_max = 4`, so the DMRS index carries the
+/// half-frame bit and only two candidate-index bits.
+#[test]
+fn recovers_mib_mu0_l_max_4() {
+    for (i, &(pci, issb, hf, sfn)) in [(623u16, 0u8, 0u8, 0x155u16), (101, 3, 1, 0x2BC), (500, 2, 1, 8)]
+        .iter()
+        .enumerate()
+    {
+        run_case(0, L_MAX_FR1_BELOW_3GHZ, pci, issb, hf, sfn, 300.0, 15.0, 0xC000 + i as u64);
     }
 }

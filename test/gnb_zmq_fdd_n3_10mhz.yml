@@ -1,0 +1,59 @@
+# OCUDU gNB config for Ferrite UE testing over ZMQ — FDD, band n3, 10 MHz, 15 kHz SCS.
+#   ZMQ IQ transport on tcp ports 2100 (DL/tx) / 2101 (UL/rx), base_srate 11.52 MHz.
+#   NGAP/GTP bind 127.0.0.20; shared qcore AMF at 127.0.0.1 (PLMN 00101, TAC 7).
+# Everything not set here is the OCUDU default (prach_config_index 16 = long preamble
+# format 0, k1 = {4}, k2 = 4, CORESET#0 auto-derived) so the UE is exercised against
+# the stock FDD configuration.
+#
+# Run:   /home/dmd/ocudu-pavo/build/apps/gnb/gnb -c /home/dmd/ferrite-ue/test/gnb_zmq_fdd_n3_10mhz.yml
+
+gnb_id: 334
+
+cu_cp:
+  inactivity_timer: 7200
+  amf:
+    addr: 127.0.0.1
+    bind_addr: 127.0.0.20
+    supported_tracking_areas:
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+                sd: 0
+
+ru_sdr:
+  device_driver: zmq
+  device_args: tx_port=tcp://127.0.0.1:2100,rx_port=tcp://127.0.0.1:2101,base_srate=11.52e6
+  srate: 11.52
+  tx_gain: 0
+  rx_gain: 0
+
+cell_cfg:
+  dl_arfcn: 368500
+  band: 3
+  channel_bandwidth_MHz: 10
+  common_scs: 15
+  plmn: "00101"
+  tac: 7
+  slicing:
+    - sst: 1
+      sd: 0
+  pci: 2
+  nof_antennas_ul: 1
+  nof_antennas_dl: 1
+  pdsch:
+    mcs_table: qam64
+  pusch:
+    mcs_table: qam64
+
+log:
+  filename: /tmp/ferrite_gnb_zmq.log
+  all_level: info
+  phy_level: debug
+  mac_level: debug
+  broadcast_enabled: true
+  hex_max_size: 1024
+
+metrics:
+  autostart_stdout_metrics: 1

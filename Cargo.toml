@@ -3,13 +3,19 @@ resolver = "2"
 members = [
     "ferrite-common",
     "ferrite-phy",
-    "ferrite-mac",
     "ferrite-radio",
+    "ferrite-asn1",
+    "ferrite-rlc",
+    "ferrite-pdcp",
+    "ferrite-nas",
+    "ferrite-rrc",
+    "ferrite-mac",
+    "ferrite-l1",
     "ferrite-ue",
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Ferrite contributors"]
@@ -20,12 +26,28 @@ rustfft = "6"
 thiserror = "2"
 crossbeam-channel = "0.5"
 rayon = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+aes = "0.8"
+cmac = "0.7"
+ctr = "0.9"
+sha2 = "0.10"
+hmac = "0.12"
+libc = "0.2"
 
 ferrite-common = { path = "ferrite-common" }
 ferrite-phy = { path = "ferrite-phy" }
-ferrite-mac = { path = "ferrite-mac" }
 ferrite-radio = { path = "ferrite-radio" }
-ferrite-ue = { path = "ferrite-ue" }
+ferrite-asn1 = { path = "ferrite-asn1" }
+ferrite-rlc = { path = "ferrite-rlc" }
+ferrite-pdcp = { path = "ferrite-pdcp" }
+ferrite-nas = { path = "ferrite-nas" }
+ferrite-rrc = { path = "ferrite-rrc" }
+ferrite-mac = { path = "ferrite-mac" }
+ferrite-l1 = { path = "ferrite-l1" }
 
 # Optimize dependencies even in debug builds; the DSP inner loops are unusably
 # slow otherwise.

@@ -1,0 +1,15 @@
+[package]
+name = "ferrite-rrc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-asn1.workspace = true
+ferrite-phy.workspace = true
+ferrite-l1.workspace = true
+ferrite-mac.workspace = true
+log.workspace = true
+hmac.workspace = true
+sha2.workspace = true

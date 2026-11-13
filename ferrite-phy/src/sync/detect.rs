@@ -71,7 +71,7 @@ impl PssDetector {
                 acc += w * r.conj();
             }
             let metric = acc.norm() / energy.sqrt();
-            if best.as_ref().map_or(true, |b| metric > b.metric) {
+            if best.as_ref().is_none_or(|b| metric > b.metric) {
                 best = Some(PssDetection {
                     sample_index: start,
                     n_id_2,
@@ -163,7 +163,7 @@ mod tests {
         let prepad = 137usize;
         let mut sig = vec![Complex32::new(0.0, 0.0); prepad];
         sig.extend_from_slice(&symbol);
-        sig.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(200));
+        sig.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 200));
 
         let d = detector.search(&sig).unwrap();
         assert_eq!(d.n_id_2, true_nid2);
@@ -182,7 +182,7 @@ mod tests {
         let prepad = 300usize;
         let mut sig = vec![Complex32::new(0.0, 0.0); prepad];
         sig.extend_from_slice(&symbol);
-        sig.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(300));
+        sig.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 300));
 
         // Per-sample signal RMS over the symbol (for SNR scaling).
         let sig_rms =
@@ -196,7 +196,7 @@ mod tests {
 
         // Add complex AWGN at ~6 dB SNR over the symbol region.
         let sigma = sig_rms * 0.5;
-        let mut rng = Rng(0xC0FFEE_1234_5678);
+        let mut rng = Rng(0x00C0_FFEE_1234_5678);
         for s in sig.iter_mut() {
             *s += Complex32::new(
                 rng.normal() * sigma / SQRT_2,

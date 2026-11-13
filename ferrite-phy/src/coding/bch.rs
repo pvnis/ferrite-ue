@@ -259,6 +259,11 @@ pub fn bch_decode(llrs: &[f32], cell_id: u16, i_ssb: u8) -> Option<Mib> {
         return None;
     }
     let c = input_deinterleave(&c_prime);
+    // The all-zero codeword passes the CRC trivially: with no signal (zero
+    // LLRs) the decoder "finds" it. A real PBCH payload is never all zero.
+    if c.iter().all(|&b| b == 0) {
+        return None;
+    }
     let a_scr: [u8; PBCH_A] = c[..PBCH_A].try_into().unwrap();
 
     // The SFN 2nd/3rd LSBs are unscrambled, so v is readable directly from the

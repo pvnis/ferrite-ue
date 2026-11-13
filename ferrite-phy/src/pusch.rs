@@ -19,6 +19,10 @@ pub struct PuschAlloc {
     pub rb_start: usize,
     /// Number of RBs.
     pub n_rb: usize,
+    /// First OFDM symbol and number of symbols of the allocation (TS 38.214
+    /// §6.1.2.1): data goes on `[sym_start, sym_start + n_sym)` minus the DM-RS.
+    pub sym_start: usize,
+    pub n_sym: usize,
     /// Slot symbols carrying single-symbol DM-RS (config type 1, CDM group 0).
     pub dmrs_symbols: Vec<usize>,
     /// Modulation order (2 = QPSK).
@@ -52,11 +56,12 @@ pub fn pusch_modulate_slot(
     cell_id: u16,
     slot_in_frame: u32,
     slot_in_subframe: usize,
+    mu: u8,
     tc_rnti: u16,
     center_freq_hz: f64,
     fs: f64,
 ) -> Vec<Complex32> {
-    pusch_modulate_slot_uci(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, tc_rnti, center_freq_hz, fs, &[], 0.0, 0)
+    pusch_modulate_slot_uci(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, mu, tc_rnti, center_freq_hz, fs, &[], 0.0, 0)
 }
 
 /// As `pusch_modulate_slot`, but multiplex up to 2 HARQ-ACK bits onto the PUSCH
@@ -74,6 +79,7 @@ pub fn pusch_modulate_slot_uci(
     cell_id: u16,
     slot_in_frame: u32,
     slot_in_subframe: usize,
+    mu: u8,
     tc_rnti: u16,
     center_freq_hz: f64,
     fs: f64,
@@ -81,7 +87,7 @@ pub fn pusch_modulate_slot_uci(
     beta_harq: f32,
     tb_bits: usize,
 ) -> Vec<Complex32> {
-    pusch_modulate_slot_uci_csi(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, tc_rnti, center_freq_hz, fs, harq_ack, beta_harq, tb_bits, &[], &[])
+    pusch_modulate_slot_uci_csi(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, mu, tc_rnti, center_freq_hz, fs, harq_ack, beta_harq, tb_bits, &[], &[])
 }
 
 /// As `pusch_modulate_slot_uci`, additionally multiplexing a CSI part 1 report
@@ -98,6 +104,7 @@ pub fn pusch_modulate_slot_uci_csi(
     cell_id: u16,
     slot_in_frame: u32,
     slot_in_subframe: usize,
+    mu: u8,
     tc_rnti: u16,
     center_freq_hz: f64,
     fs: f64,
@@ -112,7 +119,7 @@ pub fn pusch_modulate_slot_uci_csi(
     let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
 
     let dmrs_set: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs_set.contains(l)).collect();
+    let data_syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym).filter(|l| !dmrs_set.contains(l)).collect();
     let n_sc = 12 * alloc.n_rb;
     let n_re = data_syms.len() * n_sc;
 
@@ -147,13 +154,16 @@ pub fn pusch_modulate_slot_uci_csi(
         }
     }
     // DM-RS (config type 1, CDM group 0: even subcarriers). Sequence referenced
-    // to CRB 0 (point A): index by 6·(crb_offset + PRB) + j.
+    // to CRB 0 (point A): index by 6·(crb_offset + PRB) + j. The DM-RS symbols
+    // carry no data (two CDM groups without data, TS 38.214 §6.2.2), so the
+    // DM-RS EPRE is 3 dB above the data EPRE (Table 6.2.2-1).
+    let dmrs_boost = std::f32::consts::SQRT_2;
     for &l in &alloc.dmrs_symbols {
         let refs = pdsch_dmrs(cell_id, slot_in_frame, l as u32, 6 * (alloc.crb_offset + alloc.carrier_rb));
         for rb in 0..alloc.n_rb {
             for j in 0..6 {
                 let sc = 12 * (alloc.rb_start + rb) + 2 * j;
-                grids[l][bin(sc)] = refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j];
+                grids[l][bin(sc)] = refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j] * dmrs_boost;
             }
         }
     }
@@ -170,7 +180,7 @@ pub fn pusch_modulate_slot_uci_csi(
     if !harq_ack.is_empty() && harq_ack.len() <= 11 {
         let o_ack = harq_ack.len();
         let n_sc = 12 * alloc.n_rb;
-        let res = harq_ack_pusch_res(&alloc.dmrs_symbols, alloc.n_rb, o_ack, beta_harq, tb_bits);
+        let res = harq_ack_pusch_res(&alloc.dmrs_symbols, (alloc.sym_start, alloc.n_sym), alloc.n_rb, o_ack, beta_harq, tb_bits);
         // Coded bit `k` of the UCI (per RE-pair): ≤2 use the small-block form, ≥3 RM.
         let rm = if o_ack >= 3 { rm_encode(harq_ack, res.len() * 2) } else { Vec::new() };
         for (i, &(l, sc_a)) in res.iter().enumerate() {
@@ -193,9 +203,9 @@ pub fn pusch_modulate_slot_uci_csi(
 
     let mut out = Vec::with_capacity(14 * (n + 40));
     // Sample offset from the subframe start to this slot's first symbol.
-    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, 1) + n).sum();
+    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, mu) + n).sum();
     for (l, grid) in grids.iter().enumerate() {
-        let cp = ofdm.cp_len(slot_in_subframe * 14 + l, 1);
+        let cp = ofdm.cp_len(slot_in_subframe * 14 + l, mu);
         let sym = ofdm.modulate_symbol(grid, cp);
         if center_freq_hz != 0.0 {
             // §5.4 phase compensation: t_start = start of the useful part.
@@ -246,10 +256,10 @@ pub(crate) fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
 /// symbols starting after the first DM-RS symbol (strided so each symbol carries a
 /// fair share), then place the actual Q'_ACK REs on a strided subset of the reserved
 /// ones. Returns each ACK RE as `(symbol, subcarrier-within-alloc)`, in gNB order.
-fn harq_ack_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_ack: usize, beta: f32, tb_bits: usize) -> Vec<(usize, usize)> {
+fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: usize, o_ack: usize, beta: f32, tb_bits: usize) -> Vec<(usize, usize)> {
     let n_sc = 12 * n_rb;
     let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs.contains(l)).collect();
+    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1).filter(|l| !dmrs.contains(l)).collect();
     let first_dmrs = *dmrs_symbols.iter().min().unwrap();
     let l1 = match data_syms.iter().find(|&&l| l > first_dmrs) {
         Some(&l) => l,
@@ -335,10 +345,10 @@ pub fn beta_offset_csi(index: u8) -> f32 {
 /// (one RE of difference shifts the whole data map). The UL-SCH is RATE-MATCHED
 /// around these REs — the caller must shrink its data E by 2·len() and the mapper
 /// must skip them. Returns each CSI RE as `(symbol, subcarrier-within-alloc)`.
-pub fn csi1_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_csi: usize, beta: f32, alpha: f32, sum_kr: usize) -> Vec<(usize, usize)> {
+pub fn csi1_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: usize, o_csi: usize, beta: f32, alpha: f32, sum_kr: usize) -> Vec<(usize, usize)> {
     let n_sc = 12 * n_rb;
     let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (0..14).filter(|l| !dmrs.contains(l)).collect();
+    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1).filter(|l| !dmrs.contains(l)).collect();
     let nof_re_uci = data_syms.len() * n_sc;
     let sum_cb = sum_kr as f32;
     let q_csi = (((o_csi as f32) * beta * nof_re_uci as f32 / sum_cb).ceil() as usize)
@@ -365,7 +375,7 @@ pub fn csi1_pusch_res(dmrs_symbols: &[usize], n_rb: usize, o_csi: usize, beta: f
 /// Number of PUSCH data REs and rate-match length `E = N_RE·Qm` for an
 /// allocation (2 DM-RS CDM groups without data → no data on DM-RS symbols).
 pub fn pusch_e_len(alloc: &PuschAlloc) -> usize {
-    let data_syms = 14 - alloc.dmrs_symbols.len();
+    let data_syms = alloc.n_sym - alloc.dmrs_symbols.len();
     data_syms * alloc.n_rb * 12 * alloc.qm
 }
 
@@ -380,7 +390,7 @@ mod tests {
     /// symbol after the first DM-RS), strided at subcarriers 0,6,12,…
     #[test]
     fn harq_ack_pusch_re_placement() {
-        let res = harq_ack_pusch_res(&[2, 7, 11], 20, 1, 20.0, 1600);
+        let res = harq_ack_pusch_res(&[2, 7, 11], (0, 14), 20, 1, 20.0, 1600);
         assert_eq!(res.len(), 33);
         assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
         assert_eq!(&res[..3], &[(3, 0), (3, 6), (3, 12)]);
@@ -401,7 +411,7 @@ mod tests {
     /// = 99 REs in symbol 3, strided at subcarriers 0,2,4,…
     #[test]
     fn harq_ack_pusch_re_placement_3bit() {
-        let res = harq_ack_pusch_res(&[2, 7, 11], 20, 3, 20.0, 1600);
+        let res = harq_ack_pusch_res(&[2, 7, 11], (0, 14), 20, 3, 20.0, 1600);
         assert_eq!(res.len(), 99);
         assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
         assert_eq!(&res[..3], &[(3, 0), (3, 2), (3, 4)]);
@@ -412,7 +422,7 @@ mod tests {
     #[test]
     fn pusch_msg3_round_trip() {
         let ofdm = Ofdm::new(512);
-        let alloc = PuschAlloc { rb_start: 4, n_rb: 3, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
+        let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
         let e = pusch_e_len(&alloc);
         assert_eq!(e, 792);
         let (cell_id, tc_rnti, r) = (1u16, 0x4601u16, 0.117);
@@ -422,7 +432,7 @@ mod tests {
         let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
         let ulsch = dlsch_encode_single(&tb, e, r, 2, 0);
 
-        let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, tc_rnti, 0.0, 15.36e6);
+        let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, tc_rnti, 0.0, 15.36e6);
 
         // Demodulate: extract the data REs (skip DM-RS symbols), form soft bits.
         let center = alloc.carrier_rb as i32 * 6;

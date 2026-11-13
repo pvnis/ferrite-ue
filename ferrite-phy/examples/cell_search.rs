@@ -7,6 +7,7 @@
 
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::sync::cfo::correct_cfo;
+use ferrite_phy::sync::pbch::L_MAX_FR1_ABOVE_3GHZ;
 use ferrite_phy::sync::ssb::build_ssb_waveform;
 use ferrite_phy::sync::CellSearcher;
 use ferrite_phy::Ofdm;
@@ -35,7 +36,7 @@ fn main() {
     const MU: u8 = 1;
     let fs = FFT as f64 * 30_000.0;
     let ofdm = Ofdm::new(FFT);
-    let searcher = CellSearcher::new(FFT, MU);
+    let searcher = CellSearcher::new(FFT, MU, L_MAX_FR1_ABOVE_3GHZ);
     let mut rng = Rng(0xFE55_17E5);
 
     let (cell_id, i_ssb) = (623u16, 5u8);
@@ -56,13 +57,13 @@ fn main() {
     println!();
     println!("  {:>7} {:>7} | {:>5} {:>6} {:>10} {:>5} {:>6} {:>8}", "CFO/kHz", "SNR/dB", "PCI", "i_SSB", "cfo_est/Hz", "SFN", "pdcch", "result");
 
-    let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, &ofdm, MU);
+    let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, L_MAX_FR1_ABOVE_3GHZ, &ofdm, MU);
     let rms = (ssb.iter().map(|s| s.norm_sqr()).sum::<f32>() / ssb.len() as f32).sqrt();
 
     for &(cfo, snr_db) in &[(0.0f32, 40.0f32), (1_200.0, 15.0), (2_600.0, 8.0)] {
         let mut sig = vec![Complex32::new(0.0, 0.0); 411];
         sig.extend_from_slice(&ssb);
-        sig.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(300));
+        sig.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 300));
 
         let h = Complex32::from_polar(0.8, -1.9);
         let sigma = h.norm() * rms / 10f32.powf(snr_db / 20.0);
@@ -79,15 +80,15 @@ fn main() {
         correct_cfo(&mut corrected, found.cfo_hz, fs);
 
         match searcher.decode_mib(&corrected, &found) {
-            Some((dec, dec_issb)) => {
-                let ok = found.cell_id == cell_id && dec_issb == i_ssb && dec == mib;
+            Some(dec) => {
+                let ok = found.cell_id == cell_id && dec.i_ssb == i_ssb && dec.mib == mib;
                 println!(
                     "  {cfo:>7.0} {snr_db:>7.1} | {:>5} {:>6} {:>10.0} {:>5} {:>#6x} {:>8}",
                     found.cell_id,
-                    dec_issb,
+                    dec.i_ssb,
                     found.cfo_hz,
-                    dec.sfn,
-                    dec.pdcch_config_sib1,
+                    dec.mib.sfn,
+                    dec.mib.pdcch_config_sib1,
                     if ok { "MIB OK" } else { "MISMATCH" }
                 );
             }

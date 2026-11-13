@@ -7,8 +7,6 @@
 //! belief propagation on the lifted graph.
 
 use crate::coding::ldpc_tables::{BG1_EDGES, BG1_M, BG1_N, BG2_EDGES, BG2_M, BG2_N, LIFTING_SETS};
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
 
 /// Which NR LDPC base graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -16,14 +14,6 @@ pub enum BaseGraph {
     Bg1,
     Bg2,
 }
-
-/// Cache of the packed parity-solver matrix S per (base graph, Zc): the parity part
-/// H_p of the check matrix depends only on (bg, Zc), so its inversion (the expensive
-/// Gaussian elimination) is done ONCE per size and reused. Encoding is then
-/// `p[col] = parity(S[col] & (H_s · info))` — a cheap packed matrix-vector product,
-/// turning a per-PUSCH ~300 ms elimination into ~0.3 ms.
-static PARITY_SOLVER: LazyLock<Mutex<HashMap<(BaseGraph, usize), Arc<Vec<u64>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl BaseGraph {
     /// Number of systematic (information) base columns: 22 for BG1, 10 for BG2.
@@ -139,115 +129,104 @@ impl LdpcGraph {
         true
     }
 
-    /// Build the packed parity-solver matrix S (rows = parity unknowns, `words` u64
-    /// each): `p = S · rhs` where `rhs = H_s · info`. Derived once by Gauss-Jordan on
-    /// `[H_p | I]` — the right half at the pivot row of each column is that column's
-    /// solver row (the accumulated GF(2) row operations = H_p⁻¹ up to the pivot order).
-    /// info-independent, so cached per (bg, Zc). O(np³) but paid once per size.
-    fn build_parity_solver(&self) -> Vec<u64> {
-        let (kb, zc, np) = (self.bg.info_cols(), self.zc, self.m());
-        let words = np.div_ceil(64);
-        let stride = 2 * words; // each row: [ H_p (words) | I→inverse (words) ]
-        let mut aug = vec![0u64; np * stride];
-        let mut eqn = 0usize;
-        for row in &self.rows {
-            for zoff in 0..zc {
-                for &(n, s) in row {
-                    if n >= kb {
-                        let u = (n - kb) * zc + (zoff + s) % zc;
-                        aug[eqn * stride + u / 64] ^= 1u64 << (u % 64);
-                    }
-                }
-                aug[eqn * stride + words + eqn / 64] ^= 1u64 << (eqn % 64); // identity
-                eqn += 1;
-            }
-        }
-        let mut pivot_of = vec![usize::MAX; np];
-        let mut r = 0usize;
-        for col in 0..np {
-            let (w, bit) = (col / 64, col % 64);
-            let Some(piv) = (r..np).find(|&rr| (aug[rr * stride + w] >> bit) & 1 == 1) else {
-                continue;
-            };
-            if piv != r {
-                for k in 0..stride {
-                    aug.swap(r * stride + k, piv * stride + k);
-                }
-            }
-            // Eliminate this column from every other row (Gauss-Jordan). Split the
-            // buffer at the pivot row so the read (pivot) and write (target) don't alias.
-            for rr in 0..np {
-                if rr == r || (aug[rr * stride + w] >> bit) & 1 == 0 {
-                    continue;
-                }
-                let (pivot, target) = if rr < r {
-                    let (left, right) = aug.split_at_mut(r * stride);
-                    (&right[..stride], &mut left[rr * stride..rr * stride + stride])
-                } else {
-                    let (left, right) = aug.split_at_mut(rr * stride);
-                    (&left[r * stride..r * stride + stride], &mut right[..stride])
-                };
-                for k in 0..stride {
-                    target[k] ^= pivot[k];
-                }
-            }
-            pivot_of[col] = r;
-            r += 1;
-        }
-        let mut solver = vec![0u64; np * words];
-        for col in 0..np {
-            let row = pivot_of[col];
-            if row != usize::MAX {
-                solver[col * words..col * words + words]
-                    .copy_from_slice(&aug[row * stride + words..row * stride + stride]);
-            }
-        }
-        solver
-    }
-
-    /// The cached parity solver for this (bg, Zc); builds it on first use.
-    fn parity_solver(&self) -> Arc<Vec<u64>> {
-        let mut cache = PARITY_SOLVER.lock().unwrap();
-        cache
-            .entry((self.bg, self.zc))
-            .or_insert_with(|| Arc::new(self.build_parity_solver()))
-            .clone()
-    }
-
     /// Systematically encode `info` (length `k()`) into a full codeword (length
-    /// `n()`). Computes the systematic syndrome `rhs = H_s · info`, then the `M·Zc`
-    /// parity bits `p = S · rhs` via the cached solver (a packed GF(2) matrix-vector
-    /// product) — consistent with [`Self::is_codeword`] by construction.
+    /// `n()`), exploiting the TS 38.212 base-graph structure (O(edges · Zc)):
+    ///
+    /// * the four core parity columns `kb..kb+4` form a double diagonal where
+    ///   `p0` appears in three core rows (shifts `x, 0, 0`) and `p1..p3` in two
+    ///   rows each with shift 0, so summing the four core rows' systematic
+    ///   syndromes gives `rot_x(p0)`; the other core parities then follow one
+    ///   row at a time;
+    /// * every further row `m ≥ 4` holds exactly one extension parity column
+    ///   (`kb + m`, shift 0), equal to that row's syndrome over the known bits.
+    ///
+    /// Consistent with [`Self::is_codeword`] by construction (block `n` with
+    /// shift `s` contributes `c[n·Zc + (i + s) mod Zc]` to check offset `i`).
     pub fn encode(&self, info: &[u8]) -> Vec<u8> {
         assert_eq!(info.len(), self.k());
-        let (kb, zc, np) = (self.bg.info_cols(), self.zc, self.m());
-        let words = np.div_ceil(64);
-        // rhs = H_s · info, packed one bit per equation.
-        let mut rhs = vec![0u64; words];
-        let mut eqn = 0usize;
-        for row in &self.rows {
-            for zoff in 0..zc {
-                let mut b = 0u8;
-                for &(n, s) in row {
-                    if n < kb {
-                        b ^= info[n * zc + (zoff + s) % zc];
-                    }
-                }
-                if b != 0 {
-                    rhs[eqn / 64] ^= 1u64 << (eqn % 64);
-                }
-                eqn += 1;
-            }
-        }
-        let solver = self.parity_solver();
+        let (kb, zc) = (self.bg.info_cols(), self.zc);
         let mut c = vec![0u8; self.n()];
         c[..self.k()].copy_from_slice(info);
-        for col in 0..np {
-            let s = &solver[col * words..col * words + words];
-            let acc = s.iter().zip(&rhs).fold(0u64, |a, (&x, &y)| a ^ (x & y));
-            if acc.count_ones() & 1 == 1 {
-                c[(kb + col / zc) * zc + col % zc] = 1;
+        // Syndrome of row `m` over the columns `< max_col` (a Zc-vector).
+        let syndrome = |c: &[u8], m: usize, max_col: usize| -> Vec<u8> {
+            let mut acc = vec![0u8; zc];
+            for &(n, s) in &self.rows[m] {
+                if n < max_col {
+                    let blk = &c[n * zc..(n + 1) * zc];
+                    for (i, a) in acc.iter_mut().enumerate() {
+                        *a ^= blk[(i + s) % zc];
+                    }
+                }
             }
+            acc
+        };
+        // Solve `rot_s(p) = rhs` for the block `p`: p[(i + s) % Zc] = rhs[i].
+        let unrotate = |rhs: &[u8], s: usize| -> Vec<u8> {
+            let mut p = vec![0u8; zc];
+            for (i, &r) in rhs.iter().enumerate() {
+                p[(i + s) % zc] = r;
+            }
+            p
+        };
+        // p0 from the sum of the four core rows.
+        // The summed rows apply `⊕_rows rot_s(p0)` to p0; shifts occurring an
+        // even number of times cancel (BG1: shifts 1,0,1 → identity; BG2:
+        // 0,1,0 → rot_1), leaving exactly one net rotation `x`.
+        let mut total = vec![0u8; zc];
+        let mut net: Vec<usize> = Vec::new();
+        for m in 0..4 {
+            for (i, v) in syndrome(&c, m, kb).into_iter().enumerate() {
+                total[i] ^= v;
+            }
+            for &(n, s) in &self.rows[m] {
+                if n == kb {
+                    if let Some(pos) = net.iter().position(|&t| t == s) {
+                        net.swap_remove(pos);
+                    } else {
+                        net.push(s);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(net.len(), 1, "p0 column of the core rows must reduce to one rotation");
+        let x = net.first().copied().unwrap_or(0);
+        let p0 = unrotate(&total, x);
+        c[kb * zc..(kb + 1) * zc].copy_from_slice(&p0);
+        // p1..p3: repeatedly take a core row with a single unknown core parity.
+        let mut known = [true, false, false, false];
+        for _ in 0..3 {
+            let mut progressed = false;
+            for m in 0..4 {
+                let unknown: Vec<(usize, usize)> = self.rows[m].iter().copied().filter(|&(n, _)| n >= kb && n < kb + 4 && !known[n - kb]).collect();
+                if unknown.len() != 1 {
+                    continue;
+                }
+                let (n_u, s_u) = unknown[0];
+                // Syndrome over everything known in this row (systematic + known core parities).
+                let mut rhs = vec![0u8; zc];
+                for &(n, s) in &self.rows[m] {
+                    if n == n_u {
+                        continue;
+                    }
+                    let blk = &c[n * zc..(n + 1) * zc];
+                    for (i, a) in rhs.iter_mut().enumerate() {
+                        *a ^= blk[(i + s) % zc];
+                    }
+                }
+                let p = unrotate(&rhs, s_u);
+                c[n_u * zc..(n_u + 1) * zc].copy_from_slice(&p);
+                known[n_u - kb] = true;
+                progressed = true;
+                break;
+            }
+            debug_assert!(progressed, "core parity structure not double-diagonal");
+        }
+        // Extension parities: one degree-1 column per remaining row.
+        for m in 4..self.m_base {
+            let Some(&(n_u, s_u)) = self.rows[m].iter().find(|&&(n, _)| n >= kb + 4) else { continue };
+            let rhs = syndrome(&c, m, n_u);
+            let p = unrotate(&rhs, s_u);
+            c[n_u * zc..(n_u + 1) * zc].copy_from_slice(&p);
         }
         c
     }

@@ -3,89 +3,28 @@ name = "ferrite-ue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# The UE entry point is src/main.rs (binary `ferrite-ue`); the src/bin/* targets
-# are milestone-specific test/debug harnesses.
 default-run = "ferrite-ue"
 
 [features]
-# Real-SDR radio backend (seify → SoapySDR: BladeRF 2.0, USRP, …). Off by default;
-# the UE runs against the ZMQ gNB unless built with `--features sdr` and run with `--sdr`.
+# Real-SDR radio backend (seify → SoapySDR). Off by default.
 sdr = ["ferrite-radio/seify"]
 
 [dependencies]
 ferrite-common.workspace = true
 ferrite-phy.workspace = true
-ferrite-mac.workspace = true
 ferrite-radio = { workspace = true, features = ["zmq"] }
+ferrite-asn1.workspace = true
+ferrite-rlc.workspace = true
+ferrite-pdcp.workspace = true
+ferrite-nas.workspace = true
+ferrite-rrc.workspace = true
+ferrite-mac.workspace = true
+ferrite-l1.workspace = true
 num-complex.workspace = true
 crossbeam-channel.workspace = true
-rayon.workspace = true
-aes = "0.8"
-cmac = "0.7"
-sha2 = "0.10"
-hmac = "0.12"
-libc = "0.2"
-
-[[bin]]
-name = "ssb-scan"
-path = "src/bin/ssb_scan.rs"
-
-[[bin]]
-name = "sync-track"
-path = "src/bin/sync_track.rs"
-
-[[bin]]
-name = "sib1-dci"
-path = "src/bin/sib1_dci.rs"
-
-[[bin]]
-name = "sib1"
-path = "src/bin/sib1.rs"
-
-[[bin]]
-name = "pdsch-dbg"
-path = "src/bin/pdsch_dbg.rs"
-
-[[bin]]
-name = "pdsch-fwd"
-path = "src/bin/pdsch_fwd.rs"
-
-[[bin]]
-name = "pdsch-sys"
-path = "src/bin/pdsch_sys.rs"
-
-[[bin]]
-name = "pdsch-cmp"
-path = "src/bin/pdsch_cmp.rs"
-
-[[bin]]
-name = "pdsch-grid-drb"
-path = "src/bin/pdsch_grid_drb.rs"
-
-[[bin]]
-name = "pdsch-chan"
-path = "src/bin/pdsch_chan.rs"
-
-[[bin]]
-name = "prach-cmp"
-path = "src/bin/prach_cmp.rs"
-
-[[bin]]
-name = "prach-tx"
-path = "src/bin/prach_tx.rs"
-
-[[bin]]
-name = "rar-rx"
-path = "src/bin/rar_rx.rs"
-
-[[bin]]
-name = "msg3-grid"
-path = "src/bin/msg3_grid.rs"
-
-[[bin]]
-name = "sdr-analyze"
-path = "src/bin/sdr_analyze.rs"
-
-[[bin]]
-name = "sdr-sib1"
-path = "src/bin/sdr_sib1.rs"
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+toml.workspace = true
+clap.workspace = true
+libc.workspace = true

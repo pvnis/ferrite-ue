@@ -1,0 +1,9 @@
+[package]
+name = "ferrite-rlc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+log.workspace = true

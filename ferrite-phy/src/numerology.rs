@@ -1,7 +1,10 @@
 //! NR numerology / frame structure (3GPP TS 38.211 §4).
 //!
-//! A subcarrier spacing (SCS) of `15 * 2^mu` kHz defines the OFDM grid. For our
-//! target — band n78, FR1 TDD — the SSB and data use `mu = 1` (30 kHz).
+//! The numerology type itself ([`Numerology`]) is the workspace-wide one from
+//! `ferrite_common` (so every layer shares one slot clock); this module keeps
+//! the resource-grid constants the PHY needs alongside it.
+
+pub use ferrite_common::Numerology;
 
 /// Number of OFDM symbols per slot with the normal cyclic prefix (§4.3.2).
 pub const SYMBOLS_PER_SLOT_NORMAL_CP: u32 = 14;
@@ -9,41 +12,10 @@ pub const SYMBOLS_PER_SLOT_NORMAL_CP: u32 = 14;
 /// Subcarriers per resource block (§4.4.4.1).
 pub const SUBCARRIERS_PER_RB: u32 = 12;
 
-/// A concrete numerology, identified by the subcarrier-spacing index `mu`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Numerology {
-    /// Subcarrier-spacing configuration `mu` in `{0, 1, 2, 3, 4}` (§4.2).
-    pub mu: u8,
-}
-
-impl Numerology {
-    /// `mu = 1` → 30 kHz SCS, the FR1 default used by band n78.
-    pub const FR1_30KHZ: Numerology = Numerology { mu: 1 };
-
-    /// Construct a numerology from its SCS-configuration index.
-    pub const fn new(mu: u8) -> Self {
-        Self { mu }
-    }
-
-    /// Subcarrier spacing in Hz: `15_000 * 2^mu`.
-    pub const fn scs_hz(self) -> u32 {
-        15_000u32 << self.mu
-    }
-
-    /// Number of slots per subframe (§4.3.2): `2^mu`.
-    pub const fn slots_per_subframe(self) -> u32 {
-        1u32 << self.mu
-    }
-
-    /// Number of slots per 10 ms frame: `10 * 2^mu`.
-    pub const fn slots_per_frame(self) -> u32 {
-        10u32 << self.mu
-    }
-
-    /// OFDM symbol duration (excluding CP), in seconds: `1 / scs`.
-    pub fn symbol_duration_s(self) -> f64 {
-        1.0 / self.scs_hz() as f64
-    }
+/// Number of OFDM symbols per 1 ms subframe at numerology `mu` (normal CP):
+/// `14 · 2^mu`.
+pub const fn symbols_per_subframe(mu: u8) -> usize {
+    (SYMBOLS_PER_SLOT_NORMAL_CP as usize) << mu
 }
 
 #[cfg(test)]
@@ -58,6 +30,8 @@ mod tests {
 
         assert_eq!(Numerology::new(0).slots_per_frame(), 10);
         assert_eq!(Numerology::new(1).slots_per_frame(), 20);
-        assert_eq!(Numerology::FR1_30KHZ.slots_per_subframe(), 2);
+        assert_eq!(Numerology::KHZ30.slots_per_subframe(), 2);
+        assert_eq!(symbols_per_subframe(0), 14);
+        assert_eq!(symbols_per_subframe(1), 28);
     }
 }

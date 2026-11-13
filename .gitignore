@@ -5,3 +5,5 @@
 *.bin
 *.f32
 *.rec
+# Lab run logs/captures (scripts/lab.sh, scripts/probe.sh)
+/test/results/

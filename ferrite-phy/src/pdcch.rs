@@ -1,143 +1,427 @@
-//! PDCCH reception for CORESET#0 / Type0-PDCCH CSS (SIB1 scheduling).
+//! PDCCH reception: CORESET geometry, search-space candidates, DMRS channel
+//! estimation and candidate equalization.
 //!
-//! * CORESET#0 geometry: 38.213 §13, Table 13-4 ({SSB 30 kHz, PDCCH 30 kHz},
-//!   minimum channel bandwidth 5/10 MHz).
-//! * CCE→REG mapping: 38.211 §7.3.2.2 — interleaved, `L = 6`, `R = 2`,
-//!   `n_shift = N_cell_ID`; REGs numbered time-first.
-//! * PDCCH DMRS: 38.211 §7.4.1.3 — Gold-seeded QPSK on subcarriers `4k+1`,
-//!   reference point = lowest RB of the CORESET.
-//! * Candidates: 38.213 §10.1 Type0 CSS (`Y = 0`), CCE index
-//!   `L·((⌊m·N_CCE/(L·M)⌋) mod ⌊N_CCE/L⌋) + i`.
-//! * Mapping order: data symbols fill the candidate's non-DMRS REs in
-//!   increasing symbol `l`, then subcarrier `k` (empirically validated against
-//!   a live gNB — the decoded RIV matched the gNB's own SIB1 RB allocation).
+//! * CORESET model (TS 38.331 `ControlResourceSet`): any set of 6-RB groups
+//!   (or a contiguous range), 1–3 symbols, interleaved or non-interleaved
+//!   CCE→REG mapping with the general `(L, R, n_shift)` interleaver of
+//!   TS 38.211 §7.3.2.2, REGs numbered time-first (symbol fastest, then RB)
+//!   starting at the lowest RB.
+//! * PDCCH DMRS (§7.4.1.3): Gold-seeded QPSK on subcarriers `4k' + 1`; the
+//!   sequence reference is the CORESET's lowest RB for CORESET 0 (configured
+//!   by the PBCH / `controlResourceSetZero`), CRB 0 otherwise
+//!   ([`Coreset::dmrs_ref_crb`]).
+//! * Search spaces (TS 38.213 §10.1): monitoring occasions and the CCE hashing
+//!   for common (`Y = 0`) and UE-specific (`Y_{p,n}` recursion) search spaces.
+//! * Mapping order: a candidate's modulation symbols fill its non-DMRS REs in
+//!   increasing symbol `l`, then subcarrier `k` (validated against a live gNB:
+//!   the decoded RIV matched the gNB's own SIB1 allocation).
 
 use num_complex::Complex32;
 use std::f32::consts::FRAC_1_SQRT_2;
 
+use crate::coreset0::Coreset0Config;
 use crate::sequence::gold_sequence;
+use ferrite_common::SlotPoint;
 
-/// CORESET#0 layout from Table 13-4 (multiplexing pattern 1 only).
+/// Maximum number of 6-RB groups in `frequencyDomainResources` (TS 38.331).
+pub const CORESET_RB_GROUPS: usize = 45;
+/// REGs per CCE (§7.3.2.2).
+pub const REGS_PER_CCE: usize = 6;
+/// DMRS REs per REG (subcarriers 1, 5, 9).
+const DMRS_PER_REG: usize = 3;
+
+/// CCE-to-REG mapping of a CORESET (§7.3.2.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Coreset0 {
-    /// CORESET bandwidth in RBs (24 or 48).
-    pub n_rb: usize,
-    /// CORESET duration in OFDM symbols (1..3).
-    pub n_symb: usize,
-    /// Offset (RBs) from the CORESET's lowest RB up to the common RB
-    /// overlapping the SSB's first RB.
-    pub offset_rb: usize,
+pub enum CceToRegMapping {
+    /// `L = 6`, `f(x) = x`.
+    NonInterleaved,
+    /// Bundles of `reg_bundle_size` REGs (`L`: 2 or 6 for 1 symbol, `N_symb`
+    /// or 6 otherwise), interleaver rows `interleaver_size` (`R`: 2, 3, 6),
+    /// `shift_index` (`n_shift`: `shiftIndex` if configured, else the cell ID;
+    /// the cell ID for CORESET 0).
+    Interleaved {
+        reg_bundle_size: usize,
+        interleaver_size: usize,
+        shift_index: u16,
+    },
 }
 
-impl Coreset0 {
-    /// Look up `controlResourceSetZero` for {SSB 30, PDCCH 30} kHz, minimum
-    /// channel bandwidth 5/10 MHz (Table 13-4). Indices 0..=15.
-    pub fn from_index_30_30_minbw5_10(index: u8) -> Option<Coreset0> {
-        let (n_rb, n_symb, offset_rb) = match index {
-            0 => (24, 2, 0),
-            1 => (24, 2, 1),
-            2 => (24, 2, 2),
-            3 => (24, 2, 3),
-            4 => (24, 2, 4),
-            5 => (24, 3, 0),
-            6 => (24, 3, 1),
-            7 => (24, 3, 2),
-            8 => (24, 3, 3),
-            9 => (24, 3, 4),
-            10 => (48, 1, 12),
-            11 => (48, 1, 14),
-            12 => (48, 1, 16),
-            13 => (48, 2, 12),
-            14 => (48, 2, 14),
-            15 => (48, 2, 16),
-            _ => return None,
-        };
-        Some(Coreset0 {
-            n_rb,
+/// `precoderGranularity` (TS 38.331): whether the DMRS of a REG bundle may be
+/// assumed precoded identically only within the bundle or across all the
+/// CORESET's contiguous RBs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecoderGranularity {
+    SameAsRegBundle,
+    AllContiguousRbs,
+}
+
+/// A control resource set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coreset {
+    /// `controlResourceSetId` (0 for CORESET 0).
+    pub id: u8,
+    /// Common resource blocks of the CORESET, ascending. For CORESET 0 before
+    /// SIB1 is known the caller may number CRBs relative to the CORESET's
+    /// lowest RB (`first_crb = 0`).
+    pub rbs: Vec<usize>,
+    /// Duration in OFDM symbols (1..=3).
+    pub n_symb: usize,
+    pub mapping: CceToRegMapping,
+    pub precoder_granularity: PrecoderGranularity,
+    /// `N_ID` of the DMRS: `pdcch-DMRS-ScramblingID` if configured, else the
+    /// cell ID.
+    pub dmrs_scrambling_id: u16,
+    /// Reference CRB of the DMRS sequence (§7.4.1.3.2): the CORESET's lowest
+    /// RB for CORESET 0, CRB 0 otherwise. DMRS RE `k'` of CRB `n` takes
+    /// `r(3·(n − dmrs_ref_crb) + k')`.
+    pub dmrs_ref_crb: usize,
+}
+
+impl Coreset {
+    /// A contiguous CORESET of `n_rb` RBs from CRB `first_crb`, DMRS referenced
+    /// at CRB 0 and `sameAsREG-bundle` precoding.
+    pub fn contiguous(
+        id: u8,
+        first_crb: usize,
+        n_rb: usize,
+        n_symb: usize,
+        mapping: CceToRegMapping,
+        dmrs_scrambling_id: u16,
+    ) -> Self {
+        Self {
+            id,
+            rbs: (first_crb..first_crb + n_rb).collect(),
             n_symb,
-            offset_rb,
-        })
+            mapping,
+            precoder_granularity: PrecoderGranularity::SameAsRegBundle,
+            dmrs_scrambling_id,
+            dmrs_ref_crb: 0,
+        }
+    }
+
+    /// A CORESET from `frequencyDomainResources`: `groups[i]` is bit `i`
+    /// (group 0 = the first / most significant bit), each group covering 6
+    /// CRBs; the first group starts at CRB `6·⌈N_BWP_start/6⌉` (§7.3.2.2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bitmap(
+        id: u8,
+        bwp_start_crb: usize,
+        groups: &[bool],
+        n_symb: usize,
+        mapping: CceToRegMapping,
+        precoder_granularity: PrecoderGranularity,
+        dmrs_scrambling_id: u16,
+    ) -> Self {
+        let base = 6 * bwp_start_crb.div_ceil(6);
+        let rbs = groups
+            .iter()
+            .take(CORESET_RB_GROUPS)
+            .enumerate()
+            .filter(|(_, &set)| set)
+            .flat_map(|(g, _)| base + 6 * g..base + 6 * g + 6)
+            .collect();
+        Self {
+            id,
+            rbs,
+            n_symb,
+            mapping,
+            precoder_granularity,
+            dmrs_scrambling_id,
+            dmrs_ref_crb: 0,
+        }
+    }
+
+    /// CORESET 0 from its Table 13-x row (TS 38.213 §13): interleaved with
+    /// `L = 6`, `R = 2`, `n_shift = N_cell_ID`, DMRS seeded by the cell ID and
+    /// referenced at the CORESET's lowest RB, which is CRB `first_crb`.
+    pub fn coreset0(cfg: &Coreset0Config, cell_id: u16, first_crb: usize) -> Self {
+        Self {
+            id: 0,
+            rbs: (first_crb..first_crb + cfg.n_rb).collect(),
+            n_symb: cfg.n_symb,
+            mapping: CceToRegMapping::Interleaved {
+                reg_bundle_size: 6,
+                interleaver_size: 2,
+                shift_index: cell_id,
+            },
+            precoder_granularity: PrecoderGranularity::SameAsRegBundle,
+            dmrs_scrambling_id: cell_id,
+            dmrs_ref_crb: first_crb,
+        }
+    }
+
+    /// Number of RBs.
+    pub fn n_rb(&self) -> usize {
+        self.rbs.len()
     }
 
     /// Number of REGs (`N_RB · N_symb`).
     pub fn n_reg(&self) -> usize {
-        self.n_rb * self.n_symb
+        self.rbs.len() * self.n_symb
     }
 
-    /// Number of CCEs (6 REGs each).
+    /// Number of CCEs.
     pub fn n_cce(&self) -> usize {
-        self.n_reg() / 6
+        self.n_reg() / REGS_PER_CCE
     }
 
-    /// The CORESET's lowest subcarrier, in 30 kHz subcarriers relative to the
-    /// **SSB centre**. `k_ssb` is in 15 kHz subcarriers (FR1) and must be even
-    /// (odd values put the CORESET grid 7.5 kHz off the SSB grid; unsupported
-    /// here). SSB first subcarrier is at −120; the common RB overlapping it
-    /// starts `k_ssb/2` below that; the CORESET starts `offset_rb` RBs lower.
-    pub fn first_subcarrier_rel_ssb_centre(&self, k_ssb: u8) -> i32 {
-        assert!(k_ssb % 2 == 0, "odd k_SSB (15 kHz offset) not supported yet");
-        -120 - i32::from(k_ssb / 2) - 12 * self.offset_rb as i32
+    /// REG bundle size `L`.
+    pub fn reg_bundle_size(&self) -> usize {
+        match self.mapping {
+            CceToRegMapping::NonInterleaved => 6,
+            CceToRegMapping::Interleaved { reg_bundle_size, .. } => reg_bundle_size,
+        }
+    }
+
+    /// REG index → `(symbol, rb_index)`: time-first numbering, `rb_index`
+    /// indexing [`Coreset::rbs`].
+    pub fn reg_to_symbol_rb(&self, reg: usize) -> (usize, usize) {
+        (reg % self.n_symb, reg / self.n_symb)
+    }
+
+    /// The REG-bundle interleaver `f(x)` (§7.3.2.2): identity when
+    /// non-interleaved, else `f(cR + r) = (rC + c + n_shift) mod (N_REG/L)`
+    /// with `C = N_REG/(L·R)`.
+    pub fn bundle_interleaver(&self, x: usize) -> usize {
+        match self.mapping {
+            CceToRegMapping::NonInterleaved => x,
+            CceToRegMapping::Interleaved {
+                reg_bundle_size: l,
+                interleaver_size: r,
+                shift_index,
+            } => {
+                let n_bundles = self.n_reg() / l;
+                debug_assert!(n_bundles.is_multiple_of(r), "N_REG must be a multiple of L·R");
+                let c_cols = n_bundles / r;
+                let (c, rr) = (x / r, x % r);
+                (rr * c_cols + c + usize::from(shift_index)) % n_bundles
+            }
+        }
+    }
+
+    /// The REGs `(symbol, rb_index)` of CCE `cce`: bundles `f(6j/L + i)`,
+    /// `i ∈ 0..6/L`, each of `L` consecutive REGs.
+    pub fn cce_regs(&self, cce: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let l = self.reg_bundle_size();
+        (0..REGS_PER_CCE / l).flat_map(move |i| {
+            let bundle = self.bundle_interleaver(REGS_PER_CCE * cce / l + i);
+            (bundle * l..bundle * l + l).map(move |reg| self.reg_to_symbol_rb(reg))
+        })
+    }
+
+    /// All REGs of a candidate, sorted by `(symbol, rb_index)` — the RE mapping
+    /// order of its data (symbol-outer, subcarrier-inner).
+    pub fn candidate_regs(&self, cand: &Candidate) -> Vec<(usize, usize)> {
+        let mut regs: Vec<(usize, usize)> = cand.cces.iter().flat_map(|&c| self.cce_regs(c)).collect();
+        regs.sort_unstable();
+        regs
+    }
+
+    /// DMRS sequence index of DMRS RE `k'` (0..3) of the RB at `rb_index`.
+    fn dmrs_seq_index(&self, rb_index: usize, k_prime: usize) -> usize {
+        DMRS_PER_REG * (self.rbs[rb_index] - self.dmrs_ref_crb) + k_prime
+    }
+
+    /// DMRS sequence length needed to cover the CORESET.
+    fn dmrs_seq_len(&self) -> usize {
+        self.rbs.last().map_or(0, |&last| DMRS_PER_REG * (last - self.dmrs_ref_crb + 1))
     }
 }
 
-/// REG index → (symbol `l`, resource block `rb`): time-first numbering.
-fn reg_to_symbol_rb(reg: usize, n_symb: usize) -> (usize, usize) {
-    (reg % n_symb, reg / n_symb)
-}
-
-/// The CCE→REG-bundle interleaver `f(x)` for CORESET#0 (`L = 6`, `R = 2`,
-/// `n_shift = N_cell_ID`): `f(cR + r) = (rC + c + n_shift) mod (N_REG/L)`.
-fn bundle_interleaver(n_bundles: usize, cell_id: u16) -> Vec<usize> {
-    const R: usize = 2;
-    let c_cols = n_bundles / R;
-    let mut f = vec![0usize; n_bundles];
-    for (x, fx) in f.iter_mut().enumerate() {
-        let (c, r) = (x / R, x % R);
-        *fx = (r * c_cols + c + usize::from(cell_id)) % n_bundles;
-    }
-    f
-}
-
-/// A Type0-CSS PDCCH candidate: its aggregation level and CCE indices.
+/// A PDCCH candidate: its aggregation level and CCE indices.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub agg_level: usize,
     pub cces: Vec<usize>,
 }
 
-/// Enumerate the distinct Type0-PDCCH CSS candidates (38.213 Table 10.1-1:
-/// 4 candidates at AL4, 2 at AL8, 1 at AL16), deduplicated.
+/// The §10.1 CCE hashing for one aggregation level: candidate `m` of `L` CCEs
+/// starts at `L·((Y + ⌊m·N_CCE/(L·M)⌋ + n_CI) mod ⌊N_CCE/L⌋)`, `n_CI = 0`.
+fn hashed_candidates(n_cce: usize, y: u64, l: usize, m_max: usize, out: &mut Vec<Candidate>) {
+    if m_max == 0 || n_cce / l == 0 {
+        return;
+    }
+    for m in 0..m_max {
+        let base = l * (((y + (m * n_cce / (l * m_max)) as u64) % (n_cce / l) as u64) as usize);
+        let cand = Candidate {
+            agg_level: l,
+            cces: (base..base + l).collect(),
+        };
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+}
+
+/// Common-search-space candidates (`Y = 0`) for `(aggregation level,
+/// nrofCandidates)` pairs, deduplicated.
+pub fn css_candidates(n_cce: usize, al_counts: &[(usize, usize)]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for &(l, m_max) in al_counts {
+        hashed_candidates(n_cce, 0, l, m_max, &mut out);
+    }
+    out
+}
+
+/// The distinct Type0-PDCCH CSS candidates (TS 38.213 Table 10.1-1: 4 at AL4,
+/// 2 at AL8, 1 at AL16).
 pub fn type0_candidates(n_cce: usize) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = Vec::new();
-    for (l, m_max) in [(4usize, 4usize), (8, 2), (16, 1)] {
-        if n_cce / l == 0 {
+    css_candidates(n_cce, &[(4, 4), (8, 2), (16, 1)])
+}
+
+/// `Y_{p,n_s}` of the UE-specific search space hashing (§10.1):
+/// `Y_{p,n} = (A_p·Y_{p,n-1}) mod 65537`, `Y_{p,-1} = n_RNTI`, `A_p` by
+/// `p mod 3` (39827, 39829, 39839), iterated to the slot in the frame.
+pub fn uss_y(coreset_id: u8, rnti: u16, slot_in_frame: u32) -> u64 {
+    const D: u64 = 65537;
+    let a = match coreset_id % 3 {
+        0 => 39827u64,
+        1 => 39829,
+        _ => 39839,
+    };
+    let mut y = u64::from(rnti);
+    for _ in 0..=slot_in_frame {
+        y = (a * y) % D;
+    }
+    y
+}
+
+/// UE-specific search-space candidates for CORESET `coreset_id`, C-RNTI
+/// `rnti`, slot-in-frame `slot`, and `(aggregation level, nrofCandidates)`
+/// pairs from the SearchSpace configuration.
+pub fn uss_candidates(
+    n_cce: usize,
+    coreset_id: u8,
+    rnti: u16,
+    slot: u32,
+    al_counts: &[(usize, usize)],
+) -> Vec<Candidate> {
+    let y = uss_y(coreset_id, rnti, slot);
+    let mut out = Vec::new();
+    for &(l, m_max) in al_counts {
+        hashed_candidates(n_cce, y, l, m_max, &mut out);
+    }
+    out
+}
+
+/// Every CCE-aligned candidate on a CORESET for each aggregation level in
+/// `als`: candidate `m` of level `L` occupies CCEs `[m·L, m·L+L)`. An
+/// exhaustive superset of any hashed search space, for blind decoding when the
+/// SearchSpace configuration is not (yet) parsed; sound because the 24-bit
+/// RNTI-masked CRC rejects empty positions, and cheap on small CORESETs. Note
+/// that OCUDU's auto-configured UE-specific search space declares
+/// `nrofCandidates` = `N_CCE/L` (capped at 8) for AL1/AL2/AL4 and 0 for
+/// AL8/AL16, and the gNB only ever places a PDCCH on a declared candidate, so
+/// [`SearchSpace::candidates`] with the RRC-signalled counts covers the same
+/// positions once the configuration is known.
+pub fn all_candidates(n_cce: usize, als: &[usize]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for &l in als {
+        if l == 0 || l > n_cce {
             continue;
         }
-        for m in 0..m_max {
-            let base = l * ((m * n_cce / (l * m_max)) % (n_cce / l));
-            let cand = Candidate {
+        let mut base = 0;
+        while base + l <= n_cce {
+            out.push(Candidate {
                 agg_level: l,
                 cces: (base..base + l).collect(),
-            };
-            if !out.contains(&cand) {
-                out.push(cand);
-            }
+            });
+            base += l;
         }
     }
     out
 }
 
-/// PDCCH DMRS for one OFDM symbol across the whole CORESET: `3·N_RB` QPSK
-/// symbols, `r_l(m)` with the sequence reference at the CORESET's lowest RB.
-/// `c_init = (2^17·(14·slot + l + 1)·(2·N_ID + 1) + 2·N_ID) mod 2^31`.
-pub fn pdcch_dmrs(cell_id: u16, slot: u32, symbol: u32, n_rb: usize) -> Vec<Complex32> {
-    let n_id = u64::from(cell_id);
-    let c_init = (((1u64 << 17) * (14 * u64::from(slot) + u64::from(symbol) + 1)
-        * (2 * n_id + 1)
-        + 2 * n_id)
+/// Search-space type (TS 38.331 `SearchSpace.searchSpaceType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchSpaceKind {
+    /// Common: DCI formats 0_0/1_0 (and 2_x); `Y = 0`.
+    Common,
+    /// UE-specific: `fallback` selects formats 0_0/1_0 instead of 0_1/1_1.
+    UeSpecific { fallback: bool },
+}
+
+/// A search space (TS 38.331 `SearchSpace`, TS 38.213 §10.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchSpace {
+    pub id: u8,
+    pub coreset_id: u8,
+    /// `monitoringSlotPeriodicityAndOffset`: period and offset in slots.
+    pub period_slots: u32,
+    pub offset_slots: u32,
+    /// `duration`: consecutive monitored slots per occasion (1 if absent).
+    pub duration_slots: u32,
+    /// `monitoringSymbolsWithinSlot`: first symbols of the PDCCH monitoring
+    /// occasions within a monitored slot.
+    pub first_symbols: [bool; 14],
+    /// `nrofCandidates` for aggregation levels 1, 2, 4, 8, 16.
+    pub n_candidates: [u8; 5],
+    pub kind: SearchSpaceKind,
+}
+
+impl SearchSpace {
+    /// The Type0-PDCCH CSS (`searchSpaceZero`) candidate counts of Table
+    /// 10.1-1 on CORESET 0, monitored every slot of its occasions (the slot
+    /// pattern itself comes from [`crate::coreset0::type0_pdcch_monitoring`]).
+    pub fn type0(first_symbol: usize) -> Self {
+        let mut first_symbols = [false; 14];
+        first_symbols[first_symbol] = true;
+        Self {
+            id: 0,
+            coreset_id: 0,
+            period_slots: 1,
+            offset_slots: 0,
+            duration_slots: 1,
+            first_symbols,
+            n_candidates: [0, 0, 4, 2, 1],
+            kind: SearchSpaceKind::Common,
+        }
+    }
+
+    /// Whether `slot` is a monitored slot (§10.1): `(SFN·N_slot_frame + n_s −
+    /// o_s) mod k_s = 0` for one of the `duration` consecutive slots.
+    pub fn is_monitored(&self, slot: SlotPoint) -> bool {
+        if self.period_slots == 0 {
+            return false;
+        }
+        let idx = slot.index();
+        (0..self.duration_slots.max(1)).any(|d| {
+            (idx + u64::from(self.period_slots) * 1024 - u64::from(self.offset_slots) - u64::from(d))
+                .is_multiple_of(u64::from(self.period_slots))
+        })
+    }
+
+    /// `(aggregation level, nrofCandidates)` pairs with non-zero counts.
+    pub fn al_counts(&self) -> Vec<(usize, usize)> {
+        self.n_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, &m)| m > 0)
+            .map(|(i, &m)| (1usize << i, usize::from(m)))
+            .collect()
+    }
+
+    /// The PDCCH candidates to monitor in `coreset` for `rnti` in slot
+    /// `slot_in_frame` (`Y = 0` for a CSS; the `Y_{p,n}` recursion for a USS).
+    pub fn candidates(&self, coreset: &Coreset, rnti: u16, slot_in_frame: u32) -> Vec<Candidate> {
+        let counts = self.al_counts();
+        match self.kind {
+            SearchSpaceKind::Common => css_candidates(coreset.n_cce(), &counts),
+            SearchSpaceKind::UeSpecific { .. } => {
+                uss_candidates(coreset.n_cce(), coreset.id, rnti, slot_in_frame, &counts)
+            }
+        }
+    }
+}
+
+/// PDCCH DMRS sequence `r_l(0..len)` for one OFDM symbol (§7.4.1.3.1):
+/// `c_init = (2^17·(14·n_slot + l + 1)·(2·N_ID + 1) + 2·N_ID) mod 2^31`.
+pub fn pdcch_dmrs_sequence(n_id: u16, slot: u32, symbol: u32, len: usize) -> Vec<Complex32> {
+    let n_id = u64::from(n_id);
+    let c_init = (((1u64 << 17) * (14 * u64::from(slot) + u64::from(symbol) + 1) * (2 * n_id + 1) + 2 * n_id)
         % (1 << 31)) as u32;
-    let c = gold_sequence(c_init, 6 * n_rb);
-    (0..3 * n_rb)
+    let c = gold_sequence(c_init, 2 * len);
+    (0..len)
         .map(|m| {
             Complex32::new(
                 (1 - 2 * i32::from(c[2 * m])) as f32 * FRAC_1_SQRT_2,
@@ -147,211 +431,136 @@ pub fn pdcch_dmrs(cell_id: u16, slot: u32, symbol: u32, n_rb: usize) -> Vec<Comp
         .collect()
 }
 
-/// Resource-element layout of one candidate: for each of its REGs, the DMRS
-/// and data REs as `(symbol, subcarrier-within-CORESET)` plus the DMRS
-/// sequence index. Data REs are globally sorted by (k, l) per §7.3.2.5.
-pub struct CandidateLayout {
-    /// `(l, k, dmrs_seq_index)` for the 18·L DMRS REs.
-    pub dmrs: Vec<(usize, usize, usize)>,
-    /// `(l, k)` for the 54·L data REs, in mapping order (k first, then l).
-    pub data: Vec<(usize, usize)>,
+/// Per-REG channel estimate over a whole CORESET, estimated once per slot so
+/// every blind-decode candidate reuses it (the DMRS correlation is the
+/// expensive part; a REG's estimate is identical for every candidate touching
+/// it). Indexed by `(symbol, rb_index)`.
+#[derive(Clone, Debug)]
+pub struct CoresetEstimate {
+    n_rb: usize,
+    h: Vec<Complex32>,
 }
 
-/// Compute the layout of `cand` within `coreset` for a cell.
-pub fn candidate_layout(coreset: &Coreset0, cell_id: u16, cand: &Candidate) -> CandidateLayout {
-    let n_bundles = coreset.n_reg() / 6;
-    let f = bundle_interleaver(n_bundles, cell_id);
-    layout_from_bundles(coreset.n_symb, cand, |cce| f[cce])
-}
-
-/// Build a candidate's RE layout given a `bundle_of(cce)` map (interleaved for
-/// CORESET#0, identity for a non-interleaved RRC-configured CORESET). L = 6, so
-/// there is exactly one REG bundle per CCE.
-fn layout_from_bundles(n_symb: usize, cand: &Candidate, bundle_of: impl Fn(usize) -> usize) -> CandidateLayout {
-    let mut dmrs = Vec::new();
-    let mut data = Vec::new();
-    for &cce in &cand.cces {
-        let bundle = bundle_of(cce);
-        for reg in 6 * bundle..6 * bundle + 6 {
-            let (l, rb) = reg_to_symbol_rb(reg, n_symb);
-            for sc in 0..12 {
-                let k = 12 * rb + sc;
-                if sc % 4 == 1 {
-                    dmrs.push((l, k, 3 * rb + sc / 4));
-                } else {
-                    data.push((l, k));
-                }
-            }
-        }
+impl CoresetEstimate {
+    /// Channel of REG `(symbol, rb_index)`.
+    pub fn get(&self, symbol: usize, rb_index: usize) -> Complex32 {
+        self.h[symbol * self.n_rb + rb_index]
     }
-    // Data symbols map to REs in increasing symbol `l`, then subcarrier `k`
-    // (verified against a live srsRAN-derived gNB: any other order fails CRC).
-    data.sort_by_key(|&(l, k)| (l, k));
-    dmrs.sort_by_key(|&(l, k, _)| (l, k));
-    CandidateLayout { dmrs, data }
 }
 
-/// UE-specific search-space candidate CCE hashing (TS 38.213 §10.1). For a USS
-/// on CORESET `coreset_id`, C-RNTI `rnti`, and slot-in-frame `slot`:
-/// `Y_{p,n} = (A_p·Y_{p,n-1}) mod 65537`, `Y_{p,-1}=n_RNTI`, `A_p` per `p mod 3`;
-/// CCE = `L·((Y + ⌊m·N_CCE/(L·M)⌋) mod ⌊N_CCE/L⌋) + i`. `al_counts` is
-/// `(aggregation_level, nrofCandidates)` from the SearchSpace config.
-pub fn uss_candidates(n_cce: usize, coreset_id: u16, rnti: u16, slot: u32, al_counts: &[(usize, usize)]) -> Vec<Candidate> {
-    const D: u64 = 65537;
-    let a = match coreset_id % 3 {
-        0 => 39827u64,
-        1 => 39829,
-        _ => 39839,
-    };
-    let mut y = u64::from(rnti); // Y_{p,-1}
-    for _ in 0..=slot {
-        y = (a * y) % D; // iterate (slot+1) times → Y_{p,slot}
-    }
-    let mut out = Vec::new();
-    for &(l, m_max) in al_counts {
-        if m_max == 0 || n_cce / l == 0 {
-            continue;
-        }
-        for m in 0..m_max {
-            let base = l * (((y + (m * n_cce) as u64 / (l * m_max) as u64) % (n_cce / l) as u64) as usize);
-            let cand = Candidate { agg_level: l, cces: (base..base + l).collect() };
-            if !out.contains(&cand) {
-                out.push(cand);
-            }
-        }
-    }
-    out
+/// Subcarrier (CRB domain) of DMRS RE `k'` of `crb`.
+fn dmrs_sc(crb: usize, k_prime: usize) -> usize {
+    12 * crb + 4 * k_prime + 1
 }
 
-/// Every CCE-aligned candidate on a small CORESET, for each aggregation level in
-/// `als`: candidate m of level L occupies CCEs `[m·L, m·L+L)`. This is an exhaustive
-/// SUPERSET of whatever hashed candidates the actual SearchSpace defines (any Y, any
-/// nrofCandidates), so it blind-decodes the DCI without tracking the exact SearchSpace
-/// config. Sound because the 24-bit RNTI-masked CRC rejects the (few) empty positions,
-/// and cheap on an 8-CCE CORESET. Needed because with CQI feedback the gNB drops the
-/// PDCCH to AL1 with Y=0-style CCEs {0,2,4,6}, which the rnti-hashed USS misses.
-pub fn all_candidates(n_cce: usize, als: &[usize]) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    for &l in als {
-        if l == 0 || l > n_cce {
-            continue;
-        }
-        let mut base = 0;
-        while base + l <= n_cce {
-            out.push(Candidate { agg_level: l, cces: (base..base + l).collect() });
-            base += l;
-        }
+/// LS channel estimate of one REG from its 3 DMRS REs.
+fn estimate_reg(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: &impl Fn(usize) -> usize,
+    coreset: &Coreset,
+    dmrs_ref: &[Vec<Complex32>],
+    l: usize,
+    rb: usize,
+) -> Complex32 {
+    let mut sum = Complex32::new(0.0, 0.0);
+    for k_prime in 0..DMRS_PER_REG {
+        let rx = grids[l][sc_to_bin(dmrs_sc(coreset.rbs[rb], k_prime))];
+        sum += rx * dmrs_ref[l][coreset.dmrs_seq_index(rb, k_prime)].conj();
     }
-    out
+    sum / DMRS_PER_REG as f32
 }
 
-/// Equalize one candidate from per-symbol frequency grids and produce its
-/// `108·L` LLRs (positive ⇒ bit 0), before descrambling.
-///
+/// Estimate the per-REG channel across a whole CORESET from its PDCCH DMRS.
 /// `grids[l]` is the demodulated grid of CORESET symbol `l` (natural FFT
-/// order); `sc_to_bin` maps a CORESET subcarrier index to an FFT bin. The
-/// channel is estimated per REG from its 3 DMRS REs (sameAsREG-bundle
-/// precoding ⇒ constant within a REG bundle; we estimate per RB-symbol).
+/// order); `sc_to_bin` maps a CRB-domain subcarrier index (`12·crb + k`) to an
+/// FFT bin; `slot` is the slot in the frame.
+pub fn estimate_coreset(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    coreset: &Coreset,
+    slot: u32,
+) -> CoresetEstimate {
+    let len = coreset.dmrs_seq_len();
+    let dmrs_ref: Vec<Vec<Complex32>> = (0..coreset.n_symb)
+        .map(|l| pdcch_dmrs_sequence(coreset.dmrs_scrambling_id, slot, l as u32, len))
+        .collect();
+    let n_rb = coreset.n_rb();
+    let mut h = Vec::with_capacity(coreset.n_reg());
+    for l in 0..coreset.n_symb {
+        for rb in 0..n_rb {
+            h.push(estimate_reg(grids, &sc_to_bin, coreset, &dmrs_ref, l, rb));
+        }
+    }
+    CoresetEstimate { n_rb, h }
+}
+
+/// Match-filter a candidate's data REs against a channel estimate into `out`
+/// (cleared; `108·L` LLRs, positive ⇒ bit 0, before descrambling), in the RE
+/// mapping order (symbol-outer, subcarrier-inner).
+pub fn equalize_candidate_cached(
+    grids: &[Vec<Complex32>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    coreset: &Coreset,
+    cand: &Candidate,
+    est: &CoresetEstimate,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.reserve(cand.cces.len() * REGS_PER_CCE * 9 * 2);
+    for (l, rb) in coreset.candidate_regs(cand) {
+        let h = est.get(l, rb).conj();
+        let crb = coreset.rbs[rb];
+        for k in (0..12).filter(|k| k % 4 != 1) {
+            let z = grids[l][sc_to_bin(12 * crb + k)] * h;
+            out.push(z.re);
+            out.push(z.im);
+        }
+    }
+}
+
+/// Equalize one candidate on its own: per-REG LS channel estimate from the
+/// candidate's DMRS REs, then match-filter its data REs. Identical to
+/// [`estimate_coreset`] + [`equalize_candidate_cached`] for a single candidate.
 pub fn equalize_candidate(
     grids: &[Vec<Complex32>],
     sc_to_bin: impl Fn(usize) -> usize,
-    coreset: &Coreset0,
-    cell_id: u16,
-    slot: u32,
+    coreset: &Coreset,
     cand: &Candidate,
-) -> Vec<f32> {
-    let layout = candidate_layout(coreset, cell_id, cand);
-    equalize_layout(grids, sc_to_bin, &layout, cell_id, slot, coreset.n_symb, coreset.n_rb)
-}
-
-/// Equalize a candidate in an RRC-configured CORESET with NON-interleaved
-/// CCE→REG mapping (identity bundle map), spanning `n_rb` RBs over `n_symb`
-/// symbols, DMRS referenced at the CORESET's lowest RB (`sc_to_bin(0)` = its
-/// first subcarrier). Used for CORESET#1 / the UE-specific search space.
-pub fn equalize_candidate_c1(
-    grids: &[Vec<Complex32>],
-    sc_to_bin: impl Fn(usize) -> usize,
-    n_rb: usize,
-    n_symb: usize,
-    cell_id: u16,
     slot: u32,
-    cand: &Candidate,
 ) -> Vec<f32> {
-    let layout = layout_from_bundles(n_symb, cand, |cce| cce);
-    equalize_layout(grids, sc_to_bin, &layout, cell_id, slot, n_symb, n_rb)
-}
-
-/// Estimate the per-(symbol, RB) channel across a whole non-interleaved CORESET from
-/// its PDCCH DM-RS, ONCE, so the many overlapping blind-decode candidates can reuse it
-/// (the DM-RS correlation is the expensive part; the same REG's estimate is identical
-/// for every candidate that touches it). Keyed by (symbol, rb).
-pub fn estimate_coreset_c1(
-    grids: &[Vec<Complex32>],
-    sc_to_bin: impl Fn(usize) -> usize,
-    n_rb: usize,
-    n_symb: usize,
-    cell_id: u16,
-    slot: u32,
-) -> std::collections::HashMap<(usize, usize), Complex32> {
-    let dmrs_ref: Vec<Vec<Complex32>> =
-        (0..n_symb).map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb)).collect();
-    let mut h = std::collections::HashMap::new();
-    for l in 0..n_symb {
-        for rb in 0..n_rb {
-            let mut sum = Complex32::new(0.0, 0.0);
-            for (i, sc) in (1..12).step_by(4).enumerate() {
-                let rx = grids[l][sc_to_bin(12 * rb + sc)];
-                sum += rx * dmrs_ref[l][3 * rb + i].conj();
-            }
-            h.insert((l, rb), sum / 3.0);
+    let len = coreset.dmrs_seq_len();
+    let dmrs_ref: Vec<Vec<Complex32>> = (0..coreset.n_symb)
+        .map(|l| pdcch_dmrs_sequence(coreset.dmrs_scrambling_id, slot, l as u32, len))
+        .collect();
+    let regs = coreset.candidate_regs(cand);
+    let mut out = Vec::with_capacity(regs.len() * 9 * 2);
+    for (l, rb) in regs {
+        let h = estimate_reg(grids, &sc_to_bin, coreset, &dmrs_ref, l, rb).conj();
+        let crb = coreset.rbs[rb];
+        for k in (0..12).filter(|k| k % 4 != 1) {
+            let z = grids[l][sc_to_bin(12 * crb + k)] * h;
+            out.push(z.re);
+            out.push(z.im);
         }
     }
-    h
+    out
 }
 
-/// Produce one candidate's LLRs from a precomputed CORESET channel estimate (see
-/// [`estimate_coreset_c1`]) — match-filter the data REs only, no re-estimation. Same
-/// result as [`equalize_candidate_c1`] but cheap enough to blind-decode every AL/CCE.
-pub fn equalize_candidate_c1_cached(
-    grids: &[Vec<Complex32>],
-    sc_to_bin: impl Fn(usize) -> usize,
-    n_symb: usize,
-    cand: &Candidate,
-    h_reg: &std::collections::HashMap<(usize, usize), Complex32>,
-) -> Vec<f32> {
-    let layout = layout_from_bundles(n_symb, cand, |cce| cce);
-    let mut llrs = Vec::with_capacity(layout.data.len() * 2);
-    for &(l, k) in &layout.data {
-        let z = grids[l][sc_to_bin(k)] * h_reg[&(l, k / 12)].conj();
-        llrs.push(z.re);
-        llrs.push(z.im);
-    }
-    llrs
-}
-
-/// Cheap per-candidate PDCCH presence metric (srsUE's get_measure → discard): the
-/// COHERENCE of the cached per-REG channel estimate across the candidate's REGs,
-/// `|mean(h)|² / mean(|h|²)`. When a PDCCH really occupies the candidate every REG sees
-/// the same channel ⇒ ≈1; over empty (noise-only DM-RS) REGs the estimates are random
-/// ⇒ ≈1/N. Gating the blind decode on this (skip if below ~0.5) avoids the equalize +
-/// polar decode for the ~13 of 15 candidates that carry nothing — using only the
-/// estimate from [`estimate_coreset_c1`], no extra reads.
-pub fn coreset_candidate_coherence(
-    h_reg: &std::collections::HashMap<(usize, usize), Complex32>,
-    cand: &Candidate,
-    n_symb: usize,
-) -> f32 {
+/// Cheap PDCCH presence metric for a candidate: the coherence of the per-REG
+/// channel estimate across its REGs, `|mean(h)|² / mean(|h|²)`. A real PDCCH
+/// (same precoder across its REG bundles) scores ≈1; noise-only REGs give
+/// random estimates, ≈1/N. Gating the blind decode on it (≈0.3–0.5) skips the
+/// equalize + polar decode for the many empty candidates, at no extra reads.
+pub fn candidate_coherence(est: &CoresetEstimate, coreset: &Coreset, cand: &Candidate) -> f32 {
     let mut sum = Complex32::new(0.0, 0.0);
     let mut power = 0.0f32;
     let mut n = 0u32;
     for &cce in &cand.cces {
-        for reg in 6 * cce..6 * cce + 6 {
-            let (l, rb) = reg_to_symbol_rb(reg, n_symb);
-            if let Some(&h) = h_reg.get(&(l, rb)) {
-                sum += h;
-                power += h.norm_sqr();
-                n += 1;
-            }
+        for (l, rb) in coreset.cce_regs(cce) {
+            let h = est.get(l, rb);
+            sum += h;
+            power += h.norm_sqr();
+            n += 1;
         }
     }
     if n == 0 || power <= 1e-12 {
@@ -360,92 +569,75 @@ pub fn coreset_candidate_coherence(
     (sum / n as f32).norm_sqr() / (power / n as f32)
 }
 
-/// Shared equalization: per-(symbol, rb) LS channel estimate from each REG's
-/// 3 DMRS REs, then match-filter the data REs into LLRs (positive ⇒ bit 0).
-fn equalize_layout(
-    grids: &[Vec<Complex32>],
-    sc_to_bin: impl Fn(usize) -> usize,
-    layout: &CandidateLayout,
-    cell_id: u16,
-    slot: u32,
-    n_symb: usize,
-    n_rb: usize,
-) -> Vec<f32> {
-    let dmrs_ref: Vec<Vec<Complex32>> = (0..n_symb)
-        .map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb))
-        .collect();
-
-    use std::collections::HashMap;
-    let mut h_reg: HashMap<(usize, usize), Complex32> = HashMap::new();
-    let mut acc: HashMap<(usize, usize), (Complex32, u32)> = HashMap::new();
-    for &(l, k, m) in &layout.dmrs {
-        let rx = grids[l][sc_to_bin(k)];
-        let est = rx * dmrs_ref[l][m].conj();
-        let e = acc.entry((l, k / 12)).or_insert((Complex32::new(0.0, 0.0), 0));
-        e.0 += est;
-        e.1 += 1;
-    }
-    for ((l, rb), (sum, n)) in acc {
-        h_reg.insert((l, rb), sum / n as f32);
-    }
-
-    let mut llrs = Vec::with_capacity(layout.data.len() * 2);
-    for &(l, k) in &layout.data {
-        let h = h_reg[&(l, k / 12)];
-        let z = grids[l][sc_to_bin(k)] * h.conj();
-        llrs.push(z.re);
-        llrs.push(z.im);
-    }
-    llrs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::dci::{
-        dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE,
-    };
+    use crate::coding::dci::{dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE};
+    use crate::coreset0::coreset0_config;
     use crate::sequence::gold_sequence as gold;
+    use ferrite_common::Numerology;
 
-    /// The cached-channel candidate equalization matches the per-candidate one bit for
-    /// bit (so blind-decoding every candidate off one channel estimate is exact).
-    #[test]
-    fn cached_equalization_matches_direct() {
-        let (n_rb, n_symb, cell_id, slot) = (24usize, 2usize, 1u16, 3u32);
-        // Synthetic CORESET grids: DM-RS + arbitrary data, a flat channel h.
-        let h = Complex32::new(0.7, 0.4);
-        let dmrs: Vec<Vec<Complex32>> = (0..n_symb).map(|l| pdcch_dmrs(cell_id, slot, l as u32, n_rb)).collect();
-        let mut grids = vec![vec![Complex32::new(0.0, 0.0); 12 * n_rb]; n_symb];
-        for l in 0..n_symb {
-            for rb in 0..n_rb {
-                for (i, sc) in (1..12).step_by(4).enumerate() {
-                    grids[l][12 * rb + sc] = h * dmrs[l][3 * rb + i];
+    fn coreset0_live() -> Coreset {
+        // Live OCUDU cell: controlResourceSetZero = 2 (Table 13-4: 24 RB, 2 symbols).
+        Coreset::coreset0(&coreset0_config(30, 30, 10, 2).unwrap(), 1, 0)
+    }
+
+    fn coreset1(n_rb: usize, n_symb: usize, cell_id: u16) -> Coreset {
+        Coreset::contiguous(1, 0, n_rb, n_symb, CceToRegMapping::NonInterleaved, cell_id)
+    }
+
+    /// Fill CORESET grids with DMRS + arbitrary data through a flat channel.
+    fn synthetic_grids(coreset: &Coreset, slot: u32, h: Complex32) -> Vec<Vec<Complex32>> {
+        let len = 3 * (coreset.rbs.last().unwrap() + 1);
+        let mut grids = vec![vec![Complex32::new(0.0, 0.0); 12 * (coreset.rbs.last().unwrap() + 1)]; coreset.n_symb];
+        for (l, grid) in grids.iter_mut().enumerate() {
+            let dmrs = pdcch_dmrs_sequence(coreset.dmrs_scrambling_id, slot, l as u32, len);
+            for &crb in &coreset.rbs {
+                for kp in 0..3 {
+                    grid[12 * crb + 4 * kp + 1] = h * dmrs[3 * (crb - coreset.dmrs_ref_crb) + kp];
                 }
                 for sc in (0..12).filter(|s| s % 4 != 1) {
-                    grids[l][12 * rb + sc] = h * Complex32::new((rb as f32).cos(), (sc as f32).sin());
+                    grid[12 * crb + sc] = h * Complex32::new((crb as f32).cos(), (sc as f32).sin());
                 }
             }
         }
-        let hmap = estimate_coreset_c1(&grids, |sc| sc, n_rb, n_symb, cell_id, slot);
-        for &(al, base) in &[(1usize, 3usize), (2, 4), (4, 0)] {
-            let cand = Candidate { agg_level: al, cces: (base..base + al).collect() };
-            let direct = equalize_candidate_c1(&grids, |sc| sc, n_rb, n_symb, cell_id, slot, &cand);
-            let cached = equalize_candidate_c1_cached(&grids, |sc| sc, n_symb, &cand, &hmap);
-            assert_eq!(direct.len(), cached.len());
-            for (a, b) in direct.iter().zip(&cached) {
-                assert!((a - b).abs() < 1e-4, "AL{al} cce{base}: {a} vs {b}");
+        grids
+    }
+
+    /// The cached-channel candidate equalization matches the per-candidate one
+    /// bit for bit (so blind-decoding every candidate off one estimate is exact),
+    /// on both an interleaved and a non-interleaved CORESET.
+    #[test]
+    fn cached_equalization_matches_direct() {
+        let slot = 3u32;
+        let h = Complex32::new(0.7, 0.4);
+        for coreset in [coreset1(24, 2, 1), coreset0_live(), coreset1(48, 1, 5)] {
+            let grids = synthetic_grids(&coreset, slot, h);
+            let est = estimate_coreset(&grids, |sc| sc, &coreset, slot);
+            let mut cached = Vec::new();
+            for &(al, base) in &[(1usize, 3usize), (2, 4), (4, 0)] {
+                let cand = Candidate {
+                    agg_level: al,
+                    cces: (base..base + al).collect(),
+                };
+                let direct = equalize_candidate(&grids, |sc| sc, &coreset, &cand, slot);
+                equalize_candidate_cached(&grids, |sc| sc, &coreset, &cand, &est, &mut cached);
+                assert_eq!(direct.len(), cached.len());
+                assert_eq!(direct.len(), al * BITS_PER_CCE);
+                for (a, b) in direct.iter().zip(&cached) {
+                    assert!((a - b).abs() < 1e-4, "AL{al} cce{base}: {a} vs {b}");
+                }
+                assert!(candidate_coherence(&est, &coreset, &cand) > 0.99);
             }
         }
     }
 
-    /// The coherence gate: a candidate whose REGs all see the same channel scores ≈1;
-    /// one over random (noise-only) estimates scores ≪ the 0.5 gate.
+    /// The coherence gate: a candidate whose REGs all see the same channel scores
+    /// ≈1; one over random (noise-only) estimates scores ≪ the 0.5 gate.
     #[test]
     fn candidate_coherence_gates_noise() {
-        let n_symb = 2usize;
+        let coreset = coreset1(24, 2, 1);
         let h = Complex32::new(0.7, -0.4);
-        let mut coherent = std::collections::HashMap::new();
-        let mut noise = std::collections::HashMap::new();
         let mut seed = 0x1234_5678u64;
         let mut rng = || {
             seed ^= seed << 13;
@@ -453,28 +645,30 @@ mod tests {
             seed ^= seed << 17;
             ((seed >> 40) as f32) / (1u64 << 24) as f32 - 0.5
         };
-        for l in 0..n_symb {
-            for rb in 0..24 {
-                coherent.insert((l, rb), h);
-                noise.insert((l, rb), Complex32::new(rng(), rng()));
-            }
-        }
+        let n_rb = coreset.n_rb();
+        let coherent = CoresetEstimate { n_rb, h: vec![h; coreset.n_reg()] };
+        let noise = CoresetEstimate {
+            n_rb,
+            h: (0..coreset.n_reg()).map(|_| Complex32::new(rng(), rng())).collect(),
+        };
         let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
-        assert!(coreset_candidate_coherence(&coherent, &cand, n_symb) > 0.95, "coherent ≈ 1");
-        assert!(coreset_candidate_coherence(&noise, &cand, n_symb) < 0.5, "noise low");
+        assert!(candidate_coherence(&coherent, &coreset, &cand) > 0.95, "coherent ≈ 1");
+        assert!(candidate_coherence(&noise, &coreset, &cand) < 0.5, "noise low");
     }
 
-    /// Exhaustive candidates cover every CCE-aligned position, in particular the
-    /// gNB's AL1 CCEs {0,2,4,6} (which the rnti-hashed USS could place at odd CCEs).
+    /// Exhaustive candidates cover every CCE-aligned position, in particular AL1
+    /// CCEs {0,2,4,6} (which an rnti-hashed USS could place at odd CCEs).
     #[test]
     fn all_candidates_cover_al1() {
         let c = all_candidates(8, &[1, 2, 4, 8]);
         let al1: Vec<usize> = c.iter().filter(|x| x.agg_level == 1).map(|x| x.cces[0]).collect();
-        assert_eq!(al1, vec![0, 1, 2, 3, 4, 5, 6, 7]); // covers {0,2,4,6}
-        assert_eq!(c.iter().filter(|x| x.agg_level == 2).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0, 2, 4, 6]);
+        assert_eq!(al1, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            c.iter().filter(|x| x.agg_level == 2).map(|x| x.cces[0]).collect::<Vec<_>>(),
+            vec![0, 2, 4, 6]
+        );
         assert_eq!(c.iter().filter(|x| x.agg_level == 4).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0, 4]);
         assert_eq!(c.iter().filter(|x| x.agg_level == 8).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0]);
-        // Every candidate is contiguous and aligned.
         for cand in &c {
             assert_eq!(cand.cces.len(), cand.agg_level);
             assert_eq!(cand.cces[0] % cand.agg_level, 0);
@@ -488,12 +682,23 @@ mod tests {
         // nrofCandidates AL2=4, AL4=2. The gNB was observed scheduling this UE at
         // AL4 with cce_index ∈ {0, 4} across slots. Every AL4 candidate we produce
         // must therefore be one of those two, and AL2 must be 2-CCE aligned.
+        let coreset = coreset1(24, 2, 1);
+        let ss = SearchSpace {
+            id: 2,
+            coreset_id: 1,
+            period_slots: 1,
+            offset_slots: 0,
+            duration_slots: 1,
+            first_symbols: [false; 14],
+            n_candidates: [0, 4, 2, 0, 0],
+            kind: SearchSpaceKind::UeSpecific { fallback: false },
+        };
         for slot in 0..20u32 {
-            let cands = uss_candidates(8, 1, 0x4626, slot, &[(2, 4), (4, 2)]);
+            let cands = ss.candidates(&coreset, 0x4626, slot);
+            assert_eq!(cands, uss_candidates(8, 1, 0x4626, slot, &[(2, 4), (4, 2)]));
             for c in &cands {
                 assert!(c.cces.iter().all(|&x| x < 8), "CCE out of range");
                 assert_eq!(c.cces.len(), c.agg_level);
-                // contiguous, aligned to the aggregation level
                 assert_eq!(c.cces[0] % c.agg_level, 0);
                 assert!(c.cces.windows(2).all(|w| w[1] == w[0] + 1));
                 if c.agg_level == 4 {
@@ -503,27 +708,72 @@ mod tests {
         }
         // A_p for p=1 is 39829; Y_{1,0} = 39829·0x4626 mod 65537.
         let y0 = (39829u64 * 0x4626) % 65537;
-        // AL4 (L=4, M=2): base = 4·(Y mod 2) → {0 or 4}; both m give both parities.
+        assert_eq!(uss_y(1, 0x4626, 0), y0);
         let c0 = uss_candidates(8, 1, 0x4626, 0, &[(4, 2)]);
         assert!(c0.iter().any(|c| c.cces[0] == 4 * ((y0 % 2) as usize)));
     }
 
     #[test]
-    fn coreset0_table_13_4() {
-        let c = Coreset0::from_index_30_30_minbw5_10(2).unwrap();
-        assert_eq!(
-            c,
-            Coreset0 {
-                n_rb: 24,
-                n_symb: 2,
-                offset_rb: 2
-            }
-        );
+    fn search_space_monitoring_occasions() {
+        let n = Numerology::KHZ30;
+        let ss = SearchSpace {
+            id: 1,
+            coreset_id: 0,
+            period_slots: 20,
+            offset_slots: 3,
+            duration_slots: 2,
+            first_symbols: [false; 14],
+            n_candidates: [0, 0, 4, 2, 1],
+            kind: SearchSpaceKind::Common,
+        };
+        assert!(ss.is_monitored(SlotPoint::new(n, 0, 3)));
+        assert!(ss.is_monitored(SlotPoint::new(n, 0, 4)));
+        assert!(!ss.is_monitored(SlotPoint::new(n, 0, 5)));
+        assert!(ss.is_monitored(SlotPoint::new(n, 7, 3)));
+        assert!(!ss.is_monitored(SlotPoint::new(n, 0, 2)));
+        // Common search space uses Y = 0: identical to the Type0 candidate set.
+        let coreset = coreset0_live();
+        assert_eq!(ss.candidates(&coreset, 0xFFFF, 5), type0_candidates(coreset.n_cce()));
+        assert_eq!(SearchSpace::type0(0).candidates(&coreset, 0xFFFF, 0), type0_candidates(8));
+    }
+
+    #[test]
+    fn coreset0_from_table_13_4() {
+        let c = coreset0_live();
+        assert_eq!(c.n_rb(), 24);
+        assert_eq!(c.n_symb, 2);
         assert_eq!(c.n_cce(), 8);
-        assert!(Coreset0::from_index_30_30_minbw5_10(16).is_none());
-        // Live OCUDU cell: k_SSB = 16 → CORESET starts 152 subcarriers below
-        // the SSB centre (−120 − 8 − 24).
-        assert_eq!(c.first_subcarrier_rel_ssb_centre(16), -152);
+        assert_eq!(c.dmrs_ref_crb, 0);
+        assert_eq!(
+            c.mapping,
+            CceToRegMapping::Interleaved { reg_bundle_size: 6, interleaver_size: 2, shift_index: 1 }
+        );
+    }
+
+    #[test]
+    fn coreset_from_bitmap_groups_and_regs() {
+        let mut groups = [false; CORESET_RB_GROUPS];
+        groups[0] = true;
+        groups[2] = true;
+        // BWP starting at CRB 4: the first group starts at CRB 6.
+        let c = Coreset::from_bitmap(
+            1,
+            4,
+            &groups,
+            2,
+            CceToRegMapping::NonInterleaved,
+            PrecoderGranularity::AllContiguousRbs,
+            7,
+        );
+        let expect: Vec<usize> = (6..12).chain(18..24).collect();
+        assert_eq!(c.rbs, expect);
+        assert_eq!(c.n_cce(), 4);
+        // Time-first REG numbering: REG 1 is symbol 1 of the lowest RB.
+        assert_eq!(c.reg_to_symbol_rb(1), (1, 0));
+        assert_eq!(c.reg_to_symbol_rb(2), (0, 1));
+        // Non-interleaved CCE 1 = REGs 6..12 = RBs 3..6 over both symbols.
+        let regs: Vec<_> = c.cce_regs(1).collect();
+        assert_eq!(regs, vec![(0, 3), (1, 3), (0, 4), (1, 4), (0, 5), (1, 5)]);
     }
 
     #[test]
@@ -538,30 +788,50 @@ mod tests {
 
     #[test]
     fn interleaver_is_permutation_and_shifts_with_pci() {
+        let f_for = |pci: u16| -> Vec<usize> {
+            let c = Coreset::coreset0(&coreset0_config(30, 30, 10, 2).unwrap(), pci, 0);
+            (0..8).map(|x| c.bundle_interleaver(x)).collect()
+        };
         for pci in [0u16, 1, 7, 623] {
-            let f = bundle_interleaver(8, pci);
-            let mut seen = vec![false; 8];
+            let f = f_for(pci);
+            let mut seen = [false; 8];
             for &v in &f {
                 assert!(!seen[v]);
                 seen[v] = true;
             }
         }
-        assert_ne!(bundle_interleaver(8, 1), bundle_interleaver(8, 2));
+        assert_ne!(f_for(1), f_for(2));
+        // General (L, R): 48 RB × 1 symbol, L = 2, R = 6 → 24 bundles, C = 4,
+        // f(cR + r) = 4r + c + n_shift.
+        let c = Coreset::contiguous(
+            1,
+            0,
+            48,
+            1,
+            CceToRegMapping::Interleaved { reg_bundle_size: 2, interleaver_size: 6, shift_index: 3 },
+            1,
+        );
+        assert_eq!(c.bundle_interleaver(0), 3);
+        assert_eq!(c.bundle_interleaver(1), 7); // c=0, r=1
+        assert_eq!(c.bundle_interleaver(6), 4); // c=1, r=0
+        let mut all: Vec<usize> = (0..24).map(|x| c.bundle_interleaver(x)).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..24).collect::<Vec<_>>());
+        // CCE 0 = bundles f(0), f(1), f(2) of 2 REGs each.
+        let regs: Vec<_> = c.cce_regs(0).collect();
+        assert_eq!(regs.len(), 6);
+        assert_eq!(regs[0], (0, 6)); // bundle 3 → REGs 6, 7 → RBs 6, 7
+        assert_eq!(regs[2], (0, 14)); // bundle 7 → REG 14
     }
 
     #[test]
-    fn candidate_layout_counts() {
-        let coreset = Coreset0::from_index_30_30_minbw5_10(2).unwrap();
+    fn candidate_layout_counts_and_order() {
+        let coreset = coreset0_live();
         let cand = Candidate { agg_level: 4, cces: vec![0, 1, 2, 3] };
-        let lay = candidate_layout(&coreset, 1, &cand);
-        assert_eq!(lay.dmrs.len(), 4 * 18);
-        assert_eq!(lay.data.len(), 4 * 54);
-        // Mapping order: strictly increasing (l, k) — symbol first.
-        for w in lay.data.windows(2) {
-            let (l0, k0) = w[0];
-            let (l1, k1) = w[1];
-            assert!((l1, k1) > (l0, k0));
-        }
+        let regs = coreset.candidate_regs(&cand);
+        assert_eq!(regs.len(), 4 * 6);
+        // Mapping order: strictly increasing (l, rb) — symbol first.
+        assert!(regs.windows(2).all(|w| w[1] > w[0]));
     }
 
     /// Full synthetic PDCCH: encode a SI-RNTI DCI, scramble, QPSK, map onto
@@ -595,15 +865,14 @@ mod tests {
             }
         }
 
-        let coreset = Coreset0::from_index_30_30_minbw5_10(2).unwrap();
+        let coreset = coreset0_live();
         let (cell_id, slot, rnti) = (1u16, 0u32, 0xFFFFu16);
         let fft = 512usize;
         let first_sc: i32 = -144; // arbitrary placement within the grid
-        let sc_to_bin =
-            move |sc: usize| (first_sc + sc as i32).rem_euclid(fft as i32) as usize;
+        let sc_to_bin = move |sc: usize| (first_sc + sc as i32).rem_euclid(fft as i32) as usize;
 
         let mut rng = Rng(0x9DCC_0001);
-        let a_len = dci_1_0_si_size(coreset.n_rb);
+        let a_len = dci_1_0_si_size(coreset.n_rb());
         let payload: Vec<u8> = (0..a_len).map(|_| rng.bit()).collect();
 
         // Transmit on the second AL4 candidate (CCEs 4..8).
@@ -616,38 +885,56 @@ mod tests {
             *b ^= cb;
         }
 
-        // Build the CORESET grids: DMRS everywhere in the candidate's REGs,
-        // QPSK data in (k, l) order.
+        // Build the CORESET grids: DMRS in the candidate's REGs, QPSK data in
+        // (l, k) order.
         let mut grids = vec![vec![Complex32::new(0.0, 0.0); fft]; coreset.n_symb];
-        let lay = candidate_layout(&coreset, cell_id, &tx_cand);
-        for &(l, k, m) in &lay.dmrs {
-            grids[l][sc_to_bin(k)] = pdcch_dmrs(cell_id, slot, l as u32, coreset.n_rb)[m];
+        let len = 3 * coreset.n_rb();
+        let dmrs: Vec<Vec<Complex32>> =
+            (0..coreset.n_symb).map(|l| pdcch_dmrs_sequence(cell_id, slot, l as u32, len)).collect();
+        let mut i = 0;
+        for (l, rb) in coreset.candidate_regs(&tx_cand) {
+            let crb = coreset.rbs[rb];
+            for k in 0..12 {
+                grids[l][sc_to_bin(12 * crb + k)] = if k % 4 == 1 {
+                    dmrs[l][3 * crb + k / 4]
+                } else {
+                    let s = Complex32::new(
+                        (1 - 2 * i32::from(bits[2 * i])) as f32 * FRAC_1_SQRT_2,
+                        (1 - 2 * i32::from(bits[2 * i + 1])) as f32 * FRAC_1_SQRT_2,
+                    );
+                    i += 1;
+                    s
+                };
+            }
         }
-        for (i, &(l, k)) in lay.data.iter().enumerate() {
-            grids[l][sc_to_bin(k)] = Complex32::new(
-                (1 - 2 * i32::from(bits[2 * i])) as f32 * FRAC_1_SQRT_2,
-                (1 - 2 * i32::from(bits[2 * i + 1])) as f32 * FRAC_1_SQRT_2,
-            );
-        }
+        assert_eq!(2 * i, e);
 
         // Flat channel + noise at 15 dB.
         let h = Complex32::from_polar(0.9, 0.6);
         let sigma = 10f32.powf(-15.0 / 20.0);
         for g in &mut grids {
             for s in g.iter_mut() {
-                *s = *s * h
-                    + Complex32::new(rng.normal(), rng.normal())
-                        * (sigma / std::f32::consts::SQRT_2);
+                *s = *s * h + Complex32::new(rng.normal(), rng.normal()) * (sigma / std::f32::consts::SQRT_2);
             }
         }
 
-        // Receiver: try every candidate blindly; exactly one must decode.
+        // Receiver: try every candidate blindly, gated on coherence; exactly one
+        // must decode — through both the direct and the cached path.
+        let est = estimate_coreset(&grids, sc_to_bin, &coreset, slot);
         let mut hits = Vec::new();
+        let mut cached = Vec::new();
         for cand in type0_candidates(coreset.n_cce()) {
-            let mut llrs =
-                equalize_candidate(&grids, sc_to_bin, &coreset, cell_id, slot, &cand);
+            let mut llrs = equalize_candidate(&grids, sc_to_bin, &coreset, &cand, slot);
             pdcch_descramble_llr(&mut llrs, u32::from(cell_id));
-            if let Some(dec) = dci_decode(&llrs, rnti, a_len) {
+            let direct = dci_decode(&llrs, rnti, a_len);
+            equalize_candidate_cached(&grids, sc_to_bin, &coreset, &cand, &est, &mut cached);
+            pdcch_descramble_llr(&mut cached, u32::from(cell_id));
+            let via_cache = dci_decode(&cached, rnti, a_len);
+            assert_eq!(direct, via_cache);
+            if cand == tx_cand {
+                assert!(candidate_coherence(&est, &coreset, &cand) > 0.5);
+            }
+            if let Some(dec) = direct {
                 hits.push((cand.clone(), dec));
             }
         }

@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 ferrite-common.workspace = true
+ferrite-l1.workspace = true
+log.workspace = true
+ferrite-phy.workspace = true

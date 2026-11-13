@@ -9,7 +9,8 @@
 //! silence before and after.
 
 use ferrite_phy::coding::bch::Mib;
-use ferrite_phy::sync::ssb::build_ssb_waveform;
+use ferrite_phy::sync::pbch::L_MAX_FR1_ABOVE_3GHZ;
+use ferrite_phy::sync::ssb::{build_ssb_waveform, ssb_sample_offset_in_frame, SsbCase};
 use ferrite_phy::Ofdm;
 use ferrite_radio::file::FileSink;
 use ferrite_radio::SampleSink;
@@ -36,15 +37,12 @@ fn main() {
     };
 
     let ofdm = Ofdm::new(fft);
-    let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, &ofdm, MU);
+    let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, L_MAX_FR1_ABOVE_3GHZ, &ofdm, MU);
 
     // Pad to a half frame (5 ms) with the SSB at its Case C first-candidate
-    // position: symbols {2..5} of the first slot → SSB starts at symbol 2.
-    let cp_long = ofdm.cp_len(0, MU);
-    let cp = ofdm.cp_len(1, MU);
-    let sym0 = cp_long + fft;
-    let sym = cp + fft;
-    let ssb_start = sym0 + sym; // after symbols 0 and 1
+    // position (symbol 2 of the first slot, TS 38.213 §4.1).
+    let first_symbol = SsbCase::C.candidate_symbols(3.5e9)[usize::from(i_ssb)];
+    let ssb_start = ssb_sample_offset_in_frame(first_symbol, 0, MU, &ofdm);
     let half_frame_len = (fs * 0.005) as usize;
 
     let mut sig = vec![Complex32::new(0.0, 0.0); half_frame_len];

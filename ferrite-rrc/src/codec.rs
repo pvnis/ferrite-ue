@@ -1,0 +1,802 @@
+//! ASN.1 ↔ configuration bindings: the only module that touches
+//! `ferrite_asn1` types. Everything here is a pure function from decoded IEs
+//! (plus the MIB / radio facts) to the plain `PhyConfig` / `MacConfig` /
+//! `BearerSetup` structures, or from plain arguments to an encoded UL PDU.
+//!
+//! Spec references are TS 38.331 (IEs), TS 38.213 §13 (CORESET#0 placement),
+//! TS 38.214 (TDRA, Msg3 Δ) and TS 38.211 §7.3.2.2 (CORESET RB groups).
+
+use crate::derive::{CellInfo, DlCcch, DlDcch, MibInfo, RadioInfo};
+use crate::{BearerSetup, RbId, RlcSetup};
+use ferrite_asn1::cellgroup as cg;
+use ferrite_asn1::common as cm;
+use ferrite_asn1::csi as acsi;
+use ferrite_asn1::rrc;
+use ferrite_asn1::sib1;
+use ferrite_common::{DuplexMode, Numerology};
+use ferrite_l1::config::*;
+use ferrite_mac::{CsiReportMacConfig, LogicalChannelConfig, MacConfig, PucchMacConfig, RachConfig, SrConfig};
+
+// ---------------------------------------------------------------------------
+// SIB1 → common configuration
+// ---------------------------------------------------------------------------
+
+fn err<E: std::fmt::Debug>(what: &str) -> impl FnOnce(E) -> String + '_ {
+    move |e| format!("{what}: {e:?}")
+}
+
+fn numerology_of(scs: cm::SubcarrierSpacing) -> Result<Numerology, String> {
+    match scs.mu() {
+        mu @ 0..=3 => Ok(Numerology::new(mu)),
+        mu => Err(format!("unsupported subcarrier spacing µ={mu}")),
+    }
+}
+
+/// Pick the `SCS-SpecificCarrier` of the list at numerology `n` (first one otherwise).
+fn carrier_at(list: &[cm::ScsSpecificCarrier], n: Numerology) -> Option<Carrier> {
+    list.iter()
+        .find(|c| c.subcarrier_spacing.mu() == n.mu)
+        .or_else(|| list.first())
+        .map(|c| Carrier { offset_crb: c.offset_to_carrier, n_rb: c.carrier_bandwidth })
+}
+
+/// `BWP.locationAndBandwidth` → CRBs (`N_BWP^start = O_carrier + RB_start`, TS 38.214 §5.1.2.2.2 / TS 38.213 §12).
+fn bwp_of(b: &cm::Bwp, carrier: Carrier) -> Result<Bwp, String> {
+    let (start, len) = b.start_and_len();
+    Ok(Bwp { start_crb: carrier.offset_crb + start, n_rb: len, scs: numerology_of(b.subcarrier_spacing)? })
+}
+
+fn tdra_rows_pdsch(rows: &[cm::TdraRow]) -> Vec<TdraRow> {
+    rows.iter()
+        .map(|r| {
+            let (s, l) = r.start_len();
+            TdraRow { k: r.k0(), mapping_type_a: r.mapping_type_a, start_symbol: s as u8, n_symbols: l as u8 }
+        })
+        .collect()
+}
+
+fn tdra_rows_pusch(rows: &[cm::TdraRow], mu: u8) -> Vec<TdraRow> {
+    rows.iter()
+        .map(|r| {
+            let (s, l) = r.start_len();
+            TdraRow { k: r.k2(mu), mapping_type_a: r.mapping_type_a, start_symbol: s as u8, n_symbols: l as u8 }
+        })
+        .collect()
+}
+
+/// `ControlResourceSet` → geometry. RB groups of 6 CRBs start at
+/// `6·⌈N_BWP^start/6⌉` (TS 38.213 §10.1 / TS 38.331 `frequencyDomainResources`).
+fn coreset_of(c: &cm::ControlResourceSet, bwp_start_crb: u16) -> Option<CoresetConfig> {
+    let groups: Vec<u8> = (0..45u8).filter(|&g| c.has_rb_group(g)).collect();
+    let (&first, &last) = (groups.first()?, groups.last()?);
+    let base = 6 * bwp_start_crb.div_ceil(6);
+    let start_crb = base + 6 * first as u16;
+    let rb_mask: Vec<bool> = (first..=last).flat_map(|g| std::iter::repeat_n(c.has_rb_group(g), 6)).collect();
+    let interleaved = match c.cce_reg_mapping_type {
+        cm::CceRegMapping::Interleaved { reg_bundle_size, interleaver_size, shift_index } => Some((reg_bundle_size, interleaver_size, shift_index.unwrap_or(u16::MAX))),
+        cm::CceRegMapping::NonInterleaved => None,
+    };
+    Some(CoresetConfig {
+        id: c.control_resource_set_id,
+        start_crb,
+        rb_mask,
+        duration: c.duration,
+        interleaved,
+        dmrs_scrambling_id: c.pdcch_dmrs_scrambling_id,
+        ref_lowest_rb: false,
+    })
+}
+
+fn search_space_of(s: &cm::SearchSpace) -> Option<SearchSpaceConfig> {
+    let coreset_id = s.control_resource_set_id?;
+    let (period_slots, offset_slots) = s.monitoring_slot_periodicity_and_offset.map_or((1, 0), |p| (p.period_slots, p.offset));
+    let mut symbols = [false; 14];
+    for l in s.monitoring_symbols() {
+        symbols[l as usize] = true;
+    }
+    let kind = match &s.search_space_type {
+        Some(cm::SearchSpaceType::UeSpecific { dci_formats_0_1_and_1_1: true }) => SearchSpaceKind::UeSpecificNonFallback,
+        Some(cm::SearchSpaceType::UeSpecific { .. }) => SearchSpaceKind::UeSpecificFallback,
+        _ => SearchSpaceKind::Common,
+    };
+    Some(SearchSpaceConfig {
+        id: s.search_space_id,
+        coreset_id,
+        period_slots,
+        offset_slots,
+        duration_slots: s.duration.unwrap_or(1),
+        symbols,
+        candidates: s.nrof_candidates.unwrap_or([0; 5]),
+        kind,
+    })
+}
+
+fn tdd_of(t: &sib1::TddUlDlConfigCommon) -> Result<TddConfig, String> {
+    let pat = |p: &sib1::TddPattern| TddPattern {
+        period_slots: p.period_slots as u16,
+        dl_slots: p.dl_slots as u16,
+        dl_symbols: p.dl_symbols as u8,
+        ul_slots: p.ul_slots as u16,
+        ul_symbols: p.ul_symbols as u8,
+    };
+    Ok(TddConfig { reference_scs: numerology_of(t.reference_subcarrier_spacing)?, pattern1: pat(&t.pattern1), pattern2: t.pattern2.as_ref().map(pat) })
+}
+
+/// TS 38.214 Table 6.1.2.1.1-5: Msg3 slot delay Δ per µ.
+fn msg3_delta(mu: u8) -> u8 {
+    [2, 3, 4, 6][mu.min(3) as usize]
+}
+
+/// Build the PHY and MAC configuration of a cell from its SIB1 (TS 38.331
+/// `ServingCellConfigCommonSIB`) and the MIB-derived CORESET#0 facts.
+pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16) -> Result<CellInfo, String> {
+    let s = sib1::Sib1::decode(tb).map_err(err("SIB1"))?;
+    let sc = s.serving_cell().ok_or("SIB1 without servingCellConfigCommon")?;
+    let dl = &sc.downlink_config_common;
+    let dl_bwp_gen = &dl.initial_downlink_bwp.generic_parameters;
+    let numerology = numerology_of(dl_bwp_gen.subcarrier_spacing)?;
+    let mu = numerology.mu;
+    if mu != mib.mu {
+        return Err(format!("initial DL BWP µ={mu} but MIB common SCS µ={}", mib.mu));
+    }
+    let dl_carrier = carrier_at(&dl.frequency_info_dl.scs_specific_carrier_list, numerology).ok_or("no DL SCS-SpecificCarrier")?;
+    let dl_bwp = bwp_of(dl_bwp_gen, dl_carrier)?;
+
+    // SSB placement on the CRB grid: offsetToPointA is in 15 kHz RBs (FR1);
+    // a leftover 15 kHz RB at µ=1 shifts the SSB by 12 extra 15 kHz subcarriers.
+    let o = dl.frequency_info_dl.offset_to_point_a;
+    let ssb_crb = o >> mu;
+    let k_ssb = mib.k_ssb + 12 * (o & ((1 << mu) - 1)) as u8;
+    let ssb_scs = Numerology::from_scs_khz(mib.ssb_scs_khz).ok_or("bad SSB SCS")?;
+
+    // Uplink.
+    let ul = sc.uplink_config_common.as_ref().ok_or("SIB1 without uplinkConfigCommon")?;
+    let ul_bwp_gen = &ul.initial_uplink_bwp.generic_parameters;
+    let ul_carrier = carrier_at(&ul.frequency_info_ul.scs_specific_carrier_list, numerology).ok_or("no UL SCS-SpecificCarrier")?;
+    let ul_bwp = bwp_of(ul_bwp_gen, ul_carrier)?;
+    if ul_bwp.scs != numerology {
+        return Err("initial UL BWP numerology differs from DL".into());
+    }
+
+    // TDD pattern vs the duplex mode the radio was started with.
+    let tdd = match (radio.duplex, sc.tdd_ul_dl_configuration_common.as_ref()) {
+        (DuplexMode::Tdd, Some(t)) => Some(tdd_of(t)?),
+        (DuplexMode::Fdd, None) => None,
+        (DuplexMode::Tdd, None) => return Err("radio is TDD but SIB1 has no tdd-UL-DL-ConfigurationCommon".into()),
+        (DuplexMode::Fdd, Some(_)) => return Err("radio is FDD but SIB1 carries a TDD configuration".into()),
+    };
+
+    // CORESET#0 (TS 38.213 §13): lowest CRB = SSB CRB − table offset.
+    let cs0_start = (ssb_crb as i32 - mib.coreset0_offset_rb).max(0) as u16;
+    let mut coresets = vec![CoresetConfig {
+        id: 0,
+        start_crb: cs0_start,
+        rb_mask: vec![true; mib.coreset0_n_rb as usize],
+        duration: mib.coreset0_n_symb,
+        interleaved: Some((6, 2, mib.pci)),
+        dmrs_scrambling_id: None,
+        ref_lowest_rb: true,
+    }];
+    let mut search_spaces = Vec::new();
+    let mut ss0_index = mib.ss0_index;
+    if let Some(pc) = s.pdcch_config_common() {
+        if let Some(c) = pc.common_control_resource_set.as_ref().and_then(|c| coreset_of(c, dl_bwp.start_crb)) {
+            coresets.retain(|x| x.id != c.id);
+            coresets.push(c);
+        }
+        if let Some(z) = pc.search_space_zero {
+            ss0_index = z;
+        }
+        for ss in &pc.common_search_space_list {
+            if let Some(cfg) = search_space_of(ss) {
+                // The Type0 CSS (SIB1) is handled by `ss0_index`; the others
+                // (RA / paging / OSI) are monitored as common search spaces.
+                if ss.search_space_id != 0 {
+                    search_spaces.push(cfg);
+                }
+            }
+        }
+    }
+
+    // RACH.
+    let rach = s.rach_config_common().ok_or("SIB1 without rach-ConfigCommon")?;
+    let g = &rach.rach_config_generic;
+    let msg1_scs_mu = rach.msg1_subcarrier_spacing.map_or(mu, |s| s.mu());
+    let prach = PrachConfig {
+        phy: ferrite_phy::prach_config::PrachConfig {
+            index: g.prach_configuration_index as u16,
+            duplex: radio.duplex,
+            mu,
+            msg1_scs_mu,
+            msg1_fdm: g.msg1_fdm,
+            msg1_frequency_start: g.msg1_frequency_start,
+        },
+        zero_correlation_zone: g.zero_correlation_zone_config,
+        root_sequence_index: match rach.prach_root_sequence_index {
+            sib1::PrachRootSequenceIndex::L839(v) => v,
+            sib1::PrachRootSequenceIndex::L139(v) => v as u16,
+        },
+        restricted_set: match rach.restricted_set_config {
+            sib1::RestrictedSetConfig::UnrestrictedSet => 0,
+            sib1::RestrictedSetConfig::RestrictedSetTypeA => 1,
+            sib1::RestrictedSetConfig::RestrictedSetTypeB => 2,
+        },
+        total_preambles: rach.total_number_of_ra_preambles.unwrap_or(64),
+        target_power_dbm: g.preamble_received_target_power,
+        power_ramping_step_db: g.power_ramping_step_db,
+    };
+    let pusch_tdra_common = tdra_rows_pusch(s.pusch_tdra(), mu);
+    let pucch_common = s.pucch_config_common();
+
+    let phy = PhyConfig {
+        duplex: radio.duplex,
+        numerology,
+        ssb: SsbConfig { pci: mib.pci, scs: ssb_scs, period_ms: sc.ssb_periodicity_ms as u16, ssb_index: mib.ssb_index, k_ssb, dmrs_typea_pos: mib.dmrs_typea_pos },
+        dl_carrier,
+        ul_carrier,
+        ssb_crb,
+        dl_bwp,
+        ul_bwp,
+        tdd,
+        coresets,
+        search_spaces,
+        ss0_index,
+        pdsch_tdra_common: tdra_rows_pdsch(s.pdsch_tdra()),
+        pusch_tdra_common: pusch_tdra_common.clone(),
+        prach: prach.clone(),
+        n_ta_offset_tc: sc.n_timing_advance_offset.unwrap_or(25600),
+        pdsch: PdschConfig { nof_harq_processes: 8, ..PdschConfig::default() },
+        pusch: PuschConfig::default(),
+        pucch: PucchConfig {
+            resource_common: pucch_common.and_then(|p| p.pucch_resource_common),
+            hopping_id: pucch_common.and_then(|p| p.hopping_id),
+            group_hopping: pucch_common.map_or(0, |p| match p.pucch_group_hopping {
+                sib1::PucchGroupHopping::Neither => 0,
+                sib1::PucchGroupHopping::Enable => 1,
+                sib1::PucchGroupHopping::Disable => 2,
+            }),
+            ..PucchConfig::default()
+        },
+        csi_reports: Vec::new(),
+        harq_codebook_dynamic: true,
+        ul_amplitude: 0.5,
+    };
+
+    let mut mac = MacConfig::initial(
+        numerology,
+        RachConfig {
+            preamble_trans_max: g.preamble_trans_max as u32,
+            power_ramping_step_db: g.power_ramping_step_db,
+            target_power_dbm: g.preamble_received_target_power,
+            ra_response_window_slots: g.ra_response_window_slots as u16,
+            contention_resolution_ms: rach.ra_contention_resolution_timer_sf as u32,
+            nof_cb_preambles: rach.group_b_configured.as_ref().map_or(prach.total_preambles, |b| b.number_of_ra_preambles_group_a),
+            cb_preambles_per_ssb: rach.ssb_per_rach_occasion_and_cb_preambles_per_ssb.map_or(64, |(_, n)| n),
+            prach,
+            ul_bwp_rb: ul_bwp.n_rb,
+            msg3_delta: msg3_delta(mu),
+            pusch_tdra_common,
+        },
+        tx_lead,
+    );
+    mac.time_alignment_timer_ms = ul.time_alignment_timer_common.0.map_or(0, u32::from);
+
+    let plmn = s.plmn().map(|p| {
+        let mut out = String::new();
+        if let Some(mcc) = p.mcc {
+            out.extend(mcc.iter().map(|d| char::from(b'0' + d)));
+        }
+        out.extend(p.mnc.iter().map(|d| char::from(b'0' + d)));
+        out
+    });
+    Ok(CellInfo {
+        plmn: plmn.unwrap_or_default(),
+        tac: s.tac().unwrap_or(0),
+        cell_identity: s.cell_identity().unwrap_or(0),
+        phy,
+        mac,
+        t300_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t300_ms as u32),
+        numerology,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CellGroupConfig → dedicated configuration (delta on top of a baseline)
+// ---------------------------------------------------------------------------
+
+fn dmrs_dl(d: Option<&ferrite_asn1::SetupRelease<cg::DmrsDownlinkConfig>>, base: DmrsConfig) -> DmrsConfig {
+    match d.and_then(|s| s.setup()) {
+        Some(c) => DmrsConfig { additional_position: c.additional_position(), scrambling_id0: c.scrambling_id0 },
+        None => base,
+    }
+}
+
+fn dmrs_ul(d: Option<&ferrite_asn1::SetupRelease<cg::DmrsUplinkConfig>>, base: DmrsConfig) -> DmrsConfig {
+    match d.and_then(|s| s.setup()) {
+        Some(c) => DmrsConfig { additional_position: c.additional_position(), scrambling_id0: c.transform_precoding_disabled.and_then(|(id0, _)| id0) },
+        None => base,
+    }
+}
+
+fn mcs_table_of(t: Option<cg::McsTable>) -> McsTableSel {
+    match t {
+        Some(cg::McsTable::Qam256) => McsTableSel::Qam256,
+        Some(cg::McsTable::Qam64LowSe) => McsTableSel::Qam64LowSe,
+        _ => McsTableSel::Qam64,
+    }
+}
+
+fn pucch_resource_of(r: &cg::PucchResource) -> PucchResource {
+    let (start_symbol, n_symbols) = r.format.symbols();
+    let format = match r.format {
+        cg::PucchFormat::Format0 { initial_cyclic_shift, .. } => PucchFormat::F0 { initial_cyclic_shift },
+        cg::PucchFormat::Format1 { initial_cyclic_shift, time_domain_occ, .. } => PucchFormat::F1 { initial_cyclic_shift, time_domain_occ },
+        cg::PucchFormat::Format2 { nrof_prbs, .. } => PucchFormat::F2 { n_prb: nrof_prbs },
+        cg::PucchFormat::Format3 { nrof_prbs, .. } => PucchFormat::F3 { n_prb: nrof_prbs },
+        cg::PucchFormat::Format4 { occ_length, occ_index, .. } => PucchFormat::F4 { occ_length, occ_index },
+    };
+    PucchResource { id: r.pucch_resource_id, starting_prb: r.starting_prb, second_hop_prb: r.second_hop_prb, format, start_symbol, n_symbols }
+}
+
+fn format_config_of(f: Option<&ferrite_asn1::SetupRelease<cg::PucchFormatConfig>>) -> PucchFormatConfig {
+    match f.and_then(|s| s.setup()) {
+        Some(c) => PucchFormatConfig {
+            additional_dmrs: c.additional_dmrs,
+            max_code_rate_x100: c.max_code_rate.map(|r| (r.value() * 100.0).round() as u8),
+            simultaneous_harq_ack_csi: c.simultaneous_harq_ack_csi,
+        },
+        None => PucchFormatConfig::default(),
+    }
+}
+
+/// Maximum UCI payload (bits, before CRC) a PUCCH resource can carry at its
+/// configured code rate: formats 0/1 carry up to 2 bits; format 2 has 8 data
+/// REs per PRB per symbol (QPSK), format 3 twelve, with the CRC taken off.
+fn pucch_max_bits(r: &PucchResource, f2: &PucchFormatConfig, f3: &PucchFormatConfig) -> u16 {
+    let (n_prb, re_per_prb, rate) = match r.format {
+        PucchFormat::F0 { .. } | PucchFormat::F1 { .. } | PucchFormat::F4 { .. } => return 2,
+        PucchFormat::F2 { n_prb } => (n_prb, 8, f2.max_code_rate_x100.unwrap_or(35)),
+        PucchFormat::F3 { n_prb } => (n_prb, 12, f3.max_code_rate_x100.unwrap_or(35)),
+    };
+    let coded = n_prb as u32 * re_per_prb * r.n_symbols as u32 * 2 * rate as u32 / 100;
+    let crc = if coded > 30 { 11 } else if coded > 17 { 6 } else { 0 };
+    coded.saturating_sub(crc).max(1) as u16
+}
+
+fn csi_rs_resource_of(m: &cm::CsiRsResourceMapping, po: Option<cm::PeriodicityAndOffset>, zero_power: bool, scrambling_id: u16, trs: bool) -> CsiRsResource {
+    CsiRsResource {
+        zero_power,
+        row: m.frequency_domain_allocation.row,
+        freq_bits: m.frequency_domain_allocation.bits,
+        first_symbol: m.first_ofdm_symbol_in_time_domain,
+        second_symbol: m.first_ofdm_symbol_in_time_domain2,
+        density_x2: match m.density {
+            cm::CsiRsDensity::Dot5EvenPrbs | cm::CsiRsDensity::Dot5OddPrbs => 1,
+            cm::CsiRsDensity::Three => 6,
+            _ => 2,
+        },
+        start_rb: m.freq_band.starting_rb,
+        n_rb: m.freq_band.nrof_rbs,
+        period_slots: po.map_or(0, |p| p.period_slots),
+        offset_slots: po.map_or(0, |p| p.offset),
+        scrambling_id,
+        trs,
+    }
+}
+
+/// Apply a `CellGroupConfig` (RRCSetup / RRCReconfiguration) on top of the
+/// current configuration. Absent IEs keep their current values.
+pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::CellGroupConfig) -> (PhyConfig, MacConfig) {
+    let mut phy = base_phy.clone();
+    let mut mac = base_mac.clone();
+    let mu = phy.numerology.mu;
+
+    // --- PDCCH: CORESETs and search spaces (add/mod/release by id).
+    if let Some(p) = c.pdcch_config() {
+        for id in &p.control_resource_set_to_release_list {
+            phy.coresets.retain(|x| x.id != *id);
+        }
+        for cs in &p.control_resource_set_to_add_mod_list {
+            if let Some(cfg) = coreset_of(cs, phy.dl_bwp.start_crb) {
+                phy.coresets.retain(|x| x.id != cfg.id);
+                phy.coresets.push(cfg);
+            }
+        }
+        for id in &p.search_spaces_to_release_list {
+            phy.search_spaces.retain(|x| x.id != *id);
+        }
+        for ss in &p.search_spaces_to_add_mod_list {
+            if let Some(cfg) = search_space_of(ss) {
+                phy.search_spaces.retain(|x| x.id != cfg.id);
+                phy.search_spaces.push(cfg);
+            }
+        }
+    }
+
+    // --- PDSCH.
+    if let Some(p) = c.pdsch_config() {
+        phy.pdsch.dmrs_type_a = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_a.as_ref(), phy.pdsch.dmrs_type_a);
+        phy.pdsch.dmrs_type_b = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_b.as_ref(), phy.pdsch.dmrs_type_b);
+        phy.pdsch.mcs_table = mcs_table_of(p.mcs_table);
+        if let Some(rows) = p.tdra_list() {
+            phy.pdsch.tdra = tdra_rows_pdsch(rows);
+        }
+        phy.pdsch.vrb_to_prb_interleaver = p.vrb_to_prb_interleaver;
+        // ZP CSI-RS the PDSCH is rate-matched around (periodic set only).
+        phy.pdsch.csi_rs_rate_match.retain(|r| !r.zero_power);
+        for z in &p.zp_csi_rs_resource_to_add_mod_list {
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(&z.resource_mapping, z.periodicity_and_offset, true, 0, false));
+        }
+    }
+    phy.pdsch.nof_harq_processes = c.nrof_harq_processes_for_pdsch();
+
+    // --- NZP CSI-RS (rate matching + TRS/CQI measurement) and periodic reports.
+    if let Some(m) = c.csi_meas_config() {
+        phy.pdsch.csi_rs_rate_match.retain(|r| r.zero_power);
+        let trs_ids: Vec<u8> = m.nzp_csi_rs_resource_set_to_add_mod_list.iter().filter(|s| s.trs_info).flat_map(|s| s.nzp_csi_rs_resources.iter().copied()).collect();
+        for r in &m.nzp_csi_rs_resource_to_add_mod_list {
+            let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id);
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(&r.resource_mapping, r.periodicity_and_offset, false, r.scrambling_id, trs));
+        }
+        phy.csi_reports.clear();
+        for rc in &m.csi_report_config_to_add_mod_list {
+            if let acsi::CsiReportConfigType::Periodic { report_slot_config, pucch_csi_resource_list } = &rc.report_config_type {
+                let Some(res) = pucch_csi_resource_list.first() else { continue };
+                phy.csi_reports.push(CsiReportConfig {
+                    report_id: rc.report_config_id,
+                    period_slots: report_slot_config.period_slots,
+                    offset_slots: report_slot_config.offset,
+                    pucch_resource: res.pucch_resource,
+                    cqi_table: match rc.cqi_table {
+                        Some(acsi::CqiTable::Table2) => 1,
+                        Some(acsi::CqiTable::Table3) => 2,
+                        _ => 0,
+                    },
+                });
+            }
+        }
+    }
+
+    // --- PUSCH.
+    if let Some(p) = c.pusch_config() {
+        phy.pusch.dmrs_type_a = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_a.as_ref(), phy.pusch.dmrs_type_a);
+        phy.pusch.dmrs_type_b = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_b.as_ref(), phy.pusch.dmrs_type_b);
+        phy.pusch.mcs_table = mcs_table_of(p.mcs_table);
+        if let Some(rows) = p.tdra_list() {
+            phy.pusch.tdra = tdra_rows_pusch(rows, mu);
+        }
+        phy.pusch.transform_precoder = p.transform_precoder_enabled.unwrap_or(false);
+        phy.pusch.frequency_hopping = p.frequency_hopping_intra_slot.is_some();
+        if let Some(u) = p.uci_on_pusch.as_ref().and_then(|s| s.setup()) {
+            phy.pusch.uci_scaling = u.scaling;
+            phy.pusch.beta_offsets = match u.beta_offsets {
+                Some(cg::BetaOffsetsConfig::SemiStatic(b)) => Some(b),
+                Some(cg::BetaOffsetsConfig::Dynamic(b)) => Some(b[0]),
+                None => None,
+            }
+            .map(|b| BetaOffsets {
+                ack_index1: b.beta_offset_ack_index1.unwrap_or(11),
+                ack_index2: b.beta_offset_ack_index2.unwrap_or(11),
+                ack_index3: b.beta_offset_ack_index3.unwrap_or(11),
+                csi1_index1: b.beta_offset_csi_part1_index1.unwrap_or(13),
+                csi1_index2: b.beta_offset_csi_part1_index2.unwrap_or(13),
+                csi2_index1: b.beta_offset_csi_part2_index1.unwrap_or(13),
+                csi2_index2: b.beta_offset_csi_part2_index2.unwrap_or(13),
+            });
+        }
+    }
+
+    // --- PUCCH.
+    if let Some(p) = c.pucch_config() {
+        for id in &p.resource_set_to_release_list {
+            phy.pucch.resource_sets.retain(|x| x.id != *id);
+        }
+        for s in &p.resource_set_to_add_mod_list {
+            phy.pucch.resource_sets.retain(|x| x.id != s.pucch_resource_set_id);
+            phy.pucch.resource_sets.push(PucchResourceSet { id: s.pucch_resource_set_id, resources: s.resource_list.clone(), max_payload: s.max_payload_size });
+        }
+        for id in &p.resource_to_release_list {
+            phy.pucch.resources.retain(|x| x.id != *id);
+        }
+        for r in &p.resource_to_add_mod_list {
+            let cfg = pucch_resource_of(r);
+            phy.pucch.resources.retain(|x| x.id != cfg.id);
+            phy.pucch.resources.push(cfg);
+        }
+        phy.pucch.format1 = format_config_of(p.format1.as_ref());
+        phy.pucch.format2 = format_config_of(p.format2.as_ref());
+        for id in &p.scheduling_request_resource_to_release_list {
+            phy.pucch.sr_resources.retain(|x| x.sr_resource_id != *id);
+        }
+        for sr in &p.scheduling_request_resource_to_add_mod_list {
+            let Some(cg::SrPeriodicityAndOffset::Slots { period_slots, offset }) = sr.periodicity_and_offset else { continue };
+            let Some(res) = sr.resource else { continue };
+            phy.pucch.sr_resources.retain(|x| x.sr_resource_id != sr.scheduling_request_resource_id);
+            phy.pucch.sr_resources.push(SrResource { sr_resource_id: sr.scheduling_request_resource_id, sr_id: sr.scheduling_request_id, period_slots, offset_slots: offset, pucch_resource: res });
+        }
+        if !p.dl_data_to_ul_ack.is_empty() {
+            phy.pucch.k1_list = p.dl_data_to_ul_ack.clone();
+        }
+    }
+
+    if let Some(pg) = &c.physical_cell_group_config {
+        phy.harq_codebook_dynamic = matches!(pg.pdsch_harq_ack_codebook, cg::HarqAckCodebook::Dynamic);
+    }
+
+    // --- MAC: logical channels from the RLC bearers.
+    for id in &c.rlc_bearer_to_release_list {
+        mac.logical_channels.retain(|l| l.lcid != *id);
+    }
+    for b in &c.rlc_bearer_to_add_mod_list {
+        let lcid = b.logical_channel_identity;
+        let ul = b.mac_logical_channel_config.as_ref().and_then(|m| m.ul_specific_parameters.as_ref());
+        let cfg = LogicalChannelConfig {
+            lcid,
+            priority: ul.map_or(if lcid <= 3 { lcid } else { 8 }, |u| u.priority),
+            pbr_bytes_per_ms: ul.and_then(|u| u.prioritised_bit_rate_kbps).map(|kbps| kbps / 8),
+            bsd_ms: ul.map_or(1000, |u| u.bucket_size_duration_ms as u32),
+            lcg: ul.and_then(|u| u.logical_channel_group).unwrap_or(0),
+            sr_id: ul.and_then(|u| u.scheduling_request_id),
+            sr_mask: ul.is_some_and(|u| u.logical_channel_sr_mask),
+        };
+        mac.logical_channels.retain(|l| l.lcid != lcid);
+        mac.logical_channels.push(cfg);
+    }
+    mac.logical_channels.sort_by_key(|l| (l.priority, l.lcid));
+
+    // --- MAC cell group: SR, BSR, TAG.
+    if let Some(m) = &c.mac_cell_group_config {
+        if let Some(src) = &m.scheduling_request_config {
+            for id in &src.scheduling_request_to_release_list {
+                mac.sr.retain(|s| s.sr_id != *id);
+            }
+            for s in &src.scheduling_request_to_add_mod_list {
+                mac.sr.retain(|x| x.sr_id != s.scheduling_request_id);
+                mac.sr.push(SrConfig { sr_id: s.scheduling_request_id, prohibit_ms: s.sr_prohibit_timer_ms.map_or(0, u32::from), trans_max: s.sr_trans_max as u32, resources: Vec::new() });
+            }
+        }
+        if let Some(b) = &m.bsr_config {
+            mac.periodic_bsr_ms = b.periodic_bsr_timer_sf.map_or(0, u32::from);
+            mac.retx_bsr_ms = b.retx_bsr_timer_sf as u32;
+        }
+        if let Some(t) = m.tag_config.as_ref().and_then(|t| t.tag_to_add_mod_list.first()) {
+            mac.time_alignment_timer_ms = t.time_alignment_timer.0.map_or(0, u32::from);
+        }
+    }
+    // SR resources (PUCCH) attached to their SR configurations.
+    for s in &mut mac.sr {
+        s.resources = phy.pucch.sr_resources.iter().filter(|r| r.sr_id == s.sr_id).map(|r| (r.period_slots, r.offset_slots, r.pucch_resource)).collect();
+    }
+
+    // --- MAC view of PUCCH / CSI.
+    let f2 = phy.pucch.format2;
+    let f3 = PucchFormatConfig::default();
+    mac.pucch = PucchMacConfig {
+        resource_sets: phy
+            .pucch
+            .resource_sets
+            .iter()
+            .map(|s| (s.id, s.resources.clone(), s.max_payload.unwrap_or(if s.id == 0 { 2 } else { 1706 })))
+            .collect(),
+        resources: phy
+            .pucch
+            .resources
+            .iter()
+            .map(|r| {
+                let fmt = match r.format {
+                    PucchFormat::F0 { .. } => 0,
+                    PucchFormat::F1 { .. } => 1,
+                    PucchFormat::F2 { .. } => 2,
+                    PucchFormat::F3 { .. } => 3,
+                    PucchFormat::F4 { .. } => 4,
+                };
+                (r.id, fmt, pucch_max_bits(r, &f2, &f3))
+            })
+            .collect(),
+        simultaneous_harq_ack_csi: f2.simultaneous_harq_ack_csi,
+    };
+    mac.csi_reports = phy.csi_reports.iter().map(|r| CsiReportMacConfig { period_slots: r.period_slots, offset_slots: r.offset_slots, pucch_resource: r.pucch_resource }).collect();
+    mac.csi_enabled = !mac.csi_reports.is_empty();
+    mac.harq_codebook_dynamic = phy.harq_codebook_dynamic;
+    mac.nof_dl_harq = phy.pdsch.nof_harq_processes.max(1);
+    (phy, mac)
+}
+
+// ---------------------------------------------------------------------------
+// Bearers
+// ---------------------------------------------------------------------------
+
+fn rlc_setup_of(r: Option<&cg::RlcConfig>, rb: RbId) -> RlcSetup {
+    match r {
+        Some(cg::RlcConfig::Am { ul, dl }) => RlcSetup::Am {
+            sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(12),
+            t_poll_retransmit_ms: ul.t_poll_retransmit_ms as u32,
+            poll_pdu: ul.poll_pdu,
+            poll_byte: ul.poll_byte_kb.map(|kb| kb * 1000),
+            max_retx: ul.max_retx_threshold as u32,
+            t_reassembly_ms: dl.t_reassembly_ms as u32,
+            t_status_prohibit_ms: dl.t_status_prohibit_ms as u32,
+        },
+        Some(cg::RlcConfig::UmBiDirectional { ul, dl }) => RlcSetup::Um { sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
+        Some(cg::RlcConfig::UmUniDirectionalUl { ul }) => RlcSetup::Um { sn_len: ul.sn_field_length.unwrap_or(6), t_reassembly_ms: 35 },
+        Some(cg::RlcConfig::UmUniDirectionalDl { dl }) => RlcSetup::Um { sn_len: dl.sn_field_length.unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
+        // TS 38.331 §9.2.1 defaults for SRBs; a DRB without rlc-Config is malformed — treat as AM.
+        None => match rb {
+            RbId::Srb(_) | RbId::Drb(_) => RlcSetup::Am { sn_len: 12, t_poll_retransmit_ms: 45, poll_pdu: None, poll_byte: None, max_retx: 8, t_reassembly_ms: 35, t_status_prohibit_ms: 0 },
+        },
+    }
+}
+
+/// Bearer setups from the RLC bearers of a cell group and the PDCP/SDAP
+/// parameters of a `RadioBearerConfig` (when the message carries one).
+fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>) -> Vec<BearerSetup> {
+    let mut out = Vec::new();
+    for b in &c.rlc_bearer_to_add_mod_list {
+        let rb = match b.served_radio_bearer {
+            Some(cg::ServedRadioBearer::Srb(n)) => RbId::Srb(n),
+            Some(cg::ServedRadioBearer::Drb(n)) => RbId::Drb(n),
+            None => continue,
+        };
+        let rlc = rlc_setup_of(b.rlc_config.as_ref(), rb);
+        let mut setup = BearerSetup {
+            lcid: b.logical_channel_identity,
+            rb,
+            rlc,
+            pdcp_sn_len: 12,
+            pdcp_integrity: matches!(rb, RbId::Srb(_)),
+            sdap_header_ul: false,
+            sdap_header_dl: false,
+            pdu_session: None,
+            qfi: 0,
+            t_reordering_ms: None,
+            discard_timer_ms: None,
+        };
+        if let Some(rbc) = rbc {
+            match rb {
+                RbId::Srb(id) => {
+                    if let Some(s) = rbc.srb_to_add_mod_list.iter().find(|s| s.srb_identity == id) {
+                        setup.t_reordering_ms = s.pdcp_config.as_ref().and_then(|p| p.t_reordering_ms).map(u32::from);
+                    }
+                }
+                RbId::Drb(id) => {
+                    if let Some(d) = rbc.drb_to_add_mod_list.iter().find(|d| d.drb_identity == id) {
+                        if let Some(p) = &d.pdcp_config {
+                            setup.t_reordering_ms = p.t_reordering_ms.map(u32::from);
+                            if let Some(drb) = &p.drb {
+                                setup.pdcp_sn_len = drb.pdcp_sn_size_ul.or(drb.pdcp_sn_size_dl).unwrap_or(12);
+                                setup.pdcp_integrity = drb.integrity_protection;
+                                setup.discard_timer_ms = match drb.discard_timer {
+                                    Some(rrc::PdcpDiscardTimer::Ms(ms)) => Some(ms as u32),
+                                    _ => None,
+                                };
+                            }
+                        }
+                        if let Some(rrc::CnAssociation::SdapConfig(s)) = &d.cn_association {
+                            setup.pdu_session = Some(s.pdu_session);
+                            setup.sdap_header_ul = s.sdap_header_ul_present;
+                            setup.sdap_header_dl = s.sdap_header_dl_present;
+                            setup.qfi = s.mapped_qos_flows_to_add.first().copied().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(setup);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// DL message decoding
+// ---------------------------------------------------------------------------
+
+/// Msg4: `DL-CCCH-Message`.
+pub fn decode_dl_ccch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlCcch, String> {
+    match rrc::DlCcchMessage::decode(pdu).map_err(err("DL-CCCH"))? {
+        rrc::DlCcchMessage::RrcReject(_) => Ok(DlCcch::Reject),
+        rrc::DlCcchMessage::RrcSetup(s) => {
+            let (phy, mac) = apply_cell_group(&cell.phy, &cell.mac, &s.master_cell_group);
+            let bearers = bearers_of(&s.master_cell_group, Some(&s.radio_bearer_config));
+            Ok(DlCcch::Setup { tid: s.rrc_transaction_identifier, phy, mac, bearers })
+        }
+    }
+}
+
+/// `DL-DCCH-Message` (a PDCP SDU on SRB1/2).
+pub fn decode_dl_dcch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlDcch, String> {
+    Ok(match rrc::DlDcchMessage::decode(pdu).map_err(err("DL-DCCH"))? {
+        rrc::DlDcchMessage::RrcReconfiguration(r) => {
+            let cgc = r.master_cell_group();
+            let (phy, mac) = match cgc {
+                Some(c) => {
+                    let (p, m) = apply_cell_group(&cell.phy, &cell.mac, c);
+                    (Some(p), Some(m))
+                }
+                None => (None, None),
+            };
+            let bearers = cgc.map(|c| bearers_of(c, r.radio_bearer_config.as_ref())).unwrap_or_default();
+            let released = cgc.map(|c| c.rlc_bearer_to_release_list.clone()).unwrap_or_default();
+            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec() }
+        }
+        rrc::DlDcchMessage::SecurityModeCommand(m) => {
+            let a = &m.security_algorithm_config;
+            DlDcch::SecurityModeCommand {
+                tid: m.rrc_transaction_identifier,
+                integrity_alg: a.integrity_prot_algorithm.map_or(0, |i| i as u8),
+                ciphering_alg: a.ciphering_algorithm as u8,
+            }
+        }
+        rrc::DlDcchMessage::UeCapabilityEnquiry(m) => DlDcch::UeCapabilityEnquiry { tid: m.rrc_transaction_identifier },
+        rrc::DlDcchMessage::DlInformationTransfer(m) => DlDcch::DlInformationTransfer { nas: m.dedicated_nas_message },
+        rrc::DlDcchMessage::RrcRelease(_) => DlDcch::Release,
+        rrc::DlDcchMessage::RrcReestablishment(_) => DlDcch::Other("RRCReestablishment"),
+        rrc::DlDcchMessage::CounterCheck(_) => DlDcch::Other("CounterCheck"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// UL message encoding
+// ---------------------------------------------------------------------------
+
+fn cause_of(cause: u8) -> rrc::EstablishmentCause {
+    use rrc::EstablishmentCause as C;
+    match cause {
+        0 => C::Emergency,
+        1 => C::HighPriorityAccess,
+        2 => C::MtAccess,
+        4 => C::MoData,
+        5 => C::MoVoiceCall,
+        6 => C::MoVideoCall,
+        7 => C::MoSms,
+        8 => C::MpsPriorityAccess,
+        9 => C::McsPriorityAccess,
+        _ => C::MoSignalling,
+    }
+}
+
+/// `RRCSetupRequest` with a 39-bit random identity: the 6-octet CCCH SDU.
+pub fn encode_setup_request(random_id: u64, cause: u8) -> [u8; 6] {
+    let pdu = rrc::UlCcchMessage::RrcSetupRequest(rrc::RrcSetupRequest { ue_identity: rrc::InitialUeIdentity::RandomValue(random_id & ((1 << 39) - 1)), establishment_cause: cause_of(cause) }).encode();
+    let mut out = [0u8; 6];
+    out[..pdu.len().min(6)].copy_from_slice(&pdu[..pdu.len().min(6)]);
+    out
+}
+
+pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8]) -> Vec<u8> {
+    rrc::UlDcchMessage::RrcSetupComplete(rrc::RrcSetupComplete {
+        rrc_transaction_identifier: tid,
+        selected_plmn_identity: selected_plmn.max(1),
+        registered_amf: None,
+        guami_type: None,
+        s_nssai_list: Vec::new(),
+        dedicated_nas_message: nas.to_vec(),
+        ng_5g_s_tmsi_value: None,
+    })
+    .encode()
+}
+
+pub fn encode_security_mode_complete(tid: u8) -> Vec<u8> {
+    rrc::UlDcchMessage::SecurityModeComplete { rrc_transaction_identifier: tid }.encode()
+}
+
+pub fn encode_security_mode_failure(tid: u8) -> Vec<u8> {
+    rrc::UlDcchMessage::SecurityModeFailure { rrc_transaction_identifier: tid }.encode()
+}
+
+pub fn encode_reconfiguration_complete(tid: u8) -> Vec<u8> {
+    rrc::UlDcchMessage::RrcReconfigurationComplete { rrc_transaction_identifier: tid }.encode()
+}
+
+pub fn encode_ue_capability_information(tid: u8, bands: &[u16]) -> Vec<u8> {
+    let bands: Vec<u16> = if bands.is_empty() { vec![78] } else { bands.to_vec() };
+    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands }.encode();
+    rrc::UlDcchMessage::UeCapabilityInformation(rrc::UeCapabilityInformation {
+        rrc_transaction_identifier: tid,
+        ue_capability_rat_container_list: vec![rrc::UeCapabilityRatContainer { rat_type: rrc::RatType::Nr, container }],
+    })
+    .encode()
+}
+
+pub fn encode_ul_information_transfer(nas: &[u8]) -> Vec<u8> {
+    rrc::UlDcchMessage::UlInformationTransfer(rrc::UlInformationTransfer { dedicated_nas_message: Some(nas.to_vec()) }).encode()
+}

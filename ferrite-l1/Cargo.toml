@@ -1,0 +1,23 @@
+[package]
+name = "ferrite-l1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-common.workspace = true
+log.workspace = true
+ferrite-phy.workspace = true
+ferrite-radio = { workspace = true, features = ["zmq"] }
+ferrite-asn1.workspace = true
+num-complex.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
+libc.workspace = true
+
+[features]
+default = ["zmq"]
+zmq = ["ferrite-radio/zmq"]
+
+[dev-dependencies]
+env_logger.workspace = true

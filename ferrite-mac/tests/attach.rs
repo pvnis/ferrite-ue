@@ -1,0 +1,219 @@
+//! MAC entity against a scripted PHY: RA → RAR → Msg3 → Msg4 contention
+//! resolution → UL grant → PUSCH with a MAC SDU, plus a DL assignment whose
+//! HARQ-ACK goes out on a PUCCH at n + k1.
+
+use ferrite_common::{Numerology, Rnti, RntiKind, SlotPoint};
+use ferrite_l1::config::{PrachConfig, TdraRow};
+use ferrite_l1::fapi::*;
+use ferrite_mac::*;
+
+struct FakeUpper {
+    pending: Vec<u8>,
+    rx: Vec<(u8, Vec<u8>)>,
+}
+
+impl UpperLayers for FakeUpper {
+    fn dl_sdu(&mut self, lcid: u8, sdu: &[u8], _now: SlotPoint) {
+        self.rx.push((lcid, sdu.to_vec()));
+    }
+    fn ul_pull(&mut self, _lcid: u8, max_bytes: usize, _now: SlotPoint) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let n = max_bytes.min(self.pending.len());
+        Some(self.pending.drain(..n).collect())
+    }
+    fn ul_buffer_status(&mut self, _lcid: u8) -> usize {
+        self.pending.len()
+    }
+}
+
+fn config() -> MacConfig {
+    let n = Numerology::KHZ30;
+    let mut c = MacConfig::initial(
+        n,
+        RachConfig {
+            preamble_trans_max: 7,
+            power_ramping_step_db: 4,
+            target_power_dbm: -100,
+            ra_response_window_slots: 20,
+            contention_resolution_ms: 64,
+            nof_cb_preambles: 64,
+            cb_preambles_per_ssb: 64,
+            prach: PrachConfig {
+                phy: ferrite_phy::prach_config::PrachConfig { index: 159, duplex: ferrite_common::DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 5 },
+                zero_correlation_zone: 0,
+                root_sequence_index: 1,
+                restricted_set: 0,
+                total_preambles: 64,
+                target_power_dbm: -100,
+                power_ramping_step_db: 4,
+            },
+            ul_bwp_rb: 24,
+            msg3_delta: 3,
+            pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
+        },
+        3,
+    );
+    c.pucch.resource_sets = vec![(0, vec![0, 1], 2), (1, vec![8], 11)];
+    c.pucch.resources = vec![(0, 1, 2), (1, 1, 2), (8, 2, 11)];
+    c.sr = vec![SrConfig { sr_id: 0, prohibit_ms: 0, trans_max: 64, resources: vec![(10, 7, 1)] }];
+    c
+}
+
+fn slot(n: u64) -> SlotPoint {
+    SlotPoint::from_index(Numerology::KHZ30, n)
+}
+
+fn step(mac: &mut MacEntity, up: &mut FakeUpper, msg: PhyToMac) -> Vec<MacToPhy> {
+    let mut out = Vec::new();
+    mac.handle_with(msg, &mut out, up);
+    out
+}
+
+#[test]
+fn attach_flow() {
+    let mut mac = MacEntity::new(config());
+    let mut up = FakeUpper { pending: Vec::new(), rx: Vec::new() };
+    let ccch = [0x1f, 0xaa, 0xbb, 0xcc, 0xdd, 0x06];
+    mac.start_ra(ccch);
+    // Slots until a PRACH request appears.
+    let mut prach: Option<(PrachOccasion, u8)> = None;
+    let mut n = 0u64;
+    while prach.is_none() && n < 100 {
+        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) })) {
+            if let MacToPhy::UlTti(req) = m {
+                for p in req.pdus {
+                    if let UlTtiPdu::Prach { occasion, preamble, .. } = p {
+                        prach = Some((occasion, preamble));
+                    }
+                }
+            }
+        }
+        n += 1;
+    }
+    let (occ, preamble) = prach.expect("PRACH requested");
+    assert_eq!(occ.slot.slot, 19);
+    // PHY reports the preamble sent; MAC must now monitor the RA-RNTI.
+    let out = step(&mut mac, &mut up, PhyToMac::Rach(RachIndication { slot: occ.slot, ra_rnti: occ.ra_rnti, preamble }));
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { ra_rnti: Some(r), .. } if *r == occ.ra_rnti)));
+    // RAR: TA 5, grant fdra RIV for 3 RBs at RB 4 (N=24), time 0, mcs 0, tpc 7, tc-rnti 0x4601.
+    let riv = (3 - 1) * 24 + 4; // RIV = N(L-1)+S for L-1 <= N/2
+    let g: u32 = ((riv as u32) << 12) | (0 << 8) | (0 << 4) | (7 << 1);
+    let ta: u16 = 5;
+    let mut rar = vec![0x40 | preamble];
+    rar.push(((ta >> 5) & 0x7f) as u8);
+    rar.push((((ta & 0x1f) as u8) << 3) | ((g >> 24) & 7) as u8);
+    rar.extend_from_slice(&[(g >> 16) as u8, (g >> 8) as u8, g as u8]);
+    rar.extend_from_slice(&0x4601u16.to_be_bytes());
+    let rar_slot = occ.slot.add(5);
+    let out = step(&mut mac, &mut up, PhyToMac::RxData(RxDataIndication { rnti: occ.ra_rnti, rnti_kind: RntiKind::Ra, harq_id: 0, ndi: 0, pdsch_slot: rar_slot, tb: Some(rar), sinr_db: 30.0 }));
+    let msg3 = out.iter().find_map(|m| match m {
+        MacToPhy::UlTti(r) => r.pdus.iter().find_map(|p| if let UlTtiPdu::Pusch { grant, tb, .. } = p { Some((r.slot, grant.clone(), tb.clone())) } else { None }),
+        _ => None,
+    });
+    let (msg3_slot, grant, tb) = msg3.expect("Msg3 scheduled");
+    assert_eq!(msg3_slot, rar_slot.add(4 + 3));
+    assert_eq!(grant.rnti, Rnti(0x4601));
+    assert_eq!((grant.prb_start, grant.n_prb), (4, 3));
+    assert_eq!(tb[0], 52); // CCCH48 subheader
+    assert_eq!(&tb[1..7], &ccch);
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::TimingAdvance { n_ta_tc } if *n_ta_tc == 5 * 512)));
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { tc_rnti: Some(Rnti(0x4601)), .. })));
+    // Msg4: DCI 1_0 for the TC-RNTI then the PDSCH with the ConRes CE + CCCH SDU.
+    let m4_slot = msg3_slot.add(6);
+    let dl = DlGrant {
+        rnti: Rnti(0x4601),
+        rnti_kind: RntiKind::Tc,
+        pdsch_slot: m4_slot,
+        prb_start: 0,
+        n_prb: 21,
+        time: TimeAlloc { mapping_type_a: true, start_symbol: 2, n_symbols: 12 },
+        mcs: Mcs { index: 7, qm: 2, r_x1024: Some(526) },
+        tbs_bits: 2664,
+        harq_id: 0,
+        ndi: 0,
+        rv: 0,
+        ack_slot: Some(m4_slot.add(4)),
+        dai: 0,
+        pri: 0,
+        tpc: 1,
+        cdm_groups_wo_data: 2,
+        dmrs_add_pos: 2,
+        vrb_to_prb_interleaved: false,
+        r_pucch_common: 0,
+    };
+    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: m4_slot, dci: Dci::Dl(dl.clone()) }));
+    let mut pdu = vec![62];
+    pdu.extend_from_slice(&ccch);
+    pdu.extend_from_slice(&[0, 3, 0x20, 0x40, 0x08, 63, 0, 0]);
+    let out = step(&mut mac, &mut up, PhyToMac::RxData(RxDataIndication { rnti: Rnti(0x4601), rnti_kind: RntiKind::Tc, harq_id: 0, ndi: 0, pdsch_slot: m4_slot, tb: Some(pdu), sinr_db: 30.0 }));
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { c_rnti: Some(Rnti(0x4601)), tc_rnti: None, .. })));
+    let evs = mac.take_events();
+    assert!(evs.iter().any(|e| matches!(e, MacEvent::RaSucceeded { c_rnti: Rnti(0x4601) })));
+    assert!(evs.iter().any(|e| matches!(e, MacEvent::Ccch(c) if c == &[0x20, 0x40, 0x08])));
+    // Run slots up to the ACK slot − lead: a PUCCH with ACK=1 must be requested.
+    let mut pucch = None;
+    let mut s = m4_slot.add(1);
+    for _ in 0..8 {
+        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s })) {
+            if let MacToPhy::UlTti(r) = m {
+                for p in r.pdus {
+                    if let UlTtiPdu::Pucch { resource, uci } = p {
+                        pucch = Some((r.slot, resource, uci));
+                    }
+                }
+            }
+        }
+        s = s.add(1);
+    }
+    let (ps, res, uci) = pucch.expect("HARQ-ACK PUCCH");
+    assert_eq!(ps, m4_slot.add(4));
+    assert_eq!(uci.harq_ack, vec![1]);
+    assert!(matches!(res, PucchResourceRef::Dedicated(0)));
+    // Uplink data: a UL grant must produce a PUSCH carrying the SDU and a BSR.
+    up.pending = vec![0xab; 40];
+    let ul = UlGrant {
+        rnti: Rnti(0x4601),
+        rnti_kind: RntiKind::C,
+        pusch_slot: s.add(4),
+        prb_start: 0,
+        n_prb: 5,
+        time: TimeAlloc { mapping_type_a: true, start_symbol: 0, n_symbols: 14 },
+        mcs: Mcs { index: 9, qm: 2, r_x1024: Some(679) },
+        tbs_bits: 640,
+        harq_id: 1,
+        ndi: 1,
+        rv: 0,
+        dai: Some(3),
+        tpc: 1,
+        csi_request: 0,
+        ul_sch: true,
+        cdm_groups_wo_data: 2,
+        dmrs_add_pos: 1,
+        freq_hopping: false,
+    };
+    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s }));
+    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: s, dci: Dci::Ul(ul.clone()) }));
+    let mut pusch = None;
+    for _ in 0..4 {
+        s = s.add(1);
+        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s })) {
+            if let MacToPhy::UlTti(r) = m {
+                for p in r.pdus {
+                    if let UlTtiPdu::Pusch { grant, tb, uci } = p {
+                        pusch = Some((r.slot, grant, tb, uci));
+                    }
+                }
+            }
+        }
+    }
+    let (pslot, g, tb, uci) = pusch.expect("PUSCH");
+    assert_eq!(pslot, ul.pusch_slot);
+    assert_eq!(g.harq_id, 1);
+    assert_eq!(tb.len(), 80);
+    let subs = ferrite_mac::pdu::parse_dl_pdu(&tb); // same subheader layout
+    assert!(subs.iter().any(|x| matches!(x, ferrite_mac::pdu::DlSubPdu::Sdu { lcid: 1, sdu } if sdu.len() == 40)));
+    assert!(uci.harq_ack.is_empty()); // T-DAI 3 with nothing booked → no ACK bits
+    assert_eq!(mac.stats().ul_tb, 2);
+}

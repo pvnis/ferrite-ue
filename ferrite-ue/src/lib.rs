@@ -1,14 +1,7 @@
-//! Ferrite UE application layer: ties the PHY to radio backends and (soon)
-//! the protocol stack. Currently hosts bring-up tooling.
+//! Ferrite UE application crate: configuration, the L2/L3 stack composition
+//! behind the FAPI-style PHY interface, and OS plumbing (TUN, ICMP probe).
 
-pub mod milenage;
-pub mod nas;
-pub mod rrc;
-pub mod rt;
-pub mod cellgroup;
-pub mod sib1;
-pub mod uper;
-pub mod stream;
-pub mod sync;
+pub mod config;
+pub mod ip;
+pub mod stack;
 pub mod tun;
-pub mod userplane;

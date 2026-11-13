@@ -25,7 +25,9 @@ fn main() {
     println!("{} data REs, n_rb={n_rb}, n_cell={n_cell}", res.len());
 
     // Candidate orderings of the REs → LLR stream.
-    let orderings: Vec<(&str, Box<dyn Fn(&mut Vec<(u8, u16, f32, f32)>)>)> = vec![
+    type Record = (u8, u16, f32, f32);
+    type Sorter = Box<dyn Fn(&mut Vec<Record>)>;
+    let orderings: Vec<(&str, Sorter)> = vec![
         ("k,l", Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (k, l)))),
         ("l,k", Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (l, k)))),
     ];

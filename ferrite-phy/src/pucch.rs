@@ -1,6 +1,11 @@
-//! PUCCH Format 1 transmit — the HARQ-ACK the UE sends to acknowledge Msg4
-//! (contention-resolution) so the gNB completes RACH. CP-OFDM, 1 PRB, one or two
-//! HARQ bits, intra-slot frequency hopping. TS 38.211 §6.3.2.2/§6.3.2.4/§6.4.1.3.
+//! PUCCH transmit, formats 0, 1 and 2 (TS 38.211 §6.3.2).
+//!
+//! * Format 0 (§6.3.2.3): sequence only, 1–2 symbols, the UCI is carried by the
+//!   cyclic shift `m_cs` (TS 38.213 Tables 9.2.3-3/-4, 9.2.5-1/-2).
+//! * Format 1 (§6.3.2.4): the HARQ-ACK the UE sends to acknowledge Msg4
+//!   (contention resolution) so the gNB completes RACH. CP-OFDM, 1 PRB, one or
+//!   two HARQ bits, intra-slot frequency hopping, §6.4.1.3 DM-RS.
+//! * Format 2 (§6.3.2.5): RM-coded UCI (CSI) over 1–2 symbols.
 //!
 //! Structure (occ handled generally, but the common resource uses occ 0):
 //! - Base low-PAPR sequence r_{u,v}(n) = e^{jπ·φ₁₂[u][n]/4}, u = n_id mod 30, v = 0.
@@ -78,9 +83,12 @@ fn base_seq_shifted(u: usize, alpha: usize) -> [Complex32; 12] {
     out
 }
 
-/// Per-symbol cyclic shift α_l (0..11), TS 38.211 §6.3.2.2.2. Gold sequence
-/// c seeded by `n_id`; n_cs(l) = Σ_{m=0}^{7} c(8·(14·n_slot + l) + m)·2^m.
-fn alpha_index(n_id: u16, n_slot: u32, symbol: usize, m0: usize) -> usize {
+/// Per-symbol cyclic shift α_l (0..11), TS 38.211 §6.3.2.2.2:
+/// `α_l = 2π/12 · (m0 + m_cs + n_cs(n_slot, l)) mod 12` with the gold sequence
+/// c seeded by `n_id` and n_cs(l) = Σ_{m=0}^{7} c(8·(14·n_slot + l) + m)·2^m;
+/// `symbol` is the absolute symbol index `l + l'` in the slot. `m_cs = 0` for
+/// format 1; format 0 carries the UCI in it.
+fn alpha_index(n_id: u16, n_slot: u32, symbol: usize, m0: usize, m_cs: usize) -> usize {
     let base = 14 * n_slot as usize + symbol;
     let need = 8 * (base + 1);
     let c = gold_sequence(n_id as u32, need);
@@ -88,7 +96,126 @@ fn alpha_index(n_id: u16, n_slot: u32, symbol: usize, m0: usize) -> usize {
     for m in 0..8 {
         n_cs |= (c[8 * base + m] as usize) << m;
     }
-    (m0 + n_cs) % 12
+    (m0 + m_cs + n_cs) % 12
+}
+
+/// PUCCH Format 0 cyclic-shift offset `m_cs` for the UCI it carries
+/// (TS 38.213 §9.2.3 / §9.2.5):
+///
+/// | UCI                       | table    | `m_cs` by value                      |
+/// |---------------------------|----------|--------------------------------------|
+/// | 1 HARQ-ACK bit, no SR     | 9.2.3-3  | NACK 0, ACK 6                        |
+/// | 2 HARQ-ACK bits, no SR    | 9.2.3-4  | {0,0} 0, {0,1} 3, {1,1} 6, {1,0} 9   |
+/// | positive SR only          | §9.2.4   | 0                                    |
+/// | 1 bit + positive SR       | 9.2.5-1  | NACK 3, ACK 9                        |
+/// | 2 bits + positive SR      | 9.2.5-2  | {0,0} 1, {0,1} 4, {1,1} 7, {1,0} 10  |
+///
+/// A negative SR with HARQ-ACK uses the no-SR tables (the SR occasion is simply
+/// not transmitted when there is no HARQ-ACK either). `None` for more than two
+/// HARQ-ACK bits, or no UCI at all.
+pub fn pucch_f0_cyclic_shift(ack_bits: &[u8], positive_sr: bool) -> Option<usize> {
+    let m = match (ack_bits, positive_sr) {
+        ([], true) => 0,
+        ([], false) => return None,
+        ([a], sr) => usize::from(*a) * 6 + if sr { 3 } else { 0 },
+        ([a, b], sr) => {
+            let base = match (a, b) {
+                (0, 0) => 0,
+                (0, 1) => 3,
+                (1, 1) => 6,
+                _ => 9,
+            };
+            base + usize::from(sr)
+        }
+        _ => return None,
+    };
+    Some(m)
+}
+
+/// PUCCH Format 0 resource (PUCCH-Resource with `format0`).
+#[derive(Clone, Debug)]
+pub struct PucchF0 {
+    /// PRB (BWP-relative) of the first (or only) hop.
+    pub prb: usize,
+    /// Second-hop PRB when `intraSlotFrequencyHopping` is enabled (2-symbol
+    /// resources only: symbol 0 on `prb`, symbol 1 on the second hop).
+    pub second_hop_prb: Option<usize>,
+    /// First OFDM symbol `l'` (0..=13) and number of symbols (1 or 2).
+    pub start_symbol: usize,
+    pub nof_symbols: usize,
+    /// `initialCyclicShift` m0.
+    pub init_cyclic_shift: usize,
+    /// Hopping/scrambling identity n_id (`hoppingId`, else the PCI).
+    pub n_id: u16,
+    /// UL carrier size in RBs (for DC-centred subcarrier→bin mapping).
+    pub carrier_rb: usize,
+}
+
+/// CP-OFDM modulate the 14 symbol grids of one slot with §5.4 phase
+/// compensation (shared by all PUCCH formats and PUSCH). `mu` sets the CP
+/// pattern; `slot_in_frame` selects the slot within the subframe.
+fn modulate_slot_grids(
+    ofdm: &Ofdm,
+    grids: &[Vec<Complex32>],
+    slot_in_frame: u32,
+    mu: u8,
+    center_freq_hz: f64,
+    fs: f64,
+) -> Vec<Complex32> {
+    let n = ofdm.fft_size();
+    let slot_in_subframe = (slot_in_frame % (1u32 << mu)) as usize;
+    let mut out = Vec::with_capacity(14 * (n + 40));
+    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, mu) + n).sum();
+    for (l, grid) in grids.iter().enumerate() {
+        let cp = ofdm.cp_len(slot_in_subframe * 14 + l, mu);
+        let sym = ofdm.modulate_symbol(grid, cp);
+        if center_freq_hz != 0.0 {
+            let t_start = (sub_off + cp) as f64 / fs;
+            let phase = -2.0 * std::f64::consts::PI * center_freq_hz * t_start;
+            let coeff = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            out.extend(sym.iter().map(|s| s * coeff));
+        } else {
+            out.extend(sym);
+        }
+        sub_off += cp + n;
+    }
+    out
+}
+
+/// Modulate one PUCCH Format 0 slot (TS 38.211 §6.3.2.3): on each of the 1–2
+/// symbols the length-12 low-PAPR sequence `r_{u,v}^{(α_l)}` with
+/// `u = n_id mod 30` (group hopping "neither"), `α_l` from §6.3.2.2.2 with
+/// `m_cs = `[`pucch_f0_cyclic_shift`]`(ack_bits, sr)`. Returns the CP-OFDM slot
+/// samples with §5.4 phase compensation, or `None` when the UCI has no
+/// format-0 encoding.
+#[allow(clippy::too_many_arguments)]
+pub fn pucch_f0_modulate_slot(
+    ofdm: &Ofdm,
+    cfg: &PucchF0,
+    ack_bits: &[u8],
+    sr: bool,
+    slot_in_frame: u32,
+    mu: u8,
+    center_freq_hz: f64,
+    fs: f64,
+) -> Option<Vec<Complex32>> {
+    assert!(matches!(cfg.nof_symbols, 1 | 2), "PUCCH format 0 spans 1 or 2 symbols");
+    let m_cs = pucch_f0_cyclic_shift(ack_bits, sr)?;
+    let n = ofdm.fft_size();
+    let center = cfg.carrier_rb * 6;
+    let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
+    let u = (cfg.n_id % 30) as usize;
+    let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
+    for s in 0..cfg.nof_symbols {
+        let l = cfg.start_symbol + s;
+        let prb = if s == 1 { cfg.second_hop_prb.unwrap_or(cfg.prb) } else { cfg.prb };
+        let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift, m_cs);
+        let seq = base_seq_shifted(u, alpha);
+        for (k, &v) in seq.iter().enumerate() {
+            grids[l][bin(12 * prb + k)] = v;
+        }
+    }
+    Some(modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs))
 }
 
 /// BPSK/QPSK modulation of the HARQ-ACK bits (TS 38.211 §5.1). 1 bit → BPSK.
@@ -111,12 +238,14 @@ fn modulate_ack(bits: &[u8]) -> Complex32 {
 /// Modulate one PUCCH Format 1 slot carrying `ack_bits` (1 = ACK). Returns the
 /// CP-OFDM time-domain samples for the slot, with §5.4 phase compensation applied
 /// (the gNB's OFDM demodulator removes it). `slot_in_frame` seeds the shift
-/// hopping; `fs`/`center_freq_hz` drive the phase compensation.
+/// hopping and, with `mu`, selects the CP pattern; `fs`/`center_freq_hz` drive
+/// the phase compensation.
 pub fn pucch_f1_modulate_slot(
     ofdm: &Ofdm,
     cfg: &PucchF1,
     ack_bits: &[u8],
     slot_in_frame: u32,
+    mu: u8,
     center_freq_hz: f64,
     fs: f64,
 ) -> Vec<Complex32> {
@@ -139,7 +268,7 @@ pub fn pucch_f1_modulate_slot(
         let (mut i_dmrs, mut i_data) = (0usize, 0usize);
         for rel in 0..hop_len {
             let l = cfg.start_symbol + hop_start + rel;
-            let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift);
+            let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift, 0);
             let seq = base_seq_shifted(u, alpha);
             let is_dmrs = rel % 2 == 0;
             let (n_sf, m, sym_val) = if is_dmrs {
@@ -165,24 +294,7 @@ pub fn pucch_f1_modulate_slot(
         place_hop(&mut grids, n1, cfg.nof_symbols - n1, cfg.prb2);
     }
 
-    // OFDM with per-symbol §5.4 phase compensation (same as PUSCH).
-    let slot_in_subframe = (slot_in_frame % 2) as usize;
-    let mut out = Vec::with_capacity(14 * (n + 40));
-    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, 1) + n).sum();
-    for (l, grid) in grids.iter().enumerate() {
-        let cp = ofdm.cp_len(slot_in_subframe * 14 + l, 1);
-        let sym = ofdm.modulate_symbol(grid, cp);
-        if center_freq_hz != 0.0 {
-            let t_start = (sub_off + cp) as f64 / fs;
-            let phase = -2.0 * std::f64::consts::PI * center_freq_hz * t_start;
-            let coeff = Complex32::new(phase.cos() as f32, phase.sin() as f32);
-            out.extend(sym.iter().map(|s| s * coeff));
-        } else {
-            out.extend(sym);
-        }
-        sub_off += cp + n;
-    }
-    out
+    modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs)
 }
 
 /// PUCCH Format 2 resource: 1+ PRB over 1-2 symbols, carrying 3-11 UCI bits (here a
@@ -205,12 +317,14 @@ pub struct PucchF2 {
 /// (32,O) coded (TS 38.212 §5.3.3), scrambled (c_init = rnti·2^15 + n_id), QPSK, and
 /// mapped to the 8 non-DMRS subcarriers per PRB in increasing (k, then l) order
 /// (§6.3.2.5). DMRS is a QPSK gold sequence at subcarriers 3m+1 (§6.4.1.3.2.1).
-/// Returns the CP-OFDM slot samples with §5.4 phase compensation.
+/// Returns the CP-OFDM slot samples with §5.4 phase compensation; `mu` selects
+/// the CP pattern of the slot.
 pub fn pucch_f2_modulate_slot(
     ofdm: &Ofdm,
     cfg: &PucchF2,
     uci_bits: &[u8],
     slot_in_frame: u32,
+    mu: u8,
     center_freq_hz: f64,
     fs: f64,
 ) -> Vec<Complex32> {
@@ -263,24 +377,7 @@ pub fn pucch_f2_modulate_slot(
         }
     }
 
-    // OFDM with per-symbol §5.4 phase compensation (identical to F1/PUSCH).
-    let slot_in_subframe = (slot_in_frame % 2) as usize;
-    let mut out = Vec::with_capacity(14 * (n + 40));
-    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, 1) + n).sum();
-    for (l, grid) in grids.iter().enumerate() {
-        let cp = ofdm.cp_len(slot_in_subframe * 14 + l, 1);
-        let sym = ofdm.modulate_symbol(grid, cp);
-        if center_freq_hz != 0.0 {
-            let t_start = (sub_off + cp) as f64 / fs;
-            let phase = -2.0 * std::f64::consts::PI * center_freq_hz * t_start;
-            let coeff = Complex32::new(phase.cos() as f32, phase.sin() as f32);
-            out.extend(sym.iter().map(|s| s * coeff));
-        } else {
-            out.extend(sym);
-        }
-        sub_off += cp + n;
-    }
-    out
+    modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs)
 }
 
 #[cfg(test)]
@@ -296,12 +393,12 @@ mod tests {
             prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2,
             rnti: 0x4626, n_id: 1, n_id0: 1, carrier_rb: 24,
         };
-        let wave = pucch_f2_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1], 8, 0.0, 15.36e6);
+        let wave = pucch_f2_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1], 8, 1, 0.0, 15.36e6);
         // 14 symbols × (512 + CP). Just assert it is a full slot (> 14·512).
         assert!(wave.len() > 14 * 512);
         // Re-derive the grid occupancy the modulator should have produced.
         let center = 24 * 6;
-        let bin = |sc: usize| ((sc as i32 - center) as i32).rem_euclid(512) as usize;
+        let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
         // The energy in symbol 0 must sit only on PRB 23's 12 subcarriers — check a
         // data SC (k=0) and a DMRS SC (k=1) are both occupied, an out-of-PRB SC empty.
         // (Indirect: rebuild is covered by the live gNB decode; here we sanity-check
@@ -324,7 +421,7 @@ mod tests {
             prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
             init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
         };
-        let wave = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 0.0, 15.36e6);
+        let wave = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 1, 0.0, 15.36e6);
         assert_eq!(wave.len(), 7680); // one slot at μ=1, 15.36 Msps
     }
 
@@ -335,9 +432,77 @@ mod tests {
             prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
             init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
         };
-        let a = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 0.0, 15.36e6);
-        let b = pucch_f1_modulate_slot(&ofdm, &cfg, &[0], 17, 0.0, 15.36e6);
+        let a = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 1, 0.0, 15.36e6);
+        let b = pucch_f1_modulate_slot(&ofdm, &cfg, &[0], 17, 1, 0.0, 15.36e6);
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).norm()).sum();
         assert!(diff > 1.0);
+    }
+
+    #[test]
+    fn f0_cyclic_shift_tables() {
+        assert_eq!(pucch_f0_cyclic_shift(&[0], false), Some(0));
+        assert_eq!(pucch_f0_cyclic_shift(&[1], false), Some(6));
+        assert_eq!(pucch_f0_cyclic_shift(&[0, 0], false), Some(0));
+        assert_eq!(pucch_f0_cyclic_shift(&[0, 1], false), Some(3));
+        assert_eq!(pucch_f0_cyclic_shift(&[1, 1], false), Some(6));
+        assert_eq!(pucch_f0_cyclic_shift(&[1, 0], false), Some(9));
+        assert_eq!(pucch_f0_cyclic_shift(&[], true), Some(0));
+        assert_eq!(pucch_f0_cyclic_shift(&[0], true), Some(3));
+        assert_eq!(pucch_f0_cyclic_shift(&[1], true), Some(9));
+        assert_eq!(pucch_f0_cyclic_shift(&[0, 0], true), Some(1));
+        assert_eq!(pucch_f0_cyclic_shift(&[0, 1], true), Some(4));
+        assert_eq!(pucch_f0_cyclic_shift(&[1, 1], true), Some(7));
+        assert_eq!(pucch_f0_cyclic_shift(&[1, 0], true), Some(10));
+        assert_eq!(pucch_f0_cyclic_shift(&[], false), None);
+        assert_eq!(pucch_f0_cyclic_shift(&[1, 1, 1], false), None);
+    }
+
+    /// F0: a 2-symbol hopped resource occupies exactly one PRB per symbol, the
+    /// ACK / NACK waveforms differ by a cyclic shift (same magnitude per RE),
+    /// and the slot has the µ-dependent length.
+    #[test]
+    fn f0_occupancy_and_shift() {
+        let ofdm = Ofdm::new(512);
+        let cfg = PucchF0 {
+            prb: 0, second_hop_prb: Some(23), start_symbol: 12, nof_symbols: 2,
+            init_cyclic_shift: 0, n_id: 1, carrier_rb: 24,
+        };
+        let ack = pucch_f0_modulate_slot(&ofdm, &cfg, &[1], false, 3, 1, 0.0, 15.36e6).unwrap();
+        let nack = pucch_f0_modulate_slot(&ofdm, &cfg, &[0], false, 3, 1, 0.0, 15.36e6).unwrap();
+        assert_eq!(ack.len(), 7680);
+        assert_ne!(ack, nack);
+        // Symbols 0..12 carry nothing.
+        let first_used: usize = (0..12).map(|l| ofdm.cp_len(14 + l, 1) + 512).sum();
+        assert!(ack[..first_used].iter().all(|s| s.norm() < 1e-6));
+        // Demodulate symbol 12 (slot 3 → second slot of subframe 1 → symbols 14+l):
+        // energy only on PRB 0's 12 subcarriers, unit magnitude each.
+        let cp = ofdm.cp_len(14 + 12, 1);
+        let grid = ofdm.demodulate_symbol(&ack[first_used..], cp);
+        let center = 24 * 6;
+        let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
+        for k in 0..12 {
+            assert!((grid[bin(k)].norm() - 1.0).abs() < 1e-3);
+        }
+        assert!(grid[bin(12)].norm() < 1e-3);
+        assert!(grid[bin(12 * 23)].norm() < 1e-3);
+        // SR-only and an invalid UCI.
+        assert!(pucch_f0_modulate_slot(&ofdm, &cfg, &[], true, 3, 1, 0.0, 15.36e6).is_some());
+        assert!(pucch_f0_modulate_slot(&ofdm, &cfg, &[], false, 3, 1, 0.0, 15.36e6).is_none());
+    }
+
+    /// The CP pattern follows `mu`: at µ = 0 (15 kHz, 7.68 Msps for N = 512) a slot
+    /// is 1 ms = 7680 samples with the long CP only on symbol 0 and 7.
+    #[test]
+    fn f1_mu0_slot_length() {
+        let ofdm = Ofdm::new(512);
+        let cfg = PucchF1 {
+            prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
+            init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
+        };
+        let wave = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 5, 0, 0.0, 7.68e6);
+        assert_eq!(wave.len(), 7680);
+        let w1 = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 5, 1, 0.0, 15.36e6);
+        assert_eq!(w1.len(), 7680);
+        assert_ne!(wave, w1); // odd slot at µ = 1 → second half-subframe CP pattern
     }
 }

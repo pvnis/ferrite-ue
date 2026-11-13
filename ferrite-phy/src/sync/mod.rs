@@ -7,19 +7,23 @@
 //! 2. detect the SSS to get `N_ID^(1)`, hence the physical cell ID;
 //! 3. decode the PBCH to recover the MIB.
 //!
-//! This module provides the reference sequence generators; detection lives
-//! alongside the OFDM front-end (added next).
+//! The SSB candidate positions and `L_max` per SSB case (TS 38.213 §4.1) live
+//! in [`ssb`]; [`scan`] adds the GSCN raster scan and continuous frame
+//! tracking on top of the searcher.
 
 pub mod cfo;
 pub mod detect;
 pub mod pbch;
 pub mod pss;
+pub mod scan;
 pub mod search;
 pub mod ssb;
 pub mod sss;
 
 pub use detect::{PssDetection, PssDetector};
-pub use search::{detect_sss, CellSearchResult, CellSearcher, SssDetection};
+pub use scan::{freq_shift, gscn_scan, Acquired, FrameReport, FrameTracker, FreqShifter, ScanHit};
+pub use search::{detect_sss, CellSearchResult, CellSearcher, PbchDecode, SssDetection};
+pub use ssb::{frame_start_from_pss, l_max_fr1, SsbCase};
 
 /// Number of `N_ID^(1)` values (SSS), per §7.4.2.1.
 pub const N_ID_1_COUNT: u16 = 336;

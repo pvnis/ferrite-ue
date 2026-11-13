@@ -1,0 +1,730 @@
+//! The slot engine: cell search → synchronisation → the per-slot loop that
+//! drives the PHY ↔ MAC interface.
+//!
+//! State machine:
+//! ```text
+//!  CellSearch ──SSB + MIB──▶ Synced(Type0 CSS only) ──CONFIG.request──▶ Synced(configured)
+//!      ▲                           │ sync lost                               │
+//!      └───────────────────────────┴───────────────────────────────────────◀┘
+//! ```
+//! Threads: DL drain (inside `BufferedStream`), UL serve ([`crate::radio`]),
+//! the timeline (this loop), one PDSCH worker, one TX builder.
+
+use crate::cell::CellGeometry;
+use crate::config::PhyConfig;
+use crate::dl::{DlMonitor, PdschJob, PdschWorker, WorkerConfig};
+use crate::fapi::*;
+use crate::radio::{serve_uplink, DlStream, UlPacing, UlServer, UlShared};
+use crate::rt::ReadyWaveform;
+use crate::timing::SampleClock;
+use crate::ul::UlBuilder;
+use ferrite_common::{DuplexMode, Error, Iq, Numerology, Result, SlotPoint};
+use ferrite_phy::coding::bch::Mib;
+use ferrite_phy::coreset0::{self, Coreset0Config};
+use ferrite_phy::csi;
+use ferrite_phy::sync::scan::{gscn_scan, FrameTracker, FreqShifter};
+use ferrite_phy::sync::search::CellSearcher;
+use ferrite_phy::sync::ssb::{self, SsbCase};
+use ferrite_phy::Ofdm;
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+
+/// Static engine parameters (what the UE knows before touching the air).
+#[derive(Clone, Debug)]
+pub struct EngineParams {
+    pub fs: f64,
+    pub dl_center_hz: f64,
+    pub ul_center_hz: f64,
+    pub ssb_scs_khz: u32,
+    pub duplex: DuplexMode,
+    pub band: u16,
+    pub gscn_hint: Option<u32>,
+    /// How many slots ahead MAC must issue UL_TTI requests.
+    pub tx_lead_slots: u16,
+    /// Backend TX/RX calibration (samples, positive = transmit earlier).
+    pub tx_rx_offset: i64,
+    /// PRACH-only timing calibration (samples, positive = earlier).
+    pub prach_offset: i64,
+    pub pacing: UlPacing,
+    pub ul_block_len: usize,
+    /// Apply CFO correction to the data path (needed over the air).
+    pub cfo_correction: bool,
+    /// Maximum cell-search attempts before giving up (0 = forever).
+    pub max_search_attempts: u32,
+}
+
+/// Commands from the application.
+#[derive(Clone, Debug)]
+pub enum EngineCommand {
+    Stop,
+}
+
+/// Events the engine reports to the application.
+#[derive(Clone, Debug)]
+pub enum EngineEvent {
+    CellFound { pci: u16, sfn: u16, cfo_hz: f64, ssb_df_hz: f64, mib: Mib, coreset0: (u16, u8, i32), ssb_index: u8 },
+    SyncLost,
+    Stopped,
+}
+
+enum TxCmd {
+    Ul(UlTtiRequest, SampleClock, i64, std::time::Instant),
+    Reconfigure(Box<(CellGeometry, PhyConfig, u16)>),
+    Stop,
+}
+
+enum WorkerCmd {
+    Job(PdschJob),
+    Measure { slot: SlotPoint, samples: Arc<Vec<Iq>> },
+    Reconfigure(Box<WorkerConfig>),
+    Stop,
+}
+
+/// Everything derived once the cell is known.
+struct Synced {
+    clock: SampleClock,
+    geom: CellGeometry,
+    cfg: PhyConfig,
+    cell_id: u16,
+    monitor: DlMonitor,
+    coreset0: Coreset0Config,
+    ssb_case: SsbCase,
+    i_ssb: u8,
+    half_frame: u8,
+    cfo_hz: f64,
+    ssb_period_ms: u16,
+    configured: bool,
+}
+
+pub struct Engine<'a> {
+    pub params: EngineParams,
+    dl: DlStream,
+    shared: Arc<UlShared>,
+    mac: &'a mut dyn MacHandler,
+    cmds: crossbeam_channel::Receiver<EngineCommand>,
+    events: crossbeam_channel::Sender<EngineEvent>,
+    tx_cmd: crossbeam_channel::Sender<TxCmd>,
+    wk_cmd: crossbeam_channel::Sender<WorkerCmd>,
+    wk_res: crossbeam_channel::Receiver<PhyToMac>,
+    /// Previous slot's samples (for negative timing slews).
+    prev: Vec<Iq>,
+    prev_start: i64,
+    pending_dl: BTreeMap<u64, Vec<DlGrant>>,
+    pending_prach: Vec<(SlotPoint, PrachOccasion, u8)>,
+    prach_sweep: Option<Vec<i64>>,
+    prach_sweep_idx: usize,
+    pusch_sweep: Option<Vec<i64>>,
+    pusch_sweep_idx: usize,
+    stats: EngineStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineStats {
+    pub slots: u64,
+    pub dcis: u64,
+    pub pdsch_jobs: u64,
+    pub late_ul: u64,
+    pub timing_slews: u64,
+}
+
+/// Run the engine to completion (returns when stopped or the radio fails).
+pub fn run(
+    params: EngineParams,
+    dl: DlStream,
+    ul: UlServer,
+    mac: &mut dyn MacHandler,
+    cmds: crossbeam_channel::Receiver<EngineCommand>,
+    events: crossbeam_channel::Sender<EngineEvent>,
+) -> Result<EngineStats> {
+    let shared = UlShared::new(ul.start_index);
+    let spsl = Numerology::from_scs_khz(params.ssb_scs_khz).map(|n| n.samples_per_slot(params.fs)).unwrap_or(1) as i64;
+    {
+        let shared = shared.clone();
+        let fs = params.fs;
+        std::thread::Builder::new().name("ferrite-ultx".into()).spawn(move || serve_uplink(ul, shared, spsl, fs)).map_err(Error::Io)?;
+    }
+    let (tx_cmd, tx_rx) = crossbeam_channel::bounded::<TxCmd>(64);
+    let (wk_cmd, wk_rx) = crossbeam_channel::bounded::<WorkerCmd>(8);
+    let (wk_res_tx, wk_res) = crossbeam_channel::bounded::<PhyToMac>(64);
+    // TX builder thread.
+    {
+        let shared = shared.clone();
+        let ul_center_hz = params.ul_center_hz;
+        let prach_offset = params.prach_offset;
+        std::thread::Builder::new()
+            .name("ferrite-txbuild".into())
+            .spawn(move || {
+                let mut builder: Option<UlBuilder> = None;
+                while let Ok(cmd) = tx_rx.recv() {
+                    match cmd {
+                        TxCmd::Stop => break,
+                        TxCmd::Reconfigure(b) => {
+                            let (geom, cfg, cell_id) = *b;
+                            let mut b = UlBuilder::new(geom, cfg, ul_center_hz, cell_id);
+                            b.prach_offset = prach_offset;
+                            builder = Some(b);
+                        }
+                        TxCmd::Ul(req, clock, c, queued) => {
+                            let waited = queued.elapsed();
+                            if waited.as_millis() >= 5 {
+                                log::warn!("UL request for slot {} waited {:.1} ms in the build queue", req.slot, waited.as_secs_f64() * 1e3);
+                            }
+                            let Some(b) = builder.as_ref() else { continue };
+                            let crnti = c as u16;
+                            for pdu in req.pdus {
+                                let t_build = std::time::Instant::now();
+                                let built = match &pdu {
+                                    UlTtiPdu::Prach { occasion, preamble, power_offset_db } => b.prach(&clock, occasion, *preamble, *power_offset_db),
+                                    UlTtiPdu::Pusch { grant, tb, uci } => b.pusch(&clock, grant, tb, uci),
+                                    UlTtiPdu::Pucch { resource, uci } => b.pucch(&clock, req.slot, *resource, uci, crnti),
+                                };
+                                match built {
+                                    Ok(w) => {
+                                        let took = t_build.elapsed();
+                                        if took.as_millis() >= 2 {
+                                            log::warn!("{} build for slot {} took {:.1} ms", w.tag, req.slot, took.as_secs_f64() * 1e3);
+                                        }
+                                        let now = shared.served.load(Relaxed);
+                                        if w.start < now {
+                                            log::warn!("{} for slot {} is late by {} samples", w.tag, req.slot, now - w.start);
+                                        }
+                                        log::debug!("ul {} slot {}: start {} len {} (served {}, margin {} samples)", w.tag, req.slot, w.start, w.samples.len(), now, w.start - now);
+                                        shared.table.lock().unwrap().push(ReadyWaveform { pos: w.start, samples: w.samples, tag: w.tag }, now);
+                                    }
+                                    Err(e) => log::warn!("UL build failed for slot {}: {e}", req.slot),
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(Error::Io)?;
+    }
+    // PDSCH worker thread.
+    {
+        std::thread::Builder::new()
+            .name("ferrite-rxphy".into())
+            .spawn(move || {
+                let mut worker: Option<PdschWorker> = None;
+                while let Ok(cmd) = wk_rx.recv() {
+                    match cmd {
+                        WorkerCmd::Stop => break,
+                        WorkerCmd::Reconfigure(c) => match worker.as_mut() {
+                            Some(w) => w.reconfigure(*c),
+                            None => worker = Some(PdschWorker::new(*c)),
+                        },
+                        WorkerCmd::Measure { slot, samples } => {
+                            if let Some(w) = worker.as_ref() {
+                                if let Some(grids) = w.demod(slot, &samples) {
+                                    if let Some(c) = w.measure_csi(slot, &grids) {
+                                        let _ = wk_res_tx.send(PhyToMac::Csi(c));
+                                    }
+                                }
+                            }
+                        }
+                        WorkerCmd::Job(job) => {
+                            let Some(w) = worker.as_mut() else { continue };
+                            let Some(grids) = w.demod(job.slot, &job.samples) else { continue };
+                            if let Some(c) = w.measure_csi(job.slot, &grids) {
+                                let _ = wk_res_tx.send(PhyToMac::Csi(c));
+                            }
+                            let r = w.decode(&job, &grids);
+                            if wk_res_tx.send(PhyToMac::RxData(r)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(Error::Io)?;
+    }
+    let mut eng = Engine {
+        params,
+        dl,
+        shared,
+        mac,
+        cmds,
+        events,
+        tx_cmd,
+        wk_cmd,
+        wk_res,
+        prev: Vec::new(),
+        prev_start: 0,
+        pending_dl: BTreeMap::new(),
+        pending_prach: Vec::new(),
+        prach_sweep: std::env::var("FERRITE_PRACH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
+        prach_sweep_idx: 0,
+        pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
+        pusch_sweep_idx: 0,
+        stats: EngineStats::default(),
+    };
+    let r = eng.run_inner();
+    eng.shared.stop.store(true, Relaxed);
+    let _ = eng.tx_cmd.send(TxCmd::Stop);
+    let _ = eng.wk_cmd.send(WorkerCmd::Stop);
+    let _ = eng.events.send(EngineEvent::Stopped);
+    r.map(|_| eng.stats)
+}
+
+impl<'a> Engine<'a> {
+    fn stopped(&self) -> bool {
+        matches!(self.cmds.try_recv(), Ok(EngineCommand::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected))
+    }
+
+    fn run_inner(&mut self) -> Result<()> {
+        loop {
+            let synced = self.cell_search()?;
+            let Some(mut s) = synced else { return Ok(()) };
+            let lost = self.slot_loop(&mut s)?;
+            if !lost {
+                return Ok(());
+            }
+            let _ = self.events.send(EngineEvent::SyncLost);
+            self.mac.handle(PhyToMac::Error(ErrorIndication::SyncLost), &mut Vec::new());
+        }
+    }
+
+    // --------------------------------------------------------------- search
+
+    fn cell_search(&mut self) -> Result<Option<Synced>> {
+        self.shared.gate.store(false, Relaxed);
+        let p = self.params.clone();
+        let ssb_num = Numerology::from_scs_khz(p.ssb_scs_khz).ok_or_else(|| Error::Config("bad SSB SCS".into()))?;
+        let ssb_case = SsbCase::from_scs(p.ssb_scs_khz, p.duplex).ok_or_else(|| Error::Config("no SSB case".into()))?;
+        let l_max = ssb::l_max_fr1(p.dl_center_hz);
+        let frame_len = ssb_num.samples_per_frame(p.fs);
+        let fft_ssb = (p.fs / ssb_num.scs_hz() as f64).round() as usize;
+        let cap_len = 3 * frame_len; // ≥ one 20 ms SSB period plus margin
+        let mut attempts = 0u32;
+        loop {
+            if self.stopped() {
+                return Ok(None);
+            }
+            let cap_start = self.dl.position() as i64;
+            let mut cap = vec![Iq::default(); cap_len];
+            self.dl.read_exact(&mut cap)?;
+            self.shared.dl_consumed.store(self.dl.position() as i64, Relaxed);
+            attempts += 1;
+            let Some(hit) = gscn_scan(&cap, p.fs, p.dl_center_hz, p.ssb_scs_khz, l_max, p.gscn_hint) else {
+                log::info!("cell search: no SSB (attempt {attempts})");
+                if p.max_search_attempts > 0 && attempts >= p.max_search_attempts {
+                    return Err(Error::Phy("no SSB found".into()));
+                }
+                continue;
+            };
+            log::info!(
+                "scan hit: gscn {} df {:.0} Hz PCI {} pss {:.2} sss {:.2} cfo {:.0} Hz mib {}",
+                hit.gscn, hit.df_hz, hit.result.cell_id, hit.result.pss_metric, hit.result.sss_metric, hit.result.cfo_hz, hit.pbch.is_some()
+            );
+            let mut tracker = FrameTracker::new(fft_ssb, ssb_case, p.dl_center_hz);
+            let Some(acq) = tracker.acquire_from_hit(&hit) else {
+                log::info!("cell search: PCI {} seen but MIB not decoded (attempt {attempts})", hit.result.cell_id);
+                continue;
+            };
+            let mib = acq.mib;
+            let mu_data = if mib.scs_common_is_30_or_120 { 1 } else { 0 };
+            let numerology = Numerology::new(mu_data);
+            let frame_start_abs = cap_start + acq.frame_start;
+            let anchor = SlotPoint::new(numerology, mib.sfn & 0x3ff, 0);
+            let mut clock = SampleClock::new(p.fs, numerology, anchor, frame_start_abs);
+            clock.n_ta_offset_tc = 25600;
+            clock.tx_rx_offset = p.tx_rx_offset;
+            // CORESET#0 / Type0 CSS from the MIB (TS 38.213 §13).
+            let pdcch_scs = numerology.scs_khz();
+            let min_bw = if p.band == 79 { 40 } else { 10 };
+            let cs0_idx = mib.pdcch_config_sib1 >> 4;
+            let ss0_idx = mib.pdcch_config_sib1 & 0xf;
+            let Some(cs0) = coreset0::coreset0_config(p.ssb_scs_khz, pdcch_scs, min_bw, cs0_idx) else {
+                return Err(Error::Config(format!("unsupported CORESET0 index {cs0_idx}")));
+            };
+            let k_ssb = (mib.k_ssb_msb << 4) | mib.ssb_subcarrier_offset;
+            let cs0_rel_ssb = match coreset0::coreset0_first_subcarrier_rel_ssb(k_ssb, pdcch_scs, &cs0) {
+                Ok(v) => v,
+                Err(e) => return Err(Error::Config(format!("CORESET0 offset: {e:?}"))),
+            };
+            let scs = numerology.scs_hz() as f64;
+            // SSB subcarrier 0 relative to the DL stream DC (data-SCS subcarriers).
+            let ssb_sc0 = ((hit.df_hz - 120.0 * ssb_num.scs_hz() as f64) / scs).round() as i64;
+            let geom = CellGeometry::from_coreset0(p.fs, p.dl_center_hz, numerology, ssb_sc0 + cs0_rel_ssb as i64, hit.df_hz);
+            let Some(t0) = coreset0::type0_pdcch_monitoring(ss0_idx, acq.i_ssb, mu_data, &cs0) else {
+                return Err(Error::Config("unsupported searchSpaceZero".into()));
+            };
+            let cfg = initial_config(&p, &mib, &cs0, numerology, acq.cell_id, cs0_idx, ss0_idx, k_ssb);
+            let mut monitor = DlMonitor::new(geom.clone(), &cfg, acq.cell_id, Some((cs0, t0)), false);
+            monitor.rntis.si = true;
+            let synced = Synced {
+                clock,
+                geom: geom.clone(),
+                cfg: cfg.clone(),
+                cell_id: acq.cell_id,
+                monitor,
+                coreset0: cs0,
+                ssb_case,
+                i_ssb: acq.i_ssb,
+                half_frame: acq.half_frame,
+                cfo_hz: acq.cfo_hz,
+                ssb_period_ms: 20,
+                configured: false,
+            };
+            log::info!(
+                "synced PCI {} SFN {} i_ssb {} hf {} cfo {:.0} Hz ssb df {:.0} Hz mu {} CORESET0 idx {} ({} RB, {} sym) ss0 {}",
+                acq.cell_id, mib.sfn, acq.i_ssb, acq.half_frame, acq.cfo_hz, hit.df_hz, mu_data, cs0_idx, cs0.n_rb, cs0.n_symb, ss0_idx
+            );
+            let _ = self.events.send(EngineEvent::CellFound { pci: acq.cell_id, sfn: mib.sfn, cfo_hz: acq.cfo_hz, ssb_df_hz: hit.df_hz, mib, coreset0: (cs0.n_rb as u16, cs0.n_symb as u8, cs0.offset_rb), ssb_index: acq.i_ssb });
+            self.configure_threads(&synced);
+            return Ok(Some(synced));
+        }
+    }
+
+    fn configure_threads(&mut self, s: &Synced) {
+        let wc = worker_config(&s.geom, &s.cfg, s.cell_id, &s.coreset0, s.configured);
+        let _ = self.wk_cmd.send(WorkerCmd::Reconfigure(Box::new(wc)));
+        let _ = self.tx_cmd.send(TxCmd::Reconfigure(Box::new((s.geom.clone(), s.cfg.clone(), s.cell_id))));
+    }
+
+    // ------------------------------------------------------------ slot loop
+
+    /// Read the samples of the slot starting at DL index `start` (length `len`).
+    fn read_slot(&mut self, start: i64, len: usize, out: &mut Vec<Iq>) -> Result<()> {
+        out.clear();
+        let pos = self.dl.position() as i64;
+        if start >= pos {
+            self.dl.skip((start - pos) as usize)?;
+            out.resize(len, Iq::default());
+            self.dl.read_exact(out)?;
+        } else {
+            // Earlier than the stream position: take the overlap from the previous slot.
+            let back = (pos - start) as usize;
+            let prev_len = self.prev.len();
+            if back > prev_len {
+                return Err(Error::Phy(format!("timing slew of {back} samples exceeds the kept history")));
+            }
+            out.extend_from_slice(&self.prev[prev_len - back..]);
+            let need = len.saturating_sub(back);
+            let mut rest = vec![Iq::default(); need];
+            self.dl.read_exact(&mut rest)?;
+            out.extend_from_slice(&rest);
+            out.truncate(len);
+        }
+        self.prev_start = start;
+        std::mem::swap(&mut self.prev, out);
+        out.clear();
+        out.extend_from_slice(&self.prev);
+        Ok(())
+    }
+
+    /// Returns `Ok(true)` when sync was lost (caller re-searches), `Ok(false)` on stop.
+    fn slot_loop(&mut self, s: &mut Synced) -> Result<bool> {
+        let fs = self.params.fs;
+        self.shared.gate.store(true, Relaxed);
+        let numerology = s.geom.numerology;
+        let sps = s.clock.samples_per_slot();
+        // While the cell search ran (gate open) the uplink thread served
+        // whatever the lockstep gNB asked for, so the DL stream now holds a
+        // backlog the uplink has already passed. Transmissions for slots in
+        // that backlog could never be sent: drop it and start at the uplink's
+        // position.
+        let served = self.shared.served.load(Relaxed);
+        let backlog = served - self.dl.position() as i64;
+        if backlog > 2 * sps {
+            log::info!("dropping {backlog} DL samples ({:.1} ms) of search backlog", backlog as f64 / fs * 1e3);
+            self.dl.skip(backlog as usize)?;
+            self.prev.clear();
+        }
+        // Start at the first whole slot at/after the current stream position.
+        let (mut slot, off) = s.clock.slot_at(self.dl.position() as i64);
+        if off != 0 {
+            slot = slot.add(1);
+        }
+        let mut samples: Vec<Iq> = Vec::with_capacity(sps as usize);
+        let mut shifter: Option<FreqShifter> = None;
+        let mut shifted: Vec<Iq> = Vec::with_capacity(sps as usize);
+        let ofdm_ssb = Ofdm::new((fs / (15_000u32 << s.ssb_case.mu()) as f64).round() as usize);
+        let searcher = CellSearcher::new(ofdm_ssb.fft_size(), s.ssb_case.mu(), ssb::l_max_fr1(self.params.dl_center_hz));
+        let ssb_first_symbol = s.ssb_case.candidate_symbols(self.params.dl_center_hz).get(s.i_ssb as usize).copied().unwrap_or(2);
+        let ssb_off_in_frame = ssb::ssb_sample_offset_in_frame(ssb_first_symbol, s.half_frame, s.ssb_case.mu(), &ofdm_ssb) as i64;
+        let mut missed_ssb = 0u32;
+        let mut outbox: Vec<MacToPhy> = Vec::new();
+        loop {
+            if self.stopped() {
+                return Ok(false);
+            }
+            let start = s.clock.dl_index(slot);
+            self.read_slot(start, sps as usize, &mut samples)?;
+            if slot.slot == 0 {
+                // Keep the anchor within half an SFN cycle of the current slot
+                // (slot differences are modular over 1024 frames).
+                s.clock.set_anchor(slot, start);
+            }
+            self.shared.dl_consumed.store(start + sps, Relaxed);
+            self.stats.slots += 1;
+
+            // --- SSB tracking (timing + CFO) on SSB frames.
+            if slot.sfn % (s.ssb_period_ms / 10).max(1) == 0 && slot.slot as i64 == ssb_off_in_frame / sps {
+                let in_slot = (ssb_off_in_frame % sps) as usize;
+                let sh = FreqShifter::new(-s.geom.ssb_df_hz - s.cfo_hz, fs, sps as usize);
+                sh.shift_into(&samples, start as usize, &mut shifted);
+                let cp = ofdm_ssb.cp_len(ssb_first_symbol % (14 << s.ssb_case.mu()), s.ssb_case.mu());
+                let expect = in_slot + cp;
+                let lo = expect.saturating_sub(96);
+                let hi = (expect + 96).min(shifted.len());
+                match searcher.search_near(&shifted, (s.cell_id % 3) as u8, lo..hi) {
+                    Some(r) if r.pss_metric > 0.3 && r.cell_id == s.cell_id => {
+                        let err = r.timing_index as i64 - expect as i64;
+                        if err != 0 {
+                            s.clock.slew(err);
+                            self.stats.timing_slews += 1;
+                        }
+                        s.cfo_hz = 0.9 * s.cfo_hz + 0.1 * (s.cfo_hz + r.cfo_hz);
+                        missed_ssb = 0;
+                    }
+                    _ => {
+                        missed_ssb += 1;
+                        if missed_ssb >= 8 {
+                            log::warn!("SSB not found for {missed_ssb} periods: sync lost");
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            // --- CFO correction for the data path.
+            let data: &[Iq] = if self.params.cfo_correction && s.cfo_hz.abs() > 1.0 {
+                if shifter.as_ref().map_or(true, |f| (f.shift_hz() + s.cfo_hz).abs() > 0.5) {
+                    shifter = Some(FreqShifter::new(-s.cfo_hz, fs, sps as usize));
+                }
+                shifter.as_ref().unwrap().shift_into(&samples, start as usize, &mut shifted);
+                &shifted
+            } else {
+                &samples
+            };
+            let arc_samples: Arc<Vec<Iq>> = Arc::new(data.to_vec());
+
+            // --- SLOT.indication (MAC issues its UL_TTI requests for slot + lead).
+            self.mac.handle(PhyToMac::Slot(SlotIndication { slot }), &mut outbox);
+            self.drain_outbox(s, &mut outbox, slot)?;
+            // PRACH transmitted?
+            let mut rach = Vec::new();
+            self.pending_prach.retain(|(occ_slot, occ, pre)| {
+                if slot.diff(occ_slot) > 0 {
+                    rach.push(PhyToMac::Rach(RachIndication { slot: *occ_slot, ra_rnti: occ.ra_rnti, preamble: *pre }));
+                    false
+                } else {
+                    true
+                }
+            });
+            for m in rach {
+                self.mac.handle(m, &mut outbox);
+            }
+            self.drain_outbox(s, &mut outbox, slot)?;
+
+            // --- PDCCH monitoring.
+            let dcis = s.monitor.monitor(slot, data);
+            self.stats.dcis += dcis.len() as u64;
+            for d in dcis {
+                if let Dci::Dl(g) = &d.dci {
+                    self.pending_dl.entry(g.pdsch_slot.index()).or_default().push(g.clone());
+                }
+                self.mac.handle(PhyToMac::Dci(d), &mut outbox);
+            }
+            self.drain_outbox(s, &mut outbox, slot)?;
+
+            // --- PDSCH jobs for this slot (+ CSI measurement occasions).
+            let grants = self.pending_dl.remove(&slot.index()).unwrap_or_default();
+            let has_csi = s.configured && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot));
+            if grants.is_empty() && has_csi {
+                let _ = self.wk_cmd.try_send(WorkerCmd::Measure { slot, samples: arc_samples.clone() });
+            }
+            for g in grants {
+                self.stats.pdsch_jobs += 1;
+                let job = PdschJob { slot, samples: arc_samples.clone(), grant: g, skip_decode: false };
+                if self.wk_cmd.try_send(WorkerCmd::Job(job)).is_err() {
+                    log::warn!("PDSCH worker queue full: slot {slot} dropped");
+                }
+            }
+            // Drop stale pending grants (k0 misses).
+            self.pending_dl.retain(|&k, _| k as i64 >= slot.index() as i64);
+
+            // --- Worker results.
+            while let Ok(m) = self.wk_res.try_recv() {
+                self.mac.handle(m, &mut outbox);
+            }
+            self.drain_outbox(s, &mut outbox, slot)?;
+
+            slot = slot.add(1);
+            let _ = numerology;
+        }
+    }
+
+    /// Apply MAC → PHY messages.
+    fn drain_outbox(&mut self, s: &mut Synced, outbox: &mut Vec<MacToPhy>, now: SlotPoint) -> Result<()> {
+        for m in outbox.drain(..) {
+            match m {
+                MacToPhy::Config(cfg) => {
+                    let cfg = *cfg;
+                    s.geom = CellGeometry::new(self.params.fs, self.params.dl_center_hz, &cfg);
+                    s.clock.n_ta_offset_tc = cfg.n_ta_offset_tc as i64;
+                    s.ssb_period_ms = cfg.ssb.period_ms;
+                    let dedicated = !cfg.search_spaces.iter().all(|x| x.kind == crate::config::SearchSpaceKind::Common) || !cfg.pucch.resources.is_empty();
+                    let t0 = coreset0::type0_pdcch_monitoring(cfg.ss0_index, s.i_ssb, s.geom.numerology.mu, &s.coreset0);
+                    let rntis = s.monitor.rntis;
+                    s.monitor = DlMonitor::new(s.geom.clone(), &cfg, s.cell_id, t0.map(|t| (s.coreset0, t)), dedicated);
+                    s.monitor.rntis = rntis;
+                    s.cfg = cfg;
+                    s.configured = true;
+                    self.configure_threads(s);
+                    log::info!("PHY configured: dl carrier {:?} ul carrier {:?} coresets {} search spaces {} dedicated {}", s.cfg.dl_carrier, s.cfg.ul_carrier, s.cfg.coresets.len(), s.cfg.search_spaces.len(), dedicated);
+                }
+                MacToPhy::Start | MacToPhy::Stop => {}
+                MacToPhy::SetRntis { c_rnti, tc_rnti, ra_rnti } => {
+                    s.monitor.rntis.c = c_rnti;
+                    s.monitor.rntis.tc = tc_rnti;
+                    s.monitor.rntis.ra = ra_rnti;
+                }
+                MacToPhy::TimingAdvance { n_ta_tc } => {
+                    s.clock.n_ta_tc = n_ta_tc;
+                }
+                MacToPhy::UlTti(req) => {
+                    let lead = req.slot.diff(&now);
+                    if lead < 1 {
+                        self.stats.late_ul += 1;
+                        self.mac.handle(PhyToMac::Error(ErrorIndication::TxDropped { slot: req.slot, pdu: "ul_tti" }), &mut Vec::new());
+                        continue;
+                    }
+                    for pdu in &req.pdus {
+                        if let UlTtiPdu::Prach { occasion, preamble, .. } = pdu {
+                            self.pending_prach.push((occasion.slot, *occasion, *preamble));
+                        }
+                    }
+                    let crnti = s.monitor.rntis.c.map_or(0, |r| r.0) as i64;
+                    let mut clock = s.clock.clone();
+                    // Calibration aid: FERRITE_PRACH_SWEEP="-400,-200,0,200" cycles
+                    // the UL timing offset (samples) over successive PRACH attempts
+                    // so the gNB's detection log reveals the backend's TX/RX
+                    // alignment.
+                    if req.pdus.iter().any(|p| matches!(p, UlTtiPdu::Prach { .. })) {
+                        if let Some(v) = self.prach_sweep.as_ref().filter(|v| !v.is_empty()) {
+                            let off = v[self.prach_sweep_idx % v.len()];
+                            self.prach_sweep_idx += 1;
+                            clock.tx_rx_offset = off;
+                            log::info!("PRACH sweep: slot {} with tx_rx_offset {off} samples", req.slot);
+                        }
+                    } else if req.pdus.iter().any(|p| matches!(p, UlTtiPdu::Pusch { .. })) {
+                        // Same for PUSCH (FERRITE_PUSCH_SWEEP), cycled per PUSCH transmission.
+                        if let Some(v) = self.pusch_sweep.as_ref().filter(|v| !v.is_empty()) {
+                            let off = v[self.pusch_sweep_idx % v.len()];
+                            self.pusch_sweep_idx += 1;
+                            clock.tx_rx_offset = off;
+                            log::info!("PUSCH sweep: slot {} with tx_rx_offset {off} samples", req.slot);
+                        }
+                    }
+                    if self.tx_cmd.try_send(TxCmd::Ul(req, clock, crnti, std::time::Instant::now())).is_err() {
+                        self.stats.late_ul += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The minimal PHY configuration for SIB1 reception, from the MIB.
+#[allow(clippy::too_many_arguments)]
+fn initial_config(p: &EngineParams, mib: &Mib, cs0: &Coreset0Config, numerology: Numerology, cell_id: u16, _cs0_idx: u8, ss0_idx: u8, k_ssb: u8) -> PhyConfig {
+    use crate::config::*;
+    PhyConfig {
+        duplex: p.duplex,
+        numerology,
+        ssb: SsbConfig {
+            pci: cell_id,
+            scs: Numerology::from_scs_khz(p.ssb_scs_khz).unwrap_or(numerology),
+            period_ms: 20,
+            ssb_index: 0,
+            k_ssb,
+            dmrs_typea_pos: if mib.dmrs_typea_pos3 { 3 } else { 2 },
+        },
+        dl_carrier: Carrier { offset_crb: 0, n_rb: 0 },
+        ul_carrier: Carrier { offset_crb: 0, n_rb: 0 },
+        ssb_crb: 0,
+        dl_bwp: Bwp { start_crb: 0, n_rb: cs0.n_rb as u16, scs: numerology },
+        ul_bwp: Bwp { start_crb: 0, n_rb: cs0.n_rb as u16, scs: numerology },
+        tdd: None,
+        coresets: vec![CoresetConfig {
+            id: 0,
+            start_crb: 0,
+            rb_mask: vec![true; cs0.n_rb],
+            duration: cs0.n_symb as u8,
+            interleaved: Some((6, 2, cell_id)),
+            dmrs_scrambling_id: None,
+            ref_lowest_rb: true,
+        }],
+        search_spaces: Vec::new(),
+        ss0_index: ss0_idx,
+        pdsch_tdra_common: Vec::new(),
+        pusch_tdra_common: Vec::new(),
+        prach: PrachConfig {
+            phy: ferrite_phy::prach_config::PrachConfig { index: 0, duplex: p.duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+            zero_correlation_zone: 0,
+            root_sequence_index: 0,
+            restricted_set: 0,
+            total_preambles: 64,
+            target_power_dbm: -100,
+            power_ramping_step_db: 0,
+        },
+        n_ta_offset_tc: 25600,
+        pdsch: PdschConfig::default(),
+        pusch: PuschConfig::default(),
+        pucch: PucchConfig::default(),
+        csi_reports: Vec::new(),
+        harq_codebook_dynamic: true,
+        ul_amplitude: 0.5,
+    }
+}
+
+fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Coreset0Config, configured: bool) -> WorkerConfig {
+    let coreset0_first_crb = cfg.coresets.iter().find(|c| c.id == 0).map_or(0, |c| c.start_crb as usize);
+    let mut patterns = Vec::new();
+    let mut meas = Vec::new();
+    for r in &cfg.pdsch.csi_rs_rate_match {
+        let row = match r.row {
+            1 => csi::CsiRsRow::Row1,
+            2 => csi::CsiRsRow::Row2,
+            4 => csi::CsiRsRow::Row4,
+            _ => continue,
+        };
+        let mut symbols = vec![r.first_symbol as usize];
+        if let Some(s2) = r.second_symbol {
+            symbols.push(s2 as usize);
+        }
+        patterns.push(csi::CsiRsPattern {
+            period_slots: r.period_slots as u32,
+            offset_slots: r.offset_slots as u32,
+            symbols: symbols.clone(),
+            start_rb: r.start_rb as usize,
+            n_rb: r.n_rb as usize,
+            re_mask: csi::csi_rs_re_mask(row, r.freq_bits),
+        });
+        if !r.zero_power && r.trs && r.row == 1 {
+            meas.push((
+                csi::CsiRsMeasurement { row, n_id: r.scrambling_id, k0: r.freq_bits.trailing_zeros() as usize, symbol: r.first_symbol as usize, start_rb: r.start_rb as usize, n_rb: r.n_rb as usize },
+                r.period_slots as u32,
+                r.offset_slots as u32,
+            ));
+        }
+    }
+    WorkerConfig {
+        geom: geom.clone(),
+        cell_id,
+        dl_bwp_start: cfg.dl_bwp.start_crb as usize,
+        dl_bwp_rb: cfg.dl_bwp.n_rb as usize,
+        vrb_bundle_size: cfg.pdsch.vrb_to_prb_interleaver.unwrap_or(2) as usize,
+        coreset0_first_crb,
+        coreset0_rb: cs0.n_rb,
+        dmrs_typea_pos: cfg.ssb.dmrs_typea_pos,
+        scrambling_id: None,
+        dmrs_scrambling_id0: cfg.pdsch.dmrs_type_a.scrambling_id0,
+        csi_patterns: patterns,
+        csi_meas: meas,
+        csi_rate_match_enabled: configured,
+    }
+}

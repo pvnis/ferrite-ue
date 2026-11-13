@@ -1,167 +1,269 @@
-//! HARQ entities (TS 38.321 §5.4.2): per-process state for the downlink and
-//! uplink HARQ processes the UE runs.
+//! HARQ entities (TS 38.321 §5.3.2, §5.4.2) and the HARQ-ACK codebook
+//! (TS 38.213 §9.1.3, dynamic / Type-2).
 //!
-//! The MAC owns the *process* bookkeeping — which HARQ id carries which TB, its
-//! NDI/redundancy history, the recorded first-transmission shape, and (DL) the
-//! accumulated soft-combine buffer. The physical layer supplies the per-RV soft
-//! bits (`cb`) and performs the LDPC decode of the accumulated sum; this module
-//! only tracks and combines, so it stays free of any PHY dependency.
+//! Soft combining is a PHY matter (the PHY keeps the per-process LLR buffers
+//! and reports CRC per transmission); MAC keeps the *process* bookkeeping:
+//! NDI history, delivered flag, and the per-slot ACK codebook.
 
-use std::collections::HashMap;
+use ferrite_common::{Rnti, SlotPoint};
+use std::collections::BTreeMap;
 
-/// One DL HARQ process's soft-combining buffer: the accumulated circular-buffer
-/// LLRs of the transport block currently in flight on the process, tagged with
-/// the code parameters they were built with (a change ⇒ the gNB reused the
-/// process for a new TB, so the buffer is reset).
-struct HarqDlBuf {
-    tbs: usize,
-    qm: usize,
-    acc: Vec<f32>,
-    n_rx: usize,
+/// One DL HARQ process (§5.3.2).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DlHarqProcess {
+    /// NDI of the last received DCI on this process, if any.
+    pub ndi: Option<u8>,
+    /// The TB with that NDI was delivered to the disassembly entity.
+    pub delivered: bool,
+    /// TBS of the TB in flight (bits).
+    pub tbs_bits: u32,
 }
 
-/// Downlink HARQ entity: the per-process soft-combine buffers plus the
-/// bookkeeping used to classify a (re)transmission (recorded first-tx shape,
-/// delivered NDI for blind-ACK of an already-received TB).
-#[derive(Default)]
-pub struct DlHarq {
-    /// Soft-combine buffers, per HARQ process id.
-    combine: HashMap<u8, HarqDlBuf>,
-    /// First-transmission shape `(ndi, mcs, n_rb, sliv)` — a retx keeps the TB's
-    /// original size/allocation even when the gNB link-adapts the retx MCS.
-    shape: HashMap<u8, (u8, u8, usize, u8)>,
-    /// NDI of the TB last delivered on this process: a retx of it can be
-    /// blind-ACKed (CRC-OK already) without re-decoding.
-    done: HashMap<u8, u8>,
+/// Downlink HARQ entity.
+#[derive(Clone, Debug)]
+pub struct DlHarqEntity {
+    processes: Vec<DlHarqProcess>,
 }
 
-impl DlHarq {
-    /// Accumulate this (re)transmission's circular-buffer soft bits `cb` into the
-    /// process buffer and return the running reception count. Resets the buffer
-    /// on `rv == 0` (a fresh transmission) or a code-parameter change (the
-    /// process was reused for a different TB).
-    pub fn accumulate(&mut self, h_id: u8, tbs: usize, qm: usize, rv: u8, cb: &[f32]) -> usize {
-        let e = self
-            .combine
-            .entry(h_id)
-            .or_insert_with(|| HarqDlBuf { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 });
-        if e.tbs != tbs || e.qm != qm || e.acc.len() != cb.len() || rv == 0 {
-            *e = HarqDlBuf { tbs, qm, acc: vec![0.0; cb.len()], n_rx: 0 };
+impl DlHarqEntity {
+    pub fn new(n: u8) -> Self {
+        Self { processes: vec![DlHarqProcess::default(); n.max(1) as usize] }
+    }
+
+    /// Classify a DL assignment: returns `(is_new_data, already_delivered)`.
+    /// A toggled (or first) NDI means a new TB; the same NDI is a retransmission,
+    /// which may already have been delivered (then it is ACKed without decode).
+    pub fn on_assignment(&mut self, harq_id: u8, ndi: u8, tbs_bits: u32) -> (bool, bool) {
+        let n = self.processes.len();
+        let p = &mut self.processes[harq_id as usize % n];
+        match p.ndi {
+            Some(prev) if prev == ndi => (false, p.delivered),
+            _ => {
+                *p = DlHarqProcess { ndi: Some(ndi), delivered: false, tbs_bits };
+                (true, false)
+            }
         }
-        for (a, &c) in e.acc.iter_mut().zip(cb) {
-            *a += c;
-        }
-        e.n_rx += 1;
-        e.n_rx
     }
 
-    /// The accumulated soft-combine buffer for `h_id` (to hand to the LDPC
-    /// decoder), if a buffer exists.
-    pub fn combined(&self, h_id: u8) -> Option<&[f32]> {
-        self.combine.get(&h_id).map(|e| e.acc.as_slice())
+    pub fn tbs_bits(&self, harq_id: u8) -> u32 {
+        self.processes[harq_id as usize % self.processes.len()].tbs_bits
     }
 
-    /// Discard the soft-combine buffer for a process (its TB was delivered or
-    /// faithfully received).
-    pub fn clear_process(&mut self, h_id: u8) {
-        self.combine.remove(&h_id);
+    pub fn is_delivered(&self, harq_id: u8) -> bool {
+        self.processes[harq_id as usize % self.processes.len()].delivered
     }
 
-    /// NDI of the TB last delivered on this process, if any (a retx with the same
-    /// NDI can be ACKed without decoding).
-    pub fn delivered_ndi(&self, h_id: u8) -> Option<u8> {
-        self.done.get(&h_id).copied()
+    pub fn mark_delivered(&mut self, harq_id: u8) {
+        let n = self.processes.len();
+        self.processes[harq_id as usize % n].delivered = true;
     }
 
-    /// Mark a process's TB delivered at NDI `ndi` and record the shape that
-    /// decoded it (used to re-classify its later retransmissions).
-    pub fn mark_delivered(&mut self, h_id: u8, ndi: u8, mcs: u8, n_rb: usize, sliv: u8) {
-        self.done.insert(h_id, ndi);
-        self.shape.insert(h_id, (ndi, mcs, n_rb, sliv));
-    }
-
-    /// The recorded `(ndi, mcs, n_rb, sliv)` first-transmission shape for a
-    /// process, if any.
-    pub fn recorded(&self, h_id: u8) -> Option<(u8, u8, usize, u8)> {
-        self.shape.get(&h_id).copied()
-    }
-
-    /// Record the first-transmission shape of a newly-seen TB on this process.
-    pub fn record_first_tx(&mut self, h_id: u8, ndi: u8, mcs: u8, n_rb: usize, sliv: u8) {
-        self.shape.insert(h_id, (ndi, mcs, n_rb, sliv));
-    }
-
-    /// Forget all process state (on re-establishment / a new C-RNTI).
     pub fn reset(&mut self) {
-        self.combine.clear();
-        self.shape.clear();
-        self.done.clear();
+        for p in &mut self.processes {
+            *p = DlHarqProcess::default();
+        }
     }
 }
 
-/// Uplink HARQ entity: the stored transport block per process so a retransmission
-/// grant can resend the exact same TB at the DCI's redundancy version (fresh
-/// content would poison the gNB's soft combine).
-#[derive(Default)]
-pub struct UlHarq {
-    /// `(ndi, tbs_bytes, stored TB)` per HARQ process id.
-    proc: HashMap<u8, (u8, usize, Vec<u8>)>,
+/// One UL HARQ process (§5.4.2): the stored TB for retransmissions.
+#[derive(Clone, Debug, Default)]
+pub struct UlHarqProcess {
+    pub ndi: Option<u8>,
+    pub tbs_bits: u32,
+    pub tb: Vec<u8>,
 }
 
-impl UlHarq {
-    /// True if a grant for `h_id` with this `ndi`/`tbs` is a retransmission of the
-    /// stored TB (same NDI and size) rather than a new transmission.
-    pub fn is_retx(&self, h_id: u8, ndi: u8, tbs_bytes: usize) -> bool {
-        self.proc.get(&h_id).is_some_and(|(n, t, _)| *n == ndi && *t == tbs_bytes)
+/// Uplink HARQ entity.
+#[derive(Clone, Debug)]
+pub struct UlHarqEntity {
+    processes: Vec<UlHarqProcess>,
+}
+
+impl UlHarqEntity {
+    pub fn new(n: u8) -> Self {
+        Self { processes: vec![UlHarqProcess::default(); n.max(1) as usize] }
     }
 
-    /// The stored transport block for a process (to resend on a retx grant).
-    pub fn stored(&self, h_id: u8) -> Option<&[u8]> {
-        self.proc.get(&h_id).map(|(_, _, tb)| tb.as_slice())
+    /// Is a grant with this NDI/TBS a retransmission of the stored TB?
+    pub fn is_retx(&self, harq_id: u8, ndi: u8, tbs_bits: u32) -> bool {
+        let p = &self.processes[harq_id as usize % self.processes.len()];
+        p.ndi == Some(ndi) && p.tbs_bits == tbs_bits && !p.tb.is_empty()
     }
 
-    /// Store a freshly-built transport block for a process.
-    pub fn store(&mut self, h_id: u8, ndi: u8, tbs_bytes: usize, tb: Vec<u8>) {
-        self.proc.insert(h_id, (ndi, tbs_bytes, tb));
+    pub fn stored(&self, harq_id: u8) -> &[u8] {
+        &self.processes[harq_id as usize % self.processes.len()].tb
     }
+
+    pub fn store(&mut self, harq_id: u8, ndi: u8, tbs_bits: u32, tb: Vec<u8>) {
+        let n = self.processes.len();
+        self.processes[harq_id as usize % n] = UlHarqProcess { ndi: Some(ndi), tbs_bits, tb };
+    }
+
+    pub fn reset(&mut self) {
+        for p in &mut self.processes {
+            *p = UlHarqProcess::default();
+        }
+    }
+}
+
+/// A pending HARQ-ACK for one PDSCH, keyed by its UL (ACK) slot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AckEntry {
+    pub rnti: Rnti,
+    pub pdsch_slot: SlotPoint,
+    pub harq_id: u8,
+    pub dai: u8,
+    /// `None` until the decode result arrived (then ACK=1/NACK=0).
+    pub ack: Option<bool>,
+    pub pri: u8,
+}
+
+/// The per-ACK-slot HARQ-ACK codebook (dynamic, TS 38.213 §9.1.3.1): entries
+/// ordered by counter DAI; gaps (missed DCIs) are NACKed.
+#[derive(Clone, Debug, Default)]
+pub struct AckBook {
+    slots: BTreeMap<u64, Vec<AckEntry>>,
+}
+
+impl AckBook {
+    /// Pre-book a NACK when the DCI is decoded (so a lost/late decode still
+    /// yields a correctly sized codebook).
+    pub fn book(&mut self, ack_slot: SlotPoint, entry: AckEntry) {
+        let v = self.slots.entry(ack_slot.index()).or_default();
+        if let Some(e) = v.iter_mut().find(|e| e.pdsch_slot == entry.pdsch_slot && e.harq_id == entry.harq_id) {
+            *e = entry;
+        } else {
+            v.push(entry);
+        }
+    }
+
+    /// Record the decode result for a PDSCH (by its slot + HARQ id).
+    pub fn set_result(&mut self, pdsch_slot: SlotPoint, harq_id: u8, ack: bool) -> bool {
+        for v in self.slots.values_mut() {
+            if let Some(e) = v.iter_mut().find(|e| e.pdsch_slot == pdsch_slot && e.harq_id == harq_id) {
+                e.ack = Some(ack);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn has_slot(&self, ack_slot: SlotPoint) -> bool {
+        self.slots.contains_key(&ack_slot.index())
+    }
+
+    /// The PRI of the last DCI targeting `ack_slot` (TS 38.213 §9.2.3: the
+    /// PUCCH resource follows the last DCI).
+    pub fn pri(&self, ack_slot: SlotPoint) -> Option<u8> {
+        self.slots.get(&ack_slot.index()).and_then(|v| v.iter().max_by_key(|e| (e.pdsch_slot.index(), e.dai)).map(|e| e.pri))
+    }
+
+    /// Take the codebook for `ack_slot`: bits ordered by DAI with gaps NACKed.
+    /// `total_dai` (from a DCI 0_1 UL grant, (count−1) mod 4) can extend the size.
+    pub fn take(&mut self, ack_slot: SlotPoint, total_dai: Option<u8>) -> Vec<u8> {
+        let entries = self.slots.remove(&ack_slot.index()).unwrap_or_default();
+        codebook_from(&entries, total_dai)
+    }
+
+    /// Drop codebooks whose ACK slot is already in the past.
+    pub fn prune(&mut self, now: SlotPoint) {
+        let idx = now.index();
+        let total = now.slots_per_frame() as u64 * 1024;
+        self.slots.retain(|&k, _| {
+            let d = (k as i64 - idx as i64).rem_euclid(total as i64);
+            let d = if d > total as i64 / 2 { d - total as i64 } else { d };
+            d >= 0
+        });
+    }
+}
+
+/// Build the dynamic codebook bits from the booked entries (§9.1.3.1 with a
+/// single serving cell: one bit per PDSCH, ordered by the DAI sequence).
+fn codebook_from(entries: &[AckEntry], total_dai: Option<u8>) -> Vec<u8> {
+    if entries.is_empty() {
+        return match total_dai {
+            // T-DAI = (N−1) mod 4 with N unknown-but-≥1; without any DCI seen we
+            // cannot know N beyond the residue — assume the smallest consistent N.
+            Some(t) if t < 3 => vec![0; t as usize + 1],
+            _ => Vec::new(),
+        };
+    }
+    // Order by PDSCH slot then DAI; unwrap the 2-bit counter into a running index.
+    let mut sorted = entries.to_vec();
+    sorted.sort_by_key(|e| (e.pdsch_slot.index(), e.dai));
+    let mut bits: Vec<u8> = Vec::new();
+    let mut expected_dai = sorted[0].dai & 3;
+    // If the first DCI's counter isn't 0 we missed the earlier ones.
+    for _ in 0..(expected_dai as usize) {
+        bits.push(0);
+    }
+    for e in &sorted {
+        while (e.dai & 3) != expected_dai {
+            bits.push(0); // a missed PDSCH between consecutive DAIs
+            expected_dai = (expected_dai + 1) & 3;
+        }
+        bits.push(u8::from(e.ack == Some(true)));
+        expected_dai = (expected_dai + 1) & 3;
+    }
+    if let Some(t) = total_dai {
+        // Extend to the smallest N ≥ len with (N−1) mod 4 == t.
+        while ((bits.len() as u8).wrapping_sub(1) & 3) != (t & 3) {
+            bits.push(0);
+            if bits.len() > 32 {
+                break;
+            }
+        }
+    }
+    bits
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_common::Numerology;
 
-    #[test]
-    fn dl_soft_combine_accumulates_and_resets() {
-        let mut h = DlHarq::default();
-        assert_eq!(h.accumulate(0, 100, 2, 0, &[1.0, 1.0]), 1);
-        assert_eq!(h.accumulate(0, 100, 2, 2, &[1.0, 1.0]), 2); // combines
-        assert_eq!(h.combined(0), Some([2.0, 2.0].as_slice()));
-        // rv==0 resets the buffer (new transmission).
-        assert_eq!(h.accumulate(0, 100, 2, 0, &[1.0, 1.0]), 1);
-        assert_eq!(h.combined(0), Some([1.0, 1.0].as_slice()));
-        h.clear_process(0);
-        assert_eq!(h.combined(0), None);
+    fn sp(s: u16) -> SlotPoint {
+        SlotPoint::new(Numerology::KHZ30, 0, s)
     }
 
     #[test]
-    fn dl_shape_and_delivered() {
-        let mut h = DlHarq::default();
-        h.record_first_tx(3, 1, 9, 5, 53);
-        assert_eq!(h.recorded(3), Some((1, 9, 5, 53)));
-        assert_eq!(h.delivered_ndi(3), None);
-        h.mark_delivered(3, 1, 9, 5, 53);
-        assert_eq!(h.delivered_ndi(3), Some(1));
-        h.reset();
-        assert_eq!(h.recorded(3), None);
+    fn dl_ndi_classification() {
+        let mut h = DlHarqEntity::new(16);
+        assert_eq!(h.on_assignment(3, 1, 100), (true, false));
+        assert_eq!(h.on_assignment(3, 1, 100), (false, false));
+        h.mark_delivered(3);
+        assert_eq!(h.on_assignment(3, 1, 100), (false, true));
+        assert_eq!(h.on_assignment(3, 0, 200), (true, false));
+        assert_eq!(h.tbs_bits(3), 200);
     }
 
     #[test]
-    fn ul_retx_store_and_fetch() {
-        let mut u = UlHarq::default();
-        u.store(2, 0, 285, vec![0xaa, 0xbb]);
-        assert!(u.is_retx(2, 0, 285));
-        assert!(!u.is_retx(2, 1, 285)); // NDI toggled = new TB
-        assert!(!u.is_retx(2, 0, 100)); // different size
-        assert_eq!(u.stored(2), Some([0xaa, 0xbb].as_slice()));
+    fn codebook_orders_and_fills_gaps() {
+        let mut b = AckBook::default();
+        let ack = sp(7);
+        let e = |dai: u8, s: u16, ack: Option<bool>| AckEntry { rnti: Rnti(1), pdsch_slot: sp(s), harq_id: dai, dai, ack, pri: 0 };
+        b.book(ack, e(0, 1, Some(true)));
+        b.book(ack, e(2, 3, Some(true))); // DAI 1 missed
+        assert!(b.set_result(sp(1), 0, true));
+        assert_eq!(b.take(ack, None), vec![1, 0, 1]);
+        assert!(!b.has_slot(ack));
+        // Total DAI extension: 3 PDSCHs seen, T-DAI says (N−1) mod 4 = 3 → N=4.
+        b.book(ack, e(0, 1, Some(true)));
+        b.book(ack, e(1, 2, Some(false)));
+        b.book(ack, e(2, 3, None));
+        assert_eq!(b.take(ack, Some(3)), vec![1, 0, 0, 0]);
+        // Nothing booked but a grant says one ACK bit is expected.
+        assert_eq!(b.take(ack, Some(0)), vec![0]);
+        assert_eq!(b.take(ack, Some(3)), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn ul_retx_detection() {
+        let mut u = UlHarqEntity::new(16);
+        u.store(2, 0, 288, vec![1, 2, 3]);
+        assert!(u.is_retx(2, 0, 288));
+        assert!(!u.is_retx(2, 1, 288));
+        assert!(!u.is_retx(2, 0, 100));
+        assert_eq!(u.stored(2), &[1, 2, 3]);
     }
 }
