@@ -64,12 +64,18 @@ pub enum EngineCommand {
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
     CellFound { pci: u16, sfn: u16, cfo_hz: f64, ssb_df_hz: f64, mib: Mib, coreset0: (u16, u8, i32), ssb_index: u8 },
+    /// A serving-cell SSB measurement (one per SSB period), in the receiver's
+    /// own power scale (dBFS); the stack converts to dBm.
+    Measurement { pci: u16, slot: SlotPoint, rsrp_dbfs: f32, rsrq_db: f32, sinr_db: f32 },
     SyncLost,
     Stopped,
 }
 
 enum TxCmd {
     Ul(UlTtiRequest, SampleClock, i64, std::time::Instant),
+    /// Every UL request queued before this one has been issued: once they
+    /// are built, the injection table is final up to the given UL index.
+    Mark(i64),
     Reconfigure(Box<(CellGeometry, PhyConfig, u16)>),
     Stop,
 }
@@ -112,6 +118,8 @@ pub struct Engine<'a> {
     prev_start: i64,
     pending_dl: BTreeMap<u64, Vec<DlGrant>>,
     pending_prach: Vec<(SlotPoint, PrachOccasion, u8)>,
+    /// PDSCH jobs handed to the worker whose RX_Data has not come back yet.
+    outstanding_jobs: usize,
     prach_sweep: Option<Vec<i64>>,
     prach_sweep_idx: usize,
     pusch_sweep: Option<Vec<i64>>,
@@ -151,7 +159,6 @@ pub fn run(
     {
         let shared = shared.clone();
         let ul_center_hz = params.ul_center_hz;
-        let prach_offset = params.prach_offset;
         std::thread::Builder::new()
             .name("ferrite-txbuild".into())
             .spawn(move || {
@@ -159,11 +166,10 @@ pub fn run(
                 while let Ok(cmd) = tx_rx.recv() {
                     match cmd {
                         TxCmd::Stop => break,
+                        TxCmd::Mark(idx) => shared.committed.store(idx, Relaxed),
                         TxCmd::Reconfigure(b) => {
                             let (geom, cfg, cell_id) = *b;
-                            let mut b = UlBuilder::new(geom, cfg, ul_center_hz, cell_id);
-                            b.prach_offset = prach_offset;
-                            builder = Some(b);
+                            builder = Some(UlBuilder::new(geom, cfg, ul_center_hz, cell_id));
                         }
                         TxCmd::Ul(req, clock, c, queued) => {
                             let waited = queued.elapsed();
@@ -224,12 +230,22 @@ pub fn run(
                             }
                         }
                         WorkerCmd::Job(job) => {
-                            let Some(w) = worker.as_mut() else { continue };
-                            let Some(grids) = w.demod(job.slot, &job.samples) else { continue };
-                            if let Some(c) = w.measure_csi(job.slot, &grids) {
-                                let _ = wk_res_tx.send(PhyToMac::Csi(c));
-                            }
-                            let r = w.decode(&job, &grids);
+                            // Every job is answered with exactly one RX_Data (the
+                            // engine waits for them before building the HARQ-ACK).
+                            let g = &job.grant;
+                            let failed = || RxDataIndication { rnti: g.rnti, rnti_kind: g.rnti_kind, harq_id: g.harq_id, ndi: g.ndi, pdsch_slot: job.slot, tb: None, sinr_db: 0.0 };
+                            let r = match worker.as_mut() {
+                                None => failed(),
+                                Some(w) => match w.demod(job.slot, &job.samples) {
+                                    None => failed(),
+                                    Some(grids) => {
+                                        if let Some(c) = w.measure_csi(job.slot, &grids) {
+                                            let _ = wk_res_tx.send(PhyToMac::Csi(c));
+                                        }
+                                        w.decode(&job, &grids)
+                                    }
+                                },
+                            };
                             if wk_res_tx.send(PhyToMac::RxData(r)).is_err() {
                                 break;
                             }
@@ -253,6 +269,7 @@ pub fn run(
         prev_start: 0,
         pending_dl: BTreeMap::new(),
         pending_prach: Vec::new(),
+        outstanding_jobs: 0,
         prach_sweep: std::env::var("FERRITE_PRACH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
         prach_sweep_idx: 0,
         pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
@@ -304,7 +321,6 @@ impl<'a> Engine<'a> {
             let cap_start = self.dl.position() as i64;
             let mut cap = vec![Iq::default(); cap_len];
             self.dl.read_exact(&mut cap)?;
-            self.shared.dl_consumed.store(self.dl.position() as i64, Relaxed);
             attempts += 1;
             let Some(hit) = gscn_scan(&cap, p.fs, p.dl_center_hz, p.ssb_scs_khz, l_max, p.gscn_hint) else {
                 log::info!("cell search: no SSB (attempt {attempts})");
@@ -330,6 +346,8 @@ impl<'a> Engine<'a> {
             let mut clock = SampleClock::new(p.fs, numerology, anchor, frame_start_abs);
             clock.n_ta_offset_tc = 25600;
             clock.tx_rx_offset = p.tx_rx_offset;
+            // `prach_offset` < 0 is a delay: the uplink guard (all channels).
+            clock.ul_guard = -p.prach_offset;
             // CORESET#0 / Type0 CSS from the MIB (TS 38.213 §13).
             let pdcch_scs = numerology.scs_khz();
             let min_bw = if p.band == 79 { 40 } else { 10 };
@@ -417,6 +435,10 @@ impl<'a> Engine<'a> {
     /// Returns `Ok(true)` when sync was lost (caller re-searches), `Ok(false)` on stop.
     fn slot_loop(&mut self, s: &mut Synced) -> Result<bool> {
         let fs = self.params.fs;
+        // Close the gate (commit mark at the stream origin) so the uplink
+        // position is stable while the backlog is measured; it is reopened
+        // below once the first slot is known.
+        self.shared.committed.store(i64::MIN, Relaxed);
         self.shared.gate.store(true, Relaxed);
         let numerology = s.geom.numerology;
         let sps = s.clock.samples_per_slot();
@@ -437,6 +459,11 @@ impl<'a> Engine<'a> {
         if off != 0 {
             slot = slot.add(1);
         }
+        // Nothing can be requested before slot + tx_lead any more, so the
+        // uplink is final up to there: release it, or the lockstep gNB (which
+        // sends at most ~1 ms of DL beyond the UL it has received) could never
+        // deliver the first whole slot.
+        self.shared.committed.store(self.commit_mark(s, slot.add(self.params.tx_lead_slots as u64)), Relaxed);
         let mut samples: Vec<Iq> = Vec::with_capacity(sps as usize);
         let mut shifter: Option<FreqShifter> = None;
         let mut shifted: Vec<Iq> = Vec::with_capacity(sps as usize);
@@ -457,7 +484,6 @@ impl<'a> Engine<'a> {
                 // (slot differences are modular over 1024 frames).
                 s.clock.set_anchor(slot, start);
             }
-            self.shared.dl_consumed.store(start + sps, Relaxed);
             self.stats.slots += 1;
 
             // --- SSB tracking (timing + CFO) on SSB frames.
@@ -478,6 +504,9 @@ impl<'a> Engine<'a> {
                         }
                         s.cfo_hz = 0.9 * s.cfo_hz + 0.1 * (s.cfo_hz + r.cfo_hz);
                         missed_ssb = 0;
+                        if let Some(m) = ferrite_phy::sync::measure::ssb_measure(&ofdm_ssb, &shifted, r.timing_index, s.ssb_case.mu(), r.n_id_1, r.n_id_2) {
+                            let _ = self.events.try_send(EngineEvent::Measurement { pci: s.cell_id, slot, rsrp_dbfs: m.rsrp_db(), rsrq_db: m.rsrq_db(), sinr_db: m.sinr_db() });
+                        }
                     }
                     _ => {
                         missed_ssb += 1;
@@ -499,6 +528,26 @@ impl<'a> Engine<'a> {
                 &samples
             };
             let arc_samples: Arc<Vec<Iq>> = Arc::new(data.to_vec());
+
+            // --- Earlier PDSCH results first: the HARQ-ACK for a PDSCH is
+            // built at the SLOT.indication `k1 − tx_lead` slots after it, and
+            // when the DL stream arrives in bursts the engine can get there
+            // before the worker (normally ~0.3 ms) has answered.
+            while self.outstanding_jobs > 0 {
+                match self.wk_res.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(m) => {
+                        if matches!(m, PhyToMac::RxData(_)) {
+                            self.outstanding_jobs -= 1;
+                        }
+                        self.mac.handle(m, &mut outbox);
+                    }
+                    Err(_) => {
+                        log::warn!("{} PDSCH result(s) still outstanding at slot {slot}", self.outstanding_jobs);
+                        break;
+                    }
+                }
+            }
+            self.drain_outbox(s, &mut outbox, slot)?;
 
             // --- SLOT.indication (MAC issues its UL_TTI requests for slot + lead).
             self.mac.handle(PhyToMac::Slot(SlotIndication { slot }), &mut outbox);
@@ -537,9 +586,11 @@ impl<'a> Engine<'a> {
             }
             for g in grants {
                 self.stats.pdsch_jobs += 1;
-                let job = PdschJob { slot, samples: arc_samples.clone(), grant: g, skip_decode: false };
+                let job = PdschJob { slot, samples: arc_samples.clone(), grant: g, skip_decode: false, queued: std::time::Instant::now() };
                 if self.wk_cmd.try_send(WorkerCmd::Job(job)).is_err() {
                     log::warn!("PDSCH worker queue full: slot {slot} dropped");
+                } else {
+                    self.outstanding_jobs += 1;
                 }
             }
             // Drop stale pending grants (k0 misses).
@@ -547,13 +598,30 @@ impl<'a> Engine<'a> {
 
             // --- Worker results.
             while let Ok(m) = self.wk_res.try_recv() {
+                if matches!(m, PhyToMac::RxData(_)) {
+                    self.outstanding_jobs = self.outstanding_jobs.saturating_sub(1);
+                }
                 self.mac.handle(m, &mut outbox);
             }
             self.drain_outbox(s, &mut outbox, slot)?;
 
+            // --- Commit mark: MAC has now issued every UL_TTI request up to
+            // slot + tx_lead, so once the builder has drained them the uplink
+            // is final up to the start of the slot after that.
+            let mark = self.commit_mark(s, slot.add(self.params.tx_lead_slots as u64 + 1));
+            if self.tx_cmd.try_send(TxCmd::Mark(mark)).is_err() {
+                log::warn!("TX build queue full at slot {slot}: commit mark delayed");
+            }
+
             slot = slot.add(1);
             let _ = numerology;
         }
+    }
+
+    /// UL index up to which the uplink is final when every request for slots
+    /// before `first_open` has been issued and built.
+    fn commit_mark(&self, s: &Synced, first_open: SlotPoint) -> i64 {
+        s.clock.ul_index(first_open)
     }
 
     /// Apply MAC → PHY messages.
@@ -583,6 +651,9 @@ impl<'a> Engine<'a> {
                 }
                 MacToPhy::TimingAdvance { n_ta_tc } => {
                     s.clock.n_ta_tc = n_ta_tc;
+                }
+                MacToPhy::Paging { ue_id } => {
+                    s.monitor.rntis.p_ue_id = ue_id;
                 }
                 MacToPhy::UlTti(req) => {
                     let lead = req.slot.diff(&now);
@@ -634,6 +705,7 @@ fn initial_config(p: &EngineParams, mib: &Mib, cs0: &Coreset0Config, numerology:
     use crate::config::*;
     PhyConfig {
         duplex: p.duplex,
+        paging: None,
         numerology,
         ssb: SsbConfig {
             pci: cell_id,
@@ -711,6 +783,9 @@ fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Cores
                 r.offset_slots as u32,
             ));
         }
+    }
+    for p in &patterns {
+        log::info!("CSI-RS rate-match pattern: symbols {:?} rb {}+{} re-mask {:#014b} period {} offset {}", p.symbols, p.start_rb, p.n_rb, p.re_mask, p.period_slots, p.offset_slots);
     }
     WorkerConfig {
         geom: geom.clone(),

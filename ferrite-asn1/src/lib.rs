@@ -5,6 +5,8 @@
 //! * [`cellgroup`] / [`csi`] — `CellGroupConfig` (the dedicated MAC/PHY configuration).
 //! * [`rrc`] — the DL/UL CCCH/DCCH messages, `RadioBearerConfig` and a minimal
 //!   `UE-NR-Capability` encoder.
+//! * [`meas`] — `MeasConfig` (decode) and `MeasResults` (encode) for measurement reporting.
+//! * [`si`] — `SystemInformation` (SIB2/SIB3 structured, later SIBs raw).
 //! * [`common`] — IEs shared by the above.
 //!
 //! The MIB is decoded in the PHY crate and is not in scope here.
@@ -13,7 +15,9 @@
 pub mod cellgroup;
 pub mod common;
 pub mod csi;
+pub mod meas;
 pub mod rrc;
+pub mod si;
 pub mod sib1;
 pub mod uper;
 

@@ -8,9 +8,13 @@
 //!
 //! How the uplink is paced is a property of the backend, captured in
 //! [`UlPacing`]: the ZMQ gNB pulls blocks in lockstep with the samples it
-//! sends, so the UE paces the serve to real time and gates it to its own DL
-//! consumption (otherwise the gNB free-runs ahead); a real SDR's TX FIFO
-//! back-pressures writes and needs neither. The fixed RX→TX sample offset of a
+//! sends, so the UE paces the serve to real time and never serves past the
+//! *commit mark* — the UL sample index up to which the engine guarantees the
+//! injection table is final (every UL_TTI request for earlier samples has
+//! been issued and built). Serving beyond the mark would emit zeros where a
+//! transmission is still being built; serving behind it is what gives the
+//! lockstep gNB the uplink it needs before it will send more downlink. A
+//! real SDR's TX FIFO back-pressures writes and needs neither. The fixed RX→TX sample offset of a
 //! backend is reported by [`UlServer::tx_rx_offset`] and consumed by
 //! [`crate::timing::SampleClock`]; nothing else about the transport is visible.
 
@@ -28,10 +32,9 @@ pub type DlStream = BufferedStream;
 /// How to pace the uplink serve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UlPacing {
-    /// Lockstep transport (ZMQ): serve at `pace_us` wall-clock per slot and at
-    /// most `lead_slots` slots ahead of (negative: behind) the engine's DL
-    /// position.
-    Lockstep { pace_us: f64, lead_slots: i64 },
+    /// Lockstep transport (ZMQ): serve at `pace_us` wall-clock per slot and
+    /// never past the engine's commit mark ([`UlShared::committed`]).
+    Lockstep { pace_us: f64 },
     /// Free-running device clock: serve as fast as the sink accepts.
     FreeRunning,
 }
@@ -82,8 +85,10 @@ impl<S: SampleSink> UlSink for PushUlSink<S> {
 pub struct UlShared {
     /// UL index the serve thread has reached (behind the engine).
     pub served: AtomicI64,
-    /// DL index the engine has consumed up to (for lockstep gating).
-    pub dl_consumed: AtomicI64,
+    /// UL index up to which the injection table is final (lockstep gating):
+    /// the engine advances it (through the TX builder, so that every build
+    /// queued before the mark has landed) once per slot.
+    pub committed: AtomicI64,
     pub table: Mutex<InjectionTable>,
     pub stop: std::sync::atomic::AtomicBool,
     /// Lockstep gating active (false during cell search, when nothing bounds
@@ -95,7 +100,7 @@ impl UlShared {
     pub fn new(start: i64) -> Arc<Self> {
         Arc::new(Self {
             served: AtomicI64::new(start),
-            dl_consumed: AtomicI64::new(start),
+            committed: AtomicI64::new(start),
             table: Mutex::new(InjectionTable::new()),
             stop: std::sync::atomic::AtomicBool::new(false),
             gate: std::sync::atomic::AtomicBool::new(false),
@@ -110,11 +115,12 @@ pub fn serve_uplink(mut server: UlServer, shared: Arc<UlShared>, samples_per_slo
     let start = std::time::Instant::now();
     let slot_us = samples_per_slot as f64 / fs * 1e6;
     while !shared.stop.load(Relaxed) {
-        if let UlPacing::Lockstep { pace_us, lead_slots } = server.pacing {
-            // Gate: never serve more than `lead_slots` ahead of the engine's DL position.
-            let lead = lead_slots * samples_per_slot;
+        if let UlPacing::Lockstep { pace_us } = server.pacing {
+            // Gate: never serve past the commit mark (a block is served whole,
+            // so its end is what must stay within the mark).
+            let block_end = counter as i64 + server.block_len as i64;
             let mut waited = 0u32;
-            while shared.gate.load(Relaxed) && counter as i64 > shared.dl_consumed.load(Relaxed) + lead && !shared.stop.load(Relaxed) {
+            while shared.gate.load(Relaxed) && block_end > shared.committed.load(Relaxed) && !shared.stop.load(Relaxed) {
                 std::thread::sleep(std::time::Duration::from_micros(20));
                 waited += 1;
                 if waited > 500_000 {

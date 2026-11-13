@@ -132,6 +132,31 @@ pub struct SearchSpaceConfig {
     pub kind: SearchSpaceKind,
 }
 
+/// Where and when the UE monitors paging (TS 38.304 §7.1, TS 38.331 `PCCH-Config`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagingConfig {
+    /// `defaultPagingCycle` T in radio frames.
+    pub t_rf: u16,
+    /// `nAndPagingFrameOffset`: N = T / n_div.
+    pub n_div: u8,
+    /// PF_offset.
+    pub offset: u8,
+    /// `ns`: paging occasions per paging frame.
+    pub ns: u8,
+    /// `pagingSearchSpace` (0 = the Type0 CSS).
+    pub search_space_id: u8,
+}
+
+impl PagingConfig {
+    /// Is `sfn` a paging frame of the UE with `ue_id` = 5G-S-TMSI mod 1024?
+    /// `(SFN + PF_offset) mod T = (T div N) × (UE_ID mod N)`.
+    pub fn is_paging_frame(&self, sfn: u16, ue_id: u16) -> bool {
+        let t = u32::from(self.t_rf).max(1);
+        let n = (t / u32::from(self.n_div.max(1))).max(1);
+        (u32::from(sfn) + u32::from(self.offset)) % t == (t / n) * (u32::from(ue_id) % n)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchSpaceKind {
     /// Common: monitors DCI 0_0/1_0 with SI/RA/P/TC/C-RNTI as applicable.
@@ -311,6 +336,8 @@ pub struct PucchConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CsiRsResource {
     pub zero_power: bool,
+    /// `nzp-CSI-RS-ResourceId` / `zp-CSI-RS-ResourceId` (separate id spaces).
+    pub id: u8,
     /// Row of TS 38.211 Table 7.4.1.5.3-1.
     pub row: u8,
     pub freq_bits: u16,
@@ -353,6 +380,8 @@ pub struct Carrier {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhyConfig {
     pub duplex: DuplexMode,
+    /// Paging (SIB1 `pcch-Config` + `pagingSearchSpace`), `None` = never monitor P-RNTI.
+    pub paging: Option<PagingConfig>,
     /// Data numerology (`subcarrierSpacing` of the initial BWPs).
     pub numerology: Numerology,
     pub ssb: SsbConfig,

@@ -116,10 +116,25 @@ the only crate that knows about sample indices.
   the radio backend's `tx_rx_offset()`, measured once, not swept per attach.
 * Symbol-level positions use the per-symbol CP table of the numerology, so a
   PRACH occasion starting at symbol `l` of a slot is placed exactly. The
-  preamble is additionally delayed by `prach_offset` (default 1 µs): a
-  detector window may start slightly after the slot and reject negative
-  delays (OCUDU does), and over a zero-delay transport nothing else provides
-  that margin. Over the air the propagation delay plays the same role.
+  whole uplink is additionally delayed by the *uplink guard* (`ul_guard`,
+  CLI `--prach-offset`, default 1 µs): a detector window may start slightly
+  after the slot and reject negative delays (OCUDU does), and over a
+  zero-delay transport nothing else provides that margin. The guard must
+  apply to every uplink channel, not just the PRACH: the timing-advance
+  command the network answers with measures the guard, and a PRACH-only
+  delay would then leave PUSCH/PUCCH early by exactly that amount (OCUDU
+  reported `t_align = −1.04 µs` and 256-QAM failed on narrow allocations).
+  Over the air the propagation delay plays the same role and the guard can
+  be zero.
+* Lockstep transports (ZMQ) pull uplink blocks in step with the downlink they
+  send and will not run more than ~1 ms of DL ahead of the UL they have
+  received. The uplink serve is therefore gated by a *commit mark*: after
+  handling slot `n` the engine (through the TX builder, so every queued
+  build has landed) publishes the UL index up to which the injection table
+  is final, `ul_index(n + tx_lead + 1)`, and the serve never passes it. This
+  replaces any "stay k slots behind the DL" heuristic, which deadlocks at
+  15 kHz where one slot is the whole allowance. A free-running SDR back end
+  does not use the mark at all.
 
 ### 4.3 FAPI: the PHY ↔ MAC interface (`ferrite_l1::fapi`)
 
@@ -134,7 +149,8 @@ slot, the PUSCH payload being the TX_Data), the RNTI set and the timing advance.
 enum PhyToMac { Slot(SlotIndication), Dci(DciIndication), RxData(RxDataIndication),
                 Csi(CsiIndication), Rach(RachIndication), Error(ErrorIndication) }
 enum MacToPhy { Config(Box<PhyConfig>), Start, Stop, UlTti(UlTtiRequest),
-                SetRntis { c_rnti, tc_rnti, ra_rnti }, TimingAdvance { n_ta_tc } }
+                SetRntis { c_rnti, tc_rnti, ra_rnti }, TimingAdvance { n_ta_tc },
+                Paging { ue_id } }
 enum UlTtiPdu { Prach { occasion, preamble, power_offset_db },
                 Pusch { grant: UlGrant, tb: Vec<u8>, uci: UciPayload },
                 Pucch { resource: PucchResourceRef, uci: UciPayload } }
@@ -145,6 +161,16 @@ configuration (TDRA tables, k1 list, BWP size, DMRS config, MCS table, PUCCH
 resource sets), so it converts the raw DCI fields into `ResolvedDlGrant` /
 `ResolvedUlGrant` (PRBs, symbols, DMRS symbols, TBS, HARQ id, NDI, RV, k0/k1/k2,
 PUCCH resource indicator, DAI) before handing them to MAC.
+
+Blind decoding notes: common search spaces are decoded before UE-specific
+ones, and a payload already decoded for the same RNTI in the slot is not
+decoded again (a CORESET#0 PDCCH is physically visible through overlapping
+UE-specific candidates on a dedicated CORESET, where the fallback fields would
+be read against the active BWP). `Paging { ue_id }` (5G-S-TMSI mod 1024) turns
+on P-RNTI decoding in the paging search space during the UE's paging frames
+(TS 38.304 §7.1); a paging DCI whose short-message indicator announces
+scheduling information yields a PDSCH grant decoded like system information
+and delivered as a PCCH transport block.
 
 ### 4.4 L1 state machine
 
@@ -176,6 +202,10 @@ PSS every SSB period and slews the slot clock; CFO is tracked from the SSB CP.
 * **LCP** (§5.4.3.1): priority + prioritised bit rate bucket per logical
   channel; MAC CEs ordered per §6.1.2.
 * **Timing advance** (§5.2): `timeAlignmentTimer`, TA command application.
+* **PHR** (§5.4.6): `phr-PeriodicTimer` / `phr-ProhibitTimer` /
+  `phr-Tx-PowerFactorChange` triggers and the Single Entry PHR MAC CE; the
+  reported PH / P_CMAX come from a `PowerHeadroom` value the stack (later:
+  L1 power control) sets, so the procedure is transport-agnostic.
 * **DL/UL grant handling**: NDI toggling, retransmission detection, CSI /
   HARQ-ACK / SR multiplexing decision (PUSCH vs PUCCH per 38.213 §9.2.5).
 
@@ -202,7 +232,44 @@ SecurityModeCommand is verified.
   (release). Procedures: system information acquisition, connection
   establishment, security mode, UE capability transfer, reconfiguration
   (bearer setup, dedicated PHY/MAC config), DL/UL information transfer (NAS),
-  release.
+  release, measurements, paging.
+* Measurements (`ferrite-rrc/src/meas.rs`, 38.331 §5.5): `measConfig` from a
+  reconfiguration installs objects / report configs / measIds / quantity
+  config; the PHY's SSB measurements (SS-RSRP/RSRQ/SINR, `ferrite-phy
+  sync::measure`) are L3-filtered per `filterCoefficient` and evaluated for
+  periodical reports and the serving-cell events A1/A2 (hysteresis,
+  time-to-trigger, reportOnLeave, reportAmount); `MeasurementReport` carries
+  `measResultServingMOList`. Neighbour-based events (A3–A6) are evaluated
+  with no candidates until neighbour cell search exists.
+* Other system information (§5.2.2.3): SIB1's `si-SchedulingInfo` lists the
+  broadcast SI messages; the PHY keeps decoding the SI-RNTI in the Type0
+  search space, and every `SystemInformation` block is decoded
+  (`ferrite-asn1::si`: SIB2/SIB3 structured, SIB10+ raw) and kept by SIB
+  type in `RrcUe::sibs`, logged once per change.
+* Bearer continuity: a reconfiguration that lists an existing bearer keeps
+  its PDCP entity (COUNTs, reordering) unless `reestablishPDCP`, and its RLC
+  entity unless `reestablishRLC`; an `RLC-BearerConfig` without `rlc-Config`
+  keeps the previously configured RLC mode (Need M).
+* Re-establishment (§5.3.7): a radio link failure with AS security active
+  puts RRC in `Reestablishing`: `RRCReestablishmentRequest` on SRB0 (old
+  C-RNTI, PCI, shortMAC-I = 16 LSBs of the NIA MAC over VarShortMAC-Input
+  with COUNT 2³²−1 / BEARER 31 / DIRECTION 1), T301, MAC reset, SRB1 PDCP
+  re-established without security; `RRCReestablishment` refreshes the keys
+  (K_NG-RAN* by horizontal derivation from K_gNB with PCI + SSB ARFCN,
+  TS 33.501 A.11; vertical NH derivation not yet), the stack verifies its
+  MAC-I with the new K_RRCint before applying them, and the complete goes on
+  SRB1; the network restores the other bearers by reconfiguration. An
+  `RRCSetup` instead (network fallback) is treated as a lost connection.
+* UE capability: `UE-NR-Capability` advertises the band list plus
+  `pdsch-256QAM-FR1` and per-band `pusch-256QAM`, which OCUDU reads to select
+  the 256-QAM MCS tables.
+* Idle mode: an `RRCRelease` returns RRC to idle while the NAS stays
+  registered; the 5G-S-TMSI from the registration is the UE identity for
+  paging (PHY monitors the P-RNTI in the paging frames) and for later
+  `RRCSetupRequest`s (`ng-5G-S-TMSI-Part1` + `Part2` in the complete). Uplink
+  data while idle, or a `Paging` record with the UE's identity, triggers a NAS
+  Service Request (`mo-Data` / `mt-Access`); the packets wait in the stack
+  until the DRB is restored.
 * Configuration derivation (`ferrite-rrc/src/codec.rs`): `cell_from_sib1`
   (MIB facts + SIB1 → `PhyConfig`/`MacConfig`: carriers, BWPs, CORESET#0
   placement, common search spaces, TDD pattern, PRACH, PUCCH common, timers)

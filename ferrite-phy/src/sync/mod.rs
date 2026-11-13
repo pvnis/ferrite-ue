@@ -13,6 +13,7 @@
 
 pub mod cfo;
 pub mod detect;
+pub mod measure;
 pub mod pbch;
 pub mod pss;
 pub mod scan;

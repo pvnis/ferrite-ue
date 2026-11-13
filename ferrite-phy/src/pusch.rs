@@ -1,6 +1,7 @@
-//! PUSCH (uplink shared channel) modulation for Msg3 — CP-OFDM, no transform
-//! precoding. Scramble the UL-SCH bits (TS 38.211 §6.3.1.1), QPSK-map, place
-//! data and DM-RS on the allocated RBs/symbols, and IFFT each OFDM symbol.
+//! PUSCH (uplink shared channel) modulation — CP-OFDM, no transform
+//! precoding. Scramble the UL-SCH bits (TS 38.211 §6.3.1.1), map them to
+//! QPSK/16/64/256-QAM (§5.1), place data and DM-RS on the allocated
+//! RBs/symbols, and IFFT each OFDM symbol.
 //!
 //! UL-SCH channel coding is identical to DL-SCH (reuse `coding::dlsch`), and the
 //! PUSCH DM-RS sequence uses the same `c_init` as PDSCH (reuse `pdsch_dmrs`).
@@ -9,7 +10,6 @@ use crate::pdsch::{pdsch_dmrs, pdsch_scramble_c_init};
 use crate::sequence::gold_sequence;
 use crate::Ofdm;
 use num_complex::Complex32;
-use std::f32::consts::FRAC_1_SQRT_2;
 
 /// Msg3 PUSCH resource allocation on the initial UL BWP (relative to the UL
 /// carrier, which is centred at DC in the IFFT).
@@ -35,8 +35,25 @@ pub struct PuschAlloc {
     pub crb_offset: usize,
 }
 
-fn qpsk(b0: u8, b1: u8) -> Complex32 {
-    Complex32::new((1 - 2 * b0 as i32) as f32 * FRAC_1_SQRT_2, (1 - 2 * b1 as i32) as f32 * FRAC_1_SQRT_2)
+/// Map `Q_m = bits.len()` bits (2, 4, 6 or 8) to one QPSK / 16-QAM / 64-QAM /
+/// 256-QAM symbol (TS 38.211 §5.1.3–5.1.6): even-indexed bits form the I
+/// level, odd-indexed bits the Q level, the first bit of each axis is the
+/// sign and every further bit folds the magnitude.
+pub fn qam_modulate(bits: &[u8]) -> Complex32 {
+    let qm = bits.len();
+    debug_assert!(matches!(qm, 2 | 4 | 6 | 8), "unsupported modulation order {qm}");
+    let m = qm / 2;
+    let axis = |first: usize| {
+        let b = |i: usize| 1.0 - 2.0 * f32::from(bits[first + 2 * i]);
+        // 38.211: x = s0·(2^(m−1) − s1·(2^(m−2) − … (2 − s_{m−1})))
+        let mut v = 1.0f32;
+        for i in (1..m).rev() {
+            v = (1 << (m - i)) as f32 - b(i) * v;
+        }
+        b(0) * v
+    };
+    let scale = 1.0 / [2.0f32, 10.0, 42.0, 170.0][m - 1].sqrt();
+    Complex32::new(axis(0) * scale, axis(1) * scale)
 }
 
 /// Modulate one PUSCH slot (14 OFDM symbols) carrying `ulsch` rate-matched bits.
@@ -122,6 +139,7 @@ pub fn pusch_modulate_slot_uci_csi(
     let data_syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym).filter(|l| !dmrs_set.contains(l)).collect();
     let n_sc = 12 * alloc.n_rb;
     let n_re = data_syms.len() * n_sc;
+    let qm = alloc.qm;
 
     // CSI part 1 REs by map index (k'-first-then-l order) → coded-bit-pair index.
     let mut csi_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -130,7 +148,7 @@ pub fn pusch_modulate_slot_uci_csi(
             let sym_pos = data_syms.iter().position(|&x| x == l).unwrap();
             csi_at.insert(sym_pos * n_sc + sc_a, ci);
         }
-        rm_encode(csi1, csi_res.len() * 2)
+        rm_encode(csi1, csi_res.len() * qm)
     } else {
         Vec::new()
     };
@@ -138,19 +156,26 @@ pub fn pusch_modulate_slot_uci_csi(
     // Scramble (§6.3.1.1): c_init = n_RNTI·2^15 + n_ID (n_RNTI = TC-RNTI, n_ID = PCI).
     // Indexed by RE position over the whole mapping (identical to the plain stream
     // scrambling when the data occupies every RE).
-    let c = gold_sequence(pdsch_scramble_c_init(tc_rnti, cell_id), 2 * n_re);
+    let c = gold_sequence(pdsch_scramble_c_init(tc_rnti, cell_id), qm * n_re);
 
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
     // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l,
     // skipping the CSI REs (the UL-SCH is rate-matched around them).
     let mut src = 0usize; // next UL-SCH bit
+    let mut re_bits = vec![0u8; qm];
     for (di, (&l, kp)) in data_syms.iter().flat_map(|l| (0..n_sc).map(move |kp| (l, kp))).enumerate() {
         let sc = 12 * alloc.rb_start + kp;
         if let Some(&ci) = csi_at.get(&di) {
-            grids[l][bin(sc)] = qpsk(rm_csi[2 * ci] ^ c[2 * di], rm_csi[2 * ci + 1] ^ c[2 * di + 1]);
-        } else if src + 1 < ulsch.len() {
-            grids[l][bin(sc)] = qpsk(ulsch[src] ^ c[2 * di], ulsch[src + 1] ^ c[2 * di + 1]);
-            src += 2;
+            for i in 0..qm {
+                re_bits[i] = rm_csi[qm * ci + i] ^ c[qm * di + i];
+            }
+            grids[l][bin(sc)] = qam_modulate(&re_bits);
+        } else if src + qm <= ulsch.len() {
+            for i in 0..qm {
+                re_bits[i] = ulsch[src + i] ^ c[qm * di + i];
+            }
+            grids[l][bin(sc)] = qam_modulate(&re_bits);
+            src += qm;
         }
     }
     // DM-RS (config type 1, CDM group 0: even subcarriers). Sequence referenced
@@ -169,11 +194,12 @@ pub fn pusch_modulate_slot_uci_csi(
     }
 
     // UCI-on-PUSCH: overwrite (puncture) the selected data REs with the HARQ-ACK
-    // QPSK symbols. Each ACK RE is at data index `di` in the k'-first, then-l map;
-    // the scrambling bits are c[2·di], c[2·di+1] (same sequence as the data).
-    //   1-2 bits: small-block "placeholder" code — 1 bit → both QPSK components repeat
-    //     the (scrambled) bit; 2 bits → the [a0,a1,a0⊕a1] sequence over the REs.
-    //   3-11 bits: Reed-Muller (32,O) coded, rate-matched to the ACK REs, scrambled.
+    // symbols. Each ACK RE is at data index `di` in the k'-first, then-l map; the
+    // scrambling bits are c[Qm·di ..] (same sequence as the data).
+    //   1-2 bits: small-block "placeholder" code (TS 38.212 Table 5.3.3.1-1/2):
+    //     1 bit → [c0, y, x, …], 2 bits → [c0, c1, x, …], [c2, c0, x, …], [c1, c2, x, …];
+    //     scrambling (§6.3.1.1) maps x → 1 and y → the previous scrambled bit.
+    //   3-11 bits: Reed-Muller (32,O) coded, rate-matched to Q'_ACK·Qm bits, scrambled.
     // (For ≥3 bits the gNB actually rate-matches the UL-SCH around the ACK REs; we
     // still puncture, so that PUSCH's own UL data fails CRC and retransmits — but the
     // gNB reads the ACK from these REs regardless, which frees the DL HARQ.)
@@ -182,22 +208,30 @@ pub fn pusch_modulate_slot_uci_csi(
         let n_sc = 12 * alloc.n_rb;
         let res = harq_ack_pusch_res(&alloc.dmrs_symbols, (alloc.sym_start, alloc.n_sym), alloc.n_rb, o_ack, beta_harq, tb_bits);
         // Coded bit `k` of the UCI (per RE-pair): ≤2 use the small-block form, ≥3 RM.
-        let rm = if o_ack >= 3 { rm_encode(harq_ack, res.len() * 2) } else { Vec::new() };
+        let rm = if o_ack >= 3 { rm_encode(harq_ack, res.len() * qm) } else { Vec::new() };
         for (i, &(l, sc_a)) in res.iter().enumerate() {
             let di = data_syms.iter().position(|&x| x == l).unwrap() * n_sc + sc_a;
-            let (m0, m1) = (c[2 * di], c[2 * di + 1]);
-            let sym = match o_ack {
+            let m = &c[qm * di..qm * di + qm];
+            // Placeholders (`x`) scramble to 1 whatever the sequence.
+            re_bits.iter_mut().for_each(|b| *b = 1);
+            match o_ack {
                 1 => {
-                    let b = harq_ack[0] ^ m0; // placeholder y: both components carry a0⊕c0
-                    qpsk(b, b)
+                    let b = harq_ack[0] ^ m[0];
+                    re_bits[0] = b;
+                    re_bits[1] = b; // y: repeat the previous scrambled bit
                 }
                 2 => {
                     let seq = [harq_ack[0], harq_ack[1], harq_ack[0] ^ harq_ack[1]];
-                    qpsk(seq[(2 * i) % 3] ^ m0, seq[(2 * i + 1) % 3] ^ m1)
+                    re_bits[0] = seq[(2 * i) % 3] ^ m[0];
+                    re_bits[1] = seq[(2 * i + 1) % 3] ^ m[1];
                 }
-                _ => qpsk(rm[2 * i] ^ m0, rm[2 * i + 1] ^ m1),
-            };
-            grids[l][bin(12 * alloc.rb_start + sc_a)] = sym;
+                _ => {
+                    for k in 0..qm {
+                        re_bits[k] = rm[qm * i + k] ^ m[k];
+                    }
+                }
+            }
+            grids[l][bin(12 * alloc.rb_start + sc_a)] = qam_modulate(&re_bits);
         }
     }
 
@@ -420,46 +454,71 @@ mod tests {
     /// Modulate a Msg3-sized PUSCH, demodulate it, equalise trivially (no
     /// channel), descramble, and recover the transport block.
     #[test]
-    fn pusch_msg3_round_trip() {
-        let ofdm = Ofdm::new(512);
-        let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
-        let e = pusch_e_len(&alloc);
-        assert_eq!(e, 792);
-        let (cell_id, tc_rnti, r) = (1u16, 0x4601u16, 0.117);
+    fn qam_modulate_matches_38_211() {
+        // 16-QAM: bits 0000 → (1+j)/√10 ... Table 5.1.4-1 spot checks.
+        let s = 1.0 / 10f32.sqrt();
+        let p = qam_modulate(&[0, 0, 0, 0]);
+        assert!((p.re - s).abs() < 1e-6 && (p.im - s).abs() < 1e-6);
+        let p = qam_modulate(&[0, 0, 1, 1]);
+        assert!((p.re - 3.0 * s).abs() < 1e-6 && (p.im - 3.0 * s).abs() < 1e-6);
+        let p = qam_modulate(&[1, 0, 1, 0]);
+        assert!((p.re + 3.0 * s).abs() < 1e-6 && (p.im - s).abs() < 1e-6);
+        // 64-QAM 000000 → (3+3j)/√42, 256-QAM 00000000 → (5+5j)/√170.
+        let p = qam_modulate(&[0; 6]);
+        assert!((p.re - 3.0 / 42f32.sqrt()).abs() < 1e-6);
+        let p = qam_modulate(&[0; 8]);
+        assert!((p.re - 5.0 / 170f32.sqrt()).abs() < 1e-6);
+        // Every constellation has unit mean power.
+        for qm in [2usize, 4, 6, 8] {
+            let n = 1usize << qm;
+            let pw: f32 = (0..n).map(|v| qam_modulate(&(0..qm).map(|i| ((v >> (qm - 1 - i)) & 1) as u8).collect::<Vec<_>>()).norm_sqr()).sum::<f32>() / n as f32;
+            assert!((pw - 1.0).abs() < 1e-5, "qm {qm}: mean power {pw}");
+        }
+    }
 
-        // Msg3 TB: 11 bytes (88 bits).
+    /// Modulate a TB at every modulation order and decode it with the PDSCH
+    /// demapper (the gNB side): the mapper and the demapper must agree on the
+    /// constellation and on the bit order.
+    #[test]
+    fn pusch_round_trip_all_orders() {
+        let ofdm = Ofdm::new(512);
+        let (cell_id, tc_rnti) = (1u16, 0x4601u16);
         let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
         let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
-        let ulsch = dlsch_encode_single(&tb, e, r, 2, 0);
+        for qm in [2usize, 4, 6, 8] {
+            let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0 };
+            let e = pusch_e_len(&alloc);
+            assert_eq!(e, 396 * qm);
+            let r = 0.117 * qm as f64 / 2.0;
+            let ulsch = dlsch_encode_single(&tb, e, r, qm, 0);
+            let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, tc_rnti, 0.0, 15.36e6);
 
-        let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, tc_rnti, 0.0, 15.36e6);
-
-        // Demodulate: extract the data REs (skip DM-RS symbols), form soft bits.
-        let center = alloc.carrier_rb as i32 * 6;
-        let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
-        let dmrs: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
-        let mut grids = Vec::new();
-        let mut off = 0;
-        for l in 0..14 {
-            let cp = ofdm.cp_len(14 + l, 1);
-            grids.push(ofdm.demodulate_symbol(&slot[off..], cp));
-            off += cp + 512;
-        }
-        let mut llr: Vec<f32> = Vec::new();
-        for l in 0..14 {
-            if dmrs.contains(&l) {
-                continue;
+            // Demodulate: extract the data REs (skip DM-RS symbols), soft-demap.
+            let center = alloc.carrier_rb as i32 * 6;
+            let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
+            let dmrs: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
+            let mut grids = Vec::new();
+            let mut off = 0;
+            for l in 0..14 {
+                let cp = ofdm.cp_len(14 + l, 1);
+                grids.push(ofdm.demodulate_symbol(&slot[off..], cp));
+                off += cp + 512;
             }
-            for kp in 0..(12 * alloc.n_rb) {
-                let sc = 12 * alloc.rb_start + kp;
-                let z = grids[l][bin(sc)];
-                llr.push(z.re);
-                llr.push(z.im);
+            let demapper = crate::pdsch::Demapper::new(qm);
+            let mut llr: Vec<f32> = Vec::new();
+            for l in 0..14 {
+                if dmrs.contains(&l) {
+                    continue;
+                }
+                for kp in 0..(12 * alloc.n_rb) {
+                    let sc = 12 * alloc.rb_start + kp;
+                    demapper.demap(grids[l][bin(sc)], 1.0, &mut llr);
+                }
             }
+            descramble_llrs(&mut llr, pdsch_scramble_c_init(tc_rnti, cell_id));
+            let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40).unwrap_or_else(|| panic!("decode failed at qm {qm}"));
+            let out_bytes: Vec<u8> = out.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+            assert_eq!(out_bytes, tb_bytes, "qm {qm}");
         }
-        descramble_llrs(&mut llr, pdsch_scramble_c_init(tc_rnti, cell_id));
-        let out = dlsch_decode_single(&llr, 88, r, 2, 0, 40).expect("decode");
-        let out_bytes: Vec<u8> = out.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
-        assert_eq!(out_bytes, tb_bytes);
     }
 }

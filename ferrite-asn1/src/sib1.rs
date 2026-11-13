@@ -831,7 +831,7 @@ impl UplinkConfigCommonSib {
 }
 
 /// `MultiFrequencyBandListNR-SIB ::= SEQUENCE (SIZE (1..maxNrofMultiBands)) OF NR-MultiBandInfo`.
-fn decode_multi_band_list(r: &mut BitReader) -> DecodeResult<Vec<NrMultiBandInfo>> {
+pub(crate) fn decode_multi_band_list(r: &mut BitReader) -> DecodeResult<Vec<NrMultiBandInfo>> {
     r.seq_of(1, 8, |r| {
         let [has_band, has_pmax] = r.opt_bits::<2>()?;
         let freq_band_indicator_nr = r.opt(has_band, |r| r.u16(1, 1024))?;

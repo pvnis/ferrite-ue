@@ -5,7 +5,7 @@
 //! The plain-data types live here; the ASN.1-facing functions are in
 //! [`crate::codec`] and re-exported below.
 
-use crate::BearerSetup;
+use crate::{BearerSetup, RlcSetup};
 use ferrite_common::{DuplexMode, Numerology};
 use ferrite_l1::config::*;
 use ferrite_mac::MacConfig;
@@ -25,6 +25,8 @@ pub struct MibInfo {
     pub coreset0_n_rb: u16,
     pub coreset0_n_symb: u8,
     pub coreset0_offset_rb: i32,
+    /// NR-ARFCN of the SSB the UE synchronised to (key derivation input).
+    pub ssb_arfcn: u32,
 }
 
 /// Radio facts the UE was started with.
@@ -45,6 +47,20 @@ pub struct CellInfo {
     pub mac: MacConfig,
     pub t300_ms: u32,
     pub numerology: Numerology,
+    /// SIB types SIB1 schedules for broadcast (`si-SchedulingInfo`), with the
+    /// SI window length in slots.
+    pub si_scheduled: Vec<u8>,
+    pub si_window_slots: u16,
+    pub ssb_arfcn: u32,
+    /// T301 (ms) from SIB1 `ue-TimersAndConstants`.
+    pub t301_ms: u32,
+    /// The SIB1-only (common) configuration: the default the UE falls back to
+    /// on re-establishment (§5.3.7.4) before the network reconfigures it.
+    pub common_phy: PhyConfig,
+    pub common_mac: MacConfig,
+    /// RLC configuration of every bearer set up so far, by LCID (an
+    /// `RLC-BearerConfig` without `rlc-Config` keeps it).
+    pub rlc_bearers: std::collections::BTreeMap<u8, RlcSetup>,
 }
 
 /// Decoded DL-CCCH messages the state machine acts on.
@@ -57,9 +73,11 @@ pub enum DlCcch {
 pub enum DlDcch {
     SecurityModeCommand { tid: u8, integrity_alg: u8, ciphering_alg: u8 },
     UeCapabilityEnquiry { tid: u8 },
-    Reconfiguration { tid: u8, phy: Option<PhyConfig>, mac: Option<MacConfig>, bearers: Vec<BearerSetup>, released: Vec<u8>, nas: Vec<Vec<u8>> },
+    Reconfiguration { tid: u8, phy: Option<PhyConfig>, mac: Option<MacConfig>, bearers: Vec<BearerSetup>, released: Vec<u8>, nas: Vec<Vec<u8>>, meas: Option<ferrite_asn1::meas::MeasConfig> },
     DlInformationTransfer { nas: Option<Vec<u8>> },
     Release,
+    /// `RRCReestablishment` (§5.3.7.5) with its `nextHopChainingCount`.
+    Reestablishment { tid: u8, ncc: u8 },
     Other(&'static str),
 }
 

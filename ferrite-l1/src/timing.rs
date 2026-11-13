@@ -7,7 +7,7 @@
 //! slot's uplink must *start* is
 //!
 //! ```text
-//!   u(slot) = d(slot) − (N_TA + N_TA_offset)·T_c·f_s − tx_rx_offset
+//!   u(slot) = d(slot) − (N_TA + N_TA_offset)·T_c·f_s − tx_rx_offset + ul_guard
 //! ```
 //!
 //! where `tx_rx_offset` is a fixed, radio-backend-specific calibration (0 for
@@ -30,6 +30,15 @@ pub struct SampleClock {
     pub n_ta_tc: i64,
     /// Backend calibration offset in samples (see module doc).
     pub tx_rx_offset: i64,
+    /// Uplink timing guard in samples (positive = transmit later), applied
+    /// to *every* uplink transmission including the PRACH. Over a zero-delay
+    /// transport it keeps the preamble inside detector windows that start
+    /// after the slot and reject negative delays; because the network's
+    /// timing-advance command then measures and removes the same guard, the
+    /// PUSCH/PUCCH end up on time. A PRACH-only delay would leave the later
+    /// uplink early by the guard. Over the air the propagation delay plays
+    /// this role and the guard can be 0.
+    pub ul_guard: i64,
     /// Per-symbol sample offsets within a slot, for each slot-in-subframe
     /// position (index = slot_in_subframe), including the long CP of symbol 0
     /// and symbol 7·2^µ of the subframe.
@@ -52,7 +61,7 @@ impl SampleClock {
             offs[14] = acc;
             symbol_offsets.push(offs);
         }
-        Self { fs, numerology, anchor_index, anchor_slot, n_ta_offset_tc: 25600, n_ta_tc: 0, tx_rx_offset: 0, symbol_offsets }
+        Self { fs, numerology, anchor_index, anchor_slot, n_ta_offset_tc: 25600, n_ta_tc: 0, tx_rx_offset: 0, ul_guard: 0, symbol_offsets }
     }
 
     pub fn samples_per_slot(&self) -> i64 {
@@ -91,7 +100,7 @@ impl SampleClock {
 
     /// UL stream index at which the uplink of `slot` starts.
     pub fn ul_index(&self, slot: SlotPoint) -> i64 {
-        self.dl_index(slot) - self.ta_samples() - self.tx_rx_offset
+        self.dl_index(slot) - self.ta_samples() - self.tx_rx_offset + self.ul_guard
     }
 
     /// UL stream index of symbol `l` of `slot`.

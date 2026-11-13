@@ -1427,6 +1427,48 @@ pub fn default_pusch_tdra(row: u8, mu: u8) -> Option<TdraRow> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A clean AL4 DCI must decode only as itself: trying the same candidate
+    /// LLRs at other payload sizes, and the AL2 / AL8 candidates that overlap
+    /// it, must not yield a CRC-passing phantom (the SC decoder is
+    /// deterministic, so one such phantom would recur every time the gNB sends
+    /// that DCI).
+    #[test]
+    fn no_phantom_decodes_from_overlapping_candidates() {
+        let rnti = 0x4601u16;
+        let mut seed = 0x9e37_79b9u32;
+        let mut bit = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed & 1) as u8
+        };
+        for trial in 0..40 {
+            let a: Vec<u8> = (0..41).map(|_| bit()).collect();
+            let coded = dci_encode(&a, rnti, 576);
+            let llr_al4: Vec<f32> = coded.iter().map(|&b| if b == 1 { -8.0 } else { 8.0 }).collect();
+            // AL8 candidate containing the AL4 one at its start (other CCEs empty).
+            let mut llr_al8 = llr_al4.clone();
+            llr_al8.resize(1152, 0.0);
+            // AL8 candidate containing it in its second half.
+            let mut llr_al8b = vec![0.0f32; 576];
+            llr_al8b.extend_from_slice(&llr_al4);
+            // AL2 candidates = halves of the AL4 one.
+            let llr_al2a = llr_al4[..288].to_vec();
+            let llr_al2b = llr_al4[288..].to_vec();
+            for (name, llr) in [("al4", &llr_al4), ("al8", &llr_al8), ("al8b", &llr_al8b), ("al2a", &llr_al2a), ("al2b", &llr_al2b)] {
+                for size in [37usize, 41, 47] {
+                    let got = dci_decode(llr, rnti, size);
+                    let legit = size == 41 && (name == "al4" || name == "al8");
+                    if legit {
+                        assert_eq!(got.as_deref(), Some(&a[..]), "trial {trial} {name} size {size}");
+                    } else {
+                        assert!(got.is_none(), "trial {trial}: phantom decode at {name} size {size}: {got:?}");
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     struct Rng(u64);

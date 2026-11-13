@@ -8,6 +8,7 @@
 //! * [`ra`] — the random-access procedure (§5.1), one state machine;
 //! * [`harq`] — DL/UL HARQ entities and the HARQ-ACK codebook (§5.3, §5.4.2, TS 38.213 §9.1);
 //! * [`bsr`], [`sr`] — buffer status reporting (§5.4.5) and scheduling requests (§5.4.4);
+//! * [`phr`] — power headroom reporting (§5.4.6);
 //! * [`lcp`] — logical channel prioritisation (§5.4.3.1);
 //! * [`pdu`], [`rar`] — MAC PDU multiplexing/demultiplexing (§6.1) and the RAR (§6.2.3);
 //! * [`ta`] — timing advance maintenance (§5.2);
@@ -20,6 +21,7 @@ pub mod entity;
 pub mod harq;
 pub mod lcp;
 pub mod pdu;
+pub mod phr;
 pub mod ra;
 pub mod rar;
 pub mod sr;
@@ -166,6 +168,8 @@ pub struct MacConfig {
     pub tx_lead_slots: u16,
     /// Whether the UE is allowed to send CSI reports yet (dedicated config applied).
     pub csi_enabled: bool,
+    /// `phr-Config` (`None` = PHR not configured / released).
+    pub phr: Option<phr::PhrMacConfig>,
 }
 
 impl MacConfig {
@@ -194,6 +198,7 @@ impl MacConfig {
             nof_ul_harq: 16,
             tx_lead_slots,
             csi_enabled: false,
+            phr: None,
         }
     }
 

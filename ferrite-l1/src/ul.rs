@@ -50,9 +50,6 @@ pub struct UlBuilder {
     pub geom: CellGeometry,
     pub cfg: PhyConfig,
     pub ul_center_hz: f64,
-    /// Extra PRACH timing calibration in samples (positive = earlier), on top
-    /// of the backend TX/RX offset; 0 for a spec-exact gNB.
-    pub prach_offset: i64,
     pub cell_id: u16,
 }
 
@@ -65,7 +62,7 @@ pub struct Waveform {
 
 impl UlBuilder {
     pub fn new(geom: CellGeometry, cfg: PhyConfig, ul_center_hz: f64, cell_id: u16) -> Self {
-        Self { ofdm: Ofdm::new(geom.fft), geom, cfg, ul_center_hz, cell_id, prach_offset: 0 }
+        Self { ofdm: Ofdm::new(geom.fft), geom, cfg, ul_center_hz, cell_id }
     }
 
     fn normalise(&self, w: &mut [Iq]) {
@@ -103,7 +100,12 @@ impl UlBuilder {
         self.normalise(&mut w);
         // Occasion start: `start_tc` from the subframe start (TS 38.211 §5.3.2).
         let subframe_slot = occ.slot.sub(occ.slot.slot_in_subframe() as u64);
-        let start = clock.ul_index(subframe_slot) + tc_to_samples(occ.start_tc as i64, self.geom.fs) - self.prach_offset;
+        // TS 38.211 §4.3.1: the PRACH is transmitted with N_TA = 0 (the
+        // uplink guard and N_TA_offset still apply); the RAR's TA command is
+        // what sets N_TA for the connection.
+        let mut prach_clock = clock.clone();
+        prach_clock.n_ta_tc = 0;
+        let start = prach_clock.ul_index(subframe_slot) + tc_to_samples(occ.start_tc as i64, self.geom.fs);
         Ok(Waveform { start, samples: w, tag: "prach" })
     }
 
@@ -144,7 +146,7 @@ impl UlBuilder {
             let sp = seg_params(tbs_bits, r);
             pusch::csi1_pusch_res(&alloc.dmrs_symbols, (alloc.sym_start, alloc.n_sym), alloc.n_rb, uci.csi1.len(), beta_csi, alpha, sp.c * sp.k)
         };
-        e -= 2 * csi_res.len();
+        e -= alloc.qm * csi_res.len();
         let ulsch = dlsch_encode(&bits, e, r, alloc.qm, grant.rv);
         let slot = grant.pusch_slot;
         let mut w = pusch::pusch_modulate_slot_uci_csi(

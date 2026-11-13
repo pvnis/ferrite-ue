@@ -63,10 +63,8 @@ cell_cfg:
   # Ferrite UE's QPSK-tested modem can't yet produce/consume. MCS ≤ 9 = QPSK, and
   # matches the UE's qam64 mcs_params so brute-forced DL decode + UL grants align.
   mcs_table: qam64
-  max_ue_mcs: 9
  pusch:
   mcs_table: qam64
-  max_ue_mcs: 9
  # PUCCH: at 20 MHz (carrier_bw > 10) the gNB uses the full-width PUCCH layout;
  # just shorten the SR period (5 ms) to keep the idle-UE ping RTT down.
  pucch:

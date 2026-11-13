@@ -5,6 +5,7 @@
 //! round-trip tests); uplink messages encode and decode.
 
 use crate::cellgroup::CellGroupConfig;
+use crate::meas::{MeasConfig, MeasResults};
 use crate::common::{PlmnIdentity, SubcarrierSpacing};
 use crate::uper::{BitReader, BitWriter, Ctx, DecodeError, DecodeResult, SetupRelease};
 
@@ -796,13 +797,14 @@ pub struct RrcReconfigurationV1530 {
 /// SEQUENCE {} } }` with `RRCReconfiguration-IEs ::= SEQUENCE { radioBearerConfig RadioBearerConfig
 /// OPTIONAL, secondaryCellGroup OCTET STRING (CONTAINING CellGroupConfig) OPTIONAL, measConfig
 /// MeasConfig OPTIONAL, lateNonCriticalExtension OCTET STRING OPTIONAL, nonCriticalExtension
-/// RRCReconfiguration-v1530-IEs OPTIONAL }` — `measConfig` is not supported.
+/// RRCReconfiguration-v1530-IEs OPTIONAL }`.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RrcReconfiguration {
     pub rrc_transaction_identifier: u8,
     pub radio_bearer_config: Option<RadioBearerConfig>,
     /// Raw `secondaryCellGroup` container octets (not decoded).
     pub secondary_cell_group: Option<Vec<u8>>,
+    pub meas_config: Option<MeasConfig>,
     pub late_non_critical_extension: Option<Vec<u8>>,
     pub v1530: Option<RrcReconfigurationV1530>,
 }
@@ -830,9 +832,7 @@ impl RrcReconfiguration {
             .opt(rbc, RadioBearerConfig::decode)
             .ctx("radioBearerConfig")?;
         let secondary_cell_group = r.opt(scg, |r| r.octet_string())?;
-        if meas {
-            return r.unsupported("measConfig");
-        }
+        let meas_config = r.opt(meas, MeasConfig::decode).ctx("measConfig")?;
         let late_non_critical_extension = r.opt(late, |r| r.octet_string())?;
         let v1530 = r
             .opt(non_crit, Self::decode_v1530)
@@ -841,6 +841,7 @@ impl RrcReconfiguration {
             rrc_transaction_identifier,
             radio_bearer_config,
             secondary_cell_group,
+            meas_config,
             late_non_critical_extension,
             v1530,
         })
@@ -1978,7 +1979,9 @@ pub struct UeCapabilityInformation {
 /// scgFailureInformation, scgFailureInformationEUTRA }, messageClassExtension … }`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UlDcchMessage {
+    MeasurementReport(MeasResults),
     RrcReconfigurationComplete { rrc_transaction_identifier: u8 },
+    RrcReestablishmentComplete { rrc_transaction_identifier: u8 },
     RrcSetupComplete(RrcSetupComplete),
     SecurityModeComplete { rrc_transaction_identifier: u8 },
     SecurityModeFailure { rrc_transaction_identifier: u8 },
@@ -1989,7 +1992,9 @@ pub enum UlDcchMessage {
 impl UlDcchMessage {
     fn c1_index(&self) -> u32 {
         match self {
+            Self::MeasurementReport(_) => 0,
             Self::RrcReconfigurationComplete { .. } => 1,
+            Self::RrcReestablishmentComplete { .. } => 3,
             Self::RrcSetupComplete(_) => 2,
             Self::SecurityModeComplete { .. } => 5,
             Self::SecurityModeFailure { .. } => 6,
@@ -2004,7 +2009,17 @@ impl UlDcchMessage {
         w.bit(false);
         w.uint(self.c1_index(), 0, 15);
         match self {
+            Self::MeasurementReport(m) => {
+                // criticalExtensions CHOICE: measurementReport; MeasurementReport-IEs
+                // with neither lateNonCriticalExtension nor nonCriticalExtension.
+                w.bit(false);
+                w.opt_bits(&[false, false]);
+                m.encode(&mut w);
+            }
             Self::RrcReconfigurationComplete {
+                rrc_transaction_identifier,
+            }
+            | Self::RrcReestablishmentComplete {
                 rrc_transaction_identifier,
             }
             | Self::SecurityModeComplete {
@@ -2221,6 +2236,10 @@ pub struct UeNrCapability {
     pub access_stratum_release: AccessStratumRelease,
     /// `FreqBandIndicatorNR` values (1..1024), at least one.
     pub supported_band_list_nr: Vec<u16>,
+    /// `phy-ParametersFR1.pdsch-256QAM-FR1`.
+    pub pdsch_256qam_fr1: bool,
+    /// `BandNR.pusch-256QAM` on every listed band.
+    pub pusch_256qam: bool,
 }
 
 impl UeNrCapability {
@@ -2240,16 +2259,27 @@ impl UeNrCapability {
         w.opt_bits(&[false; 6]);
         w.bits(0, 10);
         w.enu(0, 16);
-        // PHY-Parameters ::= SEQUENCE { 5 OPTIONAL sub-structures }
-        w.opt_bits(&[false; 5]);
+        // PHY-Parameters ::= SEQUENCE { 5 OPTIONAL sub-structures }: only
+        // phy-ParametersFR1 when it has something to say.
+        w.opt_bits(&[false, false, false, self.pdsch_256qam_fr1, false]);
+        if self.pdsch_256qam_fr1 {
+            // Phy-ParametersFR1 ::= SEQUENCE { pdcchMonitoringSingleOccasion OPTIONAL,
+            // scs-60kHz OPTIONAL, pdsch-256QAM-FR1 ENUMERATED {supported} OPTIONAL,
+            // pdsch-RE-MappingFR1-PerSymbol OPTIONAL, ... }
+            w.bit(false);
+            w.opt_bits(&[false, false, true, false]);
+        }
         // RF-Parameters ::= SEQUENCE { supportedBandListNR SEQUENCE (SIZE (1..maxBands)) OF BandNR,
         // supportedBandCombinationList OPTIONAL, appliedFreqBandListFilter OPTIONAL, ... }
         w.bit(false);
         w.opt_bits(&[false, false]);
         w.seq_of(&self.supported_band_list_nr, 1, 1024, |w, &band| {
-            // BandNR ::= SEQUENCE { bandNR FreqBandIndicatorNR, 14 OPTIONALs, ... }
+            // BandNR ::= SEQUENCE { bandNR FreqBandIndicatorNR, 14 OPTIONALs, ... }:
+            // the 10th optional is pusch-256QAM ENUMERATED {supported}.
             w.bit(false);
-            w.opt_bits(&[false; 14]);
+            let mut opts = [false; 14];
+            opts[9] = self.pusch_256qam;
+            w.opt_bits(&opts);
             w.uint(band as u32, 1, 1024);
         });
         w.finish()
@@ -2298,6 +2328,8 @@ impl UeNrCapability {
         Ok(Self {
             access_stratum_release,
             supported_band_list_nr,
+            pdsch_256qam_fr1: false,
+            pusch_256qam: false,
         })
     }
 }
@@ -2369,15 +2401,13 @@ mod tests {
     fn ue_nr_capability_matches_ocudu_vector() {
         let cap = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel15,
-            supported_band_list_nr: vec![78],
-        };
+            supported_band_list_nr: vec![78], pdsch_256qam_fr1: false, pusch_256qam: false };
         let bytes = cap.encode();
         assert_eq!(bytes, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9a]);
         assert_eq!(UeNrCapability::decode(&bytes).unwrap(), cap);
         let multi = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel16,
-            supported_band_list_nr: vec![1, 3, 78],
-        };
+            supported_band_list_nr: vec![1, 3, 78], pdsch_256qam_fr1: false, pusch_256qam: false };
         assert_eq!(UeNrCapability::decode(&multi.encode()).unwrap(), multi);
         // UECapabilityInformation tid 0 with the minimal capability, validated against
         // OCUDU `rrc_dec gen-uecapinfo`: 4882028000000000000000002680.
@@ -2608,5 +2638,105 @@ mod tests {
         });
         assert_eq!(DlCcchMessage::decode(&rej.encode().unwrap()).unwrap(), rej);
         assert!(DlDcchMessage::decode(&[0x80]).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PCCH
+// ---------------------------------------------------------------------------
+
+/// A `PagingRecord.ue-Identity`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagingUeIdentity {
+    /// 48-bit 5G-S-TMSI.
+    Ng5gSTmsi(u64),
+    /// 40-bit fullI-RNTI.
+    FullIRnti(u64),
+}
+
+/// `PCCH-Message ::= SEQUENCE { message CHOICE { c1 CHOICE { paging Paging, spare1 NULL },
+/// messageClassExtension SEQUENCE {} } }` with `Paging ::= SEQUENCE { pagingRecordList
+/// SEQUENCE (SIZE (1..maxNrofPageRec)) OF PagingRecord OPTIONAL, lateNonCriticalExtension
+/// OCTET STRING OPTIONAL, nonCriticalExtension Paging-v1700-IEs OPTIONAL }` and
+/// `PagingRecord ::= SEQUENCE { ue-Identity PagingUE-Identity, accessType ENUMERATED
+/// { non3GPP } OPTIONAL, ... }`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PagingMessage {
+    pub records: Vec<PagingUeIdentity>,
+}
+
+impl PagingMessage {
+    pub fn decode(pdu: &[u8]) -> DecodeResult<Self> {
+        Self::decode_inner(&mut BitReader::new(pdu)).ctx("PCCH-Message")
+    }
+
+    fn decode_inner(r: &mut BitReader) -> DecodeResult<Self> {
+        if r.bit()? {
+            return r.unsupported("messageClassExtension");
+        }
+        if r.bit()? {
+            return r.unsupported("spare1");
+        }
+        let [has_list, _late, _non_crit] = r.opt_bits::<3>()?;
+        let records = if has_list {
+            r.seq_of(1, 32, |r| {
+                let ext = r.bit()?;
+                let [has_access_type] = r.opt_bits::<1>()?;
+                if r.bit()? {
+                    return r.unsupported("PagingUE-Identity extension alternative");
+                }
+                let id = if r.bit()? { PagingUeIdentity::FullIRnti(r.bitstring(40)?) } else { PagingUeIdentity::Ng5gSTmsi(r.bitstring(48)?) };
+                if has_access_type {
+                    r.enu(1)?;
+                }
+                if ext {
+                    r.skip_ext_additions()?;
+                }
+                Ok(id)
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { records })
+    }
+
+    /// Encode (tests / tooling).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.bit(false);
+        w.bit(false);
+        w.opt_bits(&[!self.records.is_empty(), false, false]);
+        if !self.records.is_empty() {
+            w.seq_of(&self.records, 1, 32, |w, id| {
+                w.bit(false);
+                w.opt_bits(&[false]);
+                w.bit(false);
+                match *id {
+                    PagingUeIdentity::Ng5gSTmsi(v) => {
+                        w.bit(false);
+                        w.bitstring(v, 48);
+                    }
+                    PagingUeIdentity::FullIRnti(v) => {
+                        w.bit(true);
+                        w.bitstring(v, 40);
+                    }
+                }
+            });
+        }
+        w.finish()
+    }
+}
+
+#[cfg(test)]
+mod pcch_tests {
+    use super::*;
+
+    #[test]
+    fn paging_round_trip() {
+        let m = PagingMessage { records: vec![PagingUeIdentity::Ng5gSTmsi(0x1234_5678_9abc), PagingUeIdentity::FullIRnti(0xab_cdef_0123)] };
+        let bytes = m.encode();
+        assert_eq!(PagingMessage::decode(&bytes).unwrap(), m);
+        // An empty Paging (no records) is 1 byte: 0 0 000 + padding.
+        assert_eq!(PagingMessage::decode(&[0x00]).unwrap().records.len(), 0);
     }
 }

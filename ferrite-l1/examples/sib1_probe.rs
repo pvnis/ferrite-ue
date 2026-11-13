@@ -70,7 +70,7 @@ fn main() {
     let block = 1920;
     let src = ferrite_radio::zmq::ZmqSource::connect("tcp://127.0.0.1:2100", fs, 5_000).expect("DL");
     let sink = ferrite_radio::zmq::ZmqSink::bind("tcp://127.0.0.1:2101", fs, block).expect("UL");
-    let server = UlServer { sink: Box::new(ZmqUlSink(sink)), pacing: UlPacing::Lockstep { pace_us: slot_us, lead_slots: -1 }, tx_rx_offset: 0, block_len: block, start_index: 0 };
+    let server = UlServer { sink: Box::new(ZmqUlSink(sink)), pacing: UlPacing::Lockstep { pace_us: slot_us }, tx_rx_offset: 0, block_len: block, start_index: 0 };
     let params = EngineParams {
         fs,
         dl_center_hz: dl,
@@ -82,7 +82,7 @@ fn main() {
         tx_lead_slots: 2,
         tx_rx_offset: 0,
         prach_offset: 0,
-        pacing: UlPacing::Lockstep { pace_us: slot_us, lead_slots: -1 },
+        pacing: UlPacing::Lockstep { pace_us: slot_us },
         ul_block_len: block,
         cfo_correction: false,
         max_search_attempts: 10,

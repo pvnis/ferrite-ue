@@ -65,6 +65,13 @@ pub struct Cli {
     pub ping_target: Option<String>,
     #[arg(long)]
     pub ping_interval_ms: Option<u64>,
+    /// Repeat the ping probe this many times (rounds), pausing
+    /// `--ping-round-gap-s` between rounds (long enough for the gNB's
+    /// inactivity release, the next round goes through a service request).
+    #[arg(long)]
+    pub ping_rounds: Option<u32>,
+    #[arg(long)]
+    pub ping_round_gap_s: Option<u64>,
     /// Create this TUN interface and carry host IP traffic over the DRB.
     #[arg(long)]
     pub tun: Option<String>,
@@ -84,13 +91,24 @@ pub struct Cli {
     /// earlier). 0 for the ZMQ lockstep transport.
     #[arg(long, allow_hyphen_values = true)]
     pub tx_rx_offset: Option<i64>,
-    /// PRACH-only timing calibration in samples (positive = earlier). The
-    /// default delays the preamble by 1 µs: well inside every preamble CP, and
-    /// it keeps the preamble out of the negative-delay region of detectors
-    /// (OCUDU's window starts a few samples after the slot) over a zero-delay
-    /// transport; over the air the propagation delay does the same.
+    /// Uplink timing guard in samples (positive = earlier, negative = later),
+    /// applied to every uplink transmission including the PRACH. The default
+    /// delays the uplink by 1 µs: it keeps the preamble out of the
+    /// negative-delay region of detectors (OCUDU's window starts a few samples
+    /// after the slot) over a zero-delay transport, and the timing-advance
+    /// command the network answers with removes the same guard from the
+    /// PUSCH/PUCCH timing. Over the air the propagation delay does the same.
     #[arg(long, allow_hyphen_values = true)]
     pub prach_offset: Option<i64>,
+    /// Receiver power calibration: dB added to the PHY's dBFS measurements to
+    /// report dBm (SS-RSRP in measurement reports). 0 over ZMQ; the RX chain
+    /// gain (negated) over the air.
+    #[arg(long, allow_hyphen_values = true)]
+    pub rx_power_offset_db: Option<f32>,
+    /// Test aid: inject a radio link failure this many seconds after start
+    /// (while connected) to exercise RRC re-establishment. 0 = never.
+    #[arg(long)]
+    pub rlf_at_s: Option<u64>,
     /// Log level (error/warn/info/debug/trace).
     #[arg(long)]
     pub log: Option<String>,
@@ -118,12 +136,16 @@ pub struct FileConfig {
     pub ping: Option<u32>,
     pub ping_target: Option<String>,
     pub ping_interval_ms: Option<u64>,
+    pub ping_rounds: Option<u32>,
+    pub ping_round_gap_s: Option<u64>,
     pub tun: Option<String>,
     pub netns: Option<String>,
     pub timeout: Option<u64>,
     pub tx_lead: Option<u16>,
     pub tx_rx_offset: Option<i64>,
     pub prach_offset: Option<i64>,
+    pub rx_power_offset_db: Option<f32>,
+    pub rlf_at_s: Option<u64>,
     pub log: Option<String>,
 }
 
@@ -145,6 +167,8 @@ pub struct UeConfig {
     pub ping_count: u32,
     pub ping_target: [u8; 4],
     pub ping_interval_ms: u64,
+    pub ping_rounds: u32,
+    pub ping_round_gap_s: u64,
     pub tun: Option<String>,
     pub netns: Option<String>,
     pub timeout_s: u64,
@@ -152,6 +176,8 @@ pub struct UeConfig {
     pub tx_lead: u16,
     pub tx_rx_offset: i64,
     pub prach_offset: i64,
+    pub rx_power_offset_db: f32,
+    pub rlf_at_s: u64,
     pub log: String,
 }
 
@@ -229,6 +255,8 @@ impl UeConfig {
             ping_count: pick!(ping, 20),
             ping_target,
             ping_interval_ms: pick!(ping_interval_ms, 1000),
+            ping_rounds: pick!(ping_rounds, 1).max(1),
+            ping_round_gap_s: pick!(ping_round_gap_s, 0),
             tun: cli.tun.clone().or(file.tun.clone()),
             netns: cli.netns.clone().or(file.netns.clone()),
             timeout_s: pick!(timeout, 0),
@@ -236,6 +264,8 @@ impl UeConfig {
             tx_lead: pick!(tx_lead, 2),
             tx_rx_offset: pick!(tx_rx_offset, 0),
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
+            rx_power_offset_db: pick!(rx_power_offset_db, 0.0),
+            rlf_at_s: pick!(rlf_at_s, 0),
             log: pick!(log, "info".into()),
         })
     }

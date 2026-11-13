@@ -37,7 +37,7 @@ fn main() {
                 BufferedStream::spawn(src, block_len),
                 UlServer {
                     sink: Box::new(ferrite_l1::radio::ZmqUlSink(sink)),
-                    pacing: UlPacing::Lockstep { pace_us: slot_us, lead_slots: -1 },
+                    pacing: UlPacing::Lockstep { pace_us: slot_us },
                     tx_rx_offset: cfg.tx_rx_offset,
                     block_len,
                     start_index: 0,
@@ -60,7 +60,7 @@ fn main() {
         tx_lead_slots: cfg.tx_lead,
         tx_rx_offset: cfg.tx_rx_offset,
         prach_offset: cfg.prach_offset,
-        pacing: UlPacing::Lockstep { pace_us: slot_us, lead_slots: -1 },
+        pacing: UlPacing::Lockstep { pace_us: slot_us },
         ul_block_len: block_len,
         cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. }),
         max_search_attempts: 0,
@@ -76,8 +76,10 @@ fn main() {
     let mut stack = Stack::new(cfg.clone(), None);
     // MIB facts reach the stack through this channel (polled on the timeline thread).
     let (mib_tx, mib_rx) = crossbeam_channel::bounded::<MibInfo>(2);
+    let (meas_tx, meas_rx) = crossbeam_channel::bounded::<(u16, ferrite_common::SlotPoint, f32, f32, f32)>(8);
     let reporter = {
         let ssb_scs_khz = cfg.ssb_scs_khz;
+        let dl_center_hz = cfg.dl_center_hz;
         std::thread::spawn(move || {
             while let Ok(ev) = ev_rx.recv() {
                 match ev {
@@ -95,7 +97,12 @@ fn main() {
                             coreset0_n_rb: coreset0.0,
                             coreset0_n_symb: coreset0.1,
                             coreset0_offset_rb: coreset0.2,
+                            ssb_arfcn: ferrite_common::band::hz_to_arfcn(dl_center_hz + ssb_df_hz),
                         });
+                    }
+                    EngineEvent::Measurement { pci, slot, rsrp_dbfs, rsrq_db, sinr_db } => {
+                        log::debug!("ssb measurement PCI {pci} @{slot}: rsrp {rsrp_dbfs:.1} dBFS rsrq {rsrq_db:.1} dB sinr {sinr_db:.1} dB");
+                        let _ = meas_tx.try_send((pci, slot, rsrp_dbfs, rsrq_db, sinr_db));
                     }
                     EngineEvent::SyncLost => log::warn!("sync lost"),
                     EngineEvent::Stopped => break,
@@ -112,7 +119,7 @@ fn main() {
         });
     }
     let result = {
-        let mut handler = Reporting { stack: &mut stack, cmd_tx: cmd_tx.clone(), exit_after_ping: cfg.exit_after_ping, done: false, mib_rx };
+        let mut handler = Reporting { stack: &mut stack, cmd_tx: cmd_tx.clone(), exit_after_ping: cfg.exit_after_ping, done: false, mib_rx, meas_rx };
         engine::run(params, dl, ul, &mut handler, cmd_rx, ev_tx)
     };
     let _ = reporter.join();
@@ -139,12 +146,16 @@ struct Reporting<'a> {
     exit_after_ping: bool,
     done: bool,
     mib_rx: crossbeam_channel::Receiver<MibInfo>,
+    meas_rx: crossbeam_channel::Receiver<(u16, ferrite_common::SlotPoint, f32, f32, f32)>,
 }
 
 impl ferrite_l1::fapi::MacHandler for Reporting<'_> {
     fn handle(&mut self, msg: ferrite_l1::fapi::PhyToMac, phy: &mut dyn ferrite_l1::fapi::MacToPhySink) {
         while let Ok(m) = self.mib_rx.try_recv() {
             self.stack.set_mib(m);
+        }
+        while let Ok((pci, slot, rsrp, rsrq, sinr)) = self.meas_rx.try_recv() {
+            self.stack.on_measurement(pci, slot, rsrp, rsrq, sinr);
         }
         self.stack.handle(msg, phy);
         while let Some(ev) = self.stack.events.pop_front() {
@@ -162,6 +173,10 @@ impl ferrite_l1::fapi::MacHandler for Reporting<'_> {
                     }
                 }
                 StackEvent::Failed(why) => log::warn!("✗ {why}"),
+                StackEvent::RrcReleased => log::info!("★ RRC released (idle)"),
+                StackEvent::ServiceRequest { cause } => log::info!("★ service request ({cause})"),
+                StackEvent::Reestablishing => log::warn!("★ radio link failure: re-establishing"),
+                StackEvent::Reestablished => log::info!("★ RRC re-established"),
             }
         }
     }

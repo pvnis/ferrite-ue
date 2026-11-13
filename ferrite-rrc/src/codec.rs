@@ -228,8 +228,20 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let pusch_tdra_common = tdra_rows_pusch(s.pusch_tdra(), mu);
     let pucch_common = s.pucch_config_common();
 
+    let paging = {
+        let pc = &sc.downlink_config_common.pcch_config;
+        let (n_div, offset) = match pc.n_and_paging_frame_offset {
+            sib1::PagingFrameOffset::OneT => (1, 0),
+            sib1::PagingFrameOffset::HalfT(o) => (2, o),
+            sib1::PagingFrameOffset::QuarterT(o) => (4, o),
+            sib1::PagingFrameOffset::OneEighthT(o) => (8, o),
+            sib1::PagingFrameOffset::OneSixteenthT(o) => (16, o),
+        };
+        s.pdcch_config_common().and_then(|p| p.paging_search_space).map(|ss| PagingConfig { t_rf: pc.default_paging_cycle_rf, n_div, offset, ns: pc.ns, search_space_id: ss })
+    };
     let phy = PhyConfig {
         duplex: radio.duplex,
+        paging,
         numerology,
         ssb: SsbConfig { pci: mib.pci, scs: ssb_scs, period_ms: sc.ssb_periodicity_ms as u16, ssb_index: mib.ssb_index, k_ssb, dmrs_typea_pos: mib.dmrs_typea_pos },
         dl_carrier,
@@ -293,10 +305,21 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         plmn: plmn.unwrap_or_default(),
         tac: s.tac().unwrap_or(0),
         cell_identity: s.cell_identity().unwrap_or(0),
+        common_phy: phy.clone(),
+        common_mac: mac.clone(),
+        rlc_bearers: Default::default(),
         phy,
         mac,
         t300_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t300_ms as u32),
         numerology,
+        si_scheduled: s
+            .si_scheduling_info
+            .as_ref()
+            .map(|si| si.scheduling_info_list.iter().filter(|e| e.si_broadcasting).flat_map(|e| e.sib_mapping_info.iter().filter_map(|m| m.sib_type)).collect())
+            .unwrap_or_default(),
+        si_window_slots: s.si_scheduling_info.as_ref().map_or(0, |si| si.si_window_length_slots),
+        ssb_arfcn: mib.ssb_arfcn,
+        t301_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t301_ms as u32),
     })
 }
 
@@ -363,9 +386,10 @@ fn pucch_max_bits(r: &PucchResource, f2: &PucchFormatConfig, f3: &PucchFormatCon
     coded.saturating_sub(crc).max(1) as u16
 }
 
-fn csi_rs_resource_of(m: &cm::CsiRsResourceMapping, po: Option<cm::PeriodicityAndOffset>, zero_power: bool, scrambling_id: u16, trs: bool) -> CsiRsResource {
+fn csi_rs_resource_of(id: u8, m: &cm::CsiRsResourceMapping, po: Option<cm::PeriodicityAndOffset>, zero_power: bool, scrambling_id: u16, trs: bool) -> CsiRsResource {
     CsiRsResource {
         zero_power,
+        id,
         row: m.frequency_domain_allocation.row,
         freq_bits: m.frequency_domain_allocation.bits,
         first_symbol: m.first_ofdm_symbol_in_time_domain,
@@ -422,24 +446,35 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
             phy.pdsch.tdra = tdra_rows_pdsch(rows);
         }
         phy.pdsch.vrb_to_prb_interleaver = p.vrb_to_prb_interleaver;
-        // ZP CSI-RS the PDSCH is rate-matched around (periodic set only).
-        phy.pdsch.csi_rs_rate_match.retain(|r| !r.zero_power);
+        // ZP CSI-RS the PDSCH is rate-matched around (periodic set only):
+        // release / add-mod by resource id — a later reconfiguration that
+        // carries a pdsch-Config without these lists keeps the resources.
+        for id in &p.zp_csi_rs_resource_to_release_list {
+            phy.pdsch.csi_rs_rate_match.retain(|r| !(r.zero_power && r.id == *id));
+        }
         for z in &p.zp_csi_rs_resource_to_add_mod_list {
-            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(&z.resource_mapping, z.periodicity_and_offset, true, 0, false));
+            phy.pdsch.csi_rs_rate_match.retain(|r| !(r.zero_power && r.id == z.zp_csi_rs_resource_id));
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(z.zp_csi_rs_resource_id, &z.resource_mapping, z.periodicity_and_offset, true, 0, false));
         }
     }
     phy.pdsch.nof_harq_processes = c.nrof_harq_processes_for_pdsch();
 
     // --- NZP CSI-RS (rate matching + TRS/CQI measurement) and periodic reports.
     if let Some(m) = c.csi_meas_config() {
-        phy.pdsch.csi_rs_rate_match.retain(|r| r.zero_power);
+        for id in &m.nzp_csi_rs_resource_to_release_list {
+            phy.pdsch.csi_rs_rate_match.retain(|r| !(!r.zero_power && r.id == *id));
+        }
         let trs_ids: Vec<u8> = m.nzp_csi_rs_resource_set_to_add_mod_list.iter().filter(|s| s.trs_info).flat_map(|s| s.nzp_csi_rs_resources.iter().copied()).collect();
         for r in &m.nzp_csi_rs_resource_to_add_mod_list {
-            let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id);
-            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(&r.resource_mapping, r.periodicity_and_offset, false, r.scrambling_id, trs));
+            let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id) || phy.pdsch.csi_rs_rate_match.iter().any(|x| !x.zero_power && x.id == r.nzp_csi_rs_resource_id && x.trs);
+            phy.pdsch.csi_rs_rate_match.retain(|x| !(!x.zero_power && x.id == r.nzp_csi_rs_resource_id));
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(r.nzp_csi_rs_resource_id, &r.resource_mapping, r.periodicity_and_offset, false, r.scrambling_id, trs));
         }
-        phy.csi_reports.clear();
+        for id in &m.csi_report_config_to_release_list {
+            phy.csi_reports.retain(|c| c.report_id != *id);
+        }
         for rc in &m.csi_report_config_to_add_mod_list {
+            phy.csi_reports.retain(|c| c.report_id != rc.report_config_id);
             if let acsi::CsiReportConfigType::Periodic { report_slot_config, pucch_csi_resource_list } = &rc.report_config_type {
                 let Some(res) = pucch_csi_resource_list.first() else { continue };
                 phy.csi_reports.push(CsiReportConfig {
@@ -562,6 +597,13 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
         if let Some(t) = m.tag_config.as_ref().and_then(|t| t.tag_to_add_mod_list.first()) {
             mac.time_alignment_timer_ms = t.time_alignment_timer.0.map_or(0, u32::from);
         }
+        if let Some(p) = &m.phr_config {
+            mac.phr = p.setup().map(|p| ferrite_mac::phr::PhrMacConfig {
+                periodic_ms: p.phr_periodic_timer_sf.map(u32::from),
+                prohibit_ms: u32::from(p.phr_prohibit_timer_sf),
+                tx_power_factor_change_db: p.phr_tx_power_factor_change_db,
+            });
+        }
     }
     // SR resources (PUCCH) attached to their SR configurations.
     for s in &mut mac.sr {
@@ -606,7 +648,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
 // Bearers
 // ---------------------------------------------------------------------------
 
-fn rlc_setup_of(r: Option<&cg::RlcConfig>, rb: RbId) -> RlcSetup {
+fn rlc_setup_of(r: Option<&cg::RlcConfig>, rb: RbId, previous: Option<&RlcSetup>) -> RlcSetup {
     match r {
         Some(cg::RlcConfig::Am { ul, dl }) => RlcSetup::Am {
             sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(12),
@@ -620,16 +662,19 @@ fn rlc_setup_of(r: Option<&cg::RlcConfig>, rb: RbId) -> RlcSetup {
         Some(cg::RlcConfig::UmBiDirectional { ul, dl }) => RlcSetup::Um { sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
         Some(cg::RlcConfig::UmUniDirectionalUl { ul }) => RlcSetup::Um { sn_len: ul.sn_field_length.unwrap_or(6), t_reassembly_ms: 35 },
         Some(cg::RlcConfig::UmUniDirectionalDl { dl }) => RlcSetup::Um { sn_len: dl.sn_field_length.unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
-        // TS 38.331 §9.2.1 defaults for SRBs; a DRB without rlc-Config is malformed — treat as AM.
-        None => match rb {
-            RbId::Srb(_) | RbId::Drb(_) => RlcSetup::Am { sn_len: 12, t_poll_retransmit_ms: 45, poll_pdu: None, poll_byte: None, max_retx: 8, t_reassembly_ms: 35, t_status_prohibit_ms: 0 },
+        // rlc-Config is "Need M": absent for a bearer the UE already has means
+        // keep the previous configuration (e.g. the reconfiguration after a
+        // re-establishment). Otherwise the TS 38.331 §9.2.1 SRB defaults.
+        None => match (previous, rb) {
+            (Some(p), _) => p.clone(),
+            (None, RbId::Srb(_) | RbId::Drb(_)) => RlcSetup::Am { sn_len: 12, t_poll_retransmit_ms: 45, poll_pdu: None, poll_byte: None, max_retx: 8, t_reassembly_ms: 35, t_status_prohibit_ms: 0 },
         },
     }
 }
 
 /// Bearer setups from the RLC bearers of a cell group and the PDCP/SDAP
 /// parameters of a `RadioBearerConfig` (when the message carries one).
-fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>) -> Vec<BearerSetup> {
+fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>, previous: &std::collections::BTreeMap<u8, RlcSetup>) -> Vec<BearerSetup> {
     let mut out = Vec::new();
     for b in &c.rlc_bearer_to_add_mod_list {
         let rb = match b.served_radio_bearer {
@@ -637,7 +682,7 @@ fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>) -> 
             Some(cg::ServedRadioBearer::Drb(n)) => RbId::Drb(n),
             None => continue,
         };
-        let rlc = rlc_setup_of(b.rlc_config.as_ref(), rb);
+        let rlc = rlc_setup_of(b.rlc_config.as_ref(), rb, previous.get(&b.logical_channel_identity));
         let mut setup = BearerSetup {
             lcid: b.logical_channel_identity,
             rb,
@@ -650,16 +695,20 @@ fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>) -> 
             qfi: 0,
             t_reordering_ms: None,
             discard_timer_ms: None,
+            reestablish_pdcp: false,
+            reestablish_rlc: b.reestablish_rlc,
         };
         if let Some(rbc) = rbc {
             match rb {
                 RbId::Srb(id) => {
                     if let Some(s) = rbc.srb_to_add_mod_list.iter().find(|s| s.srb_identity == id) {
                         setup.t_reordering_ms = s.pdcp_config.as_ref().and_then(|p| p.t_reordering_ms).map(u32::from);
+                        setup.reestablish_pdcp = s.reestablish_pdcp;
                     }
                 }
                 RbId::Drb(id) => {
                     if let Some(d) = rbc.drb_to_add_mod_list.iter().find(|d| d.drb_identity == id) {
+                        setup.reestablish_pdcp = d.reestablish_pdcp;
                         if let Some(p) = &d.pdcp_config {
                             setup.t_reordering_ms = p.t_reordering_ms.map(u32::from);
                             if let Some(drb) = &p.drb {
@@ -696,7 +745,7 @@ pub fn decode_dl_ccch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlCc
         rrc::DlCcchMessage::RrcReject(_) => Ok(DlCcch::Reject),
         rrc::DlCcchMessage::RrcSetup(s) => {
             let (phy, mac) = apply_cell_group(&cell.phy, &cell.mac, &s.master_cell_group);
-            let bearers = bearers_of(&s.master_cell_group, Some(&s.radio_bearer_config));
+            let bearers = bearers_of(&s.master_cell_group, Some(&s.radio_bearer_config), &cell.rlc_bearers);
             Ok(DlCcch::Setup { tid: s.rrc_transaction_identifier, phy, mac, bearers })
         }
     }
@@ -714,9 +763,9 @@ pub fn decode_dl_dcch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlDc
                 }
                 None => (None, None),
             };
-            let bearers = cgc.map(|c| bearers_of(c, r.radio_bearer_config.as_ref())).unwrap_or_default();
+            let bearers = cgc.map(|c| bearers_of(c, r.radio_bearer_config.as_ref(), &cell.rlc_bearers)).unwrap_or_default();
             let released = cgc.map(|c| c.rlc_bearer_to_release_list.clone()).unwrap_or_default();
-            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec() }
+            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec(), meas: r.meas_config.clone() }
         }
         rrc::DlDcchMessage::SecurityModeCommand(m) => {
             let a = &m.security_algorithm_config;
@@ -729,7 +778,7 @@ pub fn decode_dl_dcch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlDc
         rrc::DlDcchMessage::UeCapabilityEnquiry(m) => DlDcch::UeCapabilityEnquiry { tid: m.rrc_transaction_identifier },
         rrc::DlDcchMessage::DlInformationTransfer(m) => DlDcch::DlInformationTransfer { nas: m.dedicated_nas_message },
         rrc::DlDcchMessage::RrcRelease(_) => DlDcch::Release,
-        rrc::DlDcchMessage::RrcReestablishment(_) => DlDcch::Other("RRCReestablishment"),
+        rrc::DlDcchMessage::RrcReestablishment(m) => DlDcch::Reestablishment { tid: m.rrc_transaction_identifier, ncc: m.next_hop_chaining_count },
         rrc::DlDcchMessage::CounterCheck(_) => DlDcch::Other("CounterCheck"),
     })
 }
@@ -755,14 +804,22 @@ fn cause_of(cause: u8) -> rrc::EstablishmentCause {
 }
 
 /// `RRCSetupRequest` with a 39-bit random identity: the 6-octet CCCH SDU.
-pub fn encode_setup_request(random_id: u64, cause: u8) -> [u8; 6] {
-    let pdu = rrc::UlCcchMessage::RrcSetupRequest(rrc::RrcSetupRequest { ue_identity: rrc::InitialUeIdentity::RandomValue(random_id & ((1 << 39) - 1)), establishment_cause: cause_of(cause) }).encode();
+/// `RRCSetupRequest`: `s_tmsi_part1` = the 39 LSBs of the 5G-S-TMSI when the
+/// UE has one (§5.3.3.3), else `random_id`.
+pub fn encode_setup_request(random_id: u64, s_tmsi_part1: Option<u64>, cause: u8) -> [u8; 6] {
+    let ue_identity = match s_tmsi_part1 {
+        Some(v) => rrc::InitialUeIdentity::Ng5gSTmsiPart1(v & ((1 << 39) - 1)),
+        None => rrc::InitialUeIdentity::RandomValue(random_id & ((1 << 39) - 1)),
+    };
+    let pdu = rrc::UlCcchMessage::RrcSetupRequest(rrc::RrcSetupRequest { ue_identity, establishment_cause: cause_of(cause) }).encode();
     let mut out = [0u8; 6];
     out[..pdu.len().min(6)].copy_from_slice(&pdu[..pdu.len().min(6)]);
     out
 }
 
-pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8]) -> Vec<u8> {
+/// `RRCSetupComplete`: `s_tmsi` carries the 9 MSBs (`ng-5G-S-TMSI-Part2`)
+/// when the request used `ng-5G-S-TMSI-Part1`.
+pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8], s_tmsi: Option<u64>) -> Vec<u8> {
     rrc::UlDcchMessage::RrcSetupComplete(rrc::RrcSetupComplete {
         rrc_transaction_identifier: tid,
         selected_plmn_identity: selected_plmn.max(1),
@@ -770,7 +827,7 @@ pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8]) -> Vec<u8> 
         guami_type: None,
         s_nssai_list: Vec::new(),
         dedicated_nas_message: nas.to_vec(),
-        ng_5g_s_tmsi_value: None,
+        ng_5g_s_tmsi_value: s_tmsi.map(|v| rrc::Ng5gSTmsiValue::Part2(((v >> 39) & 0x1ff) as u16)),
     })
     .encode()
 }
@@ -789,12 +846,69 @@ pub fn encode_reconfiguration_complete(tid: u8) -> Vec<u8> {
 
 pub fn encode_ue_capability_information(tid: u8, bands: &[u16]) -> Vec<u8> {
     let bands: Vec<u16> = if bands.is_empty() { vec![78] } else { bands.to_vec() };
-    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands }.encode();
+    // The modem does 256-QAM in both directions (PDSCH demapper, PUSCH mapper).
+    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands, pdsch_256qam_fr1: true, pusch_256qam: true }.encode();
     rrc::UlDcchMessage::UeCapabilityInformation(rrc::UeCapabilityInformation {
         rrc_transaction_identifier: tid,
         ue_capability_rat_container_list: vec![rrc::UeCapabilityRatContainer { rat_type: rrc::RatType::Nr, container }],
     })
     .encode()
+}
+
+/// `RRCReestablishmentRequest` (SRB0, 48-bit CCCH): `short_mac_i` from
+/// [`short_mac_i`], `cause` 0 = reconfigurationFailure, 1 = handoverFailure,
+/// 2 = otherFailure.
+pub fn encode_reestablishment_request(c_rnti: u16, pci: u16, short_mac_i: u16, cause: u8) -> [u8; 6] {
+    let reestablishment_cause = match cause {
+        0 => rrc::ReestablishmentCause::ReconfigurationFailure,
+        1 => rrc::ReestablishmentCause::HandoverFailure,
+        _ => rrc::ReestablishmentCause::OtherFailure,
+    };
+    let pdu = rrc::UlCcchMessage::RrcReestablishmentRequest(rrc::RrcReestablishmentRequest { c_rnti, phys_cell_id: pci, short_mac_i, reestablishment_cause }).encode();
+    let mut out = [0u8; 6];
+    out[..pdu.len().min(6)].copy_from_slice(&pdu[..pdu.len().min(6)]);
+    out
+}
+
+/// `shortMAC-I` (TS 38.331 §5.3.7.4): the 16 LSBs of the MAC-I computed with
+/// the current K_RRCint / integrity algorithm over the UPER-encoded
+/// `VarShortMAC-Input { sourcePhysCellId, targetCellIdentity, source-c-RNTI }`
+/// with COUNT = 2^32 − 1, BEARER = 31 and DIRECTION = 1.
+pub fn short_mac_i(k_rrc_int: &[u8; 16], integrity_alg: u8, source_pci: u16, target_cell_identity: u64, source_c_rnti: u16) -> u16 {
+    let mut w = ferrite_asn1::uper::BitWriter::new();
+    w.uint(u32::from(source_pci), 0, 1007);
+    w.bitstring(target_cell_identity & ((1 << 36) - 1), 36);
+    w.uint(u32::from(source_c_rnti), 0, 65535);
+    let input = w.finish();
+    let mac = match integrity_alg {
+        2 => ferrite_pdcp::security::nia2_mac(k_rrc_int, 0xffff_ffff, 0x1f, 1, &input),
+        _ => [0u8; 4],
+    };
+    u16::from_be_bytes([mac[2], mac[3]])
+}
+
+/// `RRCReestablishmentComplete` on SRB1.
+pub fn encode_reestablishment_complete(tid: u8) -> Vec<u8> {
+    rrc::UlDcchMessage::RrcReestablishmentComplete { rrc_transaction_identifier: tid }.encode()
+}
+
+/// K_NG-RAN* for the cell `pci` / SSB `arfcn` by horizontal derivation from
+/// the current K_gNB (TS 33.501 §A.11, FC = 0x70).
+pub fn k_ng_ran_star(k_gnb: &[u8; 32], pci: u16, arfcn: u32) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut s = vec![0x70u8];
+    s.extend_from_slice(&pci.to_be_bytes());
+    s.extend_from_slice(&[0x00, 0x02]);
+    s.extend_from_slice(&arfcn.to_be_bytes()[1..]);
+    s.extend_from_slice(&[0x00, 0x03]);
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(k_gnb).expect("hmac key");
+    mac.update(&s);
+    mac.finalize().into_bytes().into()
+}
+
+/// `MeasurementReport` on SRB1.
+pub fn encode_measurement_report(results: &ferrite_asn1::meas::MeasResults) -> Vec<u8> {
+    rrc::UlDcchMessage::MeasurementReport(results.clone()).encode()
 }
 
 pub fn encode_ul_information_transfer(nas: &[u8]) -> Vec<u8> {

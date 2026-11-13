@@ -14,6 +14,7 @@
 //! into MAC PDUs immediately (LCP + MAC CEs) and parked until the target slot.
 
 use crate::pdu::*;
+use crate::phr::{PhrProcedure, PowerHeadroom};
 use crate::{harq::*, lcp::Lcp, ra::*, rar::parse_rar_pdu, sr::SrProcedure, ta::TimingAdvance, MacConfig};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 use ferrite_l1::fapi::*;
@@ -26,6 +27,8 @@ pub enum MacEvent {
     RaFailed,
     /// A BCCH transport block (SIB1 / SI) decoded with the SI-RNTI.
     Bcch(Vec<u8>),
+    /// A PCCH transport block (Paging) decoded with the P-RNTI.
+    Pcch(Vec<u8>),
     /// Msg4 CCCH SDU (RRCSetup / RRCReject) received.
     Ccch(Vec<u8>),
     /// Radio link problem: SR failure / TA timer expiry (RRC decides what to do).
@@ -61,6 +64,8 @@ pub struct MacEntity {
     pub ul_harq: UlHarqEntity,
     pub ack_book: AckBook,
     pub bsr: crate::bsr::BsrProcedure,
+    phr: PhrProcedure,
+    power: PowerHeadroom,
     pub sr: Vec<SrProcedure>,
     pub lcp: Lcp,
     pub ta: TimingAdvance,
@@ -90,6 +95,7 @@ pub struct MacStats {
     pub pucch_sent: u64,
     pub sr_sent: u64,
     pub ack_late: u64,
+    pub phr_sent: u64,
 }
 
 impl MacEntity {
@@ -101,6 +107,8 @@ impl MacEntity {
             ul_harq: UlHarqEntity::new(cfg.nof_ul_harq),
             ack_book: AckBook::default(),
             bsr: crate::bsr::BsrProcedure::new(cfg.periodic_bsr_ms * spm, cfg.retx_bsr_ms * spm),
+            phr: PhrProcedure::new(cfg.phr, spm),
+            power: PowerHeadroom::default(),
             sr: cfg.sr.iter().map(|s| SrProcedure::new(s, spm)).collect(),
             lcp: Lcp::new(&cfg.logical_channels),
             ta: TimingAdvance::new(cfg.numerology, cfg.time_alignment_timer_ms),
@@ -134,7 +142,15 @@ impl MacEntity {
         self.bsr.periodic_slots = cfg.periodic_bsr_ms * spm;
         self.bsr.retx_slots = cfg.retx_bsr_ms * spm;
         self.ta.timer_slots = cfg.time_alignment_timer_ms * spm;
+        if cfg.phr != self.cfg.phr {
+            self.phr.configure(cfg.phr);
+        }
         self.cfg = cfg;
+    }
+
+    /// Power headroom quantities to report (from L1 power control / the stack).
+    pub fn set_power_headroom(&mut self, p: PowerHeadroom) {
+        self.power = p;
     }
 
     /// RRC: start a contention-based RA carrying `ccch` (RRCSetupRequest) in Msg3.
@@ -152,11 +168,13 @@ impl MacEntity {
         self.pending_pusch.clear();
         self.pending_cqi = None;
         self.bsr.cancel();
+        self.phr.reset();
         for s in &mut self.sr {
             s.cancel();
         }
         self.ta.reset();
         self.ra = RaProcedure::new(&self.cfg.rach, self.cfg.numerology, 0x5eed);
+        phy.send(MacToPhy::TimingAdvance { n_ta_tc: self.ta.n_ta_tc });
         phy.send(MacToPhy::SetRntis { c_rnti: None, tc_rnti: None, ra_rnti: None });
         phy.send(MacToPhy::Stop);
         self.started = false;
@@ -189,6 +207,7 @@ impl MacEntity {
             .map(|c| c.priority)
             .collect();
         self.bsr.evaluate(now, &prios);
+        self.phr.tick(now, self.power.pathloss_db);
         if self.bsr.sr_pending && self.c_rnti.is_some() {
             if self.sr.is_empty() && !self.ra.is_running() {
                 // No SR configured: a RA with the C-RNTI (§5.4.4).
@@ -418,7 +437,9 @@ impl MacEntity {
     }
 
     /// Build a UL-SCH MAC PDU of exactly `tbs` bytes (§5.4.3, §6.1.2): C-RNTI CE,
-    /// BSR CE, then MAC SDUs by LCP, then a padding BSR if room, then padding.
+    /// PHR CE, BSR CE, then MAC SDUs by LCP, then a padding BSR if room, then
+    /// padding. (CEs precede SDUs; among them the C-RNTI CE has the highest
+    /// priority, §5.4.3.1.3.)
     fn build_ul_pdu(&mut self, tbs: usize, now: SlotPoint, upper: &mut dyn UpperLayers) -> (Vec<u8>, bool, bool) {
         let mut out = Vec::with_capacity(tbs);
         let mut left = tbs;
@@ -429,6 +450,12 @@ impl MacEntity {
                     left -= 3;
                 }
             }
+        }
+        if self.phr.pending && left >= 3 {
+            push_single_phr(&mut out, self.power.ph_db, self.power.pcmax_dbm);
+            left -= 3;
+            self.phr.on_sent(now, self.power.pathloss_db);
+            self.stats.phr_sent += 1;
         }
         // Buffer status per LCG.
         let mut lcg_bytes: BTreeMap<u8, usize> = BTreeMap::new();
@@ -481,15 +508,12 @@ impl MacEntity {
             if entries.len() <= 1 {
                 let (lcg, b) = entries.first().copied().unwrap_or((0, 0));
                 push_short_bsr(&mut out, lcg, b, false);
-                left -= 2;
             } else if left >= 3 + entries.len() {
                 push_long_bsr(&mut out, &entries, false);
-                left -= 3 + entries.len();
             } else {
                 // Not enough room for the long BSR: truncated short BSR of the highest-priority LCG.
                 let (lcg, b) = entries[0];
                 push_short_bsr(&mut out, lcg, b, true);
-                left -= 2;
                 bsr_truncated = true;
             }
             bsr_included = true;
@@ -529,6 +553,7 @@ impl MacEntity {
             RntiKind::Tc | RntiKind::C => {
                 if !self.ack_book.set_result(d.pdsch_slot, d.harq_id, ok) {
                     self.stats.ack_late += 1;
+                    log::debug!("HARQ-ACK for PDSCH {} harq {} arrived after its PUCCH was requested (ok={ok})", d.pdsch_slot, d.harq_id);
                 }
                 let Some(tb) = d.tb else { return };
                 if self.dl_harq.is_delivered(d.harq_id) {
@@ -557,7 +582,13 @@ impl MacEntity {
                     }
                 }
             }
-            RntiKind::P => {}
+            RntiKind::P => {
+                if let Some(tb) = d.tb {
+                    // The paging PDSCH carries one PCCH SDU in a MAC PDU with a
+                    // single subPDU (§6.1.5: no header), as for BCCH.
+                    self.events.push(MacEvent::Pcch(tb));
+                }
+            }
         }
     }
 

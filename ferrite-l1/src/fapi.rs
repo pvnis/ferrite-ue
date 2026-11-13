@@ -260,6 +260,8 @@ pub enum MacToPhy {
     SetRntis { c_rnti: Option<Rnti>, tc_rnti: Option<Rnti>, ra_rnti: Option<Rnti> },
     /// Absolute N_TA in T_c units (MAC maintains it from the RAR + TA MAC CEs).
     TimingAdvance { n_ta_tc: i64 },
+    /// Monitor paging for this UE_ID (5G-S-TMSI mod 1024); `None` stops.
+    Paging { ue_id: Option<u16> },
 }
 
 /// What MAC implements: the PHY calls this on its timeline thread.

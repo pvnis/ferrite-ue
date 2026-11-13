@@ -15,7 +15,7 @@ fn hex(s: &str) -> Vec<u8> {
 
 fn mib() -> MibInfo {
     let cs0 = ferrite_phy::coreset0::coreset0_config(30, 30, 10, 2).unwrap();
-    MibInfo { pci: 1, mu: 1, dmrs_typea_pos: 2, k_ssb: 0, coreset0_index: 2, ss0_index: 0, ssb_index: 0, ssb_scs_khz: 30, coreset0_n_rb: cs0.n_rb as u16, coreset0_n_symb: cs0.n_symb as u8, coreset0_offset_rb: cs0.offset_rb }
+    MibInfo { pci: 1, mu: 1, dmrs_typea_pos: 2, k_ssb: 0, coreset0_index: 2, ss0_index: 0, ssb_index: 0, ssb_scs_khz: 30, ssb_arfcn: 626000, coreset0_n_rb: cs0.n_rb as u16, coreset0_n_symb: cs0.n_symb as u8, coreset0_offset_rb: cs0.offset_rb }
 }
 
 fn radio() -> RadioInfo {

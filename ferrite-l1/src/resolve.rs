@@ -178,8 +178,10 @@ impl DciResolver {
         if d.pdcch_order.is_some() {
             return Some(Dci::Other { format: "1_0 pdcch-order" });
         }
-        if matches!(kind, RntiKind::P) {
-            return Some(Dci::Other { format: "1_0 paging" });
+        // P-RNTI: only a DCI whose short-messages indicator says "scheduling
+        // information for paging present" (bit 0) schedules a PDSCH.
+        if matches!(kind, RntiKind::P) && d.short_messages_indicator.map_or(true, |v| v & 1 == 0) {
+            return Some(Dci::Other { format: "1_0 paging (short message only)" });
         }
         // Frequency domain: in a CSS with CORESET0 the RIV spans CORESET0 and is
         // numbered from its lowest RB; else the active BWP.
@@ -190,11 +192,19 @@ impl DciResolver {
         } else {
             dci::riv_decode(d.fdra, self.dl_bwp_rb)?
         };
-        let row = self.pdsch_tdra_row(d.tdra as usize, false, kind)?;
+        let row = self.pdsch_tdra_row(d.tdra as usize, false, if kind == RntiKind::P { RntiKind::Si } else { kind })?;
         let mcs = self.mcs(McsTable::Qam64, d.mcs);
         // DCI 1_0: 2 CDM groups without data (1 for a 2-symbol allocation).
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
-        let tbs = self.pdsch_tbs(&row, n_rb, &mcs, cdm);
+        // RA / paging: TB scaling (TS 38.214 Table 5.1.3.2-2) applies to N_info.
+        let scale = match d.tb_scaling { Some(1) => 0.5, Some(2) => 0.25, _ => 1.0 };
+        let tbs = if scale < 1.0 {
+            let mut m = mcs;
+            m.r_x1024 = m.r_x1024.map(|r| (f32::from(r) * scale) as u16);
+            self.pdsch_tbs(&row, n_rb, &m, cdm)
+        } else {
+            self.pdsch_tbs(&row, n_rb, &mcs, cdm)
+        };
         let pdsch_slot = slot.add(row.k as u64);
         let (ack_slot, harq_id, ndi, rv, dai, pri, tpc, k1) = match kind {
             RntiKind::Tc | RntiKind::C => {

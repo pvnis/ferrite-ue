@@ -261,7 +261,7 @@ pub fn demod_slot(
 /// §5.1.3 (`Q_m` = 2/4/6/8). Per axis, the `m = Q_m/2` bits label a PAM level
 /// `(1−2b_0)·(2^{m−1} − (1−2b_1)·(2^{m−2} − …))` scaled by `1/√norm`; the I
 /// axis carries the even bits, the Q axis the odd bits.
-struct Demapper {
+pub(crate) struct Demapper {
     /// Bits per axis.
     m: usize,
     /// `√norm`: 2, 10, 42, 170.
@@ -271,7 +271,7 @@ struct Demapper {
 }
 
 impl Demapper {
-    fn new(qm: usize) -> Self {
+    pub(crate) fn new(qm: usize) -> Self {
         assert!(matches!(qm, 2 | 4 | 6 | 8), "unsupported modulation order {qm}");
         let m = qm / 2;
         let scale = [2.0f32, 10.0, 42.0, 170.0][m - 1].sqrt();
@@ -291,7 +291,7 @@ impl Demapper {
     /// Append the `Q_m` LLRs (positive ⇒ bit 0) for the zero-forced symbol
     /// `y`, weighted by the channel reliability `w = |h|²`. Returns the squared
     /// error to the nearest constellation point (normalized units) for EVM.
-    fn demap(&self, y: Complex32, w: f32, out: &mut Vec<f32>) -> f32 {
+    pub(crate) fn demap(&self, y: Complex32, w: f32, out: &mut Vec<f32>) -> f32 {
         let n = 1usize << self.m;
         let mut err = 0f32;
         // Interleave the axes' LLRs: bit 2i from I, bit 2i+1 from Q.
@@ -612,6 +612,44 @@ mod tests {
     /// Modulate random bits at every Q_m, demap the clean symbols and check the
     /// LLR signs recover the bits in §5.1.3 bit order.
     #[test]
+    /// A rate-0.93 256-QAM single-codeblock TB (the MCS 27 / 2-PRB case OCUDU
+    /// schedules at CQI 15) must decode from a clean and from a 34 dB SNR
+    /// (EVM 2 %) constellation within the worker's iteration budget.
+    #[test]
+    fn high_rate_256qam_decodes() {
+        use crate::coding::dlsch::{dlsch_decode_single_bits, dlsch_encode_single};
+        use crate::pusch::qam_modulate;
+        let tbs = 1416usize;
+        let r = 948.0 / 1024.0;
+        let qm = 8usize;
+        let n_re = 192usize;
+        let e = n_re * qm;
+        let mut seed = 0x1234_5678u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let tb: Vec<u8> = (0..tbs).map(|_| (rnd() < 0.5) as u8).collect();
+        let coded = dlsch_encode_single(&tb, e, r, qm, 0);
+        assert_eq!(coded.len(), e);
+        for (evm, iters) in [(0.0f32, 12usize), (0.02, 12), (0.02, 30)] {
+            let d = Demapper::new(qm);
+            let mut llr = Vec::with_capacity(e);
+            for sym in coded.chunks(qm) {
+                let mut y = qam_modulate(sym);
+                if evm > 0.0 {
+                    let g = |r1: f32, r2: f32| (-2.0 * r1.max(1e-9).ln()).sqrt() * (std::f32::consts::TAU * r2).cos();
+                    y += Complex32::new(g(rnd(), rnd()), g(rnd(), rnd())) * (evm / 2f32.sqrt());
+                }
+                d.demap(y, 1.0, &mut llr);
+            }
+            let (bits, _conv, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, 0, iters);
+            assert!(crc && bits == tb, "rate 0.93 256-QAM failed at evm {evm} with {iters} iterations");
+        }
+    }
+
     fn demapper_roundtrip_all_orders() {
         let mut seed = 0x1234_5678_9ABCu64;
         let mut bit = || {

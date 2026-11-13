@@ -43,6 +43,9 @@ cleanup() {
   [ -n "${UE_PID:-}" ] && kill "$UE_PID" 2>/dev/null
   [ -n "${GNB_PID:-}" ] && kill "$GNB_PID" 2>/dev/null
   [ -n "${QCORE_PID:-}" ] && sudo kill "$QCORE_PID" 2>/dev/null
+  # The sudo'd qcore is a grandchild: kill it by name so no stale core (with
+  # its eBPF datapath hook) survives into the next run.
+  [ "$CORE" = 1 ] && sudo pkill -x qcore 2>/dev/null
   sleep 1
   [ -n "${GNB_PID:-}" ] && kill -9 "$GNB_PID" 2>/dev/null
   cp /tmp/ferrite_gnb_zmq.log "$OUT/gnb.log" 2>/dev/null
@@ -50,7 +53,9 @@ cleanup() {
 trap cleanup EXIT
 
 # Make sure nothing stale holds the ports.
-for p in $(pgrep -x gnb); do kill "$p" 2>/dev/null; done; sleep 1
+for p in $(pgrep -x gnb); do kill "$p" 2>/dev/null; done
+[ "$CORE" = 1 ] && pgrep -x qcore >/dev/null && { sudo pkill -x qcore; sleep 1; }
+sleep 1
 
 if [ "$CORE" = 1 ]; then
   ( cd "$QCORE_DIR" && sudo RUST_LOG=info "$QCORE" --mcc 001 --mnc 01 --no-dhcp \
@@ -72,9 +77,19 @@ for _ in $(seq 1 30); do grep -q "gNB started" "$OUT/gnb.out" 2>/dev/null && bre
 grep -q "gNB started" "$OUT/gnb.out" || { echo "gNB did not start"; cat "$OUT/gnb.out" | tail -20; exit 1; }
 sleep 1
 
-( cd "$ROOT" && cargo run --release -p ferrite-ue -q -- --dl-arfcn "$ARFCN" --srate "$SRATE" \
+( cd "$ROOT" && RUST_LOG="${UE_LOG:-info}" cargo run --release -p ferrite-ue -q -- --dl-arfcn "$ARFCN" --srate "$SRATE" \
     --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
 UE_PID=$!
+# DL_PING=1: once the gNB has released the UE to idle, ping its IP from the
+# host (through qcore) so the network has to page it.
+if [ "${DL_PING:-0}" = "1" ]; then
+  (
+    for _ in $(seq 1 120); do grep -q "RRC released (idle)" "$OUT/ue.log" 2>/dev/null && break; sleep 0.5; done
+    sleep 1
+    UEIP=$(grep -o "PDU session up: [0-9.]*" "$OUT/ue.log" | tail -1 | awk '{print $4}')
+    [ -n "$UEIP" ] && ping -c 4 -i 1 -W 3 "$UEIP" > "$OUT/dl_ping.txt" 2>&1
+  ) &
+fi
 wait "$UE_PID"; UE_RC=$?
 cleanup
 trap - EXIT
@@ -96,6 +111,36 @@ if grep -q "ping done" "$UE"; then
   [ "$R" = "$S" ] && [ "$R" -gt 0 ] && pass "S8 ping $R/$S" || fail "S8 ping $R/$S"
 else
   fail "S8 ping (no result)"
+fi
+# S14/S17: idle mode (only when the gNB released the UE during the run): the
+# next uplink data must come back through a service request; with DL_PING=1 a
+# host-side ping during idle must page the UE.
+if grep -q "RRC released (idle)" "$UE"; then
+  grep -q "service request (mo-Data)" "$UE" && pass "S14 release → idle → service request (mo-Data)" || fail "S14 release → idle → service request (mo-Data)"
+  if [ "${DL_PING:-0}" = "1" ]; then
+    grep -q "paged: requesting service" "$UE" && pass "S17 paging → service request (mt-Access)" || fail "S17 paging → service request (mt-Access)"
+    # The first host ping is lost while the network pages (the core does not
+    # buffer); the UE must answer the ones that arrive after the DRB is back.
+    if [ -f "$OUT/dl_ping.txt" ] && [ "$(grep -o '[0-9]* received' "$OUT/dl_ping.txt" | awk '{print $1}')" -gt 0 ] 2>/dev/null; then pass "S17 paging: host ping answered ($(grep -o '[0-9]* received' "$OUT/dl_ping.txt"))"; else fail "S17 paging: host ping answered"; fi
+  fi
+fi
+# S19: RRC re-establishment (only when a radio link failure occurred, e.g. the
+# injected one from `--rlf-at-s`): the connection must come back without a
+# fresh registration and the ping probe must still complete.
+if grep -q "re-establishing" "$UE"; then
+  grep -q "RRC re-established" "$UE" && pass "S19 RRC re-establishment" || fail "S19 RRC re-establishment"
+fi
+# S18: other system information (only when SIB1 schedules SI messages).
+if grep -q "SI scheduling:" "$UE"; then
+  grep -q "acquired SIB" "$UE" && pass "S18 other SI ($(grep -o 'acquired SIB[0-9]*' "$UE" | sort -u | tr '\n' ' '))" || fail "S18 other SI"
+fi
+# S16: measurement reporting (only when the gNB config installs a measConfig).
+if grep -q "measConfig applied" "$UE"; then
+  if grep -q "MeasurementReport:" "$UE"; then
+    if grep -q "DCCH UL measurementReport" "$OUT/gnb.log" 2>/dev/null; then pass "S16 measurement report (gNB received)"; else pass "S16 measurement report (UE sent)"; fi
+  else
+    fail "S16 measurement report"
+  fi
 fi
 echo "UE exit code $UE_RC; logs in $OUT"
 exit $RESULT

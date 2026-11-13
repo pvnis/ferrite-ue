@@ -175,6 +175,28 @@ pub fn sinr_to_cqi(sinr_db: f32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    /// The TRS patterns OCUDU configures (row 1, k0 = 2, symbols 4 and 8,
+    /// period 20 slots, offsets 12/13) must mark REs 2/6/10 of every RB in
+    /// slot 2 of odd frames at 15 kHz, and nothing elsewhere.
+    #[test]
+    fn trs_rate_match_occasions() {
+        use super::*;
+        use ferrite_common::{Numerology, SlotPoint};
+        let mu0 = Numerology::from_scs_khz(15).unwrap();
+        let pats: Vec<CsiRsPattern> = [(4usize, 12u32), (8, 12), (4, 13), (8, 13)]
+            .into_iter()
+            .map(|(l, off)| CsiRsPattern { period_slots: 20, offset_slots: off, symbols: vec![l], start_rb: 0, n_rb: 52, re_mask: 0b010001000100 })
+            .collect();
+        let trs_slot = SlotPoint::new(mu0, 279, 2);
+        assert!(trs_slot.is_occasion(20, 12), "index {} ", trs_slot.index());
+        assert!(csi_rs_rate_match(&pats, trs_slot, 4, 0, 2));
+        assert!(csi_rs_rate_match(&pats, trs_slot, 8, 51, 10));
+        assert!(!csi_rs_rate_match(&pats, trs_slot, 4, 0, 3));
+        assert!(!csi_rs_rate_match(&pats, trs_slot, 5, 0, 2));
+        assert!(!csi_rs_rate_match(&pats, SlotPoint::new(mu0, 128, 8), 4, 0, 2));
+        assert!(csi_rs_rate_match(&pats, SlotPoint::new(mu0, 279, 3), 8, 3, 6));
+    }
+
     use super::*;
     use ferrite_common::Numerology;
 

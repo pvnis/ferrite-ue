@@ -50,8 +50,12 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S11 | UL HARQ | gNB PUSCH CRC KO rate < 1 % (ZMQ); UE resends identical TB on NDI-unchanged grants |
 | S12 | Timing advance | TA command MAC CEs applied; UL stays inside the CP (gNB `ta` estimate stays within ±1 unit) |
 | S13 | Idle robustness | UE idle 120 s after attach, then ping again: no RLF, SR → grant → traffic resumes |
-| S14 | Release / re-attach | gNB-initiated release (inactivity) → UE returns to idle → re-attaches successfully with a new RA |
+| S14 | Release → idle → service request | gNB-initiated release (inactivity timer) → UE returns to RRC idle, NAS stays registered, PHY keeps the cell; the next uplink packet triggers a NAS Service Request (RRCSetupRequest with ng-5G-S-TMSI-Part1, cause mo-Data); the DRB is restored and the queued packet delivered (`lab.sh` with `UE_ARGS="--ping-rounds 2 --ping-round-gap-s 14"` on a gNB with `inactivity_timer: 5`) |
 | S15 | Real-time budget | `FERRITE_PERF=1`: T0 slot period at the nominal slot duration ±5 %, rx-phy worker queue drops = 0 over 60 s |
+| S16 | Measurement reporting | gNB configured with a periodical serving-cell report (`cu_cp.mobility`): the UE applies `measConfig`, sends `MeasurementReport` (SS-RSRP/RSRQ/SINR) every `reportInterval`; the gNB RRC log shows `Rx SRB1 DCCH UL measurementReport` |
+| S19 | RRC re-establishment | With a radio link failure (lab: `UE_ARGS="--rlf-at-s 8"` injects one while connected) the UE sends RRCReestablishmentRequest, receives RRCReestablishment, refreshes the keys and completes; the gNB reconfigures the bearers and the ping probe finishes without a new registration |
+| S18 | Other SI | gNB broadcasting SIB2 (`cell_cfg.sib.si_sched_info`): the UE logs the SI scheduling from SIB1 and acquires SIB2 within one SI period (`acquired SIB2` with the reselection parameters) |
+| S17 | Paging | With the UE idle (S14), a host-side ping to the UE IP (`DL_PING=1`) makes the AMF page: the UE decodes the P-RNTI DCI/PCCH in its paging frame, sends a Service Request (cause mt-Access), the DRB is restored and the echo request is answered (0 % loss on the host ping) |
 
 Pass = S1–S12 green on T1, T2, T3, F1, F2. S13–S15 are tracked but not gating.
 
@@ -100,7 +104,7 @@ cargo run --release -p ferrite-ue -- --dl-arfcn <arfcn> --srate <MHz> --ping 20
 starts qcore and the gNB, waits for the NG setup, starts the UE with the
 matching ARFCN and sample rate, collects `/tmp/ferrite_gnb_zmq.log`, the UE
 log and the gNB stdout metrics into `test/results/<id>-<timestamp>/`, and
-evaluates S1–S8 from the logs, printing a pass/fail table. `UE_ARGS` adds UE
+evaluates S1–S8 from the logs (plus S14/S16/S17/S18/S19 when the run exercised them), printing a pass/fail table. `UE_ARGS` adds UE
 flags, `UE_LOG` sets the UE log filter.
 
 Prerequisites on the host: qcore's network (`cd /home/dmd/qcore &&

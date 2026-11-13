@@ -149,6 +149,14 @@ const LONG_BSR_LEVELS: [u32; 254] = [
         76380419, 81338368,
 ];
 
+/// Build a Single Entry PHR MAC CE subPDU (§6.1.3.8): `P` = 0 (no power
+/// backoff), `V` = 0 (real PUSCH reference), 6-bit PH, 6-bit P_CMAX,c.
+pub fn push_single_phr(out: &mut Vec<u8>, ph_db: f32, pcmax_dbm: f32) {
+    out.push(LCID_SINGLE_PHR);
+    out.push(crate::phr::ph_index(ph_db) & 0x3f);
+    out.push(crate::phr::pcmax_index(pcmax_dbm) & 0x3f);
+}
+
 /// Build a Short BSR MAC CE subPDU (LCG id + 5-bit index) into `out`.
 pub fn push_short_bsr(out: &mut Vec<u8>, lcg: u8, bytes: usize, truncated: bool) {
     out.push(if truncated { LCID_SHORT_TRUNC_BSR } else { LCID_SHORT_BSR });

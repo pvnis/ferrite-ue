@@ -10,7 +10,18 @@
 gnb_id: 334
 
 cu_cp:
-  inactivity_timer: 7200
+  # Measurement reporting (the UE must decode measConfig and send
+  # MeasurementReport): a periodical report of the serving cell.
+  mobility:
+    trigger_handover_from_measurements: false
+    cells:
+      - nr_cell_id: 0x538000
+        periodic_report_cfg_id: 1
+    report_configs:
+      - report_cfg_id: 1
+        report_type: periodical
+        report_interval_ms: 1024
+  inactivity_timer: 5
   amf:
     addr: 127.0.0.1
     bind_addr: 127.0.0.20
@@ -42,13 +53,15 @@ cell_cfg:
   pci: 2
   nof_antennas_ul: 1
   nof_antennas_dl: 1
+  # 256-QAM tables: used only if the UE capability advertises 256-QAM.
   pdsch:
-    mcs_table: qam64
+    mcs_table: qam256
   pusch:
-    mcs_table: qam64
+    mcs_table: qam256
 
 log:
   filename: /tmp/ferrite_gnb_zmq.log
+  rrc_level: debug
   all_level: info
   phy_level: debug
   mac_level: debug

@@ -537,6 +537,7 @@ dependencies = [
  "ferrite-common",
  "ferrite-l1",
  "ferrite-mac",
+ "ferrite-pdcp",
  "ferrite-phy",
  "hmac",
  "log",

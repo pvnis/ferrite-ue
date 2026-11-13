@@ -25,6 +25,8 @@ pub struct ActiveRntis {
     pub ra: Option<Rnti>,
     pub tc: Option<Rnti>,
     pub c: Option<Rnti>,
+    /// P-RNTI monitoring for this UE_ID (5G-S-TMSI mod 1024) in its paging frames.
+    pub p_ue_id: Option<u16>,
 }
 
 /// Where a search space lives and what it monitors.
@@ -47,6 +49,7 @@ pub struct DlMonitor {
     type0: Option<Type0Monitoring>,
     pub resolver: DciResolver,
     pub rntis: ActiveRntis,
+    paging: Option<crate::config::PagingConfig>,
     /// Coherence gate for the blind decode (fraction, ≈1 for a present PDCCH).
     pub coherence_gate: f32,
     dedicated: bool,
@@ -115,6 +118,7 @@ impl DlMonitor {
             type0: type0.map(|t| t.1),
             resolver: DciResolver::new(cfg, dedicated),
             rntis: ActiveRntis::default(),
+            paging: cfg.paging,
             coherence_gate: 0.1,
             dedicated,
             llr_buf: Vec::new(),
@@ -148,8 +152,17 @@ impl DlMonitor {
             }
         };
         let sc_to_bin = self.geom.dl_sc_to_bin();
-        let n_spaces = self.spaces.len();
-        for i in 0..n_spaces {
+        // Common search spaces first: a PDCCH sent in CORESET#0 can also be
+        // decodable through a UE-specific candidate on a dedicated CORESET
+        // whose REGs physically coincide, where the fallback-format fields
+        // would be read against the active BWP instead of CORESET#0 (or the
+        // payload mistaken for a non-fallback format of the same size). The
+        // CSS interpretation is the gNB's; any later decode of the same
+        // payload for the same RNTI in this slot is the same PDCCH.
+        let mut order: Vec<usize> = (0..self.spaces.len()).collect();
+        order.sort_by_key(|&i| self.spaces[i].kind != SearchSpaceKind::Common);
+        let mut seen: Vec<(u16, Vec<u8>)> = Vec::new();
+        for i in order {
             let monitored = if self.spaces[i].is_type0 { self.type0_monitored(slot) } else { self.spaces[i].ss.is_monitored(slot) };
             if !monitored {
                 continue;
@@ -172,6 +185,17 @@ impl DlMonitor {
                 let is_type0 = self.spaces[i].is_type0;
                 if is_type0 && self.rntis.si {
                     targets.push((Rnti::SI, RntiKind::Si));
+                }
+                // Paging: the P-RNTI in the paging search space during the UE's
+                // paging frames (every monitoring occasion of the frame — a
+                // superset of the PO, TS 38.304 §7.1).
+                if kind == SearchSpaceKind::Common {
+                    if let (Some(pg), Some(ue_id)) = (self.paging, self.rntis.p_ue_id) {
+                        let is_paging_ss = if pg.search_space_id == 0 { is_type0 } else { !is_type0 && self.spaces[i].ss.id == pg.search_space_id };
+                        if is_paging_ss && pg.is_paging_frame(slot.sfn, ue_id) {
+                            targets.push((Rnti::P, RntiKind::P));
+                        }
+                    }
                 }
                 if kind == SearchSpaceKind::Common && !is_type0 {
                     if let Some(r) = self.rntis.ra {
@@ -240,6 +264,11 @@ impl DlMonitor {
                         let try_fallback = in_css || kind == SearchSpaceKind::UeSpecificFallback || self.resolver.size_cfg.monitor_0_0_1_0_in_uss;
                         if try_fallback {
                             if let Some(bits) = dci_decode(&llr, rnti.0, fb_size) {
+                                if seen.iter().any(|(r, b)| *r == rnti.0 && *b == bits) {
+                                    log::debug!("dci {rk:?} fallback size {fb_size} al {} cce0 {cce0} ss {} @{slot}: same PDCCH as an earlier search space, ignored", cand.cces.len(), self.spaces[i].ss.id);
+                                    hit = true;
+                                    break;
+                                }
                                 // SI/RA/P-RNTI DCIs are always format 1_0 and carry no
                                 // format identifier; TC/C-RNTI DCIs start with it (0 = 0_0).
                                 let dci = if !matches!(rk, RntiKind::Tc | RntiKind::C) || bits[0] == 1 {
@@ -248,6 +277,8 @@ impl DlMonitor {
                                     self.resolver.resolve_0_0(&bits, rnti, rk, in_css, slot)
                                 };
                                 if let Some(d) = dci {
+                                    log::debug!("dci {rk:?} fallback size {fb_size} al {} cce0 {cce0} ss {} @{slot}: {d:?}", cand.cces.len(), self.spaces[i].ss.id);
+                                    seen.push((rnti.0, bits));
                                     out.push(DciIndication { slot, dci: d });
                                     hit = true;
                                     break;
@@ -268,8 +299,15 @@ impl DlMonitor {
                             }
                             for sz in sizes {
                                 if let Some(bits) = dci_decode(&llr, rnti.0, sz) {
+                                    if seen.iter().any(|(r, b)| *r == rnti.0 && *b == bits) {
+                                        log::debug!("dci {rk:?} non-fallback size {sz} al {} cce0 {cce0} ss {} @{slot}: same PDCCH as an earlier search space, ignored", cand.cces.len(), self.spaces[i].ss.id);
+                                        hit = true;
+                                        break;
+                                    }
                                     let dci = if bits[0] == 1 { self.resolver.resolve_1_1(&bits, rnti, slot, cce0, n_cce) } else { self.resolver.resolve_0_1(&bits, rnti, slot) };
                                     if let Some(d) = dci {
+                                        log::debug!("dci {rk:?} non-fallback size {sz} al {} cce0 {cce0} ss {} @{slot}: {d:?}", cand.cces.len(), self.spaces[i].ss.id);
+                                        seen.push((rnti.0, bits));
                                         out.push(DciIndication { slot, dci: d });
                                         hit = true;
                                         break;
@@ -335,6 +373,8 @@ pub struct PdschJob {
     pub grant: DlGrant,
     /// Retransmission of an already delivered TB: ACK without decoding.
     pub skip_decode: bool,
+    /// When the engine queued the job (latency diagnostics).
+    pub queued: std::time::Instant,
 }
 
 /// What the worker needs from the configuration.
@@ -417,7 +457,7 @@ impl PdschWorker {
         };
         // Common (SI/RA/TC in CSS, DCI 1_0): PRBs and DMRS referenced to CORESET0's
         // lowest RB when CORESET0 exists; dedicated: the BWP / CRB 0.
-        let common = matches!(g.rnti_kind, RntiKind::Si | RntiKind::Ra) || (g.rnti_kind == RntiKind::Tc);
+        let common = matches!(g.rnti_kind, RntiKind::Si | RntiKind::Ra | RntiKind::P) || (g.rnti_kind == RntiKind::Tc);
         let (bwp_start, dmrs_ref, vrb) = if common && self.cfg.coreset0_rb > 0 {
             let vrb = if g.vrb_to_prb_interleaved { VrbToPrb::coreset0(self.cfg.coreset0_rb) } else { VrbToPrb::NonInterleaved };
             (self.cfg.coreset0_first_crb, self.cfg.coreset0_first_crb, vrb)
@@ -454,12 +494,19 @@ impl PdschWorker {
         let patterns = &self.cfg.csi_patterns;
         let slot = job.slot;
         let rm_enabled = self.cfg.csi_rate_match_enabled && g.rnti_kind == RntiKind::C;
-        let skip = move |l: usize, prb: usize, k: usize| csi::csi_rs_rate_match(patterns, slot, l, bwp_start + prb, k);
+        let skipped = std::cell::Cell::new(0usize);
+        let skip = |l: usize, prb: usize, k: usize| {
+            let s = csi::csi_rs_rate_match(patterns, slot, l, bwp_start + prb, k);
+            if s {
+                skipped.set(skipped.get() + 1);
+            }
+            s
+        };
         let px = pdsch::extract_pdsch(grids, sc_to_bin, &alloc, slot_in_frame, if rm_enabled { Some(&skip) } else { None });
         let sinr = if px.evm > 1e-6 { -20.0 * px.evm.log10() } else { 40.0 };
         log::debug!(
-            "pdsch {:?} {} @{}: rb {}+{} (bwp {} ref {}) sym {}+{} dmrs {:?} cdm {} qm {} tbs {} dmrs-metric {:.2} evm {:.2}",
-            g.rnti_kind, g.rnti.0, job.slot, alloc.rb_start, alloc.n_rb, bwp_start, dmrs_ref, alloc.sym_start, alloc.n_sym, alloc.dmrs_symbols, alloc.nof_cdm_groups_without_data, alloc.qm, g.tbs_bits, px.dmrs_metric, px.evm
+            "pdsch {:?} {} @{}: rb {}+{} (bwp {} ref {}) sym {}+{} dmrs {:?} cdm {} qm {} tbs {} data-re {} rm {} skipped {} of {} patterns dmrs-metric {:.2} evm {:.2} (extracted {:.2} ms after queueing)",
+            g.rnti_kind, g.rnti.0, job.slot, alloc.rb_start, alloc.n_rb, bwp_start, dmrs_ref, alloc.sym_start, alloc.n_sym, alloc.dmrs_symbols, alloc.nof_cdm_groups_without_data, alloc.qm, g.tbs_bits, px.llrs.len() / alloc.qm.max(1), rm_enabled, skipped.get(), patterns.len(), px.dmrs_metric, px.evm, job.queued.elapsed().as_secs_f64() * 1e3
         );
         if log::log_enabled!(log::Level::Trace) && px.evm > 0.2 {
             // Per-symbol / per-RB EVM against a flat per-RB channel from the
@@ -519,7 +566,9 @@ impl PdschWorker {
         let key = (g.rnti_kind, g.harq_id);
         // Standalone decode first (fast path); then soft-combine for retransmissions.
         let (bits, _conv, crc) = dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, g.rv, self.max_iter);
-        if crc {
+        // The all-zero word is a valid LDPC codeword with a zero CRC: a decoder
+        // fed garbage can converge on it. No real MAC PDU is all zeros.
+        if crc && bits.iter().any(|&b| b != 0) {
             self.buffers.remove(&key);
             return RxDataIndication { tb: Some(pack_bits(&bits)), ..fail(sinr) };
         }
@@ -537,7 +586,7 @@ impl PdschWorker {
         e.n_rx += 1;
         if e.n_rx >= 2 {
             let (cbits, _c, ccrc) = dlsch::dlsch_decode_cb(&e.acc, tbs, r, self.max_iter);
-            if ccrc {
+            if ccrc && cbits.iter().any(|&b| b != 0) {
                 self.buffers.remove(&key);
                 return RxDataIndication { tb: Some(pack_bits(&cbits)), ..fail(sinr) };
             }

@@ -12,7 +12,7 @@
 gnb_id: 333
 
 cu_cp:
-  inactivity_timer: 7200
+  inactivity_timer: 5
   amf:
     # For SIB1-only bring-up without the core, set `no_core: true` (the cell
     # then broadcasts SSB/SIB1 without NGAP). For UE attach, leave it pointed at
@@ -63,10 +63,8 @@ cell_cfg:
   # Ferrite UE's QPSK-tested modem can't yet produce/consume. MCS ≤ 9 = QPSK, and
   # matches the UE's qam64 mcs_params so brute-forced DL decode + UL grants align.
   mcs_table: qam64
-  max_ue_mcs: 9
  pusch:
   mcs_table: qam64
-  max_ue_mcs: 9
  # PUCCH: replicate the values the gNB would auto-reduce to for this narrow (10 MHz TDD)
  # BWP — the auto-reduction only fires when the whole pucch section is left default
  # (du_high_config_translators.cpp ~line 797), and setting sr_period_ms alone would

@@ -290,6 +290,8 @@ pub struct NasUe {
     next_pti: u8,
     events: Vec<NasEvent>,
     ul_count_at_activation: Option<u32>,
+    /// Uplink NAS COUNT used by the last integrity-protected message.
+    last_ul_count: Option<u32>,
     t3510: Option<u64>,
     t3512: Option<u64>,
     t3512_len: u64,
@@ -322,6 +324,7 @@ impl NasUe {
             next_pti: 1,
             events: Vec::new(),
             ul_count_at_activation: None,
+            last_ul_count: None,
             t3510: None,
             t3512: None,
             t3512_len: timers::T3512_DEFAULT_MS,
@@ -410,9 +413,19 @@ impl NasUe {
 
     fn tx_sht(&mut self, plain: Vec<u8>, sht: SecurityHeaderType) -> Vec<u8> {
         match self.ctx.as_mut() {
-            Some(c) => c.protect(sht, &plain).0,
+            Some(c) => {
+                self.last_ul_count = Some(c.next_ul_count());
+                c.protect(sht, &plain).0
+            }
             None => plain,
         }
+    }
+
+    /// K_gNB for the uplink NAS COUNT of the last protected message (TS 33.501
+    /// §6.9.2.1 / A.9): the AS keys after a Service Request (or a Registration
+    /// Request with an existing context) are derived from that message's COUNT.
+    pub fn k_gnb_for_last_message(&self) -> Option<[u8; 32]> {
+        self.k_gnb(self.last_ul_count?)
     }
 
     fn alloc_pti(&mut self) -> u8 {
