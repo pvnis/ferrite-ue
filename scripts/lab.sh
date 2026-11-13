@@ -130,6 +130,21 @@ fi
 if grep -q "re-establishing" "$UE"; then
   grep -q "RRC re-established" "$UE" && pass "S19 RRC re-establishment" || fail "S19 RRC re-establishment"
 fi
+# S20: SRS (only when the UE was configured with periodic SRS): the gNB PHY
+# must detect the sounding (its SRS log lines carry a per-UE SINR).
+if grep -q "srs_sent: [1-9]" "$UE"; then
+  N=$(grep "SRS: sector" "$OUT/gnb.log" 2>/dev/null | grep -vc "epre=-inf" || echo 0)
+  [ "$N" -gt 0 ] && pass "S20 SRS received by gNB ($N)" || fail "S20 SRS received by gNB"
+fi
+# S21: PUCCH format 3 (only when the gNB config selects the F1+F3 layout): the
+# multi-bit UCI (CSI reports, >2 HARQ bits) rides on format 3 and the gNB must
+# report it detected (FAPI UCI.indication `detection=4`, i.e. no DTX) rather
+# than DTX (`detection=3`) for the large majority of occasions.
+if grep -q "formats: f1_and_f3" "$ROOT/test/$CFG.yml" 2>/dev/null; then
+  OK=$(grep "PUCCH format 2/3/4 format=3" "$OUT/gnb.log" 2>/dev/null | grep -c "detection=4" || echo 0)
+  ALL=$(grep -c "PUCCH format 2/3/4 format=3" "$OUT/gnb.log" 2>/dev/null || echo 0)
+  [ "$OK" -gt 0 ] && [ $((OK * 10)) -ge $((ALL * 9)) ] && pass "S21 PUCCH F3 decoded by gNB ($OK/$ALL)" || fail "S21 PUCCH F3 decoded by gNB ($OK/$ALL)"
+fi
 # S18: other system information (only when SIB1 schedules SI messages).
 if grep -q "SI scheduling:" "$UE"; then
   grep -q "acquired SIB" "$UE" && pass "S18 other SI ($(grep -o 'acquired SIB[0-9]*' "$UE" | sort -u | tr '\n' ' '))" || fail "S18 other SI"

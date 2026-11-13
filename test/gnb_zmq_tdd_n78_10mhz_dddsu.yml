@@ -71,11 +71,13 @@ cell_cfg:
  # otherwise switch the cell to the full-width PUCCH layout. sr_period_ms 5 (10 slots)
  # cuts the SR wait from 20 ms to 5 ms — the dominant term in the idle-UE ping RTT.
  pucch:
+  # PUCCH format 3 for the multi-bit set (CSI / >2 HARQ bits) instead of F2.
+  formats: f1_and_f3
   sr_period_ms: 5
-  resource_set_size: 7
+  resource_set_size: 4
   nof_cell_res_set_configs: 1
-  nof_cell_sr_res: 7
-  nof_cell_csi_res: 7
+  nof_cell_sr_res: 4
+  nof_cell_csi_res: 4
   f1_enable_occ: true
  prach:
   prach_config_index: 159

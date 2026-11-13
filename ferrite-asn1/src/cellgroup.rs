@@ -3257,6 +3257,10 @@ impl CellGroupConfig {
         self.initial_uplink_bwp()?.pusch_config.as_ref()?.setup()
     }
 
+    pub fn srs_config(&self) -> Option<&SrsConfig> {
+        self.initial_uplink_bwp()?.srs_config.as_ref()?.setup()
+    }
+
     pub fn csi_meas_config(&self) -> Option<&CsiMeasConfig> {
         self.serving_cell()?.csi_meas_config.as_ref()?.setup()
     }

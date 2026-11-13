@@ -236,6 +236,8 @@ pub enum UlTtiPdu {
     Pusch { grant: UlGrant, tb: Vec<u8>, uci: UciPayload },
     /// Transmit a PUCCH on `resource` with `uci`.
     Pucch { resource: PucchResourceRef, uci: UciPayload },
+    /// Transmit the SRS resource `resource_id` (its periodic occasion).
+    Srs { resource_id: u8 },
 }
 
 /// UL_TTI.request: everything MAC wants transmitted in `slot`.

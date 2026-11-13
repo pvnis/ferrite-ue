@@ -96,6 +96,7 @@ pub struct MacStats {
     pub sr_sent: u64,
     pub ack_late: u64,
     pub phr_sent: u64,
+    pub srs_sent: u64,
 }
 
 impl MacEntity {
@@ -323,6 +324,14 @@ impl MacEntity {
             return;
         }
         if !has_ack && !sr_positive && csi.is_none() {
+            // Nothing else in the slot: a periodic SRS occasion goes out on its
+            // own (an SRS overlapping a PUCCH/PUSCH is dropped, TS 38.214 §6.2.1).
+            if self.c_rnti.is_some() {
+                if let Some(&(id, _, _)) = self.cfg.srs_occasions.iter().find(|(_, p, o)| target.is_occasion(u32::from(*p), u32::from(*o))) {
+                    self.stats.srs_sent += 1;
+                    phy.send(MacToPhy::UlTti(UlTtiRequest { slot: target, pdus: vec![UlTtiPdu::Srs { resource_id: id }] }));
+                }
+            }
             return;
         }
         let ack = if has_ack { self.ack_book.take(target, None) } else { Vec::new() };

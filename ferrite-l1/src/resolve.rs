@@ -1,7 +1,7 @@
 //! DCI resolution: raw DCI fields (TS 38.212 §7.3.1) → FAPI grants, using the
 //! PHY configuration (TDRA tables, k1 list, BWP sizes, DMRS/MCS config).
 
-use crate::config::{McsTableSel, PhyConfig, TdraRow};
+use crate::config::{McsTableSel, PhyConfig, SearchSpaceKind, TdraRow};
 use crate::fapi::{Dci, DlGrant, Mcs, TimeAlloc, UlGrant};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 use ferrite_phy::coding::dci::{self as dci, DciSizeConfig, DciSizes, HarqAckCodebook};
@@ -51,6 +51,10 @@ impl DciResolver {
         sc.ul_bwp_active_rb = cfg.ul_bwp.n_rb as usize;
         sc.coreset0_rb = coreset0_rb;
         sc.monitor_0_1_1_1 = dedicated;
+        // Fallback formats in a USS only when one is configured for them
+        // (TS 38.212 §7.3.1.0 step 1/2: the 0_0/1_0 USS size and the 0_1
+        // one-bit padding exist only then).
+        sc.monitor_0_0_1_0_in_uss = cfg.search_spaces.iter().any(|s| s.kind == SearchSpaceKind::UeSpecificFallback);
         sc.harq_ack_codebook = if cfg.harq_codebook_dynamic { HarqAckCodebook::Dynamic } else { HarqAckCodebook::SemiStatic };
         let pdsch_rows = if !cfg.pdsch.tdra.is_empty() { cfg.pdsch.tdra.len() } else if !cfg.pdsch_tdra_common.is_empty() { cfg.pdsch_tdra_common.len() } else { 16 };
         let pusch_rows = if !cfg.pusch.tdra.is_empty() { cfg.pusch.tdra.len() } else if !cfg.pusch_tdra_common.is_empty() { cfg.pusch_tdra_common.len() } else { 16 };

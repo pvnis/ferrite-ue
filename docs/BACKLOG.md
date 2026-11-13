@@ -28,6 +28,10 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       bursts; it now waits for outstanding results before each SLOT.indication.
 - [ ] PUSCH without UL-SCH (DCI 0_1 `ul-sch` = 0): UCI-only PUSCH with the
       §6.3.2.4 rate matching (not scheduled by OCUDU; needed for other gNBs).
+- [x] 2026-11-13 Fallback DCI formats (0_0/1_0) are tried only in search
+      spaces that monitor them; a non-fallback USS whose 0_1 has the fallback
+      size (the case once SRS is configured) had its 0_1 payloads read with
+      the 0_0 layout ("hopping" grants refused, no registration).
 - [ ] HARQ soft combining per code block in the PDSCH worker (currently
       single-CB).
 - [ ] PUSCH with 1 DM-RS CDM group without data (data on the odd subcarriers
@@ -35,8 +39,16 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [ ] Double-symbol DM-RS (`maxLength = 2`), DL and UL.
 - [ ] PUSCH frequency hopping (intra-slot); MAC currently refuses the grant.
 - [ ] PT-RS (DL reception, UL insertion) when configured.
-- [ ] SRS transmission (periodic / aperiodic).
-- [ ] PUCCH formats 3 and 4.
+- [x] 2026-11-13 SRS transmission, periodic resources (comb 2/4, cyclic
+      shift, C_SRS/B_SRS table, no hopping): OCUDU detects the sounding
+      (EPRE +1.5 dB, t_align 0.2 µs, ~55 dB SINR, S20). Aperiodic /
+      semi-persistent SRS and frequency/group hopping still missing.
+- [x] 2026-11-13 PUCCH format 3 (DFT-s-OFDM data symbols, low-PAPR DM-RS on
+      the Table 6.4.1.3.3.2-1 symbols, additional-DM-RS and π/2-BPSK options,
+      RM(32,O) payloads of 3–11 bits): T2 runs OCUDU's `f1_and_f3` layout
+      and the gNB decodes 569/570 format-3 occasions (S21). Payloads above
+      11 bits (polar-coded UCI) and format 4 (block-wise OCC) are still
+      missing.
 - [ ] Transform precoding (DFT-s-OFDM) PUSCH transmit path; the MCS table
       exists, the modulator does not.
 - [ ] Two-layer PDSCH (2x2 DL MIMO), multi-antenna receive, RI/PMI in the CSI

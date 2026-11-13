@@ -184,6 +184,7 @@ pub fn run(
                                     UlTtiPdu::Prach { occasion, preamble, power_offset_db } => b.prach(&clock, occasion, *preamble, *power_offset_db),
                                     UlTtiPdu::Pusch { grant, tb, uci } => b.pusch(&clock, grant, tb, uci),
                                     UlTtiPdu::Pucch { resource, uci } => b.pucch(&clock, req.slot, *resource, uci, crnti),
+                                    UlTtiPdu::Srs { resource_id } => b.srs(&clock, req.slot, *resource_id),
                                 };
                                 match built {
                                     Ok(w) => {
@@ -748,6 +749,7 @@ fn initial_config(p: &EngineParams, mib: &Mib, cs0: &Coreset0Config, numerology:
         pusch: PuschConfig::default(),
         pucch: PucchConfig::default(),
         csi_reports: Vec::new(),
+        srs: Vec::new(),
         harq_codebook_dynamic: true,
         ul_amplitude: 0.5,
     }

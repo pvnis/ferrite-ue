@@ -250,10 +250,42 @@ impl UlBuilder {
                 }
                 pucch::pucch_f2_modulate_slot(&self.ofdm, &cfg, &bits, slot.slot as u32, mu, self.ul_center_hz, self.geom.fs)
             }
-            _ => return Err("PUCCH format 3/4 not supported".into()),
+            PucchFormat::F3 { n_prb } => {
+                let cfg = pucch::PucchF3 {
+                    prb_start: bwp0 + res.starting_prb as usize,
+                    nof_prb: n_prb as usize,
+                    start_symbol: res.start_symbol as usize,
+                    nof_symbols: res.n_symbols as usize,
+                    rnti: crnti,
+                    n_id: self.cell_id,
+                    hopping_id: self.cfg.pucch.hopping_id.unwrap_or(self.cell_id),
+                    additional_dmrs: self.cfg.pucch.format3.additional_dmrs,
+                    pi2_bpsk: self.cfg.pucch.format3.pi2_bpsk,
+                    carrier_rb,
+                };
+                let mut bits = uci.harq_ack.clone();
+                if let Some(s) = uci.sr {
+                    bits.push(u8::from(s));
+                }
+                bits.extend_from_slice(&uci.csi1);
+                if bits.len() < 3 || bits.len() > 11 {
+                    return Err(format!("PUCCH F3 payload of {} bits unsupported (polar UCI coding not implemented)", bits.len()));
+                }
+                pucch::pucch_f3_modulate_slot(&self.ofdm, &cfg, &bits, slot.slot as u32, mu, self.ul_center_hz, self.geom.fs).ok_or("PUCCH F3 configuration unsupported")?
+            }
+            _ => return Err("PUCCH format 4 not supported".into()),
         };
         let mut w = w;
         self.normalise(&mut w);
         Ok(Waveform { start: clock.ul_index(slot), samples: w, tag: "pucch" })
+    }
+
+    /// SRS resource `resource_id` in `slot` (TS 38.211 §6.4.1.4).
+    pub fn srs(&self, clock: &SampleClock, slot: SlotPoint, resource_id: u8) -> Result<Waveform, String> {
+        let r = self.cfg.srs.iter().find(|r| r.id == resource_id).ok_or("unknown SRS resource")?;
+        let mut w = ferrite_phy::srs::srs_modulate_slot(&self.ofdm, &r.params, self.geom.ul.n_rb as usize, self.geom.ul.offset_crb as usize, slot.slot as u32, self.geom.numerology.mu, self.ul_center_hz, self.geom.fs)
+            .ok_or("unsupported SRS configuration")?;
+        self.normalise(&mut w);
+        Ok(Waveform { start: clock.ul_index(slot), samples: w, tag: "srs" })
     }
 }

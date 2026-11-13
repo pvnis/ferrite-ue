@@ -259,6 +259,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         n_ta_offset_tc: sc.n_timing_advance_offset.unwrap_or(25600),
         pdsch: PdschConfig { nof_harq_processes: 8, ..PdschConfig::default() },
         pusch: PuschConfig::default(),
+        srs: Vec::new(),
         pucch: PucchConfig {
             resource_common: pucch_common.and_then(|p| p.pucch_resource_common),
             hopping_id: pucch_common.and_then(|p| p.hopping_id),
@@ -367,6 +368,7 @@ fn format_config_of(f: Option<&ferrite_asn1::SetupRelease<cg::PucchFormatConfig>
             additional_dmrs: c.additional_dmrs,
             max_code_rate_x100: c.max_code_rate.map(|r| (r.value() * 100.0).round() as u8),
             simultaneous_harq_ack_csi: c.simultaneous_harq_ack_csi,
+            pi2_bpsk: c.pi2_bpsk,
         },
         None => PucchFormatConfig::default(),
     }
@@ -540,6 +542,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
         }
         phy.pucch.format1 = format_config_of(p.format1.as_ref());
         phy.pucch.format2 = format_config_of(p.format2.as_ref());
+        phy.pucch.format3 = format_config_of(p.format3.as_ref());
         for id in &p.scheduling_request_resource_to_release_list {
             phy.pucch.sr_resources.retain(|x| x.sr_resource_id != *id);
         }
@@ -605,6 +608,45 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
             });
         }
     }
+    // --- SRS: resources by id (add-mod / release); periodic occasions for MAC.
+    if let Some(s) = c.srs_config() {
+        for id in &s.srs_resource_to_release_list {
+            phy.srs.retain(|r| r.id != *id);
+        }
+        for r in &s.srs_resource_to_add_mod_list {
+            let (k_tc, comb_offset, cyclic_shift) = match r.transmission_comb {
+                cg::SrsTransmissionComb::N2 { comb_offset, cyclic_shift } => (2u8, comb_offset, cyclic_shift),
+                cg::SrsTransmissionComb::N4 { comb_offset, cyclic_shift } => (4u8, comb_offset, cyclic_shift),
+            };
+            let (period_slots, offset_slots) = match r.resource_type {
+                cg::SrsResourceType::Periodic(po) => (po.period_slots, po.offset),
+                _ => (0, 0),
+            };
+            let cfg = SrsResourceConfig {
+                id: r.srs_resource_id,
+                params: ferrite_phy::srs::SrsResourceParams {
+                    k_tc,
+                    comb_offset,
+                    cyclic_shift,
+                    start_position: r.start_position,
+                    nrof_symbols: r.nrof_symbols,
+                    repetition_factor: r.repetition_factor,
+                    freq_domain_position: r.freq_domain_position,
+                    freq_domain_shift: r.freq_domain_shift,
+                    c_srs: r.c_srs,
+                    b_srs: r.b_srs,
+                    b_hop: r.b_hop,
+                    sequence_id: r.sequence_id,
+                },
+                period_slots,
+                offset_slots,
+            };
+            phy.srs.retain(|x| x.id != cfg.id);
+            phy.srs.push(cfg);
+        }
+    }
+    mac.srs_occasions = phy.srs.iter().filter(|r| r.period_slots > 0).map(|r| (r.id, r.period_slots, r.offset_slots)).collect();
+
     // SR resources (PUCCH) attached to their SR configurations.
     for s in &mut mac.sr {
         s.resources = phy.pucch.sr_resources.iter().filter(|r| r.sr_id == s.sr_id).map(|r| (r.period_slots, r.offset_slots, r.pucch_resource)).collect();
@@ -612,7 +654,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
 
     // --- MAC view of PUCCH / CSI.
     let f2 = phy.pucch.format2;
-    let f3 = PucchFormatConfig::default();
+    let f3 = phy.pucch.format3;
     mac.pucch = PucchMacConfig {
         resource_sets: phy
             .pucch

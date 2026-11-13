@@ -313,6 +313,8 @@ pub struct PucchFormatConfig {
     pub additional_dmrs: bool,
     pub max_code_rate_x100: Option<u8>,
     pub simultaneous_harq_ack_csi: bool,
+    /// `pi2BPSK` (formats 3/4): π/2-BPSK instead of QPSK.
+    pub pi2_bpsk: bool,
 }
 
 /// `PUCCH-Config` (dedicated) + `PUCCH-ConfigCommon`.
@@ -327,9 +329,21 @@ pub struct PucchConfig {
     pub resources: Vec<PucchResource>,
     pub format1: PucchFormatConfig,
     pub format2: PucchFormatConfig,
+    pub format3: PucchFormatConfig,
     pub sr_resources: Vec<SrResource>,
     /// `dl-DataToUL-ACK` (k1 list).
     pub k1_list: Vec<u8>,
+}
+
+/// One SRS resource: its PHY parameters and, for a periodic resource, the
+/// occasions (`period_slots`/`offset_slots`); aperiodic/semi-persistent
+/// resources have `period_slots = 0` (not transmitted today).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SrsResourceConfig {
+    pub id: u8,
+    pub params: ferrite_phy::srs::SrsResourceParams,
+    pub period_slots: u16,
+    pub offset_slots: u16,
 }
 
 /// One CSI-RS resource (NZP or ZP) as a PHY RE pattern.
@@ -409,6 +423,8 @@ pub struct PhyConfig {
     pub pusch: PuschConfig,
     pub pucch: PucchConfig,
     pub csi_reports: Vec<CsiReportConfig>,
+    /// SRS resources (`SRS-Config`), one antenna port each.
+    pub srs: Vec<SrsResourceConfig>,
     /// `pdsch-HARQ-ACK-Codebook` dynamic (true) / semi-static.
     pub harq_codebook_dynamic: bool,
     /// Transmit power (full-scale fraction) for UL waveforms; the radio backend

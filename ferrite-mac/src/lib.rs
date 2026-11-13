@@ -170,6 +170,8 @@ pub struct MacConfig {
     pub csi_enabled: bool,
     /// `phr-Config` (`None` = PHR not configured / released).
     pub phr: Option<phr::PhrMacConfig>,
+    /// Periodic SRS occasions: `(resource id, period, offset)` in slots.
+    pub srs_occasions: Vec<(u8, u16, u16)>,
 }
 
 impl MacConfig {
@@ -199,6 +201,7 @@ impl MacConfig {
             tx_lead_slots,
             csi_enabled: false,
             phr: None,
+            srs_occasions: Vec::new(),
         }
     }
 

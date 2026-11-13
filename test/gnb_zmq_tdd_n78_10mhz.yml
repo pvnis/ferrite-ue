@@ -92,6 +92,10 @@ cell_cfg:
   f1_enable_occ: true
  prach:
   prach_config_index: 159
+ # Periodic SRS for every UE (the UE sounds on its configured occasions).
+ srs:
+  type_enabled: periodic
+  period_ms: 20
  # Broadcast SIB2 in one SI message every 32 frames (the UE acquires other SI
  # from the si-SchedulingInfo windows).
  sib:

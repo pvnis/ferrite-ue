@@ -60,7 +60,7 @@ by the same code paths but untested) and any sample rate `fs = N_fft · SCS`.
 | `pdsch` | DMRS positions (type A/B, additional positions, `l_d`), CDM groups without data, VRB→PRB (interleaved bundles over the BWP), RE extraction in 38.211 §7.3.1.5 order, rate matching around CSI-RS, TBS (§5.1.3.2) | 38.211 §7.3.1/§7.4.1.1, 38.214 §5.1.3 |
 | `mcs` | MCS tables 1/2/3 (qam64, qam256, qam64LowSE) | 38.214 Tables 5.1.3.1-x, 6.1.4.1-x |
 | `pusch` | CP-OFDM PUSCH modulation, DMRS, UCI multiplexing (HARQ-ACK / CSI part 1), transform precoding **disabled** (msg3-transformPrecoder absent) | 38.211 §6.3.1, 38.212 §6.2.7 |
-| `pucch` | formats 0, 1, 2 | 38.211 §6.3.2 |
+| `pucch` | formats 0, 1, 2, 3 (F3: DFT-s-OFDM data, Table 6.4.1.3.3.2-1 DM-RS, RM(32,O) ≤11 bits) | 38.211 §6.3.2 |
 | `prach` | preamble formats 0–3 (L=839) and A1–C2 (L=139); PRACH configuration tables for FR1 FDD (6.3.3.2-2) and TDD (6.3.3.2-3); occasion → (SFN, subframe, start symbol, slot, index) enumeration; waveform generation at any `fs` | 38.211 §6.3.3, 38.213 §8.1 |
 | `csi` | NZP-CSI-RS sequence, SINR measurement, CQI mapping | 38.211 §7.4.1.5, 38.214 §5.2 |
 
@@ -202,6 +202,11 @@ PSS every SSB period and slews the slot clock; CFO is tracked from the SSB CP.
 * **LCP** (§5.4.3.1): priority + prioritised bit rate bucket per logical
   channel; MAC CEs ordered per §6.1.2.
 * **Timing advance** (§5.2): `timeAlignmentTimer`, TA command application.
+* **SRS**: periodic SRS resources from `SRS-Config` are transmitted on
+  their occasions when nothing else (PUCCH/PUSCH) goes out in the slot
+  (TS 38.214 §6.2.1 dropping rule); the PHY (`ferrite_phy::srs`) builds the
+  low-PAPR sequence (φ tables for 6/12/18/24, Zadoff-Chu above) on the comb
+  from C_SRS/B_SRS/position/shift (no hopping).
 * **PHR** (§5.4.6): `phr-PeriodicTimer` / `phr-ProhibitTimer` /
   `phr-Tx-PowerFactorChange` triggers and the Single Entry PHR MAC CE; the
   reported PH / P_CMAX come from a `PowerHeadroom` value the stack (later:

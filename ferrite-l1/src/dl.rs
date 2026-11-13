@@ -261,7 +261,11 @@ impl DlMonitor {
                         let in_css = kind == SearchSpaceKind::Common;
                         // Fallback formats 0_0/1_0 (one size for both; bit 0 tells them apart).
                         let fb_size = if in_css { self.resolver.sizes.f1_0_css.total } else { self.resolver.sizes.f1_0_uss.as_ref().map_or(self.resolver.sizes.f1_0_css.total, |s| s.total) };
-                        let try_fallback = in_css || kind == SearchSpaceKind::UeSpecificFallback || self.resolver.size_cfg.monitor_0_0_1_0_in_uss;
+                        // 0_0/1_0 are tried only where they are monitored: in a CSS
+                        // or a USS configured for them. A non-fallback USS whose
+                        // 0_1 happens to have the fallback size would otherwise
+                        // see its 0_1 payloads read with the 0_0 field layout.
+                        let try_fallback = in_css || kind == SearchSpaceKind::UeSpecificFallback;
                         if try_fallback {
                             if let Some(bits) = dci_decode(&llr, rnti.0, fb_size) {
                                 if seen.iter().any(|(r, b)| *r == rnti.0 && *b == bits) {

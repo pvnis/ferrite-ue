@@ -154,7 +154,7 @@ pub struct PucchF0 {
 /// CP-OFDM modulate the 14 symbol grids of one slot with §5.4 phase
 /// compensation (shared by all PUCCH formats and PUSCH). `mu` sets the CP
 /// pattern; `slot_in_frame` selects the slot within the subframe.
-fn modulate_slot_grids(
+pub(crate) fn modulate_slot_grids(
     ofdm: &Ofdm,
     grids: &[Vec<Complex32>],
     slot_in_frame: u32,
@@ -380,8 +380,141 @@ pub fn pucch_f2_modulate_slot(
     modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs)
 }
 
+/// PUCCH Format 3 resource (TS 38.211 §6.3.2.6): 1–16 PRBs over 4–14 symbols,
+/// DFT-s-OFDM data symbols with low-PAPR DM-RS symbols (§6.4.1.3.3).
+#[derive(Clone, Debug)]
+pub struct PucchF3 {
+    pub prb_start: usize,
+    pub nof_prb: usize,
+    pub start_symbol: usize,
+    pub nof_symbols: usize,
+    pub rnti: u16,
+    /// Data scrambling identity (`dataScramblingIdentityPUSCH` or the PCI).
+    pub n_id: u16,
+    /// DM-RS group / cyclic-shift hopping identity (`hoppingId` or the PCI).
+    pub hopping_id: u16,
+    pub additional_dmrs: bool,
+    pub pi2_bpsk: bool,
+    pub carrier_rb: usize,
+}
+
+/// DM-RS symbol indexes (relative to the first PUCCH symbol) of formats 3/4
+/// (TS 38.211 Table 6.4.1.3.3.2-1, no intra-slot hopping).
+pub fn pucch_f3_dmrs_symbols(nof_symbols: usize, additional_dmrs: bool) -> Vec<usize> {
+    match (nof_symbols, additional_dmrs) {
+        (4, _) => vec![1],
+        (5, _) => vec![0, 3],
+        (6, _) | (7, _) => vec![1, 4],
+        (8, _) => vec![1, 5],
+        (9, _) => vec![1, 6],
+        (10, false) => vec![2, 7],
+        (10, true) => vec![1, 3, 6, 8],
+        (11, false) => vec![2, 7],
+        (11, true) => vec![1, 3, 6, 9],
+        (12, false) => vec![2, 8],
+        (12, true) => vec![1, 4, 7, 10],
+        (13, false) => vec![2, 9],
+        (13, true) => vec![1, 4, 7, 11],
+        (14, false) => vec![3, 10],
+        (14, true) => vec![1, 5, 8, 12],
+        _ => vec![],
+    }
+}
+
+/// Modulate one PUCCH Format 3 slot carrying `uci_bits` (3–11 bits, RM(32,O)
+/// coded and rate-matched to the data REs): scrambling with
+/// `c_init = rnti·2^15 + n_id`, QPSK or π/2-BPSK, transform precoding over the
+/// `12·N_PRB` subcarriers of every data symbol (§6.3.2.6.4), and on each DM-RS
+/// symbol the low-PAPR sequence `r^{(α_l)}_{u,0}` with `u = hoppingId mod 30`
+/// (group hopping "neither") and `α_l` from §6.3.2.2.2 with `m0 = m_cs = 0`.
+/// Returns the CP-OFDM slot samples with §5.4 phase compensation.
+pub fn pucch_f3_modulate_slot(
+    ofdm: &Ofdm,
+    cfg: &PucchF3,
+    uci_bits: &[u8],
+    slot_in_frame: u32,
+    mu: u8,
+    center_freq_hz: f64,
+    fs: f64,
+) -> Option<Vec<Complex32>> {
+    let n = ofdm.fft_size();
+    let m_sc = 12 * cfg.nof_prb;
+    if cfg.nof_symbols < 4 || cfg.nof_symbols > 14 || cfg.start_symbol + cfg.nof_symbols > 14 || cfg.nof_prb == 0 {
+        return None;
+    }
+    let center = cfg.carrier_rb * 6;
+    let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
+    let dmrs_rel = pucch_f3_dmrs_symbols(cfg.nof_symbols, cfg.additional_dmrs);
+    let data_syms: Vec<usize> = (0..cfg.nof_symbols).filter(|l| !dmrs_rel.contains(l)).map(|l| cfg.start_symbol + l).collect();
+    let qm = if cfg.pi2_bpsk { 1 } else { 2 };
+    let e = data_syms.len() * m_sc * qm;
+    let coded = crate::pusch::rm_encode(uci_bits, e);
+    let c = gold_sequence(((cfg.rnti as u32) << 15) | cfg.n_id as u32, e);
+    let scrambled: Vec<u8> = coded.iter().zip(&c).map(|(a, b)| a ^ b).collect();
+    // Modulation (§5.1.1 / §5.1.3), one block of M_sc symbols per data symbol.
+    let mut d: Vec<Complex32> = Vec::with_capacity(data_syms.len() * m_sc);
+    if cfg.pi2_bpsk {
+        for (i, &b) in scrambled.iter().enumerate() {
+            let rot = Complex32::from_polar(1.0, PI / 2.0 * (i % 2) as f32);
+            d.push(rot * Complex32::new((1 - 2 * b as i32) as f32, (1 - 2 * b as i32) as f32) * FRAC_1_SQRT_2);
+        }
+    } else {
+        for pair in scrambled.chunks(2) {
+            d.push(Complex32::new((1 - 2 * pair[0] as i32) as f32, (1 - 2 * pair[1] as i32) as f32) * FRAC_1_SQRT_2);
+        }
+    }
+    let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
+    // Transform precoding: y(k) = Σ_n x(n)·e^{−j2πnk/M_sc} / √M_sc.
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    let dft = planner.plan_fft_forward(m_sc);
+    let scale = 1.0 / (m_sc as f32).sqrt();
+    for (si, &l) in data_syms.iter().enumerate() {
+        let mut block: Vec<Complex32> = d[si * m_sc..(si + 1) * m_sc].to_vec();
+        dft.process(&mut block);
+        for (k, y) in block.iter().enumerate() {
+            grids[l][bin(12 * cfg.prb_start + k)] = y * scale;
+        }
+    }
+    // DM-RS symbols.
+    let base = crate::srs::low_papr_base_sequence((cfg.hopping_id % 30) as u8, 0, m_sc)?;
+    for &rel in &dmrs_rel {
+        let l = cfg.start_symbol + rel;
+        let a = alpha_index(cfg.hopping_id, slot_in_frame, l, 0, 0);
+        let alpha = 2.0 * PI * a as f32 / 12.0;
+        for (k, r) in base.iter().enumerate() {
+            grids[l][bin(12 * cfg.prb_start + k)] = r * Complex32::from_polar(1.0, alpha * k as f32);
+        }
+    }
+    Some(modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs))
+}
+
 #[cfg(test)]
 mod tests {
+    /// F3 fills the allocated PRBs on every symbol, with DM-RS on the table's
+    /// symbols and transform-precoded data (unit average power) elsewhere.
+    #[test]
+    fn f3_re_occupancy() {
+        let ofdm = Ofdm::new(512);
+        let cfg = PucchF3 { prb_start: 3, nof_prb: 2, start_symbol: 0, nof_symbols: 14, rnti: 0x4601, n_id: 1, hopping_id: 1, additional_dmrs: false, pi2_bpsk: false, carrier_rb: 24 };
+        let slot = pucch_f3_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1, 0], 7, 1, 0.0, 15.36e6).unwrap();
+        let n = 512;
+        let center = 24 * 6;
+        let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
+        let mut off = 0;
+        for l in 0..14 {
+            let cp = ofdm.cp_len(14 + l, 1);
+            let g = ofdm.demodulate_symbol(&slot[off..], cp);
+            off += cp + n;
+            let p: f32 = (0..24).map(|k| g[bin(36 + k)].norm_sqr()).sum::<f32>() / 24.0;
+            assert!((p - 1.0).abs() < 0.3, "symbol {l}: mean RE power {p}");
+            let outside: f32 = g[bin(36 + 24)].norm_sqr() + g[bin(35)].norm_sqr();
+            assert!(outside < 1e-6);
+        }
+        assert_eq!(pucch_f3_dmrs_symbols(14, false), vec![3, 10]);
+        assert_eq!(pucch_f3_dmrs_symbols(10, true), vec![1, 3, 6, 8]);
+        assert!(pucch_f3_modulate_slot(&ofdm, &PucchF3 { nof_symbols: 3, ..cfg.clone() }, &[1, 0, 1], 7, 1, 0.0, 15.36e6).is_none());
+    }
+
     use super::*;
 
     /// F2 populates the right REs: per symbol, 8 data + 4 DMRS subcarriers in the one

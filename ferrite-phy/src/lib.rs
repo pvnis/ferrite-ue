@@ -22,6 +22,7 @@ pub mod prach_tables;
 pub mod pucch;
 pub mod pusch;
 pub mod sequence;
+pub mod srs;
 pub mod sync;
 
 pub use numerology::Numerology;
