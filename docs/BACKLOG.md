@@ -134,7 +134,6 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       paging (mt-Access, S17; AS keys re-derived from the Service Request's
       NAS COUNT). Note: OCUDU's DU never schedules paging on the T1 TDD
       pattern (its paging look-ahead slot is an UL slot); F1 and T2 page.
-- [ ] RRC release with `suspendConfig` (RRC_INACTIVE) and RRCResume.
 - [x] 2026-11-13 RRC re-establishment after radio link failure (shortMAC-I,
       horizontal K_NG-RAN*, SRB1 re-establishment with the refreshed keys,
       default L1/MAC config until the reconfiguration, RLC renewed and PDCP
@@ -147,8 +146,13 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [x] 2026-11-13 PRACH transmitted with N_TA = 0 (TS 38.211 §4.3.1) and the
       PHY timing advance reset on MAC reset (re-establishment / idle RAs
       were early by the old TA).
-- [ ] RRC resume (RRC_INACTIVE).
-- [ ] Handover: `reconfigurationWithSync` (intra-frequency first).
+- [ ] RRC_INACTIVE: RRC release with `suspendConfig`, RAN paging with the
+      I-RNTI, RRCResumeRequest / RRCResume, T380 periodic RNA update.
+- [ ] Handover: `reconfigurationWithSync` with T304 (intra-frequency first);
+      then conditional handover (`condReconfigToAddModList`, Rel-16).
+- [ ] 5GMM context persistence across restarts (GUTI, NAS security context,
+      last registered TAI; SQN for the USIM) so a restart does a mobility /
+      periodic registration update instead of an initial registration.
 - [x] 2026-11-13 System information beyond SIB1: `SystemInformation` decode
       with SIB2 / SIB3 structured and SIB10+ (e.g. SIB19) raw; SIB2 acquired
       live on T1 (S18). SIB4–SIB9 decoders still missing (a message carrying
@@ -263,8 +267,7 @@ report trigger and reception, out-of-order delivery, duplication, ROHC, AM-DRB
 re-establishment semantics, COUNT wrap handling, data volume for BSR; SDAP as
 its own layer (QoS flows beyond the default, reflective QoS).
 
-RRC: `reconfigurationWithSync` (handover, T304), RRC_INACTIVE (suspend /
-resume, T380), T311 as a real cell-selection timer (the UE re-selects the
+RRC: T311 as a real cell-selection timer (the UE re-selects the
 serving cell at once today), T302 / `waitTime`, vertical NH key
 derivation (`masterKeyUpdate`), `fullConfig`, CounterCheck response,
 UECapabilityEnquiry filters, SIB4–9 (a SIB that fails aborts the whole SI
@@ -280,11 +283,14 @@ across cells (today a forbidden cause only sets the substate), QoS rules
 installation from PDU SESSION MODIFICATION COMMAND, IPv6/IPv4v6/Ethernet user
 plane, EPCO (DNS/MTU), SUCI profiles A/B (`oxirush-security` has the ECIES
 profiles and NIA1/NEA1/NIA3/NEA3 — candidates to replace the hand-written
-codec and security), TUAK, SQN persistence.
+codec and security), TUAK.
 
 ASN.1: encoders for CellGroupConfig / SIB1 (round-trip tests), extension
 additions decoded (120 sites skip them), critical-extension futures / CHOICE
-extensions as `Raw` instead of failures, fuzz targets.
+extensions as `Raw` instead of failures, fuzz and property-based round-trip
+tests. Open question: a build-time ASN.1 code generator for the RRC codec
+instead of the hand-written decoders (the skipped extension sites are the
+cost of hand-writing).
 
 Tooling: `#![warn(missing_docs)]`, a crate-level MAC↔RLC↔PDCP chain test,
 CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
