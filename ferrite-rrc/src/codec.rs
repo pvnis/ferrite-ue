@@ -594,6 +594,13 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
                         Some(acsi::CqiTable::Table3) => 2,
                         _ => 0,
                     },
+                    quantity: match rc.report_quantity {
+                        acsi::CsiReportQuantity::CriRiPmiCqi | acsi::CsiReportQuantity::CriRiLiPmiCqi => CsiReportQuantity::RiPmiCqi,
+                        acsi::CsiReportQuantity::CriRiCqi => CsiReportQuantity::RiCqi,
+                        _ => CsiReportQuantity::Cqi,
+                    },
+                    nof_ports: rc.codebook_config.as_ref().map_or(1, |c| c.nof_ports()),
+                    ri_restriction: rc.codebook_config.as_ref().map_or(0x80, |c| c.ri_restriction),
                 });
             }
         }
@@ -810,7 +817,7 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             .collect(),
         simultaneous_harq_ack_csi: f2.simultaneous_harq_ack_csi,
     };
-    mac.csi_reports = phy.csi_reports.iter().map(|r| CsiReportMacConfig { period_slots: r.period_slots, offset_slots: r.offset_slots, pucch_resource: r.pucch_resource }).collect();
+    mac.csi_reports = phy.csi_reports.iter().map(|r| CsiReportMacConfig { period_slots: r.period_slots, offset_slots: r.offset_slots, pucch_resource: r.pucch_resource, quantity: r.quantity, nof_ports: r.nof_ports, allowed_ranks: r.allowed_ranks() }).collect();
     mac.csi_enabled = !mac.csi_reports.is_empty();
     mac.harq_codebook_dynamic = phy.harq_codebook_dynamic;
     mac.nof_dl_harq = phy.pdsch.nof_harq_processes.max(1);

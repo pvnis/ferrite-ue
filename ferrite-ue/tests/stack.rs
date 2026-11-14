@@ -28,7 +28,7 @@ fn mib() -> MibInfo {
 
 fn config() -> UeConfig {
     UeConfig {
-        radio: RadioConfig::Zmq { tx: String::new(), rx: String::new() },
+        radio: RadioConfig::Zmq { tx: vec![String::new()], rx: String::new() },
         fs: 15.36e6,
         dl_center_hz: 3.5e9,
         ul_center_hz: 3.5e9,

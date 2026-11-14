@@ -199,6 +199,10 @@ pub struct CsiIndication {
     pub slot: SlotPoint,
     pub sinr_db: f32,
     pub cqi: u8,
+    /// Rank indicator (1-based) and the Type I single-panel PMI (`i2`) the
+    /// PHY recommends; 1 / 0 for a single-layer receiver.
+    pub ri: u8,
+    pub pmi: u8,
     /// Wideband RSRP in dBFS (relative to full scale), for cell quality.
     pub rsrp_dbfs: f32,
 }

@@ -29,12 +29,16 @@ fn main() {
     let block_len = 1920usize;
     let mu = ferrite_common::Numerology::from_scs_khz(cfg.ssb_scs_khz).map_or(1, |n| n.mu);
     let slot_us = 1000.0 / (1u32 << mu) as f64;
-    let (dl, ul): (BufferedStream, UlServer) = match &cfg.radio {
+    let (dl, ul): (ferrite_l1::radio::DlStream, UlServer) = match &cfg.radio {
         RadioConfig::Zmq { tx, rx } => {
-            let src = ferrite_radio::zmq::ZmqSource::connect(tx, cfg.fs, 5_000).expect("connect DL");
+            let chans: Vec<BufferedStream> = tx
+                .iter()
+                .map(|ep| BufferedStream::spawn(ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000).unwrap_or_else(|e| panic!("connect DL {ep}: {e}")), block_len))
+                .collect();
+            log::info!("DL: {} receive antenna(s) {:?}", chans.len(), tx);
             let sink = ferrite_radio::zmq::ZmqSink::bind(rx, cfg.fs, block_len).expect("bind UL");
             (
-                BufferedStream::spawn(src, block_len),
+                ferrite_l1::radio::DlStream::new(chans),
                 UlServer {
                     sink: Box::new(ferrite_l1::radio::ZmqUlSink(sink)),
                     pacing: UlPacing::Lockstep { pace_us: slot_us },

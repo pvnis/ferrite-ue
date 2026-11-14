@@ -132,7 +132,7 @@ the DL-decode→HARQ-ACK path beats the 500 µs slot deadline:
   parallel).
 - **TX-build thread**: PUSCH / CSI modulation, off the timeline thread.
 
-See `ferrite-ue/src/rt.rs` for the queue/stage plumbing. Two lessons that
+See `ferrite-l1/src/rt.rs` for the queue/stage plumbing. Two lessons that
 made 500 µs work: the decode→ACK pipeline lag is bounded by the worker **queue
 depth** (kept shallow so bursts drop instead of stalling), and the PDSCH
 time-domain shape must come from the **DCI's TDRA bit**, not the slot index
@@ -140,38 +140,19 @@ time-domain shape must come from the **DCI's TDRA bit**, not the slot index
 
 ### Protocol stack (L2 / L3)
 
-There are no separate `mac`/`rlc`/`pdcp`/`sdap` modules. Ferrite targets exactly
-one bearer configuration (the one the gNB signals in RRCReconfiguration — SRB1 on
-RLC-AM, one DRB on RLC-UM, no SDAP header, PDCP NEA0), so L2 is a set of byte-exact
-**framing functions** rather than general stateful layer objects. The *state*
-(sequence numbers, reassemblers, HARQ) lives in `main.rs`'s `run()` loop; the
-framing is split by plane across two files, each citing the relevant TS inline:
-
-- **`src/userplane.rs`** — user plane (DRB 1 / LCID 4): SDAP (absent — the raw IP
-  packet *is* the SDAP SDU), PDCP 18-bit Data PDU (`pdcp_data_pdu`), RLC-UM with
-  segmentation + reassembly (`rlc_um_segment`, `RlcUmReassembler`), MAC subheader
-  framing (`drb_mac_wrap`). TS 38.323/38.322/38.321.
-- **`src/rrc.rs`** — control plane (SRB1 / LCID 1): PDCP with the 128-NIA2 MAC-I
-  (`srb1_msg5_pdu`, `parse_srb1_dl_pdcp`), RLC-AM headers + reassembly + STATUS
-  (`parse_rlc_am_header`, `RlcReassembler`, `rlc_status_mac_pdu`), MAC CEs
-  (`mac_short_bsr`) and the shared DL MAC-PDU parser (`parse_dl_mac_pdu`).
-- **`src/sib1.rs`** — hand-rolled UPER (X.691) decode of SIB1 (TS 38.331): the cell's
-  TDD UL/DL pattern, the PUSCH k2 / PDSCH SLIV time-domain allocation lists, PRACH
-  and PUCCH common config. Decoded live during the RA phase; drives the slot gates
-  (DL dispatch, Msg4 monitoring, Msg3/PUCCH/SR/CSI timing) and per-grant k2, so the
-  UE follows the broadcast TDD configuration instead of transcribed constants.
-- **`src/cellgroup.rs`** — hand-rolled UPER decode of the RRCSetup `masterCellGroup`
-  (`CellGroupConfig`, TS 38.331): the dedicated config that a shorter TDD pattern
-  needs. Extracts the dl-DataToUL-ACK (k1) list, the dedicated PUCCH resources + SR
-  config, the CSI-RS / CSI-report resources, and the TDRA-list sizes that set the
-  **DCI 0_1 / 1_1 field widths**. Parsed at the Msg4 win; drives the connected-mode
-  blind decode geometry, the HARQ-ACK / SR / CSI resource choice, and the CSI report.
-  `src/uper.rs` is the shared bit reader.
-
-RRC (TS 38.331) and NAS (TS 24.501) message coding sit above these, in `src/rrc.rs`
-and `src/nas.rs`; 5G-AKA / key derivation is in `src/milenage.rs`. The MAC
-scheduler proper — UL-grant handling, the HARQ-ACK codebook, retransmission
-soft-combining — is the T0 loop + RX-PHY worker in `main.rs`, not a framing helper.
+L2 and L3 are separate crates with real state machines (see
+`docs/ARCHITECTURE.md` for the diagrams): `ferrite-rlc` (TM/UM/AM with
+segmentation, reassembly, STATUS and polling), `ferrite-pdcp` (COUNT/HFN,
+reordering, NIA/NEA through `ferrite-security`), `ferrite-mac` (random access,
+HARQ, BSR/SR/PHR, LCP, timing advance, DRX, bandwidth parts), `ferrite-rrc`
+(system information, connection establishment, security mode, reconfiguration,
+release and paging, re-establishment, measurements, radio link failure) and
+`ferrite-nas` (registration with 5G-AKA, PDU sessions, service request,
+deregistration, the 5GMM substates and timers). `ferrite-asn1` holds the
+hand-written UPER codecs for SIB1/SI, the RRC messages and `CellGroupConfig`;
+`ferrite-ue` is the thin stack glue plus the TUN/ping user plane. The MAC
+entity is the only L2 layer that talks to the PHY, through the FAPI-style
+messages of `ferrite-fapi`.
 
 ## Workspace layout
 

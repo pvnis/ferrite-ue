@@ -154,6 +154,15 @@ another BWP resolves to `Dci::BwpSwitch` (TS 38.212 Table 7.3.1.1.2-1 value →
 BWP-Id); the grant it carries is not resolved, so the gNB's first
 transmission on the new BWP is lost and retransmitted — a known simplification.
 
+Receive antennas: `radio::DlStream` holds one `BufferedStream` per antenna
+and reads them in lockstep (same sample index everywhere); cell search and
+the SSB tracking read antenna 0, the slot loop reads all antennas and hands
+`Arc<Vec<Vec<Iq>>>` (per antenna) to the PDSCH worker. The PDCCH monitor and,
+until the two-layer demapper lands, the PDSCH decoder use antenna 0; the CSI
+report carries RI 1 / PMI 0 in the TS 38.212 Table 6.3.1.1.2-7 layout
+(`RI | padding | PMI | CQI`, sized from the codebook's ports and
+`ri-Restriction`), so a two-antenna gNB keeps scheduling one layer.
+
 Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the
 serving SSB: `rlm_evaluate` turns the SSB SINR into `SYNC.indication
 in_sync = false` below Q_out (−8 dB, or SSB not found) and `in_sync = true`

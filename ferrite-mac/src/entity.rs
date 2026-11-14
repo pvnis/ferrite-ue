@@ -92,8 +92,8 @@ pub struct MacEntity {
     c_rnti: Option<Rnti>,
     tc_rnti: Option<Rnti>,
     pending_pusch: BTreeMap<u64, PendingPusch>,
-    /// Latest CSI measurement (cqi, slot measured).
-    pending_cqi: Option<(u8, SlotPoint)>,
+    /// Latest CSI measurement and the slot it was taken in.
+    pending_csi: Option<(CsiValues, SlotPoint)>,
     /// Pending C-RNTI MAC CE for the next UL PDU (C-RNTI-based RA).
     crnti_ce_pending: bool,
     events: Vec<MacEvent>,
@@ -141,7 +141,7 @@ impl MacEntity {
             c_rnti: None,
             tc_rnti: None,
             pending_pusch: BTreeMap::new(),
-            pending_cqi: None,
+            pending_csi: None,
             crnti_ce_pending: false,
             events: Vec::new(),
             ra_start: None,
@@ -241,7 +241,7 @@ impl MacEntity {
         self.ul_harq.reset();
         self.ack_book = AckBook::default();
         self.pending_pusch.clear();
-        self.pending_cqi = None;
+        self.pending_csi = None;
         self.bsr.cancel();
         self.phr.reset();
         for s in &mut self.sr {
@@ -419,9 +419,9 @@ impl MacEntity {
         // CSI report occasion? Not outside DRX Active Time (§5.7).
         let csi: Option<(Vec<u8>, u8)> = if self.cfg.csi_enabled && self.drx.is_active() {
             self.cfg.csi_reports.iter().find(|c| target.is_occasion(c.period_slots as u32, c.offset_slots as u32)).and_then(|c| {
-                let (cqi, when) = self.pending_cqi?;
+                let (v, when) = self.pending_csi?;
                 // Only report a measurement from the current report period.
-                (target.diff(&when) >= 0 && target.diff(&when) < c.period_slots as i64).then(|| (cqi_bits(cqi), c.pucch_resource))
+                (target.diff(&when) >= 0 && target.diff(&when) < c.period_slots as i64).then(|| (csi_report_bits(c, v), c.pucch_resource))
             })
         } else {
             None
@@ -432,7 +432,7 @@ impl MacEntity {
             let ack = if has_ack || p.grant.dai.is_some() { self.ack_book.take(target, p.grant.dai) } else { Vec::new() };
             let csi1 = csi.map(|c| c.0).unwrap_or_default();
             if !csi1.is_empty() {
-                self.pending_cqi = None;
+                self.pending_csi = None;
             }
             p.tb.truncate(p.tb.len());
             let uci = UciPayload { harq_ack: ack, sr: None, csi1 };
@@ -489,7 +489,7 @@ impl MacEntity {
         };
         if let (0, false, Some(&(_, r))) = (n_ack, sr_positive, csi.as_ref()) {
             // CSI only → the report's resource (F2).
-            self.pending_cqi = None;
+            self.pending_csi = None;
             return (PucchResourceRef::Dedicated(r), UciPayload { harq_ack: Vec::new(), sr: sr_res.map(|_| false), csi1: csi_bits });
         }
         if n_ack == 0 && sr_positive {
@@ -509,7 +509,7 @@ impl MacEntity {
         // (if the slot is an SR occasion) and CSI (if simultaneous reporting is allowed).
         let csi1 = if self.cfg.pucch.simultaneous_harq_ack_csi || n_ack == 0 { csi_bits } else { Vec::new() };
         if !csi1.is_empty() {
-            self.pending_cqi = None;
+            self.pending_csi = None;
         }
         let bits = n_ack + usize::from(sr_res.is_some()) + csi1.len();
         let res = set_for(bits.max(3))
@@ -773,8 +773,58 @@ impl MacEntity {
 }
 
 /// 4-bit wideband CQI, MSB first.
-fn cqi_bits(cqi: u8) -> Vec<u8> {
-    vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]
+/// One CSI measurement as the PHY reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsiValues {
+    pub cqi: u8,
+    /// Rank indicator, 1-based.
+    pub ri: u8,
+    /// Type I single-panel PMI (`i2`).
+    pub pmi: u8,
+}
+
+fn push_bits(out: &mut Vec<u8>, v: u32, n: usize) {
+    for i in (0..n).rev() {
+        out.push(((v >> i) & 1) as u8);
+    }
+}
+
+/// PMI field width of the Type I single-panel codebook (TS 38.212 Table
+/// 6.3.1.1.2-2 for two ports: `i2` only, 2 bits at rank 1, 1 bit at rank 2;
+/// nothing for one port). Codebooks with more ports are not reported yet.
+fn pmi_bits(nof_ports: u8, rank: u8) -> usize {
+    match (nof_ports, rank) {
+        (2, 1) => 2,
+        (2, _) => 1,
+        _ => 0,
+    }
+}
+
+/// A wideband CSI report on PUCCH (TS 38.212 §6.3.1.1.2, Table 6.3.1.1.2-7):
+/// one codeword `CRI | RI | zero padding | PMI | wideband CQI`, sized for the
+/// rank with the widest PMI so its length does not depend on the reported
+/// rank. CRI is 0 bits (one CSI-RS resource); RI is `⌈log2(allowed ranks)⌉`
+/// bits indexing the ranks the `ri-Restriction` allows.
+fn csi_report_bits(cfg: &crate::CsiReportMacConfig, v: CsiValues) -> Vec<u8> {
+    use ferrite_fapi::config::CsiReportQuantity as Q;
+    let mut out = Vec::new();
+    let ranks = &cfg.allowed_ranks;
+    let with_ri = matches!(cfg.quantity, Q::RiCqi | Q::RiPmiCqi) && ranks.len() > 1;
+    let with_pmi = cfg.quantity == Q::RiPmiCqi;
+    let ri = if ranks.contains(&v.ri) { v.ri } else { ranks[0] };
+    if with_ri {
+        let bits = (usize::BITS - (ranks.len() - 1).leading_zeros()) as usize;
+        let idx = ranks.iter().position(|&r| r == ri).unwrap_or(0) as u32;
+        push_bits(&mut out, idx, bits);
+    }
+    if with_pmi {
+        let widest = ranks.iter().map(|&r| pmi_bits(cfg.nof_ports, r)).max().unwrap_or(0);
+        let mine = pmi_bits(cfg.nof_ports, ri);
+        push_bits(&mut out, 0, widest - mine);
+        push_bits(&mut out, u32::from(v.pmi), mine);
+    }
+    push_bits(&mut out, u32::from(v.cqi & 0xf), 4);
+    out
 }
 
 impl MacEntity {
@@ -784,7 +834,7 @@ impl MacEntity {
             PhyToMac::Slot(s) => self.on_slot(s.slot, phy, upper),
             PhyToMac::Dci(d) => self.on_dci(d.slot, d.dci, phy, upper),
             PhyToMac::RxData(d) => self.on_rx_data(d, phy, upper),
-            PhyToMac::Csi(c) => self.pending_cqi = Some((c.cqi, c.slot)),
+            PhyToMac::Csi(c) => self.pending_csi = Some((CsiValues { cqi: c.cqi, ri: c.ri.max(1), pmi: c.pmi }, c.slot)),
             PhyToMac::Rach(r) => {
                 let acts = self.ra.on_prach_sent(r.slot);
                 self.apply_ra_actions(acts, phy);
@@ -795,5 +845,37 @@ impl MacEntity {
                 ErrorIndication::SyncLost | ErrorIndication::Radio => self.events.push(MacEvent::RadioLinkFailure),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod csi_report_tests {
+    use super::*;
+    use ferrite_fapi::config::CsiReportQuantity as Q;
+
+    fn cfg(q: Q, ports: u8, ranks: &[u8]) -> crate::CsiReportMacConfig {
+        crate::CsiReportMacConfig { period_slots: 20, offset_slots: 0, pucch_resource: 8, quantity: q, nof_ports: ports, allowed_ranks: ranks.to_vec() }
+    }
+
+    #[test]
+    fn one_port_report_is_the_cqi_alone() {
+        let b = csi_report_bits(&cfg(Q::RiPmiCqi, 1, &[1]), CsiValues { cqi: 9, ri: 1, pmi: 0 });
+        assert_eq!(b, vec![1, 0, 0, 1]);
+        assert_eq!(csi_report_bits(&cfg(Q::Cqi, 2, &[1, 2]), CsiValues { cqi: 15, ri: 2, pmi: 1 }), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn two_port_report_has_a_fixed_seven_bit_layout() {
+        // Rank 1: RI = 0 (first allowed rank), PMI i2 2 bits, CQI 4 bits.
+        let b = csi_report_bits(&cfg(Q::RiPmiCqi, 2, &[1, 2]), CsiValues { cqi: 8, ri: 1, pmi: 3 });
+        assert_eq!(b, vec![0, 1, 1, 1, 0, 0, 0]);
+        // Rank 2: RI = 1, one padding bit, PMI 1 bit, CQI.
+        let b = csi_report_bits(&cfg(Q::RiPmiCqi, 2, &[1, 2]), CsiValues { cqi: 8, ri: 2, pmi: 1 });
+        assert_eq!(b, vec![1, 0, 1, 1, 0, 0, 0]);
+        // A rank the restriction does not allow falls back to the lowest allowed one.
+        let b = csi_report_bits(&cfg(Q::RiPmiCqi, 2, &[1]), CsiValues { cqi: 8, ri: 2, pmi: 1 });
+        assert_eq!(b, vec![0, 1, 1, 0, 0, 0], "no RI field with one allowed rank, PMI 2 bits");
+        // RI without PMI.
+        assert_eq!(csi_report_bits(&cfg(Q::RiCqi, 2, &[1, 2]), CsiValues { cqi: 1, ri: 2, pmi: 0 }), vec![1, 0, 0, 0, 1]);
     }
 }

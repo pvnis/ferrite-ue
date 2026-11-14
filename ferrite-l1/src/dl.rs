@@ -374,7 +374,8 @@ impl DlMonitor {
 /// One PDSCH to decode (the samples of its slot travel with it).
 pub struct PdschJob {
     pub slot: SlotPoint,
-    pub samples: std::sync::Arc<Vec<Iq>>,
+    /// One slot of samples per receive antenna.
+    pub samples: std::sync::Arc<Vec<Vec<Iq>>>,
     pub grant: DlGrant,
     /// Retransmission of an already delivered TB: ACK without decoding.
     pub skip_decode: bool,
@@ -442,7 +443,8 @@ impl PdschWorker {
             }
             let sinr = csi::measure_csi_rs_sinr(&grids[m.symbol], sc_to_bin, m, slot.slot as u32);
             let rsrp = grids[m.symbol].iter().map(|c| c.norm_sqr()).sum::<f32>() / grids[m.symbol].len().max(1) as f32;
-            return Some(CsiIndication { slot, sinr_db: sinr, cqi: csi::sinr_to_cqi(sinr), rsrp_dbfs: 10.0 * rsrp.max(1e-12).log10() });
+            // Single-layer receiver: rank 1, PMI 0 until the MIMO measurement exists.
+            return Some(CsiIndication { slot, sinr_db: sinr, cqi: csi::sinr_to_cqi(sinr), rsrp_dbfs: 10.0 * rsrp.max(1e-12).log10(), ri: 1, pmi: 0 });
         }
         None
     }

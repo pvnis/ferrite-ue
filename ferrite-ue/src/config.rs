@@ -16,7 +16,8 @@ pub struct Cli {
     /// Radio backend: `zmq` (gNB over ZeroMQ) or `sdr` (SoapySDR via seify).
     #[arg(long)]
     pub radio: Option<String>,
-    /// gNB downlink ZMQ endpoint (the UE reads samples here).
+    /// gNB downlink ZMQ endpoint(s), one per receive antenna, comma
+    /// separated (e.g. `tcp://127.0.0.1:2100,tcp://127.0.0.1:2102`).
     #[arg(long)]
     pub tx: Option<String>,
     /// gNB uplink ZMQ endpoint (the UE serves samples here).
@@ -203,7 +204,8 @@ pub struct UeConfig {
 
 #[derive(Debug, Clone)]
 pub enum RadioConfig {
-    Zmq { tx: String, rx: String },
+    /// One downlink endpoint per receive antenna; one uplink endpoint.
+    Zmq { tx: Vec<String>, rx: String },
     Sdr { args: String, rx_gain: f64, tx_gain: f64 },
 }
 
@@ -226,7 +228,7 @@ impl UeConfig {
         }
         let radio_kind = pick!(radio, "zmq".to_string());
         let radio = match radio_kind.as_str() {
-            "zmq" => RadioConfig::Zmq { tx: pick!(tx, "tcp://127.0.0.1:2100".into()), rx: pick!(rx, "tcp://127.0.0.1:2101".into()) },
+            "zmq" => RadioConfig::Zmq { tx: pick!(tx, "tcp://127.0.0.1:2100".into()).split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), rx: pick!(rx, "tcp://127.0.0.1:2101".into()) },
             "sdr" => RadioConfig::Sdr {
                 args: pick!(sdr_args, "driver=soapy".into()),
                 rx_gain: pick!(sdr_rx_gain, 50.0),

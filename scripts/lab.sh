@@ -4,7 +4,8 @@
 #   scripts/lab.sh <config-id> [--duration S] [--ping N] [--no-core]
 #
 # config-id ∈ T1 (tdd_n78_10mhz) T2 (tdd_n78_10mhz_dddsu) T3 (tdd_n78_20mhz)
-#             T4 (tdd_n78_10mhz_drx) F1 (fdd_n3_10mhz) F2 (fdd_n3_20mhz)
+#             T4 (tdd_n78_10mhz_drx) T5 (tdd_n78_10mhz_2x2, two DL antennas)
+#             F1 (fdd_n3_10mhz) F2 (fdd_n3_20mhz)
 #
 # Starts qcore (sudo) and the OCUDU gNB with the matching config, then the UE
 # with the matching ARFCN / sample rate, waits for the ping probe to finish (or
@@ -32,6 +33,7 @@ case "$ID" in
   T2) CFG=gnb_zmq_tdd_n78_10mhz_dddsu; ARFCN=626000; SRATE=15.36;;
   T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72;;
   T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36;;
+  T5) CFG=gnb_zmq_tdd_n78_10mhz_2x2;   ARFCN=626000; SRATE=15.36; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102";;
   F1) CFG=gnb_zmq_fdd_n3_10mhz;        ARFCN=368500; SRATE=11.52;;
   F2) CFG=gnb_zmq_fdd_n3_20mhz;        ARFCN=368500; SRATE=23.04;;
   *) echo "unknown config id $ID"; exit 2;;
@@ -79,7 +81,7 @@ grep -q "gNB started" "$OUT/gnb.out" || { echo "gNB did not start"; cat "$OUT/gn
 sleep 1
 
 ( cd "$ROOT" && RUST_LOG="${UE_LOG:-info}" cargo run --release -p ferrite-ue -q -- --dl-arfcn "$ARFCN" --srate "$SRATE" \
-    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
+    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_TX:+--tx "$UE_TX"} ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
 UE_PID=$!
 # DL_PING=1: once the gNB has released the UE to idle, ping its IP from the
 # host (through qcore) so the network has to page it.
@@ -113,10 +115,12 @@ if grep -q "ping done" "$UE"; then
 else
   fail "S8 ping (no result)"
 fi
-# S14/S17: idle mode (only when the gNB released the UE during the run): the
-# next uplink data must come back through a service request; with DL_PING=1 a
-# host-side ping during idle must page the UE.
-if grep -q "RRC released (idle)" "$UE"; then
+# S14/S17: idle mode (only when the gNB released the UE during the run and
+# the run had traffic afterwards — a second ping round or a host-side ping;
+# the deregistration at exit reconnects with mo-Signalling, not a service
+# request): the next uplink data must come back through a service request;
+# with DL_PING=1 a host-side ping during idle must page the UE.
+if grep -q "RRC released (idle)" "$UE" && { grep -q "ping round 1 of" "$UE" || [ "${DL_PING:-0}" = "1" ]; }; then
   grep -q "service request (mo-Data)" "$UE" && pass "S14 release → idle → service request (mo-Data)" || fail "S14 release → idle → service request (mo-Data)"
   if [ "${DL_PING:-0}" = "1" ]; then
     grep -q "paged: requesting service" "$UE" && pass "S17 paging → service request (mt-Access)" || fail "S17 paging → service request (mt-Access)"

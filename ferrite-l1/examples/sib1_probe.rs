@@ -102,7 +102,7 @@ fn main() {
         }
     });
     let mut probe = Probe { cmd: cmd_tx, slots: 0, got: false };
-    let r = engine::run(params, BufferedStream::spawn(src, block), server, &mut probe, cmd_rx, ev_tx);
+    let r = engine::run(params, ferrite_l1::radio::DlStream::single(BufferedStream::spawn(src, block)), server, &mut probe, cmd_rx, ev_tx);
     log::info!("engine: {r:?}");
     std::process::exit(if probe.got { 0 } else { 1 });
 }

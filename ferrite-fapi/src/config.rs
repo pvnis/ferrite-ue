@@ -488,6 +488,31 @@ pub struct CsiReportConfig {
     pub pucch_resource: u8,
     /// `cqi-Table`: 0 = table1, 1 = table2, 2 = table3.
     pub cqi_table: u8,
+    /// `reportQuantity`.
+    pub quantity: CsiReportQuantity,
+    /// CSI-RS antenna ports of the PMI codebook (1 without a `codebookConfig`).
+    pub nof_ports: u8,
+    /// `typeI-SinglePanel-ri-Restriction` (MSB first: bit 7 allows rank 1);
+    /// `0x80` without a codebook.
+    pub ri_restriction: u8,
+}
+
+/// `CSI-ReportConfig.reportQuantity`, the part the UE implements (TS 38.214
+/// §5.2.1.4): CQI alone, with RI, or with RI and PMI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CsiReportQuantity {
+    #[default]
+    Cqi,
+    RiCqi,
+    RiPmiCqi,
+}
+
+impl CsiReportConfig {
+    /// Ranks the `ri-Restriction` allows, ascending (rank 1 when nothing is set).
+    pub fn allowed_ranks(&self) -> Vec<u8> {
+        let v: Vec<u8> = (0..8u8).filter(|i| self.ri_restriction & (0x80 >> i) != 0).map(|i| i + 1).collect();
+        if v.is_empty() { vec![1] } else { v }
+    }
 }
 
 /// A carrier (`SCS-SpecificCarrier`): where the sampled stream sits on the CRB grid.

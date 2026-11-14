@@ -298,6 +298,75 @@ pub struct ReportFreqConfiguration {
     pub csi_reporting_band: Option<(u8, u32)>,
 }
 
+/// `CodebookConfig ::= SEQUENCE { codebookType CHOICE { type1 SEQUENCE { subType CHOICE {
+/// typeI-SinglePanel SEQUENCE { nrOfAntennaPorts CHOICE { two SEQUENCE {
+/// twoTX-CodebookSubsetRestriction BIT STRING (SIZE (6)) }, moreThanTwo SEQUENCE { n1-n2 CHOICE {
+/// two-one … sixteen-one (13 restriction bit strings) },
+/// typeI-SinglePanel-codebookSubsetRestriction-i2 BIT STRING (SIZE (16)) OPTIONAL } },
+/// typeI-SinglePanel-ri-Restriction BIT STRING (SIZE (8)) }, typeI-MultiPanel SEQUENCE {…} },
+/// codebookMode INTEGER (1..2) }, type2 SEQUENCE {…} } }` (TS 38.331). Only Type I single
+/// panel is decoded; multi-panel and Type II are a decode error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodebookConfig {
+    pub ports: CodebookPorts,
+    /// `typeI-SinglePanel-ri-Restriction`: bit `i` (MSB first, so bit 7 is
+    /// rank 1) allows rank `i + 1`.
+    pub ri_restriction: u8,
+    /// `codebookMode` 1 or 2.
+    pub codebook_mode: u8,
+}
+
+/// `nrOfAntennaPorts` of the Type I single-panel codebook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodebookPorts {
+    /// Two antenna ports with the 6-bit `twoTX-CodebookSubsetRestriction`.
+    Two { subset_restriction: u8 },
+    /// `(N1, N2)` panel and the restriction bit string (MSB first), plus the
+    /// optional `codebookSubsetRestriction-i2`.
+    MoreThanTwo { n1: u8, n2: u8, restriction: Vec<u8>, i2_restriction: Option<u16> },
+}
+
+impl CodebookConfig {
+    /// Number of CSI-RS antenna ports the codebook describes.
+    pub fn nof_ports(&self) -> u8 {
+        match &self.ports {
+            CodebookPorts::Two { .. } => 2,
+            CodebookPorts::MoreThanTwo { n1, n2, .. } => 2 * n1 * n2,
+        }
+    }
+
+    /// Highest rank the `ri-Restriction` allows (0 when none).
+    pub fn max_rank(&self) -> u8 {
+        (0..8u8).rev().find(|i| self.ri_restriction & (0x80 >> i) != 0).map_or(0, |i| i + 1)
+    }
+
+    fn decode(r: &mut BitReader) -> DecodeResult<Self> {
+        if r.bit()? {
+            return r.unsupported("codebookConfig type2");
+        }
+        if r.bit()? {
+            return r.unsupported("codebookConfig typeI-MultiPanel");
+        }
+        let ports = if !r.bit()? {
+            CodebookPorts::Two { subset_restriction: r.bitstring(6)? as u8 }
+        } else {
+            let [has_i2] = r.opt_bits::<1>()?;
+            // n1-n2 CHOICE: (N1, N2, restriction bits) per alternative.
+            const ALTS: [(u8, u8, u16); 13] = [
+                (2, 1, 8), (2, 2, 64), (4, 1, 16), (3, 2, 96), (6, 1, 24), (4, 2, 128), (8, 1, 32),
+                (4, 3, 192), (6, 2, 192), (12, 1, 48), (4, 4, 256), (8, 2, 256), (16, 1, 64),
+            ];
+            let (n1, n2, bits) = ALTS[r.uint(0, 12)? as usize];
+            let restriction = r.bitstring_bytes(bits as usize)?;
+            let i2_restriction = r.opt(has_i2, |r| Ok(r.bitstring(16)? as u16))?;
+            CodebookPorts::MoreThanTwo { n1, n2, restriction, i2_restriction }
+        };
+        let ri_restriction = r.bitstring(8)? as u8;
+        let codebook_mode = r.uint(1, 2)? as u8;
+        Ok(CodebookConfig { ports, ri_restriction, codebook_mode })
+    }
+}
+
 /// `groupBasedBeamReporting CHOICE { enabled NULL, disabled SEQUENCE { nrofReportedRS
 /// ENUMERATED { n1, n2, n3, n4 } OPTIONAL } }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,7 +395,7 @@ pub enum CqiTable {
 /// non-PMI-PortIndication SEQUENCE (SIZE (1..maxNrofNZP-CSI-RS-ResourcesPerConfig)) OF
 /// PortIndexFor8Ranks OPTIONAL, ... }`.
 ///
-/// `codebookConfig` and `non-PMI-PortIndication` are not supported (decode error when present).
+/// `non-PMI-PortIndication` is not supported (decode error when present).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CsiReportConfig {
     pub report_config_id: u8,
@@ -339,6 +408,8 @@ pub struct CsiReportConfig {
     pub report_freq_configuration: Option<ReportFreqConfiguration>,
     pub time_restriction_for_channel_measurements: bool,
     pub time_restriction_for_interference_measurements: bool,
+    /// `codebookConfig` (PMI codebook) when the report carries a PMI.
+    pub codebook_config: Option<CodebookConfig>,
     /// `dummy ENUMERATED { dynamic, semiStatic }`: `Some(true)` = dynamic.
     pub dummy_dynamic: Option<bool>,
     pub group_based_beam_reporting: GroupBasedBeamReporting,
@@ -430,9 +501,7 @@ impl CsiReportConfig {
         })?;
         let time_restriction_for_channel_measurements = r.enu(2)? == 0;
         let time_restriction_for_interference_measurements = r.enu(2)? == 0;
-        if has_cb {
-            return r.unsupported("codebookConfig");
-        }
+        let codebook_config = r.opt(has_cb, CodebookConfig::decode)?;
         let dummy_dynamic = r.opt(has_dummy, |r| Ok(r.enu(2)? == 0))?;
         let group_based_beam_reporting = if !r.bit()? {
             GroupBasedBeamReporting::Enabled
@@ -468,6 +537,7 @@ impl CsiReportConfig {
             report_freq_configuration,
             time_restriction_for_channel_measurements,
             time_restriction_for_interference_measurements,
+            codebook_config,
             dummy_dynamic,
             group_based_beam_reporting,
             cqi_table,

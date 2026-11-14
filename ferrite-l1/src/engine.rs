@@ -93,7 +93,8 @@ enum TxCmd {
 
 enum WorkerCmd {
     Job(PdschJob),
-    Measure { slot: SlotPoint, samples: Arc<Vec<Iq>> },
+    /// One slot of samples per receive antenna.
+    Measure { slot: SlotPoint, samples: Arc<Vec<Vec<Iq>>> },
     Reconfigure(Box<WorkerConfig>),
     Stop,
 }
@@ -186,8 +187,8 @@ pub struct Engine<'a> {
     tx_cmd: crossbeam_channel::Sender<TxCmd>,
     wk_cmd: crossbeam_channel::Sender<WorkerCmd>,
     wk_res: crossbeam_channel::Receiver<PhyToMac>,
-    /// Previous slot's samples (for negative timing slews).
-    prev: Vec<Iq>,
+    /// Previous slot's samples per antenna (for negative timing slews).
+    prev: Vec<Vec<Iq>>,
     prev_start: i64,
     pending_dl: BTreeMap<u64, Vec<DlGrant>>,
     pending_prach: Vec<(SlotPoint, PrachOccasion, u8)>,
@@ -301,7 +302,7 @@ pub fn run(
                         },
                         WorkerCmd::Measure { slot, samples } => {
                             if let Some(w) = worker.as_ref() {
-                                if let Some(grids) = w.demod(slot, &samples) {
+                                if let Some(grids) = w.demod(slot, &samples[0]) {
                                     if let Some(c) = w.measure_csi(slot, &grids) {
                                         let _ = wk_res_tx.send(PhyToMac::Csi(c));
                                     }
@@ -315,7 +316,7 @@ pub fn run(
                             let failed = || RxDataIndication { rnti: g.rnti, rnti_kind: g.rnti_kind, harq_id: g.harq_id, ndi: g.ndi, pdsch_slot: job.slot, tb: None, sinr_db: 0.0 };
                             let r = match worker.as_mut() {
                                 None => failed(),
-                                Some(w) => match w.demod(job.slot, &job.samples) {
+                                Some(w) => match w.demod(job.slot, &job.samples[0]) {
                                     None => failed(),
                                     Some(grids) => {
                                         if let Some(c) = w.measure_csi(job.slot, &grids) {
@@ -493,31 +494,33 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------ slot loop
 
     /// Read the samples of the slot starting at DL index `start` (length `len`).
-    fn read_slot(&mut self, start: i64, len: usize, out: &mut Vec<Iq>) -> Result<()> {
-        out.clear();
+    /// Read the slot starting at sample `start` on every antenna into
+    /// `out[antenna]`.
+    fn read_slot(&mut self, start: i64, len: usize, out: &mut Vec<Vec<Iq>>) -> Result<()> {
         let pos = self.dl.position() as i64;
         if start >= pos {
             self.dl.skip((start - pos) as usize)?;
-            out.resize(len, Iq::default());
-            self.dl.read_exact(out)?;
+            self.dl.read_exact_all(len, out)?;
         } else {
             // Earlier than the stream position: take the overlap from the previous slot.
             let back = (pos - start) as usize;
-            let prev_len = self.prev.len();
+            let prev_len = self.prev.first().map_or(0, Vec::len);
             if back > prev_len {
                 return Err(Error::Phy(format!("timing slew of {back} samples exceeds the kept history")));
             }
-            out.extend_from_slice(&self.prev[prev_len - back..]);
             let need = len.saturating_sub(back);
-            let mut rest = vec![Iq::default(); need];
-            self.dl.read_exact(&mut rest)?;
-            out.extend_from_slice(&rest);
-            out.truncate(len);
+            let mut rest: Vec<Vec<Iq>> = Vec::new();
+            self.dl.read_exact_all(need, &mut rest)?;
+            out.resize_with(rest.len(), Vec::new);
+            for (a, o) in out.iter_mut().enumerate() {
+                o.clear();
+                o.extend_from_slice(&self.prev[a][prev_len - back..]);
+                o.extend_from_slice(&rest[a]);
+                o.truncate(len);
+            }
         }
         self.prev_start = start;
-        std::mem::swap(&mut self.prev, out);
-        out.clear();
-        out.extend_from_slice(&self.prev);
+        self.prev.clone_from(out);
         Ok(())
     }
 
@@ -541,7 +544,7 @@ impl<'a> Engine<'a> {
         if backlog > 2 * sps {
             log::info!("dropping {backlog} DL samples ({:.1} ms) of search backlog", backlog as f64 / fs * 1e3);
             self.dl.skip(backlog as usize)?;
-            self.prev.clear();
+            self.prev.iter_mut().for_each(Vec::clear);
         }
         // Start at the first whole slot at/after the current stream position.
         let (mut slot, off) = s.clock.slot_at(self.dl.position() as i64);
@@ -553,9 +556,10 @@ impl<'a> Engine<'a> {
         // sends at most ~1 ms of DL beyond the UL it has received) could never
         // deliver the first whole slot.
         self.shared.committed.store(self.commit_mark(s, slot.add(self.params.tx_lead_slots as u64)), Relaxed);
-        let mut samples: Vec<Iq> = Vec::with_capacity(sps as usize);
+        let mut samples: Vec<Vec<Iq>> = Vec::new();
         let mut shifter: Option<FreqShifter> = None;
         let mut shifted: Vec<Iq> = Vec::with_capacity(sps as usize);
+        let mut shifted_all: Vec<Vec<Iq>> = Vec::new();
         let ofdm_ssb = Ofdm::new((fs / (15_000u32 << s.ssb_case.mu()) as f64).round() as usize);
         let searcher = CellSearcher::new(ofdm_ssb.fft_size(), s.ssb_case.mu(), ssb::l_max_fr1(self.params.dl_center_hz));
         let ssb_first_symbol = s.ssb_case.candidate_symbols(self.params.dl_center_hz).get(s.i_ssb as usize).copied().unwrap_or(2);
@@ -579,7 +583,7 @@ impl<'a> Engine<'a> {
             if slot.sfn % (s.ssb_period_ms / 10).max(1) == 0 && slot.slot as i64 == ssb_off_in_frame / sps {
                 let in_slot = (ssb_off_in_frame % sps) as usize;
                 let sh = FreqShifter::new(-s.geom.ssb_df_hz - s.cfo_hz, fs, sps as usize);
-                sh.shift_into(&samples, start as usize, &mut shifted);
+                sh.shift_into(&samples[0], start as usize, &mut shifted);
                 let cp = ofdm_ssb.cp_len(ssb_first_symbol % (14 << s.ssb_case.mu()), s.ssb_case.mu());
                 let expect = in_slot + cp;
                 let lo = expect.saturating_sub(96);
@@ -623,17 +627,21 @@ impl<'a> Engine<'a> {
                     self.mac.handle(PhyToMac::Sync(SyncIndication { slot, in_sync }), &mut outbox);
                 }
             }
-            // --- CFO correction for the data path.
-            let data: &[Iq] = if self.params.cfo_correction && s.cfo_hz.abs() > 1.0 {
+            // --- CFO correction for the data path (every antenna shares the LO).
+            let arc_samples: Arc<Vec<Vec<Iq>>> = if self.params.cfo_correction && s.cfo_hz.abs() > 1.0 {
                 if shifter.as_ref().is_none_or(|f| (f.shift_hz() + s.cfo_hz).abs() > 0.5) {
                     shifter = Some(FreqShifter::new(-s.cfo_hz, fs, sps as usize));
                 }
-                shifter.as_ref().unwrap().shift_into(&samples, start as usize, &mut shifted);
-                &shifted
+                shifted_all.resize_with(samples.len(), Vec::new);
+                for (a, sa) in samples.iter().enumerate() {
+                    shifter.as_ref().unwrap().shift_into(sa, start as usize, &mut shifted_all[a]);
+                }
+                Arc::new(shifted_all.clone())
             } else {
-                &samples
+                Arc::new(samples.clone())
             };
-            let arc_samples: Arc<Vec<Iq>> = Arc::new(data.to_vec());
+            // PDCCH monitoring and SSB tracking use antenna 0.
+            let data: &[Iq] = &arc_samples[0];
 
             // --- Earlier PDSCH results first: the HARQ-ACK for a PDSCH is
             // built at the SLOT.indication `k1 − tx_lead` slots after it, and

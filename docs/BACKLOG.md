@@ -64,8 +64,14 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       Msg3 setting). T3 runs OCUDU with `enable_transform_precoding` (S22,
       98/99 PUSCH CRC OK at 64-QAM). `dataScramblingIdentityPUSCH` is parsed
       but not applied (OCUDU never sets it).
-- [ ] Two-layer PDSCH (2x2 DL MIMO), multi-antenna receive, RI/PMI in the CSI
-      report (type-I single-panel codebook).
+- [ ] Two-layer PDSCH (2x2 DL MIMO). Done 2026-11-14: multi-antenna receive
+      path (`DlStream` with one stream per antenna, `--tx a,b`), the
+      `codebookConfig` decoder, and the CSI report in the Table 6.3.1.1.2-7
+      wideband PUCCH layout with RI 1 / PMI 0 — the two-antenna cell T5
+      attaches and pings with antenna 0 (before the layout fix OCUDU read the
+      4-bit CQI as RI 2 and scheduled two layers). Open: per-antenna channel
+      estimation and the 2-layer MMSE demapper, DCI 1_1 two-layer antenna
+      ports and TBS, RI/PMI measurement on the two-port (row 3) CSI-RS.
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC
@@ -231,7 +237,7 @@ for tracking; PDCCH precoder granularity allContiguousRBs; neighbour cell
 search; `EngineEvent::CellFound` / `Measurement` bypass FAPI (MIB and SSB
 measurements should be PHY→MAC indications).
 
-MAC: BWP switching; 2-step / contention-free RA (PDCCH order is
+MAC: 2-step / contention-free RA (PDCCH order is
 `Dci::Other`); SSB-based preamble/occasion selection; preamble group B; Long
 Truncated BSR, Multiple-Entry PHR, BFR, Recommended bit rate CEs; BSR
 truncation picks the lowest LCG id; padding BSR only with remaining data; LCP

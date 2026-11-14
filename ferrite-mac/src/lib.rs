@@ -140,11 +140,16 @@ pub struct PucchMacConfig {
 }
 
 /// Periodic CSI report MAC schedules: (period slots, offset slots, pucch resource id).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CsiReportMacConfig {
     pub period_slots: u16,
     pub offset_slots: u16,
     pub pucch_resource: u8,
+    /// What the report carries and the codebook it refers to (TS 38.212
+    /// Table 6.3.1.1.2-7 sizes the PUCCH payload from these).
+    pub quantity: ferrite_fapi::config::CsiReportQuantity,
+    pub nof_ports: u8,
+    pub allowed_ranks: Vec<u8>,
 }
 
 /// The MAC configuration (from RRC).

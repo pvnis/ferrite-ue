@@ -24,10 +24,67 @@ use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::rt::InjectionTable;
-use crate::stream::BufferedStream;
+pub use crate::stream::BufferedStream;
 
 /// Downlink stream handed to the engine.
-pub type DlStream = BufferedStream;
+/// The downlink sample streams, one per receive antenna, read in lockstep
+/// (the same sample index on every antenna). Antenna 0 carries the timing:
+/// cell search and the SSB tracking read it alone, the slot loop reads all.
+pub struct DlStream {
+    chans: Vec<BufferedStream>,
+    scratch: Vec<Iq>,
+}
+
+impl DlStream {
+    /// `chans` must hold at least one stream.
+    pub fn new(chans: Vec<BufferedStream>) -> Self {
+        assert!(!chans.is_empty(), "at least one receive antenna");
+        Self { chans, scratch: Vec::new() }
+    }
+
+    pub fn single(chan: BufferedStream) -> Self {
+        Self::new(vec![chan])
+    }
+
+    pub fn nof_antennas(&self) -> usize {
+        self.chans.len()
+    }
+
+    /// Samples consumed so far (identical on every antenna).
+    pub fn position(&self) -> usize {
+        self.chans[0].position()
+    }
+
+    pub fn skip(&mut self, n: usize) -> Result<()> {
+        for c in &mut self.chans {
+            c.skip(n)?;
+        }
+        Ok(())
+    }
+
+    /// Read antenna 0 into `buf`; the other antennas advance by the same
+    /// amount (their samples are dropped).
+    pub fn read_exact(&mut self, buf: &mut [Iq]) -> Result<()> {
+        self.chans[0].read_exact(buf)?;
+        if self.chans.len() > 1 {
+            self.scratch.resize(buf.len(), Iq::default());
+            for c in &mut self.chans[1..] {
+                c.read_exact(&mut self.scratch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read `len` samples of every antenna into `out[antenna]`.
+    pub fn read_exact_all(&mut self, len: usize, out: &mut Vec<Vec<Iq>>) -> Result<()> {
+        out.resize_with(self.chans.len(), Vec::new);
+        for (c, o) in self.chans.iter_mut().zip(out.iter_mut()) {
+            o.resize(len, Iq::default());
+            c.read_exact(o)?;
+        }
+        Ok(())
+    }
+}
 
 /// How to pace the uplink serve.
 #[derive(Clone, Copy, Debug, PartialEq)]
