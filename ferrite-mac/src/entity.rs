@@ -103,6 +103,9 @@ pub struct MacEntity {
     pending_pusch: BTreeMap<u64, PendingPusch>,
     /// Latest CSI measurement and the slot it was taken in.
     pending_csi: Option<(CsiValues, SlotPoint)>,
+    /// Rank and PMI from the latest multi-port CSI-RS measurement; a
+    /// single-port (TRS) measurement updates the CQI but keeps these.
+    csi_rank: Option<(u8, u8)>,
     /// Pending C-RNTI MAC CE for the next UL PDU (C-RNTI-based RA).
     crnti_ce_pending: bool,
     events: Vec<MacEvent>,
@@ -152,6 +155,7 @@ impl MacEntity {
             tc_rnti: None,
             pending_pusch: BTreeMap::new(),
             pending_csi: None,
+            csi_rank: None,
             crnti_ce_pending: false,
             events: Vec::new(),
             ra_start: None,
@@ -256,6 +260,7 @@ impl MacEntity {
         self.ack_book = AckBook::default();
         self.pending_pusch.clear();
         self.pending_csi = None;
+        self.csi_rank = None;
         self.bsr.cancel();
         self.phr.reset();
         for s in &mut self.sr {
@@ -977,6 +982,21 @@ impl MacEntity {
 }
 
 /// 4-bit wideband CQI, MSB first.
+/// Fold a CSI indication into the report values: a multi-port measurement
+/// sets the rank / PMI (remembered in `rank`), a single-port one carries the
+/// CQI only and keeps the last multi-port rank / PMI (rank 1 if none yet).
+fn merge_csi(rank: &mut Option<(u8, u8)>, c: &CsiIndication) -> CsiValues {
+    if c.nof_ports >= 2 {
+        *rank = Some((c.ri.max(1), c.pmi));
+    }
+    let (ri, pmi) = rank.unwrap_or((1, 0));
+    CsiValues {
+        cqi: c.cqi,
+        ri,
+        pmi,
+    }
+}
+
 /// One CSI measurement as the PHY reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CsiValues {
@@ -1052,14 +1072,8 @@ impl MacEntity {
             PhyToMac::Dci(d) => self.on_dci(d.slot, d.dci, phy, upper),
             PhyToMac::RxData(d) => self.on_rx_data(d, phy, upper),
             PhyToMac::Csi(c) => {
-                self.pending_csi = Some((
-                    CsiValues {
-                        cqi: c.cqi,
-                        ri: c.ri.max(1),
-                        pmi: c.pmi,
-                    },
-                    c.slot,
-                ))
+                let v = merge_csi(&mut self.csi_rank, &c);
+                self.pending_csi = Some((v, c.slot));
             }
             PhyToMac::Rach(r) => {
                 let acts = self.ra.on_prach_sent(r.slot);
@@ -1082,6 +1096,30 @@ impl MacEntity {
 mod csi_report_tests {
     use super::*;
     use ferrite_fapi::config::CsiReportQuantity as Q;
+
+    /// A single-port TRS measurement after a two-port one keeps the rank and
+    /// PMI the two-port measurement recommended, and only refreshes the CQI.
+    #[test]
+    fn single_port_measurement_keeps_the_multi_port_rank() {
+        let ind = |cqi, ri, pmi, nof_ports| CsiIndication {
+            slot: SlotPoint::new(ferrite_common::Numerology::from_scs_khz(30).unwrap(), 0, 4),
+            sinr_db: 30.0,
+            cqi,
+            ri,
+            pmi,
+            nof_ports,
+            rsrp_dbfs: -20.0,
+        };
+        let mut rank = None;
+        let v = merge_csi(&mut rank, &ind(12, 1, 0, 1));
+        assert_eq!((v.cqi, v.ri, v.pmi), (12, 1, 0));
+        let v = merge_csi(&mut rank, &ind(15, 2, 1, 2));
+        assert_eq!((v.cqi, v.ri, v.pmi), (15, 2, 1));
+        let v = merge_csi(&mut rank, &ind(13, 1, 0, 1));
+        assert_eq!((v.cqi, v.ri, v.pmi), (13, 2, 1));
+        let v = merge_csi(&mut rank, &ind(14, 1, 3, 2));
+        assert_eq!((v.cqi, v.ri, v.pmi), (14, 1, 3));
+    }
 
     fn cfg(q: Q, ports: u8, ranks: &[u8]) -> crate::CsiReportMacConfig {
         crate::CsiReportMacConfig {

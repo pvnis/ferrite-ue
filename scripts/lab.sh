@@ -156,7 +156,7 @@ fi
 # UE reports RI 2, the gNB schedules two-layer PDSCHs and the UE decodes them
 # (DL transport block failures stay below 10 %).
 if grep -q "nof_antennas_dl: 2" "$ROOT/test/$CFG.yml" 2>/dev/null; then
-  L2=$(grep -c "nof_layers=2" "$OUT/gnb.log" 2>/dev/null || echo 0)
+  L2=$(grep -c "nof_layers=2" "$OUT/gnb.log" 2>/dev/null); L2=${L2:-0}
   OK=$(grep -o "dl_tb_ok: [0-9]*" "$UE" | tail -1 | awk '{print $2}'); KO=$(grep -o "dl_tb_ko: [0-9]*" "$UE" | tail -1 | awk '{print $2}')
   if [ "${L2:-0}" -gt 0 ] && [ "${OK:-0}" -gt 0 ] && [ $((KO * 10)) -le "$OK" ]; then pass "S28 two-layer PDSCH ($L2 scheduled, DL TB ok/ko $OK/$KO)"; else fail "S28 two-layer PDSCH (layers-2 $L2, DL TB ok/ko ${OK:-0}/${KO:-0})"; fi
 fi

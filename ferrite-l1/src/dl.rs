@@ -566,27 +566,44 @@ impl PdschWorker {
     ) -> Option<CsiIndication> {
         let grids: &[Vec<Iq>] = &grids_all[0];
         let sc_to_bin = self.cfg.geom.dl_sc_to_bin();
+        let rsrp_dbfs = |symbol: usize| {
+            let p = grids[symbol].iter().map(|c| c.norm_sqr()).sum::<f32>()
+                / grids[symbol].len().max(1) as f32;
+            10.0 * p.max(1e-12).log10()
+        };
+        // A two-port resource in this slot gives rank, PMI and CQI from every
+        // antenna; otherwise the single-port TRS gives the CQI alone (rank 1).
+        let mut single = None;
         for (m, period, offset) in &self.cfg.csi_meas {
             if !csi::csi_rs_slots(*period, *offset, slot) {
                 continue;
             }
-            let sinr = csi::measure_csi_rs_sinr(&grids[m.symbol], sc_to_bin, m, slot.slot as u32);
-            let rsrp = grids[m.symbol].iter().map(|c| c.norm_sqr()).sum::<f32>()
-                / grids[m.symbol].len().max(1) as f32;
-            // Rank: one layer per receive antenna (up to two) until the
-            // two-port CSI-RS measurement exists — right for the lab's
-            // identity channel, where each antenna sees one gNB port.
-            let ri = grids_all.len().min(2) as u8;
-            return Some(CsiIndication {
-                slot,
-                sinr_db: sinr,
-                cqi: csi::sinr_to_cqi(sinr),
-                rsrp_dbfs: 10.0 * rsrp.max(1e-12).log10(),
-                ri,
-                pmi: 0,
-            });
+            if m.row == csi::CsiRsRow::Row3 {
+                let views: Vec<&[Iq]> = grids_all.iter().map(|g| g[m.symbol].as_slice()).collect();
+                let e = csi::measure_csi_rs_ports(&views, sc_to_bin, m, slot.slot as u32, 2);
+                return Some(CsiIndication {
+                    slot,
+                    sinr_db: e.sinr_db,
+                    cqi: e.cqi,
+                    rsrp_dbfs: rsrp_dbfs(m.symbol),
+                    ri: e.ri,
+                    pmi: e.pmi,
+                    nof_ports: 2,
+                });
+            }
+            single.get_or_insert(m);
         }
-        None
+        let m = single?;
+        let sinr = csi::measure_csi_rs_sinr(&grids[m.symbol], sc_to_bin, m, slot.slot as u32);
+        Some(CsiIndication {
+            slot,
+            sinr_db: sinr,
+            cqi: csi::sinr_to_cqi(sinr),
+            rsrp_dbfs: rsrp_dbfs(m.symbol),
+            ri: 1,
+            pmi: 0,
+            nof_ports: 1,
+        })
     }
 
     pub fn demod(&self, slot: SlotPoint, samples: &[Iq]) -> Option<Vec<Vec<Iq>>> {

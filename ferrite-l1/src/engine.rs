@@ -17,7 +17,7 @@
 //! the timeline (this loop), one PDSCH worker, one TX builder.
 
 use crate::cell::CellGeometry;
-use crate::config::PhyConfig;
+use crate::config::{CsiRsResource, PhyConfig};
 use crate::dl::{DlMonitor, PdschJob, PdschWorker, WorkerConfig};
 use crate::fapi::*;
 use crate::radio::{serve_uplink, DlStream, UlPacing, UlServer, UlShared};
@@ -328,6 +328,15 @@ pub fn run(
                                     samples.iter().filter_map(|s| w.demod(slot, s)).collect();
                                 if grids.len() == samples.len() {
                                     if let Some(c) = w.measure_csi(slot, &grids) {
+                                        log::debug!(
+                                            "CSI {}: sinr {:.1} dB cqi {} ri {} pmi {} ({} rx antennas)",
+                                            slot,
+                                            c.sinr_db,
+                                            c.cqi,
+                                            c.ri,
+                                            c.pmi,
+                                            grids.len()
+                                        );
                                         let _ = wk_res_tx.send(PhyToMac::Csi(c));
                                     }
                                 }
@@ -862,7 +871,8 @@ impl<'a> Engine<'a> {
             let grants = self.pending_dl.remove(&slot.index()).unwrap_or_default();
             let has_csi = s.phase.configured()
                 && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| {
-                    r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot)
+                    csi_rs_measured(r).is_some()
+                        && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot)
                 });
             if grants.is_empty() && has_csi {
                 let _ = self.wk_cmd.try_send(WorkerCmd::Measure {
@@ -1114,6 +1124,26 @@ fn initial_config(
     )
 }
 
+/// The Table 7.4.1.5.3-1 row of a configured CSI-RS resource, if supported.
+fn csi_rs_row(r: &CsiRsResource) -> Option<csi::CsiRsRow> {
+    match (r.row, r.nof_ports) {
+        (1, _) => Some(csi::CsiRsRow::Row1),
+        (2, _) => Some(csi::CsiRsRow::Row2),
+        (4, _) => Some(csi::CsiRsRow::Row4),
+        // `other` with two ports: row 3 (one FD-CDM2 group).
+        (0, 2) => Some(csi::CsiRsRow::Row3),
+        _ => None,
+    }
+}
+
+/// Whether the UE measures this resource: the single-port TRS (CQI) and
+/// every two-port NZP resource (rank, PMI and CQI).
+fn csi_rs_measured(r: &CsiRsResource) -> Option<csi::CsiRsRow> {
+    let row = csi_rs_row(r)?;
+    (!r.zero_power && ((r.trs && row == csi::CsiRsRow::Row1) || row == csi::CsiRsRow::Row3))
+        .then_some(row)
+}
+
 fn worker_config(
     geom: &CellGeometry,
     cfg: &PhyConfig,
@@ -1129,11 +1159,8 @@ fn worker_config(
     let mut patterns = Vec::new();
     let mut meas = Vec::new();
     for r in &cfg.pdsch.csi_rs_rate_match {
-        let row = match r.row {
-            1 => csi::CsiRsRow::Row1,
-            2 => csi::CsiRsRow::Row2,
-            4 => csi::CsiRsRow::Row4,
-            _ => continue,
+        let Some(row) = csi_rs_row(r) else {
+            continue;
         };
         let mut symbols = vec![r.first_symbol as usize];
         if let Some(s2) = r.second_symbol {
@@ -1147,12 +1174,12 @@ fn worker_config(
             n_rb: r.n_rb as usize,
             re_mask: csi::csi_rs_re_mask(row, r.freq_bits),
         });
-        if !r.zero_power && r.trs && r.row == 1 {
+        if csi_rs_measured(r).is_some() {
             meas.push((
                 csi::CsiRsMeasurement {
                     row,
                     n_id: r.scrambling_id,
-                    k0: r.freq_bits.trailing_zeros() as usize,
+                    k0: csi::csi_rs_k0(row, r.freq_bits),
                     symbol: r.first_symbol as usize,
                     start_rb: r.start_rb as usize,
                     n_rb: r.n_rb as usize,

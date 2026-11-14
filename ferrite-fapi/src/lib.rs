@@ -209,9 +209,12 @@ pub struct CsiIndication {
     pub sinr_db: f32,
     pub cqi: u8,
     /// Rank indicator (1-based) and the Type I single-panel PMI (`i2`) the
-    /// PHY recommends; 1 / 0 for a single-layer receiver.
+    /// PHY recommends; 1 / 0 from a single-port measurement.
     pub ri: u8,
     pub pmi: u8,
+    /// Number of CSI-RS ports measured: only a multi-port measurement
+    /// carries a rank / PMI recommendation, a single-port one only the CQI.
+    pub nof_ports: u8,
     /// Wideband RSRP in dBFS (relative to full scale), for cell quality.
     pub rsrp_dbfs: f32,
 }

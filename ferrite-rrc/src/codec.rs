@@ -620,6 +620,7 @@ fn csi_rs_resource_of(
         zero_power,
         id,
         row: m.frequency_domain_allocation.row,
+        nof_ports: m.nrof_ports,
         freq_bits: m.frequency_domain_allocation.bits,
         first_symbol: m.first_ofdm_symbol_in_time_domain,
         second_symbol: m.first_ofdm_symbol_in_time_domain2,

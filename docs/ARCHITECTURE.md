@@ -87,7 +87,7 @@ state beyond the arguments, generalised over `mu ∈ {0,1}` and any `fs`.
 | `pucch` | formats 0, 1, 2, 3 | 38.211 §6.3.2 |
 | `prach` | preamble formats 0–3 and A1–C2, waveform at any `fs` | 38.211 §6.3.3 |
 | `srs` | low-PAPR sequences, SRS modulation | 38.211 §6.4.1.4 |
-| `csi` | NZP-CSI-RS sequence, SINR, CQI | 38.211 §7.4.1.5, 38.214 §5.2 |
+| `csi` | NZP-CSI-RS sequence, rows 1/2/3/4 RE patterns, SINR / CQI, two-port rank + PMI selection on the Type I codebook | 38.211 §7.4.1.5, 38.214 §5.2 |
 
 ## 3. Radio transport (ferrite-radio)
 
@@ -171,10 +171,20 @@ order (layer 0 then layer 1 per RE, §7.3.1.3) and the TBS/rate matching use
 resolved (`DlGrant::{n_layers, dmrs_ports}`); three and four layers are
 dropped. The CSI report goes out in the TS 38.212 Table 6.3.1.1.2-7 layout
 (`RI | padding | PMI | CQI`, sized from the codebook's ports and the
-`ri-Restriction` whose bit `i` (LSB = rank 1) allows rank `i + 1`); until the
-two-port CSI-RS measurement exists the PHY reports one rank per receive
-antenna (up to two) with PMI 0, which is right for the lab's identity
-channel.
+`ri-Restriction` whose bit `i` (LSB = rank 1) allows rank `i + 1`). The
+rank and PMI come from the two-port NZP-CSI-RS (Table 7.4.1.5.3-1 row 3: one
+FD-CDM2 group on subcarriers `k0, k0+1`, sequence index `2n + k'`):
+`csi::measure_csi_rs_ports` despreads the two ports on every receive
+antenna per RB, takes the noise from the RB-to-RB spread of the estimates,
+and picks the rank and `i2` of the two-port Type I single-panel codebook
+(TS 38.214 Table 5.2.2.2.1-1: rank 1 `[1, φ_n]/√2`, rank 2
+`[[1, 1], [φ_n, −φ_n]]/2`, `φ_n = e^{jπn/2}`) that maximise the sum of the
+per-layer `log2(1 + SINR)` (MRC gain for rank 1, post-MMSE SINRs for rank
+2); the CQI maps the mean post-equalisation SINR. The engine queues a CSI
+measurement on every occasion of a measured resource (the single-port TRS
+and every two-port resource); the MAC keeps the rank / PMI of the latest
+multi-port measurement and lets a single-port one refresh only the CQI
+(`CsiIndication::nof_ports`).
 
 Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the
 serving SSB: `rlm_evaluate` turns the SSB SINR into `SYNC.indication

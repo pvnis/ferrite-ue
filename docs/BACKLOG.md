@@ -74,12 +74,16 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       demapper (`extract_pdsch_mimo`, loopback-tested on a full-rank 2x2
       channel), DCI 1_1 two-layer antenna ports and TBS, and the
       `ri-Restriction` bit order (LSB = rank 1): T5 stage S28 passes with
-      two-layer PDSCHs decoded. Open: RI/PMI measurement on the two-port
-      CSI-RS (today RI = number of receive antennas, PMI 0), the Type I
-      two-port codebook (`i2`: rank 1 `[1, e^{jπn/2}]/√2`, rank 2
-      `[[1, 1], [e^{jπn/2}, −e^{jπn/2}]]/2`; OCUDU passes the raw `i2`
-      field as `pmi`), three/four layers, the SDR two-channel receive path,
-      and the Sionna RT / TS 38.901 channel emulator (step 2).
+      two-layer PDSCHs decoded. Also done 2026-11-14: RI / PMI / CQI from the
+      two-port NZP-CSI-RS (row 3, FD-CDM2, measured on every receive antenna)
+      with the two-port Type I single-panel codebook (`i2`: rank 1
+      `[1, e^{jπn/2}]/√2`, rank 2 `[[1, 1], [e^{jπn/2}, −e^{jπn/2}]]/2`;
+      OCUDU logs the raw `i2` as `pmi`), rank chosen by sum spectral
+      efficiency with post-MMSE SINRs; the MAC keeps the multi-port rank
+      across single-port TRS measurements. T5 S28: gNB receives `ri=2`, 82
+      two-layer PDSCHs in a 40 s run. Open: three/four layers, the SDR
+      two-channel receive path, and the Sionna RT / TS 38.901 channel
+      emulator (step 2).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC
@@ -220,7 +224,7 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [x] 2026-11-14 Reachable panics removed: DCI payload larger than the
       candidate, CSS RIV above a dedicated BWP, UL BWP below the carrier, common
       PUCCH on a narrow BWP, ICMP echo with a lying Total Length, PUCCH F0 with
-      a bad symbol count, CSI-RS row 4 SINR.
+      a bad symbol count, CSI-RS row 4 SINR / row 4 two-port measurement.
 - [x] 2026-11-14 DL MAC CE parsing per Table 6.2.1-1 (fixed-size CEs 47–52
       no longer mis-parsed as L-field CEs); PDSCH soft buffers reset on NDI
       toggle (combining across different TBs was possible); NAS T3582 for the
@@ -236,7 +240,7 @@ TCI, rate-match groups, CBG, two codewords…); RA type 0; `ra-SearchSpace` /
 `searchSpaceOtherSystemInformation` not distinguished; TDRA default tables
 B/C; single-layer / port-0 only (no ports 1001+, n_SCID, DM-RS type 2 /
 maxLength 2, PT-RS, TB2); PDSCH rate matching around the SSB / rateMatchPatterns
-/ CSI-RS rows other than 1/2/4; LBRM; multi-CB soft combining; CBG;
+/ CSI-RS rows other than 1/2/3/4; LBRM; multi-CB soft combining; CBG;
 `dataScramblingIdentityPDSCH/PUSCH`; UCI ≥3 ACK bits puncture instead of
 rate-matching the UL-SCH; CSI part 2 / polar UCI; PUCCH F4, F2/F3 intra-slot
 hopping and group hopping; PRACH restricted sets, FR2 table, MsgA;

@@ -521,8 +521,12 @@ pub struct CsiRsResource {
     pub zero_power: bool,
     /// `nzp-CSI-RS-ResourceId` / `zp-CSI-RS-ResourceId` (separate id spaces).
     pub id: u8,
-    /// Row of TS 38.211 Table 7.4.1.5.3-1.
+    /// Row of TS 38.211 Table 7.4.1.5.3-1 as the `frequencyDomainAllocation`
+    /// choice names it: 1, 2, 4, or 0 for `other` (rows 3 and 5+, told apart
+    /// by `nof_ports`).
     pub row: u8,
+    /// `nrofPorts`.
+    pub nof_ports: u8,
     pub freq_bits: u16,
     pub first_symbol: u8,
     pub second_symbol: Option<u8>,
