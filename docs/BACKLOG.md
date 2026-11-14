@@ -73,7 +73,23 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [x] 2026-11-13 PHR MAC CE (periodic / prohibit timers, pathloss-change
       trigger; values from a `PowerHeadroom` input, nominal until OTA power
       control exists).
-- [ ] Connected-mode DRX (the ASN.1 is parsed; MAC ignores it).
+- [x] 2026-11-14 Connected-mode DRX (`ferrite-mac/src/drx.rs`): on-duration
+      from the long / short cycle, inactivity timer, per-HARQ RTT and
+      retransmission timers, DRX / Long DRX Command CEs, Active Time for a
+      running RA or pending SR; the PHY stops searching C-RNTI candidates
+      (`MacToPhy::PdcchMonitoring`), periodic CSI is skipped outside Active
+      Time. T4 (`cell_cfg.drx`) lab stage S25. Two interoperability
+      findings against OCUDU, both handled on the UE side as supersets of
+      the specified Active Time: (1) its scheduler restarts the inactivity
+      timer on retransmission grants too (the UE now does the same);
+      (2) its TA manager consumes the `time_advance_offset` of every SRS
+      indication, detected or not (`cell_event_manager.cpp`
+      `handle_srs_indication`), so the SRS occasions a sleeping UE leaves
+      empty yield a −1 TA command per DRX cycle and the uplink leaves the
+      CP after ~8 cycles → the UE keeps its periodic SRS during sleep
+      (`MacConfig::srs_outside_active_time`). The UE also had to advertise
+      `longDRX-Cycle`/`shortDRX-Cycle` in `mac-ParametersXDD-Diff`: OCUDU
+      configures DRX only for UEs that do.
 - [ ] BWP switching (DCI and timer based).
 - [ ] 2-step random access.
 
@@ -193,7 +209,7 @@ for tracking; PDCCH precoder granularity allContiguousRBs; neighbour cell
 search; `EngineEvent::CellFound` / `Measurement` bypass FAPI (MIB and SSB
 measurements should be PHY→MAC indications).
 
-MAC: DRX; BWP switching; 2-step / contention-free RA (PDCCH order is
+MAC: BWP switching; 2-step / contention-free RA (PDCCH order is
 `Dci::Other`); SSB-based preamble/occasion selection; preamble group B; Long
 Truncated BSR, Multiple-Entry PHR, BFR, Recommended bit rate CEs; BSR
 truncation picks the lowest LCG id; padding BSR only with remaining data; LCP

@@ -4,7 +4,7 @@
 #   scripts/lab.sh <config-id> [--duration S] [--ping N] [--no-core]
 #
 # config-id ∈ T1 (tdd_n78_10mhz) T2 (tdd_n78_10mhz_dddsu) T3 (tdd_n78_20mhz)
-#             F1 (fdd_n3_10mhz) F2 (fdd_n3_20mhz)
+#             T4 (tdd_n78_10mhz_drx) F1 (fdd_n3_10mhz) F2 (fdd_n3_20mhz)
 #
 # Starts qcore (sudo) and the OCUDU gNB with the matching config, then the UE
 # with the matching ARFCN / sample rate, waits for the ping probe to finish (or
@@ -31,6 +31,7 @@ case "$ID" in
   T1) CFG=gnb_zmq_tdd_n78_10mhz;       ARFCN=626000; SRATE=15.36;;
   T2) CFG=gnb_zmq_tdd_n78_10mhz_dddsu; ARFCN=626000; SRATE=15.36;;
   T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72;;
+  T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36;;
   F1) CFG=gnb_zmq_fdd_n3_10mhz;        ARFCN=368500; SRATE=11.52;;
   F2) CFG=gnb_zmq_fdd_n3_20mhz;        ARFCN=368500; SRATE=23.04;;
   *) echo "unknown config id $ID"; exit 2;;
@@ -129,6 +130,14 @@ fi
 # fresh registration and the ping probe must still complete.
 if grep -q "re-establishing" "$UE"; then
   grep -q "RRC re-established" "$UE" && pass "S19 RRC re-establishment" || fail "S19 RRC re-establishment"
+fi
+# S25: connected-mode DRX (only when the gNB config has a `drx` section): the
+# UE applies the DRX-Config, spends slots outside Active Time (no C-RNTI PDCCH
+# monitoring) and still completes the ping probe.
+if grep -q "^ drx:" "$ROOT/test/$CFG.yml" 2>/dev/null; then
+  grep -q "DRX configured" "$UE" && pass "S25 DRX configured" || fail "S25 DRX configured"
+  N=$(grep -o "drx_sleep_slots: [0-9]*" "$UE" | tail -1 | awk '{print $2}')
+  [ "${N:-0}" -gt 0 ] && pass "S25 DRX sleep ($N slots outside Active Time)" || fail "S25 DRX sleep"
 fi
 # S23/S24: radio link monitoring (only when the UE ran with an RLM outage,
 # `UE_ARGS="--rlm-outage-s 8 --rlm-outage-ms 1500"`): N310 out-of-sync

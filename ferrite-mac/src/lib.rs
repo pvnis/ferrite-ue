@@ -12,11 +12,13 @@
 //! * [`lcp`] — logical channel prioritisation (§5.4.3.1);
 //! * [`pdu`], [`rar`] — MAC PDU multiplexing/demultiplexing (§6.1) and the RAR (§6.2.3);
 //! * [`ta`] — timing advance maintenance (§5.2);
+//! * [`drx`] — discontinuous reception (§5.7): Active Time, PDCCH monitoring on/off;
 //! * [`entity`] — the [`MacEntity`] tying it together.
 
 #![forbid(unsafe_code)]
 
 pub(crate) mod bsr;
+pub mod drx;
 pub mod entity;
 pub(crate) mod harq;
 pub(crate) mod lcp;
@@ -27,6 +29,7 @@ pub(crate) mod rar;
 pub(crate) mod sr;
 pub(crate) mod ta;
 
+pub use drx::{DrxMacConfig, DrxState, ShortDrxMacConfig};
 pub use entity::{MacEntity, MacEvent, MacStats, UpperLayers};
 pub use ra::RaState;
 pub use sr::SrState;
@@ -169,6 +172,14 @@ pub struct MacConfig {
     pub phr: Option<phr::PhrMacConfig>,
     /// Periodic SRS occasions: `(resource id, period, offset)` in slots.
     pub srs_occasions: Vec<(u8, u16, u16)>,
+    /// `drx-Config` (`None` = no DRX, always in Active Time).
+    pub drx: Option<DrxMacConfig>,
+    /// Keep transmitting the periodic SRS outside DRX Active Time. TS 38.321
+    /// §5.7 says not to, but a gNB that derives the timing advance from every
+    /// SRS occasion (OCUDU does, detected or not) walks the UE's uplink timing
+    /// out of the cyclic prefix within a few DRX cycles when the occasions
+    /// are left empty. Sounding a little more never loses data.
+    pub srs_outside_active_time: bool,
 }
 
 impl MacConfig {
@@ -199,6 +210,8 @@ impl MacConfig {
             csi_enabled: false,
             phr: None,
             srs_occasions: Vec::new(),
+            drx: None,
+            srs_outside_active_time: true,
         }
     }
 

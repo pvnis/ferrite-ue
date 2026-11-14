@@ -776,6 +776,9 @@ impl<'a> Engine<'a> {
                 MacToPhy::Paging { ue_id } => {
                     s.monitor.rntis.p_ue_id = ue_id;
                 }
+                MacToPhy::PdcchMonitoring { c_rnti } => {
+                    s.monitor.monitor_c_rnti = c_rnti;
+                }
                 MacToPhy::UlTti(req) => {
                     if !self.tx_enabled {
                         self.mac.handle(PhyToMac::Error(ErrorIndication::TxDropped { slot: req.slot, pdu: "ul_tti (STOP)" }), &mut followups);

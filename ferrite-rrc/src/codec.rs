@@ -620,6 +620,25 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
                 tx_power_factor_change_db: p.phr_tx_power_factor_change_db,
             });
         }
+        if let Some(d) = &m.drx_config {
+            let spsf = mac.numerology.slots_per_subframe();
+            mac.drx = d.setup().map(|d| ferrite_mac::DrxMacConfig {
+                on_duration_slots: match d.drx_on_duration_timer {
+                    // 1/32 ms units: round up to whole slots.
+                    cg::DrxOnDurationTimer::SubMilliSeconds(n) => (u32::from(n) * spsf).div_ceil(32).max(1),
+                    cg::DrxOnDurationTimer::MilliSeconds(ms) => (u32::from(ms) * spsf).max(1),
+                },
+                inactivity_slots: u32::from(d.drx_inactivity_timer_ms) * spsf,
+                harq_rtt_dl_symbols: d.drx_harq_rtt_timer_dl,
+                harq_rtt_ul_symbols: d.drx_harq_rtt_timer_ul,
+                retx_dl_slots: u32::from(d.drx_retransmission_timer_dl_slots),
+                retx_ul_slots: u32::from(d.drx_retransmission_timer_ul_slots),
+                long_cycle_ms: u32::from(d.drx_long_cycle_ms),
+                start_offset_ms: u32::from(d.drx_long_cycle_start_offset),
+                slot_offset_slots: (u32::from(d.drx_slot_offset) * spsf) / 32,
+                short: d.short_drx.map(|s| ferrite_mac::ShortDrxMacConfig { cycle_ms: u32::from(s.drx_short_cycle_ms), timer_cycles: u32::from(s.drx_short_cycle_timer) }),
+            });
+        }
     }
     // --- SRS: resources by id (add-mod / release); periodic occasions for MAC.
     if let Some(s) = c.srs_config() {
@@ -902,7 +921,7 @@ pub fn encode_reconfiguration_complete(tid: u8) -> Vec<u8> {
 pub fn encode_ue_capability_information(tid: u8, bands: &[u16]) -> Vec<u8> {
     let bands: Vec<u16> = if bands.is_empty() { vec![78] } else { bands.to_vec() };
     // The modem does 256-QAM in both directions (PDSCH demapper, PUSCH mapper).
-    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands, pdsch_256qam_fr1: true, pusch_256qam: true }.encode();
+    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands, pdsch_256qam_fr1: true, pusch_256qam: true, drx: true }.encode();
     rrc::UlDcchMessage::UeCapabilityInformation(rrc::UeCapabilityInformation {
         rrc_transaction_identifier: tid,
         ue_capability_rat_container_list: vec![rrc::UeCapabilityRatContainer { rat_type: rrc::RatType::Nr, container }],

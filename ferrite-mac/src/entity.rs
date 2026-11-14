@@ -79,6 +79,7 @@ pub struct MacEntity {
     sr: Vec<SrProcedure>,
     lcp: Lcp,
     ta: TimingAdvance,
+    drx: crate::drx::Drx,
     c_rnti: Option<Rnti>,
     tc_rnti: Option<Rnti>,
     pending_pusch: BTreeMap<u64, PendingPusch>,
@@ -107,6 +108,8 @@ pub struct MacStats {
     pub ack_late: u64,
     pub phr_sent: u64,
     pub srs_sent: u64,
+    /// Slots outside DRX Active Time (no C-RNTI PDCCH monitoring).
+    pub drx_sleep_slots: u64,
 }
 
 impl MacEntity {
@@ -123,6 +126,7 @@ impl MacEntity {
             sr: cfg.sr.iter().map(|s| SrProcedure::new(s, spm)).collect(),
             lcp: Lcp::new(&cfg.logical_channels),
             ta: TimingAdvance::new(cfg.numerology, cfg.time_alignment_timer_ms),
+            drx: crate::drx::Drx::new(cfg.drx),
             c_rnti: None,
             tc_rnti: None,
             pending_pusch: BTreeMap::new(),
@@ -156,7 +160,15 @@ impl MacEntity {
         if cfg.phr != self.cfg.phr {
             self.phr.configure(cfg.phr);
         }
+        if cfg.drx != self.cfg.drx {
+            self.drx.configure(cfg.drx);
+        }
         self.cfg = cfg;
+    }
+
+    /// DRX state (diagnostics).
+    pub fn drx_state(&self) -> crate::drx::DrxState {
+        self.drx.state()
     }
 
     /// Random-access procedure state (diagnostics).
@@ -204,7 +216,9 @@ impl MacEntity {
             s.cancel();
         }
         self.ta.reset();
+        self.drx.reset();
         self.ra = RaProcedure::new(&self.cfg.rach, self.cfg.numerology, 0x5eed);
+        phy.send(MacToPhy::PdcchMonitoring { c_rnti: true });
         phy.send(MacToPhy::TimingAdvance { n_ta_tc: self.ta.n_ta_tc });
         phy.send(MacToPhy::SetRntis { c_rnti: None, tc_rnti: None, ra_rnti: None });
         phy.send(MacToPhy::Stop);
@@ -240,6 +254,19 @@ impl MacEntity {
         // Start a RA if RRC asked for one.
         if let Some(ccch) = self.ra_start.take() {
             self.ra.start(now, Some(ccch), None);
+        }
+        // DRX (§5.7): Active Time decides whether the PHY monitors the C-RNTI
+        // PDCCH candidates in this slot (and whether CSI / SRS go out).
+        let was_active = self.drx.is_active();
+        let sr_pending = self.sr.iter().any(|s| matches!(s.state(), crate::sr::SrState::Pending { .. }));
+        let dl_harq = &self.dl_harq;
+        let active = self.drx.on_slot(now, self.ra.is_running(), sr_pending, |h| !dl_harq.is_delivered(h));
+        if active != was_active {
+            log::debug!("DRX: {} at {now}", if active { "active" } else { "sleep" });
+            phy.send(MacToPhy::PdcchMonitoring { c_rnti: active });
+        }
+        if !active {
+            self.stats.drx_sleep_slots += 1;
         }
         // Buffer status → BSR / SR triggers (§5.4.5): one snapshot per slot.
         let with_data: Vec<(u8, Option<u8>)> = self
@@ -341,8 +368,8 @@ impl MacEntity {
                 }
             }
         }
-        // CSI report occasion?
-        let csi: Option<(Vec<u8>, u8)> = if self.cfg.csi_enabled {
+        // CSI report occasion? Not outside DRX Active Time (§5.7).
+        let csi: Option<(Vec<u8>, u8)> = if self.cfg.csi_enabled && self.drx.is_active() {
             self.cfg.csi_reports.iter().find(|c| target.is_occasion(c.period_slots as u32, c.offset_slots as u32)).and_then(|c| {
                 let (cqi, when) = self.pending_cqi?;
                 // Only report a measurement from the current report period.
@@ -373,8 +400,10 @@ impl MacEntity {
         }
         if !has_ack && !sr_positive && csi.is_none() {
             // Nothing else in the slot: a periodic SRS occasion goes out on its
-            // own (an SRS overlapping a PUCCH/PUSCH is dropped, TS 38.214 §6.2.1).
-            if self.c_rnti.is_some() {
+            // own (an SRS overlapping a PUCCH/PUSCH is dropped, TS 38.214 §6.2.1);
+            // outside DRX Active Time only if configured to (§5.7 says no; see
+            // `MacConfig::srs_outside_active_time`).
+            if self.c_rnti.is_some() && (self.drx.is_active() || self.cfg.srs_outside_active_time) {
                 if let Some(&(id, _, _)) = self.cfg.srs_occasions.iter().find(|(_, p, o)| target.is_occasion(u32::from(*p), u32::from(*o))) {
                     self.stats.srs_sent += 1;
                     phy.send(MacToPhy::UlTti(UlTtiRequest { slot: target, pdus: vec![UlTtiPdu::Srs { resource_id: id }] }));
@@ -458,11 +487,17 @@ impl MacEntity {
         }
     }
 
-    fn on_dl_grant(&mut self, _slot: SlotPoint, g: DlGrant) {
+    fn on_dl_grant(&mut self, slot: SlotPoint, g: DlGrant) {
         if !matches!(g.rnti_kind, RntiKind::C | RntiKind::Tc) {
             return; // SI/RA/P: the PHY decodes; nothing to book.
         }
         let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
+        if g.rnti_kind == RntiKind::C {
+            self.drx.on_crnti_pdcch(slot);
+            if let Some(ack_slot) = g.ack_slot {
+                self.drx.on_dl_assignment(g.harq_id, ack_slot);
+            }
+        }
         if let Some(ack_slot) = g.ack_slot {
             self.ack_book_common_r = Some(g.r_pucch_common);
             self.ack_book.book(
@@ -483,6 +518,10 @@ impl MacEntity {
         }
         let tbs_bytes = (g.tbs_bits / 8) as usize;
         let retx = self.ul_harq.is_retx(g.harq_id, g.ndi, g.tbs_bits);
+        if g.rnti_kind == RntiKind::C {
+            self.drx.on_crnti_pdcch(slot);
+            self.drx.on_ul_grant(g.harq_id, g.pusch_slot);
+        }
         let (tb, bsr_included, bsr_truncated) = if retx {
             self.stats.ul_retx += 1;
             (self.ul_harq.stored(g.harq_id).to_vec(), false, false)
@@ -640,7 +679,9 @@ impl MacEntity {
                             let acts = self.ra.on_contention_resolution_id(&id);
                             self.apply_ra_actions(acts, phy);
                         }
-                        DlSubPdu::DrxCommand | DlSubPdu::LongDrxCommand | DlSubPdu::Other { .. } => {}
+                        DlSubPdu::DrxCommand => self.drx.on_drx_command(d.pdsch_slot, false),
+                        DlSubPdu::LongDrxCommand => self.drx.on_drx_command(d.pdsch_slot, true),
+                        DlSubPdu::Other { .. } => {}
                     }
                 }
             }

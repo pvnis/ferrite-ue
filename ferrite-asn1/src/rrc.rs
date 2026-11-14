@@ -2240,6 +2240,9 @@ pub struct UeNrCapability {
     pub pdsch_256qam_fr1: bool,
     /// `BandNR.pusch-256QAM` on every listed band.
     pub pusch_256qam: bool,
+    /// `mac-Parameters.mac-ParametersXDD-Diff { longDRX-Cycle, shortDRX-Cycle }`:
+    /// connected-mode DRX supported (the gNB configures DRX only then).
+    pub drx: bool,
 }
 
 impl UeNrCapability {
@@ -2251,7 +2254,9 @@ impl UeNrCapability {
         // fdd-Add-UE-NR-Capabilities, tdd-Add-UE-NR-Capabilities, fr1-Add-UE-NR-Capabilities,
         // fr2-Add-UE-NR-Capabilities, featureSets, featureSetCombinations,
         // lateNonCriticalExtension, nonCriticalExtension), no extension marker.
-        w.opt_bits(&[false; 11]);
+        let mut opts = [false; 11];
+        opts[1] = self.drx; // mac-Parameters
+        w.opt_bits(&opts);
         w.enu_ext(self.access_stratum_release as u32, 8);
         // PDCP-Parameters ::= SEQUENCE { supportedROHC-Profiles SEQUENCE { 10 × BOOLEAN },
         // maxNumberROHC-ContextSessions ENUMERATED (16), 6 OPTIONALs, ... }
@@ -2259,6 +2264,17 @@ impl UeNrCapability {
         w.opt_bits(&[false; 6]);
         w.bits(0, 10);
         w.enu(0, 16);
+        if self.drx {
+            // MAC-Parameters ::= SEQUENCE { mac-ParametersCommon OPTIONAL,
+            // mac-ParametersXDD-Diff OPTIONAL } (no extension marker);
+            // MAC-ParametersXDD-Diff ::= SEQUENCE { skipUplinkTxDynamic,
+            // logicalChannelSR-DelayTimer, longDRX-Cycle, shortDRX-Cycle,
+            // multipleSR-Configurations, multipleConfiguredGrants (all
+            // ENUMERATED {supported} OPTIONAL, zero bits each), ... }
+            w.opt_bits(&[false, true]);
+            w.bit(false);
+            w.opt_bits(&[false, false, true, true, false, false]);
+        }
         // PHY-Parameters ::= SEQUENCE { 5 OPTIONAL sub-structures }: only
         // phy-ParametersFR1 when it has something to say.
         w.opt_bits(&[false, false, false, self.pdsch_256qam_fr1, false]);
@@ -2290,7 +2306,7 @@ impl UeNrCapability {
     pub fn decode(octets: &[u8]) -> DecodeResult<Self> {
         let r = &mut BitReader::new(octets);
         let o = r.opt_bits::<11>()?;
-        if o.iter().any(|&p| p) {
+        if o.iter().enumerate().any(|(i, &p)| p && i != 1) {
             return r.unsupported("UE-NR-Capability optional containers");
         }
         let access_stratum_release = match r.enu_ext(8)? {
@@ -2306,6 +2322,21 @@ impl UeNrCapability {
         r.enu(16)?;
         if pext || po.iter().any(|&p| p) {
             return r.unsupported("PDCP-Parameters optional fields");
+        }
+        let mut drx = false;
+        if o[1] {
+            let [common, xdd] = r.opt_bits::<2>()?;
+            if common {
+                return r.unsupported("mac-ParametersCommon");
+            }
+            if xdd {
+                let ext = r.bit()?;
+                let x = r.opt_bits::<6>()?;
+                if ext || x[0] || x[1] || x[4] || x[5] {
+                    return r.unsupported("MAC-ParametersXDD-Diff fields");
+                }
+                drx = x[2] && x[3];
+            }
         }
         let ph = r.opt_bits::<5>()?;
         if ph.iter().any(|&p| p) {
@@ -2330,6 +2361,7 @@ impl UeNrCapability {
             supported_band_list_nr,
             pdsch_256qam_fr1: false,
             pusch_256qam: false,
+            drx,
         })
     }
 }
@@ -2401,14 +2433,20 @@ mod tests {
     fn ue_nr_capability_matches_ocudu_vector() {
         let cap = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel15,
-            supported_band_list_nr: vec![78], pdsch_256qam_fr1: false, pusch_256qam: false };
+            supported_band_list_nr: vec![78], pdsch_256qam_fr1: false, pusch_256qam: false, drx: false };
         let bytes = cap.encode();
         assert_eq!(bytes, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9a]);
         assert_eq!(UeNrCapability::decode(&bytes).unwrap(), cap);
         let multi = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel16,
-            supported_band_list_nr: vec![1, 3, 78], pdsch_256qam_fr1: false, pusch_256qam: false };
+            supported_band_list_nr: vec![1, 3, 78], pdsch_256qam_fr1: false, pusch_256qam: false, drx: false };
         assert_eq!(UeNrCapability::decode(&multi.encode()).unwrap(), multi);
+        // mac-Parameters with long + short DRX: 2 + 1 + 6 extra bits after PDCP-Parameters.
+        let drx = UeNrCapability { drx: true, ..multi.clone() };
+        let b = drx.encode();
+        assert_eq!(b[0] & 0x40, 0x40, "mac-Parameters present");
+        assert_eq!(b.len() * 8, multi.encode().len() * 8 + 8);
+        assert_eq!(UeNrCapability::decode(&b).unwrap(), drx);
         // UECapabilityInformation tid 0 with the minimal capability, validated against
         // OCUDU `rrc_dec gen-uecapinfo`: 4882028000000000000000002680.
         let m = UlDcchMessage::UeCapabilityInformation(UeCapabilityInformation {

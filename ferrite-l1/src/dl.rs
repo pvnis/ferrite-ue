@@ -48,6 +48,8 @@ pub struct DlMonitor {
     type0: Option<Type0Monitoring>,
     pub resolver: DciResolver,
     pub rntis: ActiveRntis,
+    /// DRX: C-RNTI candidates are searched only while MAC is in Active Time.
+    pub monitor_c_rnti: bool,
     paging: Option<crate::config::PagingConfig>,
     /// Coherence gate for the blind decode (fraction, ≈1 for a present PDCCH).
     pub coherence_gate: f32,
@@ -116,6 +118,7 @@ impl DlMonitor {
             type0: type0.map(|t| t.1),
             resolver: DciResolver::new(cfg, dedicated),
             rntis: ActiveRntis::default(),
+            monitor_c_rnti: true,
             paging: cfg.paging,
             coherence_gate: 0.1,
             dedicated,
@@ -202,12 +205,12 @@ impl DlMonitor {
                     if let Some(r) = self.rntis.tc {
                         targets.push((r, RntiKind::Tc));
                     }
-                    if let Some(r) = self.rntis.c {
+                    if let Some(r) = self.rntis.c.filter(|_| self.monitor_c_rnti) {
                         targets.push((r, RntiKind::C));
                     }
                 }
                 if kind != SearchSpaceKind::Common {
-                    if let Some(r) = self.rntis.c {
+                    if let Some(r) = self.rntis.c.filter(|_| self.monitor_c_rnti) {
                         targets.push((r, RntiKind::C));
                     }
                 }

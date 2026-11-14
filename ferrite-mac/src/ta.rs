@@ -42,7 +42,9 @@ impl TimingAdvance {
 
     /// Apply a 6-bit TA Command MAC CE (relative).
     pub fn apply_ce(&mut self, ta_cmd: u8, now: SlotPoint) {
+        let before = self.n_ta_tc;
         self.n_ta_tc = ta::n_ta_apply_ce(self.n_ta_tc, ta_cmd, self.numerology);
+        log::debug!("TA command {ta_cmd} at {now}: N_TA {before} → {} T_c", self.n_ta_tc);
         self.restart(now);
     }
 

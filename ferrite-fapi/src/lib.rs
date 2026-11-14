@@ -319,6 +319,10 @@ pub enum MacToPhy {
     TimingAdvance { n_ta_tc: i64 },
     /// Monitor paging for this UE_ID (5G-S-TMSI mod 1024); `None` stops.
     Paging { ue_id: Option<u16> },
+    /// DRX (TS 38.321 §5.7): whether the PDCCH candidates addressed to the
+    /// C-RNTI are monitored from this slot on (`false` outside Active Time).
+    /// SI-, RA-, TC-, P-RNTI monitoring is unaffected.
+    PdcchMonitoring { c_rnti: bool },
     /// Resolve a RAR UL grant (TS 38.213 §8.2 / §8.3) into the Msg3 PUSCH
     /// grant. The PHY answers with a [`PhyToMac::Dci`] carrying
     /// `Dci::Ul(UlGrant { rnti_kind: Tc, harq_id: 0, ndi: 0, .. })` for the

@@ -168,7 +168,8 @@ enum PhyToMac { Slot(SlotIndication), Dci(DciIndication), RxData(RxDataIndicatio
                 Error(ErrorIndication) }
 enum MacToPhy { Config(Box<PhyConfig>), Start, Stop, UlTti(UlTtiRequest),
                 SetRntis { c_rnti, tc_rnti, ra_rnti }, TimingAdvance { n_ta_tc },
-                Paging { ue_id }, RarGrant { rar_slot, tc_rnti, grant: RarUlGrant } }
+                Paging { ue_id }, PdcchMonitoring { c_rnti: bool },
+                RarGrant { rar_slot, tc_rnti, grant: RarUlGrant } }
 enum UlTtiPdu { Prach { occasion, preamble, power_offset_db },
                 Pusch { grant: UlGrant, tb, uci }, Pucch { resource, uci }, Srs { resource_id } }
 trait MacHandler { fn handle(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink); }
@@ -210,6 +211,20 @@ views. Sub-procedures and their states:
 * **HARQ**: DL per process `ndi` / `delivered` (duplicates of a delivered TB
   are dropped); UL per process the stored TB for retransmissions at the
   signalled RV; the HARQ-ACK codebook (dynamic, §9.1.3) is booked per slot.
+* **DRX** (§5.7), `DrxState`: `Off → Long ⇄ Short { until }`. `drx.rs` runs
+  drx-onDurationTimer (from `[(SFN×10)+subframe] mod cycle = offset`, plus
+  `drx-SlotOffset`), drx-InactivityTimer (restarted by every C-RNTI PDCCH:
+  the spec says new transmissions only, but OCUDU extends the Active Time on
+  retransmission grants too and staying awake longer never loses data),
+  per-HARQ-process RTT → retransmission timers (DL only for a TB that
+  was not decoded) and the short-cycle timer; the DRX / Long DRX Command CEs
+  end the on-duration. Active Time also covers a running random access and a
+  pending SR. Each slot the entity tells the PHY `PdcchMonitoring { c_rnti }`
+  on a change, so C-RNTI candidates are not searched while asleep; periodic
+  CSI is skipped outside Active Time, HARQ-ACKs are always sent, and the
+  periodic SRS keeps going by default (`MacConfig::srs_outside_active_time`:
+  OCUDU derives the timing advance from every SRS occasion, empty ones
+  included, and walks the uplink out of the cyclic prefix otherwise).
 * **BSR** (§5.4.5, regular/periodic/padding, short/long), **LCP** (§5.4.3.1),
   **PHR** (§5.4.6, Single Entry PHR from a `PowerHeadroom` input), **SRS**
   occasions (dropped when a PUCCH/PUSCH goes out in the slot).
