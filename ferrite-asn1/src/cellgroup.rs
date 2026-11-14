@@ -3233,6 +3233,39 @@ impl CellGroupConfig {
         self.serving_cell()?.initial_downlink_bwp.as_ref()
     }
 
+    /// The common / dedicated parts of DL BWP `id` (0 = the initial BWP,
+    /// whose common part is in SIB1).
+    pub fn dl_bwp(&self, id: u8) -> (Option<&crate::sib1::BwpDownlinkCommon>, Option<&BwpDownlinkDedicated>) {
+        if id == 0 {
+            return (None, self.initial_downlink_bwp());
+        }
+        match self.serving_cell().and_then(|s| s.downlink_bwp_to_add_mod_list.iter().find(|b| b.bwp_id == id)) {
+            Some(b) => (b.bwp_common.as_ref(), b.bwp_dedicated.as_ref()),
+            None => (None, None),
+        }
+    }
+
+    /// The common / dedicated parts of UL BWP `id` (0 = the initial BWP).
+    pub fn ul_bwp(&self, id: u8) -> (Option<&crate::sib1::BwpUplinkCommon>, Option<&BwpUplinkDedicated>) {
+        if id == 0 {
+            return (None, self.initial_uplink_bwp());
+        }
+        match self.serving_cell().and_then(|s| s.uplink_config.as_ref()).and_then(|u| u.uplink_bwp_to_add_mod_list.iter().find(|b| b.bwp_id == id)) {
+            Some(b) => (b.bwp_common.as_ref(), b.bwp_dedicated.as_ref()),
+            None => (None, None),
+        }
+    }
+
+    /// Ids of the DL BWPs this message adds or modifies (never 0).
+    pub fn dl_bwp_ids(&self) -> Vec<u8> {
+        self.serving_cell().map_or(Vec::new(), |s| s.downlink_bwp_to_add_mod_list.iter().map(|b| b.bwp_id).collect())
+    }
+
+    /// Ids of the UL BWPs this message adds or modifies (never 0).
+    pub fn ul_bwp_ids(&self) -> Vec<u8> {
+        self.serving_cell().and_then(|s| s.uplink_config.as_ref()).map_or(Vec::new(), |u| u.uplink_bwp_to_add_mod_list.iter().map(|b| b.bwp_id).collect())
+    }
+
     pub fn initial_uplink_bwp(&self) -> Option<&BwpUplinkDedicated> {
         self.serving_cell()?
             .uplink_config

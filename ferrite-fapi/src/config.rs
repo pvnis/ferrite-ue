@@ -115,6 +115,8 @@ pub struct SsbConfig {
 /// Bandwidth part (common or dedicated): `BWP` generic parameters resolved to CRBs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bwp {
+    /// `BWP-Id` (0 = the initial BWP).
+    pub id: u8,
     /// First common resource block (relative to point A) of the BWP.
     pub start_crb: u16,
     pub n_rb: u16,
@@ -230,7 +232,7 @@ impl PrachConfig {
     fn occasion_symbols(&self, format: ferrite_ran::prach_config::PreambleFormat, mu: u8) -> u8 {
         let Ok(p) = ferrite_ran::prach_config::format_params(format, self.phy.msg1_scs_mu) else { return 14 };
         // Normal-CP symbol at mu: (2048 + 144) · 64 / 2^mu T_c.
-        let symbol_tc = (2048u64 + 144) * 64 >> mu;
+        let symbol_tc = ((2048u64 + 144) * 64) >> mu;
         p.nominal_tc.div_ceil(symbol_tc).clamp(1, 14) as u8
     }
 
@@ -251,8 +253,8 @@ impl PrachConfig {
         }
         // Flexible symbols: the SSB rule, for the half frames that carry a burst.
         let spf = slot.numerology.slots_per_frame() as u16;
-        let frames_per_burst = u16::from(self.ssb_period_ms / 10).max(1);
-        let burst_frame = slot.sfn % frames_per_burst == 0;
+        let frames_per_burst = (self.ssb_period_ms / 10).max(1);
+        let burst_frame = slot.sfn.is_multiple_of(frames_per_burst);
         if !burst_frame || slot.slot >= spf / 2 {
             return true;
         }
@@ -529,8 +531,13 @@ pub struct PhyConfig {
     /// overlapping the SSB start (`offsetToPointA` converted) — with `ssb.k_ssb`
     /// the extra subcarrier offset.
     pub ssb_crb: u16,
+    /// The active DL / UL bandwidth parts.
     pub dl_bwp: Bwp,
     pub ul_bwp: Bwp,
+    /// Bandwidth parts configured by RRC besides the initial one (`n_BWP,RRC`
+    /// of TS 38.212 §7.3.1: the DCI 1_1 / 0_1 BWP indicator width).
+    pub nof_dl_bwp_rrc: u8,
+    pub nof_ul_bwp_rrc: u8,
     pub tdd: Option<TddConfig>,
     pub coresets: Vec<CoresetConfig>,
     pub search_spaces: Vec<SearchSpaceConfig>,
@@ -570,8 +577,10 @@ impl PhyConfig {
             dl_carrier: Carrier { offset_crb: 0, n_rb: 0 },
             ul_carrier: Carrier { offset_crb: 0, n_rb: 0 },
             ssb_crb: 0,
-            dl_bwp: Bwp { start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
-            ul_bwp: Bwp { start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            dl_bwp: Bwp { id: 0, start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            ul_bwp: Bwp { id: 0, start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            nof_dl_bwp_rrc: 0,
+            nof_ul_bwp_rrc: 0,
             tdd: None,
             coresets: vec![CoresetConfig {
                 id: 0,

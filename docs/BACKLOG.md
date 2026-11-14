@@ -90,7 +90,17 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       (`MacConfig::srs_outside_active_time`). The UE also had to advertise
       `longDRX-Cycle`/`shortDRX-Cycle` in `mac-ParametersXDD-Diff`: OCUDU
       configures DRX only for UEs that do.
-- [ ] BWP switching (DCI and timer based).
+- [x] 2026-11-14 BWP switching: per-BWP configurations from
+      `CellGroupConfig` (generic parameters, common and dedicated parts,
+      `firstActiveDownlinkBWP-Id`), DCI 1_1/0_1 bandwidth-part indicator →
+      `Dci::BwpSwitch`, bwp-InactivityTimer → default BWP, random access →
+      initial BWP, RRC `switch_bwp` → CONFIG.request. Unit-tested only:
+      OCUDU configures one BWP. Known simplification: the grant carried by
+      the switching DCI is not resolved (the gNB retransmits on the new BWP).
+- [x] 2026-11-14 TDD pattern as a scheduling input: PDSCH in UL symbols /
+      PUSCH in DL symbols dropped by the resolver; PRACH occasions filtered
+      per TS 38.211 §6.3.3.2 (UL symbols, or flexible symbols after the
+      slot's SSBs + N_gap). T1/T2/T3 random access unchanged.
 - [ ] 2-step random access.
 
 ## RRC
@@ -193,8 +203,8 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 ## Gaps found by the audit (open, non-OTA)
 
 PHY/L1: extended CP and 60/120 kHz data numerology; SSB cases D/E (FR2);
-FR2 CORESET#0; TDD pattern not used for PRACH/UL validity or SFI; single BWP
-(indicator ignored, no bwp-InactivityTimer); DCI formats 2_x and 0_2/1_2;
+FR2 CORESET#0; SFI (DCI 2_0) not used; the grant carried by a BWP-switching
+DCI is dropped; DCI formats 2_x and 0_2/1_2;
 MCS-C/CS/SP-CSI RNTIs; DCI-size inputs fixed to one profile (DM-RS type/len,
 TCI, rate-match groups, CBG, two codewords…); RA type 0; `ra-SearchSpace` /
 `searchSpaceOtherSystemInformation` not distinguished; TDRA default tables

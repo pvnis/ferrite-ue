@@ -143,6 +143,17 @@ search space or PUCCH resource is configured). Orthogonal to it: `tx_enabled`
 MAC) and the HARQ soft buffers of the PDSCH worker (one per `(RntiKind,
 process)`, reset when the NDI toggles or the TB size changes).
 
+The TDD pattern is a scheduling input: `DciResolver` drops a PDSCH that
+would lie in UL symbols and a PUSCH (DCI 0_0/0_1, RAR grant) in DL symbols
+(`PhyConfig::dl_allowed` / `ul_allowed`, TS 38.213 §11.1; flexible symbols are
+allowed), and `PrachConfig::occasions_in_slot` keeps only the occasions valid
+under TS 38.211 §6.3.3.2 (UL symbols, or flexible symbols after the slot's
+SS/PBCH blocks plus `N_gap`; the transmitted SSBs come from SIB1 through
+`ferrite_ran::ssb`). A DCI 1_1 / 0_1 whose bandwidth-part indicator names
+another BWP resolves to `Dci::BwpSwitch` (TS 38.212 Table 7.3.1.1.2-1 value →
+BWP-Id); the grant it carries is not resolved, so the gNB's first
+transmission on the new BWP is lost and retransmitted — a known simplification.
+
 Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the
 serving SSB: `rlm_evaluate` turns the SSB SINR into `SYNC.indication
 in_sync = false` below Q_out (−8 dB, or SSB not found) and `in_sync = true`
@@ -225,6 +236,13 @@ views. Sub-procedures and their states:
   periodic SRS keeps going by default (`MacConfig::srs_outside_active_time`:
   OCUDU derives the timing advance from every SRS occasion, empty ones
   included, and walks the uplink out of the cyclic prefix otherwise).
+* **Bandwidth parts** (§5.15): `MacConfig::{dl_bwp_id, default_dl_bwp_id,
+  bwp_inactivity_timer_ms}`. The bwp-InactivityTimer runs on a non-default
+  BWP, restarts on every C-RNTI PDCCH, is stopped by a random access and
+  switches back to the default BWP on expiry; a `Dci::BwpSwitch` and a random
+  access from a non-initial BWP (only the initial UL BWP has PRACH) also
+  request a switch. Every switch is a `MacEvent::BwpSwitch` that RRC answers
+  with the BWP's configuration (`Reconfigure` → CONFIG.request).
 * **BSR** (§5.4.5, regular/periodic/padding, short/long), **LCP** (§5.4.3.1),
   **PHR** (§5.4.6, Single Entry PHR from a `PowerHeadroom` input), **SRS**
   occasions (dropped when a PUCCH/PUSCH goes out in the slot).
@@ -272,7 +290,15 @@ Radio link failure (§5.3.10.3) comes from `MacNotification`: T310 expiry
 consecutive in-sync stop it; T310/N310/N311 from SIB1 `ue-TimersAndConstants`,
 only counted while `Connected`), `RaFailed` while connected, `RlcMaxRetx`, and
 `RadioLinkFailure` (the PHY gave the cell up). T311 is trivially satisfied
-today: the UE re-selects the serving cell at once. `RRCSetup` is
+today: the UE re-selects the serving cell at once. Bandwidth parts: every
+`CellGroupConfig` is applied per configured DL BWP (`codec::cell_group_bwps`
+→ `apply_cell_group_bwp`: the BWP's generic parameters and common
+PDCCH/PDSCH/PUSCH/PUCCH config, its dedicated part, the cell-level items),
+kept in `CellInfo::bwps`; `firstActiveDownlinkBWP-Id` selects the active one
+and `RrcUe::switch_bwp` (from `MacNotification::BwpSwitch`) activates another
+with a `Reconfigure`. The UL BWP with the same id is paired with a DL BWP,
+the initial UL BWP otherwise. OCUDU configures a single BWP, so this path has
+unit tests only (`tests/codec.rs`). `RRCSetup` is
 accepted only while `Connecting`; an algorithm the UE cannot run in a
 SecurityModeCommand yields a SecurityModeFailure. RRC never touches the lower
 layers: it emits `RrcEvent`s (`CellConfigured`, `Reconfigure`, `SetupBearer`,

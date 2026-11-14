@@ -43,6 +43,11 @@ pub enum MacEvent {
     /// Radio link monitoring indication from the PHY (TS 38.331 §5.3.10:
     /// RRC counts N310 / N311 and runs T310).
     Sync { in_sync: bool },
+    /// Switch the active bandwidth part (§5.15): a DCI bandwidth-part
+    /// indicator, the bwp-InactivityTimer expiry (to the default BWP) or a
+    /// random access started on a BWP without PRACH (to the initial BWP).
+    /// RRC applies the BWP's configuration with a CONFIG.request.
+    BwpSwitch { dl_bwp: Option<u8>, ul_bwp: Option<u8> },
 }
 
 /// What MAC needs from the layers above (the RLC bearers), implemented by the
@@ -80,6 +85,10 @@ pub struct MacEntity {
     lcp: Lcp,
     ta: TimingAdvance,
     drx: crate::drx::Drx,
+    /// bwp-InactivityTimer expiry (§5.15); `bwp_timer_arm` starts it at the
+    /// next slot after a (re)configuration onto a non-default BWP.
+    bwp_inactivity_until: Option<SlotPoint>,
+    bwp_timer_arm: bool,
     c_rnti: Option<Rnti>,
     tc_rnti: Option<Rnti>,
     pending_pusch: BTreeMap<u64, PendingPusch>,
@@ -127,6 +136,8 @@ impl MacEntity {
             lcp: Lcp::new(&cfg.logical_channels),
             ta: TimingAdvance::new(cfg.numerology, cfg.time_alignment_timer_ms),
             drx: crate::drx::Drx::new(cfg.drx),
+            bwp_inactivity_until: None,
+            bwp_timer_arm: cfg.bwp_inactivity_timer_ms.is_some() && cfg.dl_bwp_id != cfg.default_dl_bwp_id,
             c_rnti: None,
             tc_rnti: None,
             pending_pusch: BTreeMap::new(),
@@ -163,7 +174,20 @@ impl MacEntity {
         if cfg.drx != self.cfg.drx {
             self.drx.configure(cfg.drx);
         }
+        // §5.15: the bwp-InactivityTimer runs while a non-default BWP is active.
+        self.bwp_inactivity_until = None;
+        self.bwp_timer_arm = cfg.bwp_inactivity_timer_ms.is_some() && cfg.dl_bwp_id != cfg.default_dl_bwp_id;
         self.cfg = cfg;
+    }
+
+    /// §5.15: (re)start the bwp-InactivityTimer on a PDCCH addressed to the
+    /// C-RNTI (DL assignment or UL grant) on the active BWP.
+    fn restart_bwp_timer(&mut self, now: SlotPoint) {
+        if let Some(ms) = self.cfg.bwp_inactivity_timer_ms {
+            if self.cfg.dl_bwp_id != self.cfg.default_dl_bwp_id {
+                self.bwp_inactivity_until = Some(now.add(u64::from(self.cfg.ms_to_slots(ms))));
+            }
+        }
     }
 
     /// DRX state (diagnostics).
@@ -199,6 +223,14 @@ impl MacEntity {
     /// RRC: start a contention-based RA carrying `ccch` (RRCSetupRequest) in Msg3.
     pub fn start_ra(&mut self, ccch: [u8; 6]) {
         self.ra_start = Some(ccch);
+    }
+
+    /// §5.15: a random access on a BWP without PRACH occasions switches to the
+    /// initial BWP first (only the initial UL BWP carries the cell's PRACH).
+    fn ensure_initial_bwp_for_ra(&mut self) {
+        if self.cfg.dl_bwp_id != 0 {
+            self.events.push(MacEvent::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) });
+        }
     }
 
     /// RRC: MAC reset (§5.12): back to idle, forget RNTIs and HARQ state.
@@ -253,7 +285,21 @@ impl MacEntity {
 
         // Start a RA if RRC asked for one.
         if let Some(ccch) = self.ra_start.take() {
+            self.ensure_initial_bwp_for_ra();
             self.ra.start(now, Some(ccch), None);
+        }
+        // bwp-InactivityTimer (§5.15): stopped during a random access, expiry
+        // switches back to the default BWP.
+        if self.bwp_timer_arm {
+            self.bwp_timer_arm = false;
+            self.restart_bwp_timer(now);
+        }
+        if self.ra.is_running() {
+            self.bwp_inactivity_until = None;
+        } else if self.bwp_inactivity_until.is_some_and(|t| now.diff(&t) >= 0) {
+            self.bwp_inactivity_until = None;
+            log::info!("bwp-InactivityTimer expired: back to the default BWP {}", self.cfg.default_dl_bwp_id);
+            self.events.push(MacEvent::BwpSwitch { dl_bwp: Some(self.cfg.default_dl_bwp_id), ul_bwp: Some(self.cfg.default_dl_bwp_id) });
         }
         // DRX (§5.7): Active Time decides whether the PHY monitors the C-RNTI
         // PDCCH candidates in this slot (and whether CSI / SRS go out).
@@ -281,6 +327,7 @@ impl MacEntity {
         if self.bsr.sr_pending && self.c_rnti.is_some() {
             if self.sr.is_empty() && !self.ra.is_running() {
                 // No SR configured: a RA with the C-RNTI (§5.4.4).
+                self.ensure_initial_bwp_for_ra();
                 self.ra.start(now, None, self.c_rnti);
                 self.crnti_ce_pending = true;
             }
@@ -298,6 +345,7 @@ impl MacEntity {
                 s.cancel();
             }
             if !self.ra.is_running() {
+                self.ensure_initial_bwp_for_ra();
                 self.ra.start(now, None, self.c_rnti);
                 self.crnti_ce_pending = true;
             }
@@ -479,6 +527,10 @@ impl MacEntity {
             Dci::Dl(g) => self.on_dl_grant(slot, g),
             Dci::Ul(g) => self.on_ul_grant(slot, g, phy, upper),
             Dci::Other { .. } => {}
+            Dci::BwpSwitch { dl_bwp, ul_bwp } => {
+                log::info!("DCI bandwidth-part indicator: switching to DL BWP {dl_bwp:?} / UL BWP {ul_bwp:?}");
+                self.events.push(MacEvent::BwpSwitch { dl_bwp, ul_bwp });
+            }
         }
         // C-RNTI based RA resolves on any C-RNTI PDCCH (§5.1.5).
         if self.c_rnti.is_some() {
@@ -494,6 +546,7 @@ impl MacEntity {
         let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
         if g.rnti_kind == RntiKind::C {
             self.drx.on_crnti_pdcch(slot);
+            self.restart_bwp_timer(slot);
             if let Some(ack_slot) = g.ack_slot {
                 self.drx.on_dl_assignment(g.harq_id, ack_slot);
             }
@@ -521,6 +574,7 @@ impl MacEntity {
         if g.rnti_kind == RntiKind::C {
             self.drx.on_crnti_pdcch(slot);
             self.drx.on_ul_grant(g.harq_id, g.pusch_slot);
+            self.restart_bwp_timer(slot);
         }
         let (tb, bsr_included, bsr_truncated) = if retx {
             self.stats.ul_retx += 1;

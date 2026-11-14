@@ -250,3 +250,57 @@ fn attach_flow() {
     assert!(uci.harq_ack.is_empty()); // T-DAI 3 with nothing booked → no ACK bits
     assert_eq!(mac.stats().ul_tb, 2);
 }
+
+/// TS 38.321 §5.15: on a non-default BWP the bwp-InactivityTimer runs,
+/// restarts on every C-RNTI PDCCH and switches back to the default BWP on
+/// expiry; a DCI bandwidth-part indicator and a random access switch too.
+#[test]
+fn bwp_inactivity_timer_and_switch_requests() {
+    let mut c = config();
+    c.dl_bwp_id = 1;
+    c.default_dl_bwp_id = 0;
+    c.bwp_inactivity_timer_ms = Some(10); // 20 slots
+    let mut mac = MacEntity::new(c);
+    let mut up = FakeUpper { pending: Vec::new(), rx: Vec::new() };
+    let switches = |mac: &mut MacEntity| mac.take_events().into_iter().filter(|e| matches!(e, MacEvent::BwpSwitch { .. })).collect::<Vec<_>>();
+    for n in 0..19 {
+        step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) }));
+    }
+    assert!(switches(&mut mac).is_empty());
+    // A C-RNTI DL assignment at slot 19 restarts the timer.
+    let dl = DlGrant {
+        rnti: Rnti(0x4601),
+        rnti_kind: RntiKind::C,
+        pdsch_slot: slot(19),
+        prb_start: 0,
+        n_prb: 4,
+        time: TimeAlloc { mapping_type_a: true, start_symbol: 2, n_symbols: 12 },
+        mcs: Mcs { index: 7, qm: 2, r_x1024: Some(526) },
+        tbs_bits: 500,
+        harq_id: 0,
+        ndi: 1,
+        rv: 0,
+        ack_slot: None,
+        dai: 0,
+        pri: 0,
+        tpc: 1,
+        cdm_groups_wo_data: 2,
+        dmrs_add_pos: 2,
+        vrb_to_prb_interleaved: false,
+        r_pucch_common: 0,
+    };
+    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: slot(19), dci: Dci::Dl(dl) }));
+    for n in 19..38 {
+        step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) }));
+    }
+    assert!(switches(&mut mac).is_empty(), "restarted at slot 19: no expiry before 39");
+    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(39) }));
+    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) }]);
+    // A DCI with a bandwidth-part indicator is passed up as a switch request.
+    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: slot(40), dci: Dci::BwpSwitch { dl_bwp: Some(2), ul_bwp: None } }));
+    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(2), ul_bwp: None }]);
+    // A random access from a non-initial BWP asks for the initial one first.
+    mac.start_ra([0x1f, 1, 2, 3, 4, 5]);
+    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(41) }));
+    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) }]);
+}

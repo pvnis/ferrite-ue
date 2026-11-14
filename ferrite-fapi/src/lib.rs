@@ -159,6 +159,10 @@ pub enum Dci {
     /// A DCI the PHY recognised but MAC does not act on (paging short
     /// messages, SI scheduling for a SIB the UE has not requested, …).
     Other { format: &'static str },
+    /// A DCI 1_1 / 0_1 whose bandwidth-part indicator names a BWP other than
+    /// the active one (TS 38.213 §12): MAC switches the active BWP; the
+    /// grant itself, which would apply on the new BWP, is not resolved.
+    BwpSwitch { dl_bwp: Option<u8>, ul_bwp: Option<u8> },
 }
 
 /// SLOT.indication.

@@ -425,3 +425,15 @@ fn t310_without_security_goes_to_idle() {
     assert_eq!(ue.state(), RrcState::Idle);
     assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::Failed(_))));
 }
+
+#[test]
+fn bwp_switch_to_an_unknown_bwp_is_ignored() {
+    let mut ue = connected();
+    assert_eq!(ue.active_bwp(), Some(0));
+    ue.on_mac(MacNotification::BwpSwitch { dl_bwp: Some(1), ul_bwp: None });
+    assert!(ue.take_events().is_empty());
+    assert_eq!(ue.active_bwp(), Some(0));
+    // Switching to the active BWP is a no-op too.
+    ue.on_mac(MacNotification::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) });
+    assert!(ue.take_events().is_empty());
+}

@@ -18,6 +18,11 @@ pub struct DciResolver {
     pub dl_bwp_rb: usize,
     pub ul_bwp_rb: usize,
     pub dl_bwp_start: usize,
+    /// Active BWP ids and the number of RRC-configured BWPs (BWP indicator).
+    pub dl_bwp_id: u8,
+    pub ul_bwp_id: u8,
+    pub nof_dl_bwp_rrc: u8,
+    pub nof_ul_bwp_rrc: u8,
     pub pdsch_tdra: Vec<TdraRow>,
     pub pusch_tdra: Vec<TdraRow>,
     pub pdsch_tdra_common: Vec<TdraRow>,
@@ -58,6 +63,8 @@ impl DciResolver {
         sc.ul_bwp_active_rb = cfg.ul_bwp.n_rb as usize;
         sc.coreset0_rb = coreset0_rb;
         sc.monitor_0_1_1_1 = dedicated;
+        sc.nof_dl_bwp_rrc = usize::from(cfg.nof_dl_bwp_rrc);
+        sc.nof_ul_bwp_rrc = usize::from(cfg.nof_ul_bwp_rrc);
         // Fallback formats in a USS only when one is configured for them
         // (TS 38.212 §7.3.1.0 step 1/2: the 0_0/1_0 USS size and the 0_1
         // one-bit padding exist only then).
@@ -82,6 +89,10 @@ impl DciResolver {
             dl_bwp_rb: cfg.dl_bwp.n_rb as usize,
             ul_bwp_rb: cfg.ul_bwp.n_rb as usize,
             dl_bwp_start: cfg.dl_bwp.start_crb as usize,
+            dl_bwp_id: cfg.dl_bwp.id,
+            ul_bwp_id: cfg.ul_bwp.id,
+            nof_dl_bwp_rrc: cfg.nof_dl_bwp_rrc,
+            nof_ul_bwp_rrc: cfg.nof_ul_bwp_rrc,
             pdsch_tdra: cfg.pdsch.tdra.clone(),
             pusch_tdra: cfg.pusch.tdra.clone(),
             pdsch_tdra_common: cfg.pdsch_tdra_common.clone(),
@@ -154,6 +165,17 @@ impl DciResolver {
             start_symbol: r.s as u8,
             n_symbols: r.l as u8,
         })
+    }
+
+    /// BWP-Id named by a DCI bandwidth-part indicator (TS 38.212 Table
+    /// 7.3.1.1.2-1): the field value itself when up to 3 BWPs are configured
+    /// besides the initial one (0 = initial), else value + 1.
+    fn bwp_id_of(indicator: u8, nof_bwp_rrc: u8) -> u8 {
+        if nof_bwp_rrc <= 3 {
+            indicator
+        } else {
+            indicator + 1
+        }
     }
 
     /// TS 38.213 §11.1: a PDSCH must not be in UL symbols, a PUSCH not in DL
@@ -336,6 +358,12 @@ impl DciResolver {
     pub fn resolve_1_1(&self, bits: &[u8], rnti: Rnti, slot: SlotPoint, cce0: usize, n_cce: usize) -> Option<Dci> {
         let size = self.sizes.f1_1.as_ref()?;
         let d = dci::parse_dci_1_1(bits, size).ok()?;
+        if let Some(b) = d.bwp_indicator {
+            let id = Self::bwp_id_of(b, self.nof_dl_bwp_rrc);
+            if id != self.dl_bwp_id {
+                return Some(Dci::BwpSwitch { dl_bwp: Some(id), ul_bwp: None });
+            }
+        }
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.dl_bwp_rb)?;
         let row = self.pdsch_tdra_row(d.tdra as usize, true, RntiKind::C)?;
         let mcs = self.mcs(self.pdsch_mcs, d.mcs);
@@ -423,6 +451,12 @@ impl DciResolver {
     pub fn resolve_0_1(&self, bits: &[u8], rnti: Rnti, slot: SlotPoint) -> Option<Dci> {
         let size = self.sizes.f0_1.as_ref()?;
         let d = dci::parse_dci_0_1(bits, size).ok()?;
+        if let Some(b) = d.bwp_indicator {
+            let id = Self::bwp_id_of(b, self.nof_ul_bwp_rrc);
+            if id != self.ul_bwp_id {
+                return Some(Dci::BwpSwitch { dl_bwp: None, ul_bwp: Some(id) });
+            }
+        }
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.ul_bwp_rb)?;
         let row = self.pusch_tdra_row(d.tdra as usize, true)?;
         let mcs = self.pusch_mcs_of(self.pusch_mcs, d.mcs, self.ded_tp.is_some_and(|t| t.pi2_bpsk));
@@ -716,9 +750,13 @@ mod tests {
 
     /// DCI 1_1 payload with the resolver's field widths.
     fn dci_1_1(r: &DciResolver, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, pri: u32, k1_idx: u32, ports: u32) -> Vec<u8> {
+        dci_1_1_bwp(r, 0, riv, tdra, mcs, ndi, rv, harq, dai, pri, k1_idx, ports)
+    }
+
+    fn dci_1_1_bwp(r: &DciResolver, bwp: u32, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, pri: u32, k1_idx: u32, ports: u32) -> Vec<u8> {
         let s = r.sizes.f1_1.as_ref().expect("1_1 size");
         let mut b = Bits::new();
-        b.put(1, 1).put(0, s.carrier_indicator).put(0, s.bwp_indicator).put(riv, s.fdra).put(tdra, s.tdra).put(0, s.vrb_to_prb).put(0, s.prb_bundling).put(0, s.rate_matching).put(0, s.zp_csi_rs_trigger);
+        b.put(1, 1).put(0, s.carrier_indicator).put(bwp, s.bwp_indicator).put(riv, s.fdra).put(tdra, s.tdra).put(0, s.vrb_to_prb).put(0, s.prb_bundling).put(0, s.rate_matching).put(0, s.zp_csi_rs_trigger);
         b.put(mcs, 5).put(ndi, 1).put(rv, 2);
         if s.tb2 > 0 {
             b.put(0, 8);
@@ -821,6 +859,25 @@ mod tests {
         // FDD: never dropped.
         let r = DciResolver::new(&cfg(), false);
         assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4).is_some());
+    }
+
+    #[test]
+    fn bwp_indicator_switches_the_bandwidth_part() {
+        // One BWP besides the initial one: a 1-bit indicator naming BWP 0 or 1.
+        let mut c = dedicated_cfg();
+        c.nof_dl_bwp_rrc = 1;
+        let r = DciResolver::new(&c, true);
+        assert_eq!(r.sizes.f1_1.as_ref().unwrap().bwp_indicator, 1);
+        let same = dci_1_1_bwp(&r, 0, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
+        assert!(matches!(r.resolve_1_1(&same, Rnti(0x4601), slot(40), 8, 16), Some(Dci::Dl(_))));
+        let other = dci_1_1_bwp(&r, 1, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
+        assert_eq!(r.resolve_1_1(&other, Rnti(0x4601), slot(40), 8, 16), Some(Dci::BwpSwitch { dl_bwp: Some(1), ul_bwp: None }));
+        // Four configured BWPs: 2 bits, value + 1 (the initial BWP is not addressable).
+        assert_eq!(DciResolver::bwp_id_of(2, 4), 3);
+        assert_eq!(DciResolver::bwp_id_of(2, 3), 2);
+        // Without configured BWPs the field is absent and nothing switches.
+        let r = DciResolver::new(&dedicated_cfg(), true);
+        assert_eq!(r.sizes.f1_1.as_ref().unwrap().bwp_indicator, 0);
     }
 
     #[test]

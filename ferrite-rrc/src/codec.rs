@@ -41,9 +41,29 @@ fn carrier_at(list: &[cm::ScsSpecificCarrier], n: Numerology) -> Option<Carrier>
 }
 
 /// `BWP.locationAndBandwidth` → CRBs (`N_BWP^start = O_carrier + RB_start`, TS 38.214 §5.1.2.2.2 / TS 38.213 §12).
-fn bwp_of(b: &cm::Bwp, carrier: Carrier) -> Result<Bwp, String> {
+fn bwp_of(b: &cm::Bwp, carrier: Carrier, id: u8) -> Result<Bwp, String> {
     let (start, len) = b.start_and_len();
-    Ok(Bwp { start_crb: carrier.offset_crb + start, n_rb: len, scs: numerology_of(b.subcarrier_spacing)? })
+    Ok(Bwp { id, start_crb: carrier.offset_crb + start, n_rb: len, scs: numerology_of(b.subcarrier_spacing)? })
+}
+
+/// `PDCCH-ConfigCommon` of a BWP: its common CORESET and common search spaces
+/// (add/mod by id; the Type0 CSS stays on `ss0_index`).
+fn apply_pdcch_common(phy: &mut PhyConfig, pc: &sib1::PdcchConfigCommon) {
+    if let Some(c) = pc.common_control_resource_set.as_ref().and_then(|c| coreset_of(c, phy.dl_bwp.start_crb)) {
+        phy.coresets.retain(|x| x.id != c.id);
+        phy.coresets.push(c);
+    }
+    if let Some(z) = pc.search_space_zero {
+        phy.ss0_index = z;
+    }
+    for ss in &pc.common_search_space_list {
+        if let Some(cfg) = search_space_of(ss) {
+            if ss.search_space_id != 0 {
+                phy.search_spaces.retain(|x| x.id != cfg.id);
+                phy.search_spaces.push(cfg);
+            }
+        }
+    }
 }
 
 fn tdra_rows_pdsch(rows: &[cm::TdraRow]) -> Vec<TdraRow> {
@@ -136,7 +156,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         return Err(format!("initial DL BWP µ={mu} but MIB common SCS µ={}", mib.mu));
     }
     let dl_carrier = carrier_at(&dl.frequency_info_dl.scs_specific_carrier_list, numerology).ok_or("no DL SCS-SpecificCarrier")?;
-    let dl_bwp = bwp_of(dl_bwp_gen, dl_carrier)?;
+    let dl_bwp = bwp_of(dl_bwp_gen, dl_carrier, 0)?;
 
     // SSB placement on the CRB grid: offsetToPointA is in 15 kHz RBs (FR1);
     // a leftover 15 kHz RB at µ=1 shifts the SSB by 12 extra 15 kHz subcarriers.
@@ -149,7 +169,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let ul = sc.uplink_config_common.as_ref().ok_or("SIB1 without uplinkConfigCommon")?;
     let ul_bwp_gen = &ul.initial_uplink_bwp.generic_parameters;
     let ul_carrier = carrier_at(&ul.frequency_info_ul.scs_specific_carrier_list, numerology).ok_or("no UL SCS-SpecificCarrier")?;
-    let ul_bwp = bwp_of(ul_bwp_gen, ul_carrier)?;
+    let ul_bwp = bwp_of(ul_bwp_gen, ul_carrier, 0)?;
     if ul_bwp.scs != numerology {
         return Err("initial UL BWP numerology differs from DL".into());
     }
@@ -278,6 +298,8 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         ssb_crb,
         dl_bwp,
         ul_bwp,
+        nof_dl_bwp_rrc: 0,
+        nof_ul_bwp_rrc: 0,
         tdd,
         coresets,
         search_spaces,
@@ -356,6 +378,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         n310: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n310),
         n311: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n311),
         t311_ms: s.ue_timers_and_constants.as_ref().map_or(30000, |t| t.t311_ms as u32),
+        bwps: std::collections::BTreeMap::new(),
     })
 }
 
@@ -448,12 +471,59 @@ fn csi_rs_resource_of(id: u8, m: &cm::CsiRsResourceMapping, po: Option<cm::Perio
 /// Apply a `CellGroupConfig` (RRCSetup / RRCReconfiguration) on top of the
 /// current configuration. Absent IEs keep their current values.
 pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::CellGroupConfig) -> (PhyConfig, MacConfig) {
+    apply_cell_group_bwp(base_phy, base_mac, c, base_phy.dl_bwp.id, base_phy.ul_bwp.id)
+}
+
+/// Apply a `CellGroupConfig` delta for the configuration of DL BWP `dl_id` /
+/// UL BWP `ul_id` (0 = initial): the BWP's own common part (generic
+/// parameters, PDCCH/PDSCH/PUSCH/PUCCH-ConfigCommon) when the message carries
+/// it, its dedicated part, and the cell-level items (CSI, HARQ, MAC).
+pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::CellGroupConfig, dl_id: u8, ul_id: u8) -> (PhyConfig, MacConfig) {
     let mut phy = base_phy.clone();
     let mut mac = base_mac.clone();
     let mu = phy.numerology.mu;
+    let (dl_common, dl_ded) = c.dl_bwp(dl_id);
+    let (ul_common, ul_ded) = c.ul_bwp(ul_id);
+
+    // --- BWP common parts (non-initial BWPs: TS 38.331 BWP-DownlinkCommon / BWP-UplinkCommon).
+    if let Some(bc) = dl_common {
+        match bwp_of(&bc.generic_parameters, phy.dl_carrier, dl_id) {
+            Ok(b) => phy.dl_bwp = b,
+            Err(e) => log::warn!("DL BWP {dl_id}: {e}"),
+        }
+        if let Some(pc) = bc.pdcch_config_common.as_ref().and_then(|p| p.setup()) {
+            apply_pdcch_common(&mut phy, pc);
+        }
+        if let Some(pd) = bc.pdsch_config_common.as_ref().and_then(|p| p.setup()) {
+            phy.pdsch_tdra_common = tdra_rows_pdsch(&pd.pdsch_time_domain_allocation_list);
+        }
+    }
+    if let Some(uc) = ul_common {
+        match bwp_of(&uc.generic_parameters, phy.ul_carrier, ul_id) {
+            Ok(b) => phy.ul_bwp = b,
+            Err(e) => log::warn!("UL BWP {ul_id}: {e}"),
+        }
+        if let Some(pu) = uc.pusch_config_common.as_ref().and_then(|p| p.setup()) {
+            phy.pusch_tdra_common = tdra_rows_pusch(&pu.pusch_time_domain_allocation_list, mu);
+            phy.pusch.msg3_group_hopping = pu.group_hopping_enabled_transform_precoding;
+        }
+        if let Some(pc) = uc.pucch_config_common.as_ref().and_then(|p| p.setup()) {
+            phy.pucch.resource_common = pc.pucch_resource_common;
+            phy.pucch.hopping_id = pc.hopping_id;
+        }
+    }
+    phy.dl_bwp.id = dl_id;
+    phy.ul_bwp.id = ul_id;
+    if let Some(scc) = c.serving_cell() {
+        phy.nof_dl_bwp_rrc = phy.nof_dl_bwp_rrc.max(scc.downlink_bwp_to_add_mod_list.iter().filter(|b| b.bwp_id != 0).count() as u8);
+        phy.nof_ul_bwp_rrc = phy.nof_ul_bwp_rrc.max(scc.uplink_config.as_ref().map_or(0, |u| u.uplink_bwp_to_add_mod_list.iter().filter(|b| b.bwp_id != 0).count() as u8));
+        mac.bwp_inactivity_timer_ms = scc.bwp_inactivity_timer_ms.map(u32::from).or(mac.bwp_inactivity_timer_ms);
+        mac.default_dl_bwp_id = scc.default_downlink_bwp_id.unwrap_or(mac.default_dl_bwp_id);
+    }
+    mac.dl_bwp_id = dl_id;
 
     // --- PDCCH: CORESETs and search spaces (add/mod/release by id).
-    if let Some(p) = c.pdcch_config() {
+    if let Some(p) = dl_ded.and_then(|d| d.pdcch_config.as_ref()?.setup()) {
         for id in &p.control_resource_set_to_release_list {
             phy.coresets.retain(|x| x.id != *id);
         }
@@ -475,7 +545,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
     }
 
     // --- PDSCH.
-    if let Some(p) = c.pdsch_config() {
+    if let Some(p) = dl_ded.and_then(|d| d.pdsch_config.as_ref()?.setup()) {
         phy.pdsch.dmrs_type_a = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_a.as_ref(), phy.pdsch.dmrs_type_a);
         phy.pdsch.dmrs_type_b = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_b.as_ref(), phy.pdsch.dmrs_type_b);
         phy.pdsch.mcs_table = mcs_table_of(p.mcs_table);
@@ -530,7 +600,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
     }
 
     // --- PUSCH.
-    if let Some(p) = c.pusch_config() {
+    if let Some(p) = ul_ded.and_then(|d| d.pusch_config.as_ref()?.setup()) {
         phy.pusch.dmrs_type_a = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_a.as_ref(), phy.pusch.dmrs_type_a);
         phy.pusch.dmrs_type_b = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_b.as_ref(), phy.pusch.dmrs_type_b);
         phy.pusch.mcs_table = mcs_table_of(p.mcs_table);
@@ -566,7 +636,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
     }
 
     // --- PUCCH.
-    if let Some(p) = c.pucch_config() {
+    if let Some(p) = ul_ded.and_then(|d| d.pucch_config.as_ref()?.setup()) {
         for id in &p.resource_set_to_release_list {
             phy.pucch.resource_sets.retain(|x| x.id != *id);
         }
@@ -670,7 +740,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
         }
     }
     // --- SRS: resources by id (add-mod / release); periodic occasions for MAC.
-    if let Some(s) = c.srs_config() {
+    if let Some(s) = ul_ded.and_then(|d| d.srs_config.as_ref()?.setup()) {
         for id in &s.srs_resource_to_release_list {
             phy.srs.retain(|r| r.id != *id);
         }
@@ -842,14 +912,49 @@ fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>, pre
 // DL message decoding
 // ---------------------------------------------------------------------------
 
+/// The per-BWP configurations a `CellGroupConfig` leaves the UE with, and
+/// the active one (TS 38.331 `firstActiveDownlinkBWP-Id`, else the BWP that
+/// was active before).
+#[derive(Clone, Debug)]
+pub struct BwpConfigs {
+    /// `(PhyConfig, MacConfig)` per DL BWP id (the UL BWP with the same id is
+    /// paired with it, the initial UL BWP when there is none).
+    pub by_id: std::collections::BTreeMap<u8, (PhyConfig, MacConfig)>,
+    pub active_id: u8,
+    pub active: (PhyConfig, MacConfig),
+}
+
+/// Apply the delta `c` to every BWP the UE knows (the ones in `cell.bwps`
+/// plus the ones `c` adds), starting a new BWP from the common configuration.
+pub fn cell_group_bwps(cell: &CellInfo, c: &cg::CellGroupConfig) -> BwpConfigs {
+    let mut ids: std::collections::BTreeSet<u8> = cell.bwps.keys().copied().collect();
+    ids.insert(0);
+    ids.extend(c.dl_bwp_ids());
+    let ul_ids = c.ul_bwp_ids();
+    let mut by_id = std::collections::BTreeMap::new();
+    for id in ids {
+        let (base_phy, base_mac) = match cell.bwps.get(&id) {
+            Some((p, m)) => (p, m),
+            None if id == cell.phy.dl_bwp.id => (&cell.phy, &cell.mac),
+            None => (&cell.common_phy, &cell.common_mac),
+        };
+        let ul_id = if id == 0 || ul_ids.contains(&id) || cell.bwps.get(&id).is_some_and(|(p, _)| p.ul_bwp.id == id) { id } else { 0 };
+        by_id.insert(id, apply_cell_group_bwp(base_phy, base_mac, c, id, ul_id));
+    }
+    let active_id = c.serving_cell().and_then(|s| s.first_active_downlink_bwp_id).filter(|id| by_id.contains_key(id)).unwrap_or(cell.phy.dl_bwp.id);
+    let active = by_id.get(&active_id).or_else(|| by_id.get(&0)).cloned().expect("BWP 0 is always present");
+    BwpConfigs { by_id, active_id, active }
+}
+
 /// Msg4: `DL-CCCH-Message`.
 pub fn decode_dl_ccch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlCcch, String> {
     match rrc::DlCcchMessage::decode(pdu).map_err(err("DL-CCCH"))? {
         rrc::DlCcchMessage::RrcReject(_) => Ok(DlCcch::Reject),
         rrc::DlCcchMessage::RrcSetup(s) => {
-            let (phy, mac) = apply_cell_group(&cell.phy, &cell.mac, &s.master_cell_group);
+            let bwps = cell_group_bwps(cell, &s.master_cell_group);
+            let (phy, mac) = bwps.active.clone();
             let bearers = bearers_of(&s.master_cell_group, Some(&s.radio_bearer_config), &cell.rlc_bearers);
-            Ok(DlCcch::Setup { tid: s.rrc_transaction_identifier, phy, mac, bearers })
+            Ok(DlCcch::Setup { tid: s.rrc_transaction_identifier, phy, mac, bearers, bwps })
         }
     }
 }
@@ -859,16 +964,14 @@ pub fn decode_dl_dcch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlDc
     Ok(match rrc::DlDcchMessage::decode(pdu).map_err(err("DL-DCCH"))? {
         rrc::DlDcchMessage::RrcReconfiguration(r) => {
             let cgc = r.master_cell_group();
-            let (phy, mac) = match cgc {
-                Some(c) => {
-                    let (p, m) = apply_cell_group(&cell.phy, &cell.mac, c);
-                    (Some(p), Some(m))
-                }
+            let bwps = cgc.map(|c| cell_group_bwps(cell, c));
+            let (phy, mac) = match &bwps {
+                Some(b) => (Some(b.active.0.clone()), Some(b.active.1.clone())),
                 None => (None, None),
             };
             let bearers = cgc.map(|c| bearers_of(c, r.radio_bearer_config.as_ref(), &cell.rlc_bearers)).unwrap_or_default();
             let released = cgc.map(|c| c.rlc_bearer_to_release_list.clone()).unwrap_or_default();
-            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec(), meas: r.meas_config.clone() }
+            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec(), meas: r.meas_config.clone(), bwps }
         }
         rrc::DlDcchMessage::SecurityModeCommand(m) => {
             let a = &m.security_algorithm_config;

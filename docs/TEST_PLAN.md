@@ -88,14 +88,17 @@ Pass = S1–S12 green on T1, T2, T3, F1, F2. S13–S15 are tracked but not gatin
 * **ferrite-nas**: message codecs byte-exact vs captured qcore exchanges, 5G-AKA
   vectors (TS 35.208), full registration + PDU session against a fake core.
 * **ferrite-mac**: RA state machine (RAR window expiry, backoff, contention
-  resolution timeout, success), HARQ codebook assembly, BSR/SR timers, LCP.
+  resolution timeout, success), HARQ codebook assembly, BSR/SR timers, LCP,
+  DRX timers (`drx.rs`), bwp-InactivityTimer and BWP switch requests
+  (`tests/attach.rs`).
 * **ferrite-rrc**: state machine transitions on each DL message
   (`tests/state_machine.rs`: establishment, T300, SMC verdicts, RLF /
   T301 / T310 / N310 / N311, release, paging, NAS transport); derived
   `PhyConfig`/`MacConfig` for the TDD capture (`tests/codec.rs`).
 * **ferrite-l1**: slot clock ↔ sample index mapping, UL position = DL −
   (N_TA + N_TA_offset); injection table; `DciResolver` for every DCI format
-  and the RAR grant (`resolve.rs` tests); RLM thresholds; a closed-loop test
+  and the RAR grant, TDD direction checks and the BWP indicator (`resolve.rs`
+  tests); RLM thresholds; a closed-loop test
   with a simulated gNB (file source/sink) exercising SSB → SIB1 → PRACH
   placement.
 * **ferrite-ue**: the stack through the FAPI interface (`tests/stack.rs`:

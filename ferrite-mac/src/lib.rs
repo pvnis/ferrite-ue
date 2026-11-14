@@ -180,6 +180,12 @@ pub struct MacConfig {
     /// out of the cyclic prefix within a few DRX cycles when the occasions
     /// are left empty. Sounding a little more never loses data.
     pub srs_outside_active_time: bool,
+    /// Active DL BWP (`firstActiveDownlinkBWP-Id` / the last switch) and the
+    /// `defaultDownlinkBWP-Id` the `bwp-InactivityTimer` (ms, `None` = no
+    /// timer) falls back to (TS 38.321 §5.15).
+    pub dl_bwp_id: u8,
+    pub default_dl_bwp_id: u8,
+    pub bwp_inactivity_timer_ms: Option<u32>,
 }
 
 impl MacConfig {
@@ -212,6 +218,9 @@ impl MacConfig {
             srs_occasions: Vec::new(),
             drx: None,
             srs_outside_active_time: true,
+            dl_bwp_id: 0,
+            default_dl_bwp_id: 0,
+            bwp_inactivity_timer_ms: None,
         }
     }
 

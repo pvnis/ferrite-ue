@@ -70,12 +70,15 @@ pub struct CellInfo {
     /// RLC configuration of every bearer set up so far, by LCID (an
     /// `RLC-BearerConfig` without `rlc-Config` keeps it).
     pub rlc_bearers: std::collections::BTreeMap<u8, RlcSetup>,
+    /// Dedicated configuration per DL BWP id (TS 38.331 §5.3.5.5.3; empty
+    /// until the RRCSetup). `phy` / `mac` are the active BWP's.
+    pub bwps: std::collections::BTreeMap<u8, (PhyConfig, MacConfig)>,
 }
 
 /// Decoded DL-CCCH messages the state machine acts on.
 #[allow(clippy::large_enum_variant)] // one message at a time; boxing the configs buys nothing
 pub enum DlCcch {
-    Setup { tid: u8, phy: PhyConfig, mac: MacConfig, bearers: Vec<BearerSetup> },
+    Setup { tid: u8, phy: PhyConfig, mac: MacConfig, bearers: Vec<BearerSetup>, bwps: BwpConfigs },
     Reject,
 }
 
@@ -84,7 +87,7 @@ pub enum DlCcch {
 pub enum DlDcch {
     SecurityModeCommand { tid: u8, integrity_alg: u8, ciphering_alg: u8 },
     UeCapabilityEnquiry { tid: u8 },
-    Reconfiguration { tid: u8, phy: Option<PhyConfig>, mac: Option<MacConfig>, bearers: Vec<BearerSetup>, released: Vec<u8>, nas: Vec<Vec<u8>>, meas: Option<ferrite_asn1::meas::MeasConfig> },
+    Reconfiguration { tid: u8, phy: Option<PhyConfig>, mac: Option<MacConfig>, bearers: Vec<BearerSetup>, released: Vec<u8>, nas: Vec<Vec<u8>>, meas: Option<ferrite_asn1::meas::MeasConfig>, bwps: Option<BwpConfigs> },
     DlInformationTransfer { nas: Option<Vec<u8>> },
     Release,
     /// `RRCReestablishment` (§5.3.7.5) with its `nextHopChainingCount`.

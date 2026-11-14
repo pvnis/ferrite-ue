@@ -457,6 +457,7 @@ impl Stack {
                 MacEvent::TimeAlignmentExpired => self.rrc.on_mac(MacNotification::TimeAlignmentExpired),
                 MacEvent::RadioLinkFailure => self.rrc.on_mac(MacNotification::RadioLinkFailure),
                 MacEvent::Sync { in_sync } => self.rrc.on_mac(MacNotification::SyncIndication { in_sync }),
+                MacEvent::BwpSwitch { dl_bwp, ul_bwp } => self.rrc.on_mac(MacNotification::BwpSwitch { dl_bwp, ul_bwp }),
             }
         }
         self.apply_rrc_events(phy, now);

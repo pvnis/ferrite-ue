@@ -178,6 +178,9 @@ pub enum MacNotification {
     /// One radio link monitoring indication from the PHY (§5.3.10.1): `false`
     /// = out-of-sync (RLM-RS below Q_out), `true` = in-sync (above Q_in).
     SyncIndication { in_sync: bool },
+    /// MAC switches the active bandwidth part (TS 38.321 §5.15): RRC applies
+    /// the BWP's configuration (`Reconfigure`).
+    BwpSwitch { dl_bwp: Option<u8>, ul_bwp: Option<u8> },
 }
 
 /// RRC configuration knobs.
@@ -448,7 +451,34 @@ impl RrcUe {
                 }
             }
             MacNotification::SyncIndication { in_sync } => self.on_sync_indication(in_sync),
+            MacNotification::BwpSwitch { dl_bwp, ul_bwp } => self.switch_bwp(dl_bwp, ul_bwp),
         }
+    }
+
+    /// Activate the configuration of DL BWP `dl_bwp` (or, for a UL-only
+    /// indicator, the DL BWP paired with `ul_bwp`); unknown ids are ignored.
+    pub fn switch_bwp(&mut self, dl_bwp: Option<u8>, ul_bwp: Option<u8>) {
+        let Some(id) = dl_bwp.or(ul_bwp) else { return };
+        if self.state != RrcState::Connected {
+            return;
+        }
+        let Some(cell) = self.cell.as_mut() else { return };
+        let Some((phy, mac)) = cell.bwps.get(&id).cloned() else {
+            log::warn!("BWP {id} is not configured: switch ignored");
+            return;
+        };
+        if cell.phy.dl_bwp.id == id && cell.phy.ul_bwp.id == phy.ul_bwp.id {
+            return;
+        }
+        log::info!("BWP switch: DL {} → {id} (CRB {}+{}), UL {}", cell.phy.dl_bwp.id, phy.dl_bwp.start_crb, phy.dl_bwp.n_rb, phy.ul_bwp.id);
+        cell.phy = phy.clone();
+        cell.mac = mac.clone();
+        self.events.push(RrcEvent::Reconfigure { phy: Box::new(phy), mac: Box::new(mac) });
+    }
+
+    /// The active DL BWP id.
+    pub fn active_bwp(&self) -> Option<u8> {
+        self.cell.as_ref().map(|c| c.phy.dl_bwp.id)
     }
 
     /// §5.3.7.2: on RLF with AS security active, request a re-establishment
@@ -570,7 +600,7 @@ impl RrcUe {
             Ok(derive::DlCcch::Setup { .. }) if self.state != RrcState::Connecting => {
                 log::warn!("RRCSetup received in state {:?} without a pending request: ignored", self.state);
             }
-            Ok(derive::DlCcch::Setup { tid, phy, mac, bearers }) => {
+            Ok(derive::DlCcch::Setup { tid, phy, mac, bearers, bwps }) => {
                 self.t300_expiry = None;
                 self.set_state(RrcState::Connected);
                 // The dedicated configuration becomes the baseline later
@@ -578,6 +608,7 @@ impl RrcUe {
                 if let Some(c) = self.cell.as_mut() {
                     c.phy = phy.clone();
                     c.mac = mac.clone();
+                    c.bwps = bwps.by_id;
                 }
                 for b in bearers {
                     if let Some(c) = self.cell.as_mut() {
@@ -642,8 +673,14 @@ impl RrcUe {
                 let pdu = derive::encode_ue_capability_information(tid, &self.cfg.bands);
                 self.events.push(RrcEvent::TxSrb { srb: 1, pdu });
             }
-            derive::DlDcch::Reconfiguration { tid, phy, mac, bearers, released, nas, meas } => {
+            derive::DlDcch::Reconfiguration { tid, phy, mac, bearers, released, nas, meas, bwps } => {
                 self.stats.reconfigurations += 1;
+                if let (Some(b), Some(c)) = (bwps, self.cell.as_mut()) {
+                    if b.active_id != c.phy.dl_bwp.id {
+                        log::info!("firstActiveDownlinkBWP-Id {}: BWP switch", b.active_id);
+                    }
+                    c.bwps = b.by_id;
+                }
                 if let Some(mc) = &meas {
                     self.meas.apply(mc);
                     log::info!("measConfig applied: {} objects, {} report configs, {} measIds", mc.meas_object_to_add_mod_list.len(), mc.report_config_to_add_mod_list.len(), mc.meas_id_to_add_mod_list.len());
