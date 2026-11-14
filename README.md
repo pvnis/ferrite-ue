@@ -220,3 +220,7 @@ cargo test --workspace                            # core (no native libs needed)
 cargo build --release -p ferrite-ue --bin ferrite-ue
 cargo build -p ferrite-radio --features soapy     # SoapySDR backend
 ```
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Copyright 2026 Pavonis LLC.
