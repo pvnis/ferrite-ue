@@ -337,3 +337,91 @@ fn paging_with_the_ue_identity_requests_service() {
     ue.on_pcch(&paging(mine));
     assert!(ue.take_events().is_empty());
 }
+
+#[test]
+fn n310_out_of_sync_indications_start_t310_and_its_expiry_is_a_radio_link_failure() {
+    let mut ue = secured();
+    ue.tick(slot(0));
+    let (t310, n310) = (ue.cell().unwrap().t310_ms, ue.cell().unwrap().n310.max(1));
+    for _ in 0..n310 - 1 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+        assert!(!ue.t310_running());
+    }
+    // An in-sync indication before N310 resets the count.
+    ue.on_mac(MacNotification::SyncIndication { in_sync: true });
+    for _ in 0..n310 - 1 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    }
+    assert!(!ue.t310_running(), "N310 counts consecutive indications");
+    ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    assert!(ue.t310_running());
+    assert_eq!(ue.state(), RrcState::Connected, "T310 running is not yet a failure");
+    assert!(ue.take_events().is_empty());
+    ue.tick(slot(ms(t310) - 1));
+    assert_eq!(ue.state(), RrcState::Connected);
+    ue.tick(slot(ms(t310)));
+    assert_eq!(ue.state(), RrcState::Reestablishing, "T310 expiry → RLF → re-establishment (security active)");
+    assert!(!ue.t310_running());
+    let ev = ue.take_events();
+    assert!(has(&ev, |e| matches!(e, RrcEvent::Reestablishing)), "{ev:?}");
+    assert!(has(&ev, |e| matches!(e, RrcEvent::StartRa { .. })));
+}
+
+#[test]
+fn n311_in_sync_indications_stop_t310() {
+    let mut ue = secured();
+    ue.tick(slot(0));
+    let (t310, n310, n311) = (ue.cell().unwrap().t310_ms, ue.cell().unwrap().n310.max(1), ue.cell().unwrap().n311.max(1));
+    for _ in 0..n310 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    }
+    assert!(ue.t310_running());
+    for _ in 0..n311 - 1 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: true });
+        assert!(ue.t310_running());
+    }
+    // An out-of-sync in the middle resets the N311 count.
+    ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    for _ in 0..n311 - 1 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: true });
+    }
+    assert!(ue.t310_running());
+    ue.on_mac(MacNotification::SyncIndication { in_sync: true });
+    assert!(!ue.t310_running(), "N311 in-sync indications stop T310");
+    ue.tick(slot(ms(t310) + 10));
+    assert_eq!(ue.state(), RrcState::Connected);
+    assert!(ue.take_events().is_empty());
+}
+
+#[test]
+fn sync_indications_only_count_while_connected() {
+    let mut ue = camped();
+    ue.tick(slot(0));
+    for _ in 0..40 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    }
+    assert!(!ue.t310_running());
+    assert!(ue.take_events().is_empty());
+    // Release while T310 runs stops it.
+    let mut ue = secured();
+    ue.tick(slot(0));
+    for _ in 0..ue.cell().unwrap().n310.max(1) {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    }
+    assert!(ue.t310_running());
+    ue.on_dl_dcch(1, &release(0));
+    assert!(!ue.t310_running());
+}
+
+#[test]
+fn t310_without_security_goes_to_idle() {
+    let mut ue = connected();
+    ue.tick(slot(0));
+    let (t310, n310) = (ue.cell().unwrap().t310_ms, ue.cell().unwrap().n310.max(1));
+    for _ in 0..n310 {
+        ue.on_mac(MacNotification::SyncIndication { in_sync: false });
+    }
+    ue.tick(slot(ms(t310)));
+    assert_eq!(ue.state(), RrcState::Idle);
+    assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::Failed(_))));
+}

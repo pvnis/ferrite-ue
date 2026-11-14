@@ -31,6 +31,7 @@ impl MacHandler for Probe {
                 }
             }
             PhyToMac::Dci(d) => log::info!("DCI @ {}: {:?}", d.slot, d.dci),
+            PhyToMac::Sync(s) => log::debug!("RLM @ {}: in_sync {}", s.slot, s.in_sync),
             PhyToMac::RxData(r) => {
                 log::info!("RX_Data @ {} {:?} harq {} crc {}", r.pdsch_slot, r.rnti_kind, r.harq_id, r.tb.is_some());
                 if r.rnti_kind == RntiKind::Si {
@@ -86,6 +87,7 @@ fn main() {
         ul_block_len: block,
         cfo_correction: false,
         max_search_attempts: 10,
+        rlm_outage: None,
     };
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(4);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded(16);

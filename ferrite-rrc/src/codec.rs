@@ -323,6 +323,10 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         si_window_slots: s.si_scheduling_info.as_ref().map_or(0, |si| si.si_window_length_slots),
         ssb_arfcn: mib.ssb_arfcn,
         t301_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t301_ms as u32),
+        t310_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t310_ms as u32),
+        n310: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n310),
+        n311: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n311),
+        t311_ms: s.ue_timers_and_constants.as_ref().map_or(30000, |t| t.t311_ms as u32),
     })
 }
 

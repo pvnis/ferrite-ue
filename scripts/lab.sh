@@ -130,6 +130,18 @@ fi
 if grep -q "re-establishing" "$UE"; then
   grep -q "RRC re-established" "$UE" && pass "S19 RRC re-establishment" || fail "S19 RRC re-establishment"
 fi
+# S23/S24: radio link monitoring (only when the UE ran with an RLM outage,
+# `UE_ARGS="--rlm-outage-s 8 --rlm-outage-ms 1500"`): N310 out-of-sync
+# indications start T310; a long outage expires it (RLF → re-establishment,
+# S23), a short one (`--rlm-outage-ms 500`) is stopped by N311 in-sync
+# indications and the connection survives (S24).
+if grep -q "T310 started" "$UE"; then
+  if grep -q "T310 expired" "$UE"; then
+    grep -q "RRC re-established" "$UE" && pass "S23 T310 expiry → RLF → re-establishment" || fail "S23 T310 expiry → RLF → re-establishment"
+  else
+    grep -q "T310 stopped" "$UE" && ! grep -q "re-establishing" "$UE" && pass "S24 T310 stopped by N311 in-sync" || fail "S24 T310 stopped by N311 in-sync"
+  fi
+fi
 # S20: SRS (only when the UE was configured with periodic SRS): the gNB PHY
 # must detect the sounding (its SRS log lines carry a per-UE SINR).
 if grep -q "srs_sent: [1-9]" "$UE"; then

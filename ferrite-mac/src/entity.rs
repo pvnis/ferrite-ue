@@ -40,6 +40,9 @@ pub enum MacEvent {
     /// The PHY lost synchronisation or the radio failed: RRC treats it as a
     /// radio link failure.
     RadioLinkFailure,
+    /// Radio link monitoring indication from the PHY (TS 38.331 §5.3.10:
+    /// RRC counts N310 / N311 and runs T310).
+    Sync { in_sync: bool },
 }
 
 /// What MAC needs from the layers above (the RLC bearers), implemented by the
@@ -691,6 +694,7 @@ impl MacEntity {
                 let acts = self.ra.on_prach_sent(r.slot);
                 self.apply_ra_actions(acts, phy);
             }
+            PhyToMac::Sync(s) => self.events.push(MacEvent::Sync { in_sync: s.in_sync }),
             PhyToMac::Error(e) => match e {
                 ErrorIndication::TxDropped { slot, pdu } => log::warn!("PHY dropped {pdu} for slot {slot}"),
                 ErrorIndication::SyncLost | ErrorIndication::Radio => self.events.push(MacEvent::RadioLinkFailure),

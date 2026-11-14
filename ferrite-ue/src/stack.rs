@@ -456,6 +456,7 @@ impl Stack {
                 MacEvent::SrFailure => self.rrc.on_mac(MacNotification::SrFailure),
                 MacEvent::TimeAlignmentExpired => self.rrc.on_mac(MacNotification::TimeAlignmentExpired),
                 MacEvent::RadioLinkFailure => self.rrc.on_mac(MacNotification::RadioLinkFailure),
+                MacEvent::Sync { in_sync } => self.rrc.on_mac(MacNotification::SyncIndication { in_sync }),
             }
         }
         self.apply_rrc_events(phy, now);
@@ -470,6 +471,7 @@ impl MacHandler for Stack {
             PhyToMac::RxData(d) => d.pdsch_slot,
             PhyToMac::Csi(c) => c.slot,
             PhyToMac::Rach(r) => r.slot,
+            PhyToMac::Sync(s) => s.slot,
             PhyToMac::Error(_) => self.last_slot.unwrap_or(SlotPoint::new(self.numerology, 0, 0)),
         };
         self.last_slot = Some(now);

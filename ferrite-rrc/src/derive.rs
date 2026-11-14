@@ -54,6 +54,15 @@ pub struct CellInfo {
     pub ssb_arfcn: u32,
     /// T301 (ms) from SIB1 `ue-TimersAndConstants`.
     pub t301_ms: u32,
+    /// Radio link monitoring constants from SIB1 `ue-TimersAndConstants`
+    /// (TS 38.331 §7.1 / §7.3): T310 (ms, 0 = immediate failure), N310
+    /// consecutive out-of-sync indications before T310 starts, N311
+    /// consecutive in-sync indications that stop it, and T311 (ms) for the
+    /// cell selection after the failure.
+    pub t310_ms: u32,
+    pub n310: u8,
+    pub n311: u8,
+    pub t311_ms: u32,
     /// The SIB1-only (common) configuration: the default the UE falls back to
     /// on re-establishment (§5.3.7.4) before the network reconfigures it.
     pub common_phy: PhyConfig,

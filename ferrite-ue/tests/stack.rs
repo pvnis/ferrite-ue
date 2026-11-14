@@ -54,6 +54,7 @@ fn config() -> UeConfig {
         prach_offset: 0,
         rx_power_offset_db: 0.0,
         rlf_at_s: 0,
+        rlm_outage: None,
         log: "info".into(),
     }
 }

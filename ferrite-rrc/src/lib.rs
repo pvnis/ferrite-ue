@@ -2,8 +2,10 @@
 //!
 //! The state machine is [`RrcState`] (Idle / Connecting / Connected /
 //! Reestablishing, transitions in its documentation, every change logged by
-//! `set_state`). Timers: T300 (connection establishment) and T301
-//! (re-establishment) run on the slot clock passed to [`RrcUe::tick`].
+//! `set_state`). Timers: T300 (connection establishment), T301
+//! (re-establishment) and T310 (radio link failure detection from the PHY's
+//! in-sync / out-of-sync indications, N310 / N311) run on the slot clock
+//! passed to [`RrcUe::tick`].
 //! Procedures: system information (MIB/SIB1 → cell configuration), connection
 //! establishment (§5.3.3), security mode (§5.3.4), UE capability (§5.6.1),
 //! reconfiguration (§5.3.5: bearers, dedicated PHY/MAC), DL/UL information
@@ -33,6 +35,9 @@ use ferrite_mac::MacConfig;
 ///  Connected ──RRCRelease──▶ Idle              Connected ──RLF with AS security (T301)──▶ Reestablishing
 ///  Connected ──RLF without security──▶ Idle    Reestablishing ──RRCReestablishment verified──▶ Connected
 ///  Reestablishing ──T301 / RRCReject / RRCSetup fallback / RA failure──▶ Idle
+///
+///  RLF (§5.3.10.3) = T310 expiry (N310 out-of-sync indications started it and
+///  N311 in-sync ones did not stop it), random access problem, or RLC maxRetx.
 /// ```
 /// `RRC_INACTIVE` (suspend / resume) is not implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +175,9 @@ pub enum MacNotification {
     RlcMaxRetx { lcid: u8 },
     /// The PHY lost synchronisation (or the radio failed).
     RadioLinkFailure,
+    /// One radio link monitoring indication from the PHY (§5.3.10.1): `false`
+    /// = out-of-sync (RLM-RS below Q_out), `true` = in-sync (above Q_in).
+    SyncIndication { in_sync: bool },
 }
 
 /// RRC configuration knobs.
@@ -219,6 +227,12 @@ pub struct RrcUe {
     t301_expiry: Option<SlotPoint>,
     /// Transaction id of the RRCReestablishment awaiting verification.
     pending_reest: Option<u8>,
+    /// Radio link monitoring (§5.3.10.1): consecutive out-of-sync indications
+    /// (towards N310), consecutive in-sync indications while T310 runs
+    /// (towards N311), and T310 itself.
+    n310_count: u8,
+    n311_count: u8,
+    t310_expiry: Option<SlotPoint>,
     /// Measurement configuration and reporting (§5.5).
     pub meas: meas::MeasProcedure,
     /// Other system information acquired so far, by SIB type (§5.2.2.3).
@@ -254,6 +268,9 @@ impl RrcUe {
             c_rnti: None,
             t301_expiry: None,
             pending_reest: None,
+            n310_count: 0,
+            n311_count: 0,
+            t310_expiry: None,
             meas: meas::MeasProcedure::default(),
             sibs: std::collections::BTreeMap::new(),
             stats: RrcStats::default(),
@@ -319,7 +336,62 @@ impl RrcUe {
         if self.state != to {
             log::info!("RRC: {:?} → {:?}", self.state, to);
             self.state = to;
+            // Radio link monitoring only runs in RRC_CONNECTED (§5.3.10.1);
+            // T310 stops on any state change (release, RLF, re-establishment).
+            self.stop_t310();
         }
+    }
+
+    /// Whether T310 is running (N310 out-of-sync indications received, RLF pending).
+    pub fn t310_running(&self) -> bool {
+        self.t310_expiry.is_some()
+    }
+
+    fn stop_t310(&mut self) {
+        self.t310_expiry = None;
+        self.n310_count = 0;
+        self.n311_count = 0;
+    }
+
+    /// §5.3.10.1 / §5.3.10.2: N310 consecutive out-of-sync indications start
+    /// T310; N311 consecutive in-sync indications while it runs stop it.
+    fn on_sync_indication(&mut self, in_sync: bool) {
+        if self.state != RrcState::Connected {
+            return;
+        }
+        let Some(cell) = self.cell.as_ref() else { return };
+        let (t310_ms, n310, n311) = (cell.t310_ms, cell.n310.max(1), cell.n311.max(1));
+        match (self.t310_expiry, in_sync) {
+            (None, true) => self.n310_count = 0,
+            (None, false) => {
+                self.n310_count = self.n310_count.saturating_add(1);
+                if self.n310_count >= n310 {
+                    let Some(now) = self.now else { return };
+                    self.n310_count = 0;
+                    self.n311_count = 0;
+                    self.t310_expiry = Some(now.add(u64::from(t310_ms) * u64::from(now.numerology.slots_per_subframe())));
+                    log::warn!("T310 started: {n310} out-of-sync indication(s), radio link failure in {t310_ms} ms unless {n311} in-sync");
+                    if t310_ms == 0 {
+                        self.on_t310_expiry();
+                    }
+                }
+            }
+            (Some(_), true) => {
+                self.n311_count = self.n311_count.saturating_add(1);
+                if self.n311_count >= n311 {
+                    log::info!("T310 stopped: {n311} in-sync indication(s)");
+                    self.stop_t310();
+                }
+            }
+            (Some(_), false) => self.n311_count = 0,
+        }
+    }
+
+    /// §5.3.10.3: T310 expiry is a radio link failure.
+    fn on_t310_expiry(&mut self) {
+        self.t310_expiry = None;
+        log::warn!("T310 expired: radio link failure");
+        self.start_reestablishment();
     }
 
     /// The NAS-assigned 5G-S-TMSI (48 bits), or `None` once it is lost.
@@ -375,6 +447,7 @@ impl RrcUe {
                     self.start_reestablishment();
                 }
             }
+            MacNotification::SyncIndication { in_sync } => self.on_sync_indication(in_sync),
         }
     }
 
@@ -458,6 +531,9 @@ impl RrcUe {
         if self.state == RrcState::Connected {
             self.meas.tick(now);
             self.send_measurement_reports();
+            if self.t310_expiry.is_some_and(|t| now.diff(&t) >= 0) {
+                self.on_t310_expiry();
+            }
         }
         if let Some(t) = self.t301_expiry {
             if self.state == RrcState::Reestablishing && now.diff(&t) >= 0 {

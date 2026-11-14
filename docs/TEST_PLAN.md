@@ -54,6 +54,8 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S15 | Real-time budget | `FERRITE_PERF=1`: T0 slot period at the nominal slot duration ±5 %, rx-phy worker queue drops = 0 over 60 s |
 | S16 | Measurement reporting | gNB configured with a periodical serving-cell report (`cu_cp.mobility`): the UE applies `measConfig`, sends `MeasurementReport` (SS-RSRP/RSRQ/SINR) every `reportInterval`; the gNB RRC log shows `Rx SRB1 DCCH UL measurementReport` |
 | S19 | RRC re-establishment | With a radio link failure (lab: `UE_ARGS="--rlf-at-s 8"` injects one while connected) the UE sends RRCReestablishmentRequest, receives RRCReestablishment, refreshes the keys and completes; the gNB reconfigures the bearers and the ping probe finishes without a new registration |
+| S23 | RLF detection (T310) | PHY out-of-sync indications (lab: `UE_ARGS="--rlm-outage-s 8 --rlm-outage-ms 1500"` forces them for 1.5 s): after N310 of them RRC starts T310 (`T310 started`); when it expires (`T310 expired: radio link failure`) the UE re-establishes (S19 behaviour) and the ping probe still completes |
+| S24 | RLM recovery (N311) | A shorter outage (`--rlm-outage-ms 500`) starts T310, then N311 in-sync indications stop it (`T310 stopped`): no re-establishment, no lost pings |
 | S20 | SRS | gNB with `cell_cfg.srs.type_enabled: periodic`: the UE transmits its periodic SRS resource; the gNB PHY log shows `SRS:` detections with a sane SINR/EPRE for the UE's C-RNTI |
 | S22 | Transform-precoded PUSCH | gNB with `pusch.enable_transform_precoding: true` (T3): Msg3, fallback-DCI and DCI 0_1 PUSCHs are DFT-s-OFDM with the low-PAPR DM-RS and the Table 6.1.4.1-1 MCS mapping; ≥90 % of the gNB's PUSCH CRCs pass |
 | S21 | PUCCH format 3 | gNB with `pucch.formats: f1_and_f3` (T2): CSI reports and >2-bit HARQ feedback are sent on PUCCH format 3 (DFT-s-OFDM, RM(32,O) for ≤11 bits); ≥90 % of the gNB's format-3 UCI indications are `detection=4` (no DTX) with the expected payload |
@@ -85,11 +87,17 @@ Pass = S1–S12 green on T1, T2, T3, F1, F2. S13–S15 are tracked but not gatin
   vectors (TS 35.208), full registration + PDU session against a fake core.
 * **ferrite-mac**: RA state machine (RAR window expiry, backoff, contention
   resolution timeout, success), HARQ codebook assembly, BSR/SR timers, LCP.
-* **ferrite-rrc**: state machine transitions on each DL message; derived
-  `L1Config`/`MacConfig` for the TDD and FDD captures.
+* **ferrite-rrc**: state machine transitions on each DL message
+  (`tests/state_machine.rs`: establishment, T300, SMC verdicts, RLF /
+  T301 / T310 / N310 / N311, release, paging, NAS transport); derived
+  `PhyConfig`/`MacConfig` for the TDD capture (`tests/codec.rs`).
 * **ferrite-l1**: slot clock ↔ sample index mapping, UL position = DL −
-  (N_TA + N_TA_offset); injection table; a closed-loop test with a simulated
-  gNB (file source/sink) exercising SSB → SIB1 → PRACH placement.
+  (N_TA + N_TA_offset); injection table; `DciResolver` for every DCI format
+  and the RAR grant (`resolve.rs` tests); RLM thresholds; a closed-loop test
+  with a simulated gNB (file source/sink) exercising SSB → SIB1 → PRACH
+  placement.
+* **ferrite-ue**: the stack through the FAPI interface (`tests/stack.rs`:
+  SIB1 → CONFIG.request → registration → PRACH; retry after a failure).
 
 ## 5. Lab procedure (ZMQ)
 

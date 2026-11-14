@@ -12,6 +12,14 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 
 ## PHY / L1
 
+- [x] 2026-11-14 Radio link monitoring: one `SYNC.indication` per SSB period
+      (out-of-sync below Q_out = −8 dB SSB SINR or SSB missing, in-sync above
+      Q_in = −6 dB) through FAPI → MAC → RRC; RRC runs N310 / T310 / N311 with
+      the SIB1 `ue-TimersAndConstants` values and declares the RLF on T310
+      expiry (re-establishment with security, idle without). The engine only
+      gives the cell up (re-search) after 250 missed SSB periods, above any
+      T310. Lab stages S23 (`--rlm-outage-s 8 --rlm-outage-ms 1500` → RLF →
+      re-established) and S24 (500 ms → T310 stopped by N311).
 - [x] 2026-11-13 Lockstep uplink pacing at 15 kHz: the ZMQ gNB sends at most
       ~1 ms of DL beyond the UL it has received; the UL serve is now gated by
       an explicit commit mark (UL index up to which every UL_TTI request has
@@ -200,8 +208,8 @@ re-establishment semantics, COUNT wrap handling, data volume for BSR; SDAP as
 its own layer (QoS flows beyond the default, reflective QoS).
 
 RRC: `reconfigurationWithSync` (handover, T304), RRC_INACTIVE (suspend /
-resume, T380), T310/N310/N311 and T311 (RLF detection from L1 indications,
-cell selection before re-establishment), T302 / `waitTime`, vertical NH key
+resume, T380), T311 as a real cell-selection timer (the UE re-selects the
+serving cell at once today), T302 / `waitTime`, vertical NH key
 derivation (`masterKeyUpdate`), `fullConfig`, CounterCheck response,
 UECapabilityEnquiry filters, SIB4–9 (a SIB that fails aborts the whole SI
 message), SI modification / valueTag, paging short messages, fullI-RNTI

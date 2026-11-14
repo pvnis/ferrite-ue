@@ -218,6 +218,17 @@ pub enum ErrorIndication {
     Radio,
 }
 
+/// Radio link monitoring result for one evaluation period (TS 38.213 §5,
+/// TS 38.133 §8.1): the PHY compares the serving-cell RLM-RS (SSB) quality
+/// with Q_out / Q_in and reports `in_sync = false` when it is below Q_out (or
+/// the SSB was not found) and `in_sync = true` when it is above Q_in. RRC
+/// counts the indications (N310 / N311) and runs T310 (TS 38.331 §5.3.10).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SyncIndication {
+    pub slot: SlotPoint,
+    pub in_sync: bool,
+}
+
 /// PHY → MAC messages, delivered in slot order on the PHY's timeline thread.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PhyToMac {
@@ -226,6 +237,9 @@ pub enum PhyToMac {
     RxData(RxDataIndication),
     Csi(CsiIndication),
     Rach(RachIndication),
+    /// Out-of-sync / in-sync indication from radio link monitoring; MAC passes
+    /// it up unchanged (it is an L1 → RRC indication).
+    Sync(SyncIndication),
     Error(ErrorIndication),
 }
 

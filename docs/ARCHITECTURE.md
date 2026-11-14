@@ -132,7 +132,7 @@ behind"; a free-running SDR does not use the mark.
 ```
  CellSearch ──SSB + MIB──▶ Synced { phase: AwaitSib1 } ──CONFIG.request (SIB1)──▶ { phase: Common }
      ▲                           │                                               │ CONFIG.request (dedicated)
-     │ RLM: PSS missed for        │                                               ▼
+     │ PSS missed for             │                                               ▼
      │ RLM_MAX_MISSED_SSB periods ◀──────────────────────────────────── { phase: Dedicated }
 ```
 
@@ -141,10 +141,20 @@ search space or PUCCH resource is configured). Orthogonal to it: `tx_enabled`
 (`START` / `STOP.request`; a `STOP` makes every UL_TTI request an
 `ERROR.indication TxDropped`), the uplink timing (`SampleClock`, N_TA from
 MAC) and the HARQ soft buffers of the PDSCH worker (one per `(RntiKind,
-process)`, reset when the NDI toggles or the TB size changes). On a sync loss
-the engine re-searches and rebuilds `Synced` from the MIB: MAC receives
-`ErrorIndication::SyncLost`; RRC must send a new `CONFIG.request` and MAC new
-RNTIs once the cell is found again.
+process)`, reset when the NDI toggles or the TB size changes).
+
+Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the
+serving SSB: `rlm_evaluate` turns the SSB SINR into `SYNC.indication
+in_sync = false` below Q_out (−8 dB, or SSB not found) and `in_sync = true`
+above Q_in (−6 dB), nothing in between. The indication goes to MAC, which hands
+it to RRC unchanged; RRC runs N310 / T310 / N311 with the cell's values. The
+engine's own `RlmState` is separate: after `RLM_MAX_MISSED_SSB` (250) periods
+without the PSS the slot timing cannot be trusted any more and it re-searches
+and rebuilds `Synced` from the MIB (MAC receives `ErrorIndication::SyncLost`;
+RRC must send a new `CONFIG.request` and MAC new RNTIs once the cell is found
+again). That limit is above the largest T310 so that RRC declares the failure
+first. `EngineParams::rlm_outage` (`--rlm-outage-s/-ms`) forces out-of-sync for
+a test window without touching the data path.
 
 ## 5. FAPI: the PHY ↔ MAC interface (ferrite-fapi)
 
@@ -154,7 +164,8 @@ CONFIG.request payload RRC derives from MIB/SIB1/CellGroupConfig).
 
 ```rust
 enum PhyToMac { Slot(SlotIndication), Dci(DciIndication), RxData(RxDataIndication),
-                Csi(CsiIndication), Rach(RachIndication), Error(ErrorIndication) }
+                Csi(CsiIndication), Rach(RachIndication), Sync(SyncIndication),
+                Error(ErrorIndication) }
 enum MacToPhy { Config(Box<PhyConfig>), Start, Stop, UlTti(UlTtiRequest),
                 SetRntis { c_rnti, tc_rnti, ra_rnti }, TimingAdvance { n_ta_tc },
                 Paging { ue_id }, RarGrant { rar_slot, tc_rnti, grant: RarUlGrant } }
@@ -180,7 +191,7 @@ P-RNTI decoding in the UE's paging frames (TS 38.304 §7.1).
 (`dl_sdu`, `ul_pull`, `ul_buffer_status`) is the SAP the bearer table
 implements; RRC drives it with `reconfigure`, `start_ra`, `reset` and reads
 `take_events()` (`MacEvent`: `RaSucceeded`, `RaFailed`, `Bcch`, `Pcch`, `Ccch`,
-`SrFailure`, `TimeAlignmentExpired`, `RadioLinkFailure`). Fields are private;
+`SrFailure`, `TimeAlignmentExpired`, `RadioLinkFailure`, `Sync`). Fields are private;
 `ra_state()`, `ta_state()`, `sr_states()`, `c_rnti()`, `stats()` are read-only
 views. Sub-procedures and their states:
 
@@ -241,8 +252,12 @@ every transition goes through `set_state`, which logs it):
  Reestablishing ──T301 / RRCReject / RRCSetup fallback / RA failure──▶ Idle
 ```
 
-Radio link failure (§5.3.10.3) comes from `MacNotification` (`RaFailed` while
-connected, `RlcMaxRetx`, `RadioLinkFailure` = PHY sync loss). `RRCSetup` is
+Radio link failure (§5.3.10.3) comes from `MacNotification`: T310 expiry
+(`SyncIndication`s from the PHY: N310 consecutive out-of-sync start T310, N311
+consecutive in-sync stop it; T310/N310/N311 from SIB1 `ue-TimersAndConstants`,
+only counted while `Connected`), `RaFailed` while connected, `RlcMaxRetx`, and
+`RadioLinkFailure` (the PHY gave the cell up). T311 is trivially satisfied
+today: the UE re-selects the serving cell at once. `RRCSetup` is
 accepted only while `Connecting`; an algorithm the UE cannot run in a
 SecurityModeCommand yields a SecurityModeFailure. RRC never touches the lower
 layers: it emits `RrcEvent`s (`CellConfigured`, `Reconfigure`, `SetupBearer`,

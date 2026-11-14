@@ -64,6 +64,7 @@ fn main() {
         ul_block_len: block_len,
         cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. }),
         max_search_attempts: 0,
+        rlm_outage: cfg.rlm_outage,
     };
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<EngineCommand>(4);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<EngineEvent>(64);

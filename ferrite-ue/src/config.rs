@@ -109,6 +109,14 @@ pub struct Cli {
     /// (while connected) to exercise RRC re-establishment. 0 = never.
     #[arg(long)]
     pub rlf_at_s: Option<u64>,
+    /// Test aid: from this many seconds after start, the PHY's radio link
+    /// monitoring reports out-of-sync for `--rlm-outage-ms` (exercises N310 /
+    /// T310 / N311 with the cell's values). Unset = never.
+    #[arg(long)]
+    pub rlm_outage_s: Option<u64>,
+    /// Length of the radio link monitoring outage (ms, default 1500).
+    #[arg(long)]
+    pub rlm_outage_ms: Option<u64>,
     /// Log level (error/warn/info/debug/trace).
     #[arg(long)]
     pub log: Option<String>,
@@ -146,6 +154,8 @@ pub struct FileConfig {
     pub prach_offset: Option<i64>,
     pub rx_power_offset_db: Option<f32>,
     pub rlf_at_s: Option<u64>,
+    pub rlm_outage_s: Option<u64>,
+    pub rlm_outage_ms: Option<u64>,
     pub log: Option<String>,
 }
 
@@ -178,6 +188,8 @@ pub struct UeConfig {
     pub prach_offset: i64,
     pub rx_power_offset_db: f32,
     pub rlf_at_s: u64,
+    /// Test aid: `(start_s, duration_ms)` radio link monitoring outage.
+    pub rlm_outage: Option<(u64, u64)>,
     pub log: String,
 }
 
@@ -266,6 +278,7 @@ impl UeConfig {
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
             rx_power_offset_db: pick!(rx_power_offset_db, 0.0),
             rlf_at_s: pick!(rlf_at_s, 0),
+            rlm_outage: cli.rlm_outage_s.or(file.rlm_outage_s).map(|s| (s, pick!(rlm_outage_ms, 1500))),
             log: pick!(log, "info".into()),
         })
     }

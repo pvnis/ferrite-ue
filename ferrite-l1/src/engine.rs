@@ -58,6 +58,11 @@ pub struct EngineParams {
     pub cfo_correction: bool,
     /// Maximum cell-search attempts before giving up (0 = forever).
     pub max_search_attempts: u32,
+    /// Test aid: `(start_s, duration_ms)` window after engine start during
+    /// which radio link monitoring reports out-of-sync whatever the SSB says
+    /// (exercises N310 / T310 / N311 and the re-establishment without
+    /// touching the data path). `None` in normal operation.
+    pub rlm_outage: Option<(u64, u64)>,
 }
 
 /// Commands from the application.
@@ -129,8 +134,10 @@ impl CellPhase {
     }
 }
 
-/// Radio link monitoring on the serving SSB (TS 38.213 §5, simplified: the
-/// PSS must be found at the expected position).
+/// The engine's own hold on the cell: consecutive SSB periods without the PSS
+/// at the expected position. Independent of RRC's T310 (which gets the
+/// per-period [`SyncIndication`]s): after [`RLM_MAX_MISSED_SSB`] misses the
+/// slot timing can no longer be trusted and the engine returns to cell search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RlmState {
     InSync,
@@ -146,8 +153,28 @@ impl RlmState {
     }
 }
 
-/// Consecutive SSB periods without the PSS before synchronisation is declared lost.
-const RLM_MAX_MISSED_SSB: u32 = 8;
+/// Consecutive SSB periods without the PSS before the engine gives the cell up
+/// and searches again: long enough (≥ 2.5 s at the 10 ms SSB period) for RRC's
+/// N310 / T310 to declare the radio link failure first with the network's
+/// values (T310 ≤ 2 s).
+const RLM_MAX_MISSED_SSB: u32 = 250;
+
+/// Radio link monitoring thresholds (TS 38.133 §8.1.1): Q_out is the SSB SINR
+/// at which the hypothetical PDCCH BLER is 10 %, Q_in where it is 2 %.
+const RLM_Q_OUT_DB: f32 = -8.0;
+const RLM_Q_IN_DB: f32 = -6.0;
+
+/// One RLM evaluation (TS 38.133 §8.1.2): `ssb_sinr_db` is `None` when the SSB
+/// was not found. `Some(false)` = out-of-sync (below Q_out), `Some(true)` =
+/// in-sync (above Q_in), `None` = in the hysteresis band, no indication.
+fn rlm_evaluate(ssb_sinr_db: Option<f32>) -> Option<bool> {
+    match ssb_sinr_db {
+        None => Some(false),
+        Some(s) if s < RLM_Q_OUT_DB => Some(false),
+        Some(s) if s >= RLM_Q_IN_DB => Some(true),
+        Some(_) => None,
+    }
+}
 
 pub struct Engine<'a> {
     pub params: EngineParams,
@@ -173,6 +200,7 @@ pub struct Engine<'a> {
     pusch_sweep: Option<Vec<i64>>,
     pusch_sweep_idx: usize,
     stats: EngineStats,
+    started: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -182,6 +210,8 @@ pub struct EngineStats {
     pub pdsch_jobs: u64,
     pub late_ul: u64,
     pub timing_slews: u64,
+    /// Out-of-sync indications sent to RRC.
+    pub out_of_sync: u64,
 }
 
 /// Run the engine to completion (returns when stopped or the radio fails).
@@ -325,6 +355,7 @@ pub fn run(
         pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
         pusch_sweep_idx: 0,
         stats: EngineStats::default(),
+        started: std::time::Instant::now(),
     };
     let r = eng.run_inner();
     eng.shared.stop.store(true, Relaxed);
@@ -335,6 +366,14 @@ pub fn run(
 }
 
 impl<'a> Engine<'a> {
+    /// Inside the `rlm_outage` test window.
+    fn in_rlm_outage(&self) -> bool {
+        self.params.rlm_outage.is_some_and(|(start_s, ms)| {
+            let t = self.started.elapsed().as_millis() as u64;
+            t >= start_s * 1000 && t < start_s * 1000 + ms
+        })
+    }
+
     fn stopped(&self) -> bool {
         matches!(self.cmds.try_recv(), Ok(EngineCommand::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected))
     }
@@ -545,6 +584,7 @@ impl<'a> Engine<'a> {
                 let expect = in_slot + cp;
                 let lo = expect.saturating_sub(96);
                 let hi = (expect + 96).min(shifted.len());
+                let mut ssb_sinr: Option<f32> = None;
                 match searcher.search_near(&shifted, (s.cell_id % 3) as u8, lo..hi) {
                     Some(r) if r.pss_metric > 0.3 && r.cell_id == s.cell_id => {
                         let err = r.timing_index as i64 - expect as i64;
@@ -554,7 +594,10 @@ impl<'a> Engine<'a> {
                         }
                         s.cfo_hz = 0.9 * s.cfo_hz + 0.1 * (s.cfo_hz + r.cfo_hz);
                         rlm = RlmState::InSync;
+                        // Found but not measurable: treat as a strong SSB.
+                        ssb_sinr = Some(f32::INFINITY);
                         if let Some(m) = ferrite_phy::sync::measure::ssb_measure(&ofdm_ssb, &shifted, r.timing_index, s.ssb_case.mu(), r.n_id_1, r.n_id_2) {
+                            ssb_sinr = Some(m.sinr_db());
                             let _ = self.events.try_send(EngineEvent::Measurement { pci: s.cell_id, slot, rsrp_dbfs: m.rsrp_db(), rsrq_db: m.rsrq_db(), sinr_db: m.sinr_db() });
                         }
                     }
@@ -567,6 +610,17 @@ impl<'a> Engine<'a> {
                             }
                         }
                     }
+                }
+                // Radio link monitoring indication to RRC (via MAC), one per
+                // SSB period. The test outage forces out-of-sync.
+                if self.in_rlm_outage() {
+                    ssb_sinr = None;
+                }
+                if let Some(in_sync) = rlm_evaluate(ssb_sinr) {
+                    if !in_sync {
+                        self.stats.out_of_sync += 1;
+                    }
+                    self.mac.handle(PhyToMac::Sync(SyncIndication { slot, in_sync }), &mut outbox);
                 }
             }
             // --- CFO correction for the data path.
@@ -828,5 +882,36 @@ fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Cores
         csi_patterns: patterns,
         csi_meas: meas,
         csi_rate_match_enabled: configured,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TS 38.133 §8.1: out-of-sync below Q_out, in-sync above Q_in, nothing
+    /// in between; a missing SSB is out-of-sync.
+    #[test]
+    fn rlm_thresholds_have_hysteresis() {
+        assert_eq!(rlm_evaluate(None), Some(false));
+        assert_eq!(rlm_evaluate(Some(-20.0)), Some(false));
+        assert_eq!(rlm_evaluate(Some(RLM_Q_OUT_DB - 0.1)), Some(false));
+        assert_eq!(rlm_evaluate(Some(RLM_Q_OUT_DB)), None);
+        assert_eq!(rlm_evaluate(Some(-7.0)), None);
+        assert_eq!(rlm_evaluate(Some(RLM_Q_IN_DB)), Some(true));
+        assert_eq!(rlm_evaluate(Some(30.0)), Some(true));
+        assert_eq!(rlm_evaluate(Some(f32::INFINITY)), Some(true));
+    }
+
+    #[test]
+    fn engine_gives_the_cell_up_after_rrc_had_its_chance() {
+        // SSB period ≥ 10 ms → ≥ 2 s: longer than the largest T310 (2000 ms)
+        // plus N310 (≤ 20) indications at that period.
+        assert!(RLM_MAX_MISSED_SSB as u64 * 10 >= 2000 + 20 * 10);
+        let mut r = RlmState::InSync;
+        for _ in 0..RLM_MAX_MISSED_SSB {
+            r = r.miss();
+        }
+        assert_eq!(r, RlmState::OutOfSync { misses: RLM_MAX_MISSED_SSB });
     }
 }
