@@ -55,6 +55,7 @@ fn config() -> UeConfig {
         rx_power_offset_db: 0.0,
         rlf_at_s: 0,
         rlm_outage: None,
+        t3512_s: None,
         log: "info".into(),
     }
 }

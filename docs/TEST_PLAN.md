@@ -57,6 +57,8 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S19 | RRC re-establishment | With a radio link failure (lab: `UE_ARGS="--rlf-at-s 8"` injects one while connected) the UE sends RRCReestablishmentRequest, receives RRCReestablishment, refreshes the keys and completes; the gNB reconfigures the bearers and the ping probe finishes without a new registration |
 | S23 | RLF detection (T310) | PHY out-of-sync indications (lab: `UE_ARGS="--rlm-outage-s 8 --rlm-outage-ms 1500"` forces them for 1.5 s): after N310 of them RRC starts T310 (`T310 started`); when it expires (`T310 expired: radio link failure`) the UE re-establishes (S19 behaviour) and the ping probe still completes |
 | S24 | RLM recovery (N311) | A shorter outage (`--rlm-outage-ms 500`) starts T310, then N311 in-sync indications stop it (`T310 stopped`): no re-establishment, no lost pings |
+| S26 | Deregistration at exit | Whenever the UE registered: on exit (ping probe done, timeout or Ctrl-C) the UE sends DEREGISTRATION REQUEST (switch off) before the radio stops, from idle through a mo-Signalling connection; the core logs the deregistration |
+| S27 | Periodic registration update | `UE_ARGS="--t3512-s 8 --ping-rounds 2 --ping-round-gap-s 25"` on a config with the gNB's inactivity release (T1): after the release the UE is in 5GMM-IDLE, T3512 expires, the UE connects (mo-Signalling) with REGISTRATION REQUEST (periodic) and the core accepts (`registration update complete`); the second ping round, after the next release, still goes through a service request (S14) |
 | S25 | Connected-mode DRX | gNB with `cell_cfg.drx` (T4): the UE applies the DRX-Config (`DRX configured`), stops monitoring the C-RNTI PDCCH and sending periodic CSI outside Active Time (`drx_sleep_slots > 0` in the final MAC stats) and the ping probe still completes through the on-duration / SR wake-ups. Note: the periodic SRS is kept during sleep (`MacConfig::srs_outside_active_time`): OCUDU feeds the timing-advance estimate of every SRS occasion to its TA manager, detected or not, and empty occasions produce a −1 TA command per DRX cycle until the uplink leaves the cyclic prefix (observed: UL dead after ~8 cycles, RLF) |
 | S20 | SRS | gNB with `cell_cfg.srs.type_enabled: periodic`: the UE transmits its periodic SRS resource; the gNB PHY log shows `SRS:` detections with a sane SINR/EPRE for the UE's C-RNTI |
 | S22 | Transform-precoded PUSCH | gNB with `pusch.enable_transform_precoding: true` (T3): Msg3, fallback-DCI and DCI 0_1 PUSCHs are DFT-s-OFDM with the low-PAPR DM-RS and the Table 6.1.4.1-1 MCS mapping; ≥90 % of the gNB's PUSCH CRCs pass |
@@ -86,7 +88,12 @@ Pass = S1–S12 green on T1, T2, T3, F1, F2. S13–S15 are tracked but not gatin
 * **ferrite-pdcp**: COUNT/HFN, reordering, NIA2/NEA2 test vectors, SRB
   integrity failure, DRB with/without SDAP header.
 * **ferrite-nas**: message codecs byte-exact vs captured qcore exchanges, 5G-AKA
-  vectors (TS 35.208), full registration + PDU session against a fake core.
+  vectors (TS 35.208), full registration + PDU session against a fake core;
+  substate / timer scenarios (`tests/registration.rs`: T3511/T3502 attempt
+  counter, T3346 congestion, service reject #10/#22/#28, network-initiated
+  re-registration, CONFIGURATION UPDATE "registration requested", mobility
+  update on a new TAI, NOTIFICATION, PDU SESSION MODIFICATION); every uplink
+  message decoded and validated by the independent `oxirush-nas` crate.
 * **ferrite-mac**: RA state machine (RAR window expiry, backoff, contention
   resolution timeout, success), HARQ codebook assembly, BSR/SR timers, LCP,
   DRX timers (`drx.rs`), bwp-InactivityTimer and BWP switch requests

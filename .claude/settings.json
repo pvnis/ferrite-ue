@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo doc*)",
+      "Bash(git status)",
+      "Bash(git diff*)"
+    ],
+    "ask": [
+      "Bash(cargo add*)",
+      "Bash(cargo remove*)",
+      "Bash(cargo update*)",
+      "Bash(git commit*)",
+      "Bash(git push*)"
+    ],
+    "deny": [
+      "Bash(rm -rf*)"
+    ]
+  }
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --quiet"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy --all-targets -- -D warnings && cargo test --quiet || exit 2"
+          }
+        ]
+      }
+    ]
+  }
+}
+

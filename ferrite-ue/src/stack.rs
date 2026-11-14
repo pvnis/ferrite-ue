@@ -36,6 +36,10 @@ pub enum StackEvent {
     /// Radio link failure: RRC re-establishment started / completed.
     Reestablishing,
     Reestablished,
+    /// A NAS registration update (periodic / mobility / network-requested) completed.
+    RegistrationUpdated,
+    /// The UE is deregistered (network- or UE-initiated).
+    Deregistered,
 }
 
 /// Connection-establishment retry (an RRC failure is not final; TS 38.331
@@ -75,13 +79,18 @@ pub struct Stack {
     last_slot: Option<SlotPoint>,
     /// Test aid: an RLF injected once at `--rlf-at-s`.
     rlf_injected: bool,
+    /// NAS clock in microseconds, derived from the slot indications (the NAS
+    /// timers run on the air-interface time, not the wall clock).
+    nas_us: u64,
+    /// NAS asked for an N1 connection (`NasEvent::ConnectionNeeded`).
+    nas_connect_pending: bool,
 }
 
 impl Stack {
     pub fn new(cfg: UeConfig, mib: Option<derive::MibInfo>) -> Self {
         let numerology = Numerology::from_scs_khz(cfg.ssb_scs_khz).unwrap_or(Numerology::KHZ30);
         let id = UeIdentity::from_imsi(&cfg.imsi, cfg.ki, cfg.opc);
-        let nas_cfg = NasConfig { dnn: cfg.dnn.clone(), ..NasConfig::default() };
+        let nas_cfg = NasConfig { dnn: cfg.dnn.clone(), t3512_override_ms: cfg.t3512_s.map(|s| s * 1000), ..NasConfig::default() };
         let radio = derive::RadioInfo { fs: cfg.fs, duplex: cfg.duplex, band: cfg.band };
         let rrc = RrcUe::new(RrcConfig { bands: vec![cfg.band], tx_lead_slots: cfg.tx_lead, ..RrcConfig::default() });
         // A placeholder MAC config until SIB1 (reconfigured by RRC).
@@ -105,7 +114,47 @@ impl Stack {
             start: std::time::Instant::now(),
             last_slot: None,
             rlf_injected: false,
+            nas_us: 0,
+            nas_connect_pending: false,
             cfg,
+        }
+    }
+
+    /// Shut down gracefully: a registered UE sends DEREGISTRATION REQUEST
+    /// (switch off) first. Returns `true` when a message was sent or a
+    /// connection for it was requested, so the caller should allow a moment
+    /// before stopping the radio.
+    pub fn begin_shutdown(&mut self, now: SlotPoint) -> bool {
+        if !self.nas.is_registered() {
+            return false;
+        }
+        match self.nas.deregister_with(true) {
+            Some(pdu) => {
+                self.rrc.send_nas(&pdu);
+                true
+            }
+            None => {
+                self.on_nas_events(now);
+                self.nas_connect(now);
+                true
+            }
+        }
+    }
+
+    /// The N1 connection the NAS asked for: an RRC connection with the NAS
+    /// message in RRCSetupComplete (mo-Signalling), AS keys from that
+    /// message's uplink NAS COUNT (TS 33.501 §6.9.2.1).
+    fn nas_connect(&mut self, now: SlotPoint) {
+        if !self.nas_connect_pending || self.rrc.state() != RrcState::Idle || self.rrc.cell().is_none() {
+            return;
+        }
+        self.nas_connect_pending = false;
+        if let Some(pdu) = self.nas.take_pending_initial_message() {
+            if let Some(k) = self.nas.k_gnb_for_last_message() {
+                self.rrc.set_k_gnb(k);
+            }
+            log::info!("NAS signalling connection requested (mo-Signalling)");
+            self.rrc.connect_for(pdu, now, 3);
         }
     }
 
@@ -207,6 +256,7 @@ impl Stack {
             RrcEvent::DlNas(nas) => self.on_dl_nas(&nas, now),
             RrcEvent::Connected => {
                 log::info!("RRC connected");
+                self.nas.on_connection_established();
                 self.events.push_back(StackEvent::RrcConnected);
             }
             RrcEvent::Released => {
@@ -216,6 +266,8 @@ impl Stack {
                 self.bearers.clear();
                 self.security = None;
                 self.mac.reset(phy);
+                self.nas.on_connection_released();
+                self.on_nas_events(now);
                 self.events.push_back(StackEvent::RrcReleased);
             }
             RrcEvent::Paged => {
@@ -224,6 +276,7 @@ impl Stack {
             }
             RrcEvent::Failed(why) => {
                 log::warn!("RRC failure: {why}");
+                self.nas.on_connection_released();
                 self.events.push_back(StackEvent::Failed(why.to_string()));
                 // Back off and try again (a failed RA / T300 is not final).
                 self.bearers.clear();
@@ -370,7 +423,27 @@ impl Stack {
                     self.idle_pending_ul.clear();
                     self.rrc.set_s_tmsi(None);
                     self.pending_paging_cfg = Some(None);
+                    self.events.push_back(StackEvent::Deregistered);
                 }
+                NasEvent::ConnectionNeeded { cause } => {
+                    log::info!("NAS needs a connection ({cause:?})");
+                    self.nas_connect_pending = true;
+                }
+                NasEvent::RegistrationUpdated { guti } | NasEvent::ConfigurationUpdated { guti } => {
+                    // A reallocated 5G-GUTI changes the 5G-S-TMSI RRC puts in
+                    // RRCSetupRequest and the paging UE_ID.
+                    let s_tmsi = guti.map(|g| g.s_tmsi_u64());
+                    self.rrc.set_s_tmsi(s_tmsi);
+                    self.pending_paging_cfg = Some(s_tmsi.map(|v| (v & 0x3ff) as u16));
+                    if matches!(ev, NasEvent::RegistrationUpdated { .. }) {
+                        log::info!("registration update complete");
+                        self.events.push_back(StackEvent::RegistrationUpdated);
+                    } else {
+                        log::info!("configuration updated");
+                    }
+                }
+                NasEvent::ServiceAccepted => log::info!("service accepted"),
+                NasEvent::ServiceRejected(c) => log::warn!("service rejected: 5GMM cause #{c}"),
                 other => log::info!("NAS event: {other:?}"),
             }
         }
@@ -495,15 +568,23 @@ impl MacHandler for Stack {
             if let Some(t) = self.conn.retry_at {
                 if now.diff(&t) >= 0 && self.rrc.state() == RrcState::Idle && self.rrc.cell().is_some() {
                     self.conn.retry_at = None;
-                    log::info!("retrying the connection (attempt {})", self.conn.attempts + 1);
-                    self.start_connection(now);
+                    if self.nas.is_registered() || self.nas_connect_pending {
+                        // A registered UE's NAS owns its retries (T3511 / T3502).
+                        self.nas_connect_pending = true;
+                    } else {
+                        log::info!("retrying the connection (attempt {})", self.conn.attempts + 1);
+                        self.start_connection(now);
+                    }
                 }
             }
-            let ms = self.start.elapsed().as_millis() as u64;
-            for ul in self.nas.tick(ms) {
+            // The NAS timers run on air-interface time: one slot (1 ms / 2^µ) per SLOT.indication.
+            self.nas_us += 1_000 / u64::from(self.numerology.slots_per_subframe()).max(1);
+            let nas_pdus = self.nas.tick(self.nas_us / 1000);
+            for ul in nas_pdus {
                 self.rrc.send_nas(&ul);
             }
             self.on_nas_events(now);
+            self.nas_connect(now);
             self.user_plane_slot(now);
             self.apply_rrc_events(phy, now);
         }

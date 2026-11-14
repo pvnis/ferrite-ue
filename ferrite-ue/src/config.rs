@@ -117,6 +117,11 @@ pub struct Cli {
     /// Length of the radio link monitoring outage (ms, default 1500).
     #[arg(long)]
     pub rlm_outage_ms: Option<u64>,
+    /// Test aid: run the NAS periodic registration timer T3512 with this
+    /// length (seconds) instead of the network's value, so a periodic
+    /// registration update happens within a lab run.
+    #[arg(long)]
+    pub t3512_s: Option<u64>,
     /// Log level (error/warn/info/debug/trace).
     #[arg(long)]
     pub log: Option<String>,
@@ -156,6 +161,7 @@ pub struct FileConfig {
     pub rlf_at_s: Option<u64>,
     pub rlm_outage_s: Option<u64>,
     pub rlm_outage_ms: Option<u64>,
+    pub t3512_s: Option<u64>,
     pub log: Option<String>,
 }
 
@@ -190,6 +196,8 @@ pub struct UeConfig {
     pub rlf_at_s: u64,
     /// Test aid: `(start_s, duration_ms)` radio link monitoring outage.
     pub rlm_outage: Option<(u64, u64)>,
+    /// Test aid: T3512 override (seconds).
+    pub t3512_s: Option<u64>,
     pub log: String,
 }
 
@@ -279,6 +287,7 @@ impl UeConfig {
             rx_power_offset_db: pick!(rx_power_offset_db, 0.0),
             rlf_at_s: pick!(rlf_at_s, 0),
             rlm_outage: cli.rlm_outage_s.or(file.rlm_outage_s).map(|s| (s, pick!(rlm_outage_ms, 1500))),
+            t3512_s: cli.t3512_s.or(file.t3512_s),
             log: pick!(log, "info".into()),
         })
     }

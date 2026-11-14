@@ -8,3 +8,7 @@ license.workspace = true
 ferrite-common.workspace = true
 log.workspace = true
 ferrite-security.workspace = true
+
+[dev-dependencies]
+oxirush-nas = { version = "0.7", features = ["security"] }
+oxirush-security = "0.4"

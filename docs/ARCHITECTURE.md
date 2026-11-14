@@ -317,14 +317,41 @@ ASN.1.
 
 ## 10. NAS (ferrite-nas)
 
-`NasUe` keeps `MmState` (`Deregistered → RegistrationInitiated →
-Authenticating → SecurityMode → Registered`, plus `ServiceRequestInitiated`
-and `DeregistrationInitiated`) and one `SmState` per PDU session (`Inactive →
-ActivePending → Active → InactivePending`). Timers T3510, T3512, T3517, T3520,
-T3521, T3580, T3582 run on the millisecond clock of `tick`. 5G-AKA with
-MILENAGE and SQN management, NAS security context (NIA2 / NEA0 / NEA2), PDU
-session establishment (IPv4). The NAS exchanges opaque PDUs with RRC through
-the stack (`NasUe::on_dl_nas` → UL PDUs; `NasEvent`s to the stack).
+`NasUe` keeps `MmState` with the TS 24.501 §5.1.3.2 substates:
+`Deregistered(DeregisteredSub)` (`NormalService`, `LimitedService`,
+`AttemptingRegistration`, `PlmnSearch`, `NoSupi`, `InitialRegistrationNeeded`),
+the procedure states `RegistrationInitiated → Authenticating → SecurityMode`,
+`Registered(RegisteredSub)` (`NormalService`, `NonAllowedService`,
+`AttemptingRegistrationUpdate`, `LimitedService`, `PlmnSearch`,
+`UpdateNeeded`), `ServiceRequestInitiated` and `DeregistrationInitiated`; and
+one `SmState` per PDU session (`Inactive → ActivePending → Active →
+InactivePending`). Orthogonal to it, `CmState` (5GMM-IDLE / 5GMM-CONNECTED) is
+set by the stack from the RRC connection: a procedure started in 5GMM-IDLE
+queues its first message and emits `NasEvent::ConnectionNeeded`; the stack
+establishes the RRC connection (mo-Signalling) and carries
+`take_pending_initial_message()` in RRCSetupComplete, with the AS keys derived
+from that message's uplink NAS COUNT.
+
+Timers (Table 10.2.1) run on the air-interface clock the stack derives from
+the slot indications: T3510 (registration), T3511 / T3502 with the
+registration attempt counter (§5.5.1.2.7: five T3511 retries, then T3502),
+T3512 (periodic registration update, running only in 5GMM-IDLE, §5.3.7),
+T3517, T3519 (SUCI reuse), T3520, T3521, T3346 (congestion back-off from a
+REJECT or DEREGISTRATION REQUEST; `barred()` holds registrations and service
+requests), T3580 / T3582. 5GMM causes map to substates in `cause_outcome`
+(#3/#6/#7/#27 → `NoSupi`, #11/#73/#74 → `PlmnSearch`, #12/#13/#15/#72/#75/#76
+→ `LimitedService`, #22 → T3346, #9/#10 → a fresh initial registration,
+others → the attempt counter). A network DEREGISTRATION REQUEST with
+"re-registration required" registers again on the same connection; a
+CONFIGURATION UPDATE COMMAND with "registration requested" starts a mobility
+registration update when the connection is released; a TAI outside the
+registration area does so immediately. NOTIFICATION is answered with the PDU
+session status, PDU SESSION MODIFICATION COMMAND with a COMPLETE (the default
+QoS rule stays in force). 5G-AKA with MILENAGE and SQN management, NAS
+security context (NIA2 / NEA0 / NEA2), PDU session establishment (IPv4). The
+NAS exchanges opaque PDUs with RRC through the stack (`NasUe::on_dl_nas` → UL
+PDUs; `NasEvent`s to the stack). Every uplink message is cross-checked in the
+tests with the independent `oxirush-nas` decoder (`validate()` clean).
 
 ## 11. Application (ferrite-ue)
 

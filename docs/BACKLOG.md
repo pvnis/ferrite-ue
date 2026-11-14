@@ -150,7 +150,19 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [ ] IPv6 and IPv4v6 PDU sessions end to end (NAS plumbed, TUN untested).
 - [ ] Multiple concurrent PDU sessions with separate TUN routing.
 - [ ] SDAP reflective QoS / QFI mapping beyond the default bearer.
-- [ ] Periodic registration update (T3512) and service request from idle.
+- [x] 2026-11-14 5GMM substates (`DeregisteredSub` / `RegisteredSub`),
+      5GMM-IDLE / CONNECTED from the RRC connection (procedures started in
+      idle request a mo-Signalling connection), T3511 / T3502 with the
+      attempt counter, T3346 back-off, T3519, T3512 only in idle with the
+      periodic registration update (lab S27 with `--t3512-s`), per-cause
+      REGISTRATION / SERVICE REJECT handling, network-initiated deregistration
+      with re-registration, CONFIGURATION UPDATE "registration requested",
+      mobility registration update on a new TAI, NOTIFICATION RESPONSE, PDU
+      SESSION MODIFICATION COMPLETE, SERVICE ACCEPT / REJECT events, UE
+      deregistration (switch off) at exit (lab S26), NAS clock derived from
+      the slot indications. `oxirush-nas` 0.7 (Apache-2.0) is a
+      dev-dependency: an independent decoder that validates every uplink
+      message in the tests.
 
 ## Tooling / hygiene
 
@@ -245,15 +257,12 @@ whole message (sCellToAddModList, configuredGrantConfig,
 beamFailureRecoveryConfig, slotFormatIndicator, crossCarrierSchedulingConfig,
 codebookConfig, aperiodicTriggerStateList, …), unified access control.
 
-NAS: 5GMM substates and the CM-IDLE/CM-CONNECTED distinction (RRC release not
-told to NAS), T3502/T3511/T3519/T3346 handling and the attempt counter, EAP-AKA',
-registration update types (mobility, emergency), per-cause reject handling,
-network-initiated deregistration re-registration, service request types other
-than data/MT, SERVICE ACCEPT/REJECT events, NOTIFICATION response,
-CONFIGURATION UPDATE `registrationRequested`, PDU session modification (answered
-with 5GSM STATUS today), QoS rules installation, IPv6/IPv4v6/Ethernet user plane,
-EPCO (DNS/MTU), SUCI profiles A/B, TUAK, SQN persistence, UE-initiated
-deregistration on exit; NAS runs on wall-clock time while RRC/MAC run on slots.
+NAS: EAP-AKA', emergency registration, forbidden PLMN / TA lists kept
+across cells (today a forbidden cause only sets the substate), QoS rules
+installation from PDU SESSION MODIFICATION COMMAND, IPv6/IPv4v6/Ethernet user
+plane, EPCO (DNS/MTU), SUCI profiles A/B (`oxirush-security` has the ECIES
+profiles and NIA1/NEA1/NIA3/NEA3 — candidates to replace the hand-written
+codec and security), TUAK, SQN persistence.
 
 ASN.1: encoders for CellGroupConfig / SIB1 (round-trip tests), extension
 additions decoded (120 sites skip them), critical-extension futures / CHOICE

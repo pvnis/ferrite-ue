@@ -68,10 +68,18 @@ fn main() {
     };
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<EngineCommand>(4);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<EngineEvent>(64);
+    // A shutdown request first lets the NAS deregister (switch off); the
+    // engine stops a moment later (see `Reporting`), or at once when the UE
+    // is not registered.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
+        let shutdown = shutdown.clone();
         let cmd_tx = cmd_tx.clone();
         ctrlc_handler(move || {
-            let _ = cmd_tx.try_send(EngineCommand::Stop);
+            if shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Second Ctrl-C: stop now.
+                let _ = cmd_tx.try_send(EngineCommand::Stop);
+            }
         });
     }
     let mut stack = Stack::new(cfg.clone(), None);
@@ -113,14 +121,18 @@ fn main() {
     };
     if cfg.timeout_s > 0 {
         let cmd_tx = cmd_tx.clone();
+        let shutdown = shutdown.clone();
         let t = cfg.timeout_s;
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(t));
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Backstop: the engine stops even if no slot indication arrives.
+            std::thread::sleep(std::time::Duration::from_secs(3));
             let _ = cmd_tx.try_send(EngineCommand::Stop);
         });
     }
     let result = {
-        let mut handler = Reporting { stack: &mut stack, cmd_tx: cmd_tx.clone(), exit_after_ping: cfg.exit_after_ping, done: false, mib_rx, meas_rx };
+        let mut handler = Reporting { stack: &mut stack, cmd_tx: cmd_tx.clone(), exit_after_ping: cfg.exit_after_ping, done: false, mib_rx, meas_rx, shutdown, stop_at: None };
         engine::run(params, dl, ul, &mut handler, cmd_rx, ev_tx)
     };
     let _ = reporter.join();
@@ -148,12 +160,35 @@ struct Reporting<'a> {
     done: bool,
     mib_rx: crossbeam_channel::Receiver<MibInfo>,
     meas_rx: crossbeam_channel::Receiver<(u16, ferrite_common::SlotPoint, f32, f32, f32)>,
+    /// Set by Ctrl-C, the timeout or the ping probe: deregister, then stop.
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the engine is stopped after the deregistration went out.
+    stop_at: Option<ferrite_common::SlotPoint>,
 }
 
 impl ferrite_fapi::MacHandler for Reporting<'_> {
     fn handle(&mut self, msg: ferrite_fapi::PhyToMac, phy: &mut dyn ferrite_fapi::MacToPhySink) {
         while let Ok(m) = self.mib_rx.try_recv() {
             self.stack.set_mib(m);
+        }
+        if let ferrite_fapi::PhyToMac::Slot(s) = &msg {
+            let now = s.slot;
+            if self.shutdown.load(std::sync::atomic::Ordering::SeqCst) && !self.done {
+                self.done = true;
+                if self.stack.begin_shutdown(now) {
+                    // Give the DEREGISTRATION REQUEST (and the RRC connection
+                    // it may need) time to go out before the radio stops.
+                    let slots = 600 * u64::from(now.numerology.slots_per_subframe());
+                    log::info!("shutting down: deregistering first");
+                    self.stop_at = Some(now.add(slots));
+                } else {
+                    let _ = self.cmd_tx.try_send(EngineCommand::Stop);
+                }
+            }
+            if self.stop_at.is_some_and(|t| now.diff(&t) >= 0) {
+                self.stop_at = None;
+                let _ = self.cmd_tx.try_send(EngineCommand::Stop);
+            }
         }
         while let Ok((pci, slot, rsrp, rsrq, sinr)) = self.meas_rx.try_recv() {
             self.stack.on_measurement(pci, slot, rsrp, rsrq, sinr);
@@ -168,11 +203,15 @@ impl ferrite_fapi::MacHandler for Reporting<'_> {
                 StackEvent::PingReply { seq, rtt_ms } => log::info!("🏓 seq={seq} time={rtt_ms:.1} ms"),
                 StackEvent::PingDone { sent, received } => {
                     log::info!("★ ping done: {received}/{sent} replies");
-                    if self.exit_after_ping && !self.done {
-                        self.done = true;
-                        let _ = self.cmd_tx.try_send(EngineCommand::Stop);
+                    if self.exit_after_ping {
+                        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
+                StackEvent::RegistrationUpdated => log::info!("★ registration update complete"),
+                // With "switch off" the NAS deregisters locally at once; the
+                // request itself still needs the shutdown window (and, from
+                // idle, an RRC connection) to reach the network.
+                StackEvent::Deregistered => log::info!("★ deregistered"),
                 StackEvent::Failed(why) => log::warn!("✗ {why}"),
                 StackEvent::RrcReleased => log::info!("★ RRC released (idle)"),
                 StackEvent::ServiceRequest { cause } => log::info!("★ service request ({cause})"),

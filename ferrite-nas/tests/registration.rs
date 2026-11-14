@@ -17,7 +17,7 @@ use ferrite_nas::sm::{
     decode_sm, PduAddress, PduSessionEstablishmentAccept, PduSessionEstablishmentReject,
     PduSessionReleaseCommand, PduSessionType, QosRule, SessionAmbr, SmMessage,
 };
-use ferrite_nas::{MmState, NasConfig, NasError, NasEvent, NasUe, SmState, Snssai, UeIdentity};
+use ferrite_nas::{CmState, ConnectionCause, DeregisteredSub, MmState, NasConfig, NasError, NasEvent, NasUe, RegisteredSub, SmState, Snssai, UeIdentity};
 
 const IMSI: &str = "001010167891203";
 const K: [u8; 16] = [
@@ -324,7 +324,7 @@ fn full_flow(ea: u8, ia: u8) -> (NasUe, FakeCore) {
     );
     pump(&mut u, &mut core, vec![rr]);
 
-    assert_eq!(u.state(), MmState::Registered);
+    assert!(u.is_registered(), "{:?}", u.state());
     assert_eq!(u.guti(), Some(guti()));
     let ev = u.events();
     assert_eq!(
@@ -391,7 +391,7 @@ fn configuration_update_identity_and_network_deregistration() {
     assert_eq!(ul.len(), 1);
     assert_eq!(core.rx(&ul[0]), mm::configuration_update_complete());
     assert_eq!(u.tai_list()[0].tac, 9);
-    assert_eq!(u.events(), vec![NasEvent::ConfigurationUpdated]);
+    assert!(matches!(u.events()[..], [NasEvent::ConfigurationUpdated { .. }]));
     // Identity request (protected) → SUCI.
     let dl = core.tx(
         IdentityRequest {
@@ -421,7 +421,7 @@ fn configuration_update_identity_and_network_deregistration() {
     let dl = core.tx(d.encode(), SecurityHeaderType::IntegrityCiphered);
     let ul = u.on_dl_nas(&dl).unwrap();
     assert_eq!(core.rx(&ul[0]), mm::deregistration_accept(true));
-    assert_eq!(u.state(), MmState::Deregistered);
+    assert!(u.is_deregistered(), "{:?}", u.state());
     assert_eq!(
         u.events(),
         vec![NasEvent::PduSessionDown { psi: 5 }, NasEvent::Deregistered]
@@ -449,11 +449,14 @@ fn ue_deregistration_and_session_release() {
         u.events()[0],
         NasEvent::PduSessionUp { psi: 5, .. }
     ));
-    // Deregister.
-    let d = u.deregister().expect("dereg");
+    // Deregister (from 5GMM-IDLE the request first needs a connection).
+    assert!(u.deregister().is_none());
+    assert_eq!(u.events(), vec![NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling }]);
+    let d = u.take_pending_initial_message().expect("queued DEREGISTRATION REQUEST");
     assert_eq!(u.state(), MmState::DeregistrationInitiated);
+    u.on_connection_established();
     pump(&mut u, &mut core, vec![d]);
-    assert_eq!(u.state(), MmState::Deregistered);
+    assert!(u.is_deregistered(), "{:?}", u.state());
     assert_eq!(
         u.events(),
         vec![NasEvent::PduSessionDown { psi: 5 }, NasEvent::Deregistered]
@@ -471,7 +474,7 @@ fn sqn_resynchronisation() {
     let mut core = FakeCore::new(0, 2);
     let rr = u.start_registration();
     pump(&mut u, &mut core, vec![rr]);
-    assert_eq!(u.state(), MmState::Registered);
+    assert!(u.is_registered(), "{:?}", u.state());
     assert_eq!(
         core.sqn, 0x102,
         "core resynchronised to SQN_MS + 1 then incremented"
@@ -505,7 +508,7 @@ fn replay_and_unprotected_messages_are_rejected() {
     }
     .encode();
     assert_eq!(u.on_dl_nas(&ra), Err(NasError::Unprotected(0x42)));
-    assert_eq!(u.state(), MmState::Registered);
+    assert!(u.is_registered(), "{:?}", u.state());
 }
 
 #[test]
@@ -520,21 +523,27 @@ fn registration_reject_and_timers() {
         rejected_nssai: None,
     };
     assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
-    assert_eq!(u.state(), MmState::Deregistered);
+    assert!(u.is_deregistered(), "{:?}", u.state());
     assert_eq!(
         u.events(),
         vec![NasEvent::RegistrationRejected(11), NasEvent::Deregistered]
     );
 
-    // Periodic registration update after T3512 (1 minute from the accept).
+    // Periodic registration update after T3512 (1 minute from the accept):
+    // the UE is in 5GMM-IDLE, so it asks for a connection and hands the
+    // REGISTRATION REQUEST over as the initial NAS message.
     let (mut u, mut core) = full_flow(0, 2);
-    let out = u.tick(1_000 + 60_000);
-    assert_eq!(out.len(), 1);
-    let plain = core.rx(&out[0]);
+    assert_eq!(u.cm_state(), CmState::Idle);
+    assert!(u.tick(1_000 + 60_000).is_empty());
+    assert_eq!(u.events(), vec![NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling }]);
+    let rr_pdu = u.take_pending_initial_message().expect("pending REGISTRATION REQUEST");
+    assert!(u.take_pending_initial_message().is_none());
+    let plain = core.rx(&rr_pdu);
     let rr = RegistrationRequest::decode(&plain).unwrap();
     assert_eq!(rr.reg_type, mm::RegistrationType::PeriodicUpdating);
     assert_eq!(rr.pdu_session_status, Some(1 << 5));
     assert_eq!(u.state(), MmState::RegistrationInitiated);
+    u.on_connection_established();
     let ra = RegistrationAccept {
         result: 1,
         ..Default::default()
@@ -546,8 +555,14 @@ fn registration_reject_and_timers() {
         1,
         "only REGISTRATION COMPLETE after a periodic update"
     );
-    assert_eq!(u.state(), MmState::Registered);
-    assert!(u.events().is_empty());
+    assert_eq!(u.state(), MmState::Registered(RegisteredSub::NormalService));
+    assert_eq!(u.events(), vec![NasEvent::RegistrationUpdated { guti: Some(guti()) }]);
+    // T3512 does not run while connected; it restarts on release.
+    assert!(u.tick(1_000 + 60_000 + 70_000).is_empty());
+    u.on_connection_released();
+    assert!(u.tick(1_000 + 60_000 + 70_000 + 59_000).is_empty());
+    assert!(u.tick(1_000 + 60_000 + 70_000 + 60_000).is_empty());
+    assert_eq!(u.events(), vec![NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling }]);
 }
 
 #[test]
@@ -560,7 +575,7 @@ fn pdu_session_reject_and_t3580_retry() {
     let mut core = FakeCore::new(0, 2);
     let rr = u.start_registration();
     pump(&mut u, &mut core, vec![rr]);
-    assert_eq!(u.state(), MmState::Registered);
+    assert!(u.is_registered(), "{:?}", u.state());
     let _ = u.events();
     let req = u.request_pdu_session(3).expect("request");
     // No answer: T3580 retransmits with the same PTI.
@@ -610,4 +625,253 @@ fn pdu_session_reject_and_t3580_retry() {
         u.events(),
         vec![NasEvent::PduSessionRejected { psi: 3, cause: 91 }]
     );
+}
+
+/// A registered, connected UE with its fake core.
+fn connected_flow() -> (NasUe, FakeCore) {
+    let (mut u, core) = full_flow(0, 2);
+    u.on_connection_established();
+    (u, core)
+}
+
+#[test]
+fn registration_reject_congestion_backs_off_with_t3346() {
+    let mut u = ue(NasConfig::default());
+    u.on_connection_established();
+    let _ = u.start_registration();
+    let rj = RegistrationReject { cause: 22, t3346: Some(mm::GprsTimer2 { unit: 0, value: 1 }), t3502: None, eap_message: None, rejected_nssai: None }; // 1 × 2 s
+    assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
+    assert_eq!(u.state(), MmState::Deregistered(DeregisteredSub::AttemptingRegistration));
+    assert!(u.barred());
+    // Nothing happens before T3346 runs out; then the registration is retried.
+    assert!(u.tick(1_500).is_empty());
+    assert!(u.barred());
+    let out = u.tick(2_100);
+    assert!(!u.barred());
+    assert_eq!(out.len(), 1, "REGISTRATION REQUEST after T3346");
+    assert_eq!(u.state(), MmState::RegistrationInitiated);
+    let _ = u.events();
+}
+
+#[test]
+fn registration_reject_abnormal_cause_uses_the_attempt_counter() {
+    let mut u = ue(NasConfig::default());
+    u.on_connection_established();
+    let _ = u.start_registration();
+    let rj = RegistrationReject { cause: 111, t3346: None, t3502: None, eap_message: None, rejected_nssai: None };
+    assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
+    assert_eq!(u.state(), MmState::Deregistered(DeregisteredSub::AttemptingRegistration));
+    assert!(u.tick(9_000).is_empty());
+    assert_eq!(u.tick(10_000).len(), 1, "T3511 → retry");
+    // Four more failures → T3502 instead of T3511.
+    let mut t = 10_000;
+    for _ in 0..4 {
+        assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
+        t += 10_000;
+        u.tick(t);
+    }
+    assert!(u.tick(t + 60_000).is_empty(), "T3502 (12 min) running, no retry after 1 min");
+    assert_eq!(u.tick(t + 12 * 60_000).len(), 1, "retry after T3502");
+}
+
+#[test]
+fn service_reject_implicitly_deregistered_registers_again() {
+    let (mut u, mut core) = connected_flow();
+    u.on_connection_released();
+    let sr = u.service_request(1).expect("SERVICE REQUEST");
+    let _ = core.rx(&sr);
+    u.on_connection_established();
+    let rj = mm::ServiceReject { cause: 10, pdu_session_status: None, t3346: None };
+    // SERVICE REJECT may be sent without integrity protection.
+    let out = u.on_dl_nas(&rj.encode()).unwrap();
+    assert_eq!(out.len(), 1, "a fresh REGISTRATION REQUEST on the same connection");
+    let rr = RegistrationRequest::decode(&out[0]).unwrap();
+    assert_eq!(rr.reg_type, mm::RegistrationType::Initial);
+    assert!(matches!(rr.mobile_identity, MobileIdentity::Suci { .. }), "GUTI and context were deleted");
+    let ev = u.events();
+    assert!(ev.contains(&NasEvent::ServiceRejected(10)) && ev.contains(&NasEvent::Deregistered), "{ev:?}");
+    assert_eq!(u.state(), MmState::RegistrationInitiated);
+}
+
+#[test]
+fn service_reject_restricted_area_and_congestion() {
+    let (mut u, _core) = connected_flow();
+    u.on_connection_released();
+    let _ = u.service_request(1).unwrap();
+    u.on_connection_established();
+    let rj = mm::ServiceReject { cause: 28, pdu_session_status: None, t3346: None };
+    assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
+    assert_eq!(u.state(), MmState::Registered(RegisteredSub::NonAllowedService));
+    let _ = u.events();
+    u.on_connection_released();
+    let _ = u.service_request(1).unwrap();
+    let rj = mm::ServiceReject { cause: 22, pdu_session_status: None, t3346: Some(mm::GprsTimer2 { unit: 0, value: 5 }) };
+    assert!(u.on_dl_nas(&rj.encode()).unwrap().is_empty());
+    assert!(u.barred());
+    assert!(u.service_request(1).is_none(), "barred by T3346");
+    assert!(u.is_registered());
+}
+
+#[test]
+fn network_deregistration_with_reregistration_required() {
+    let (mut u, mut core) = connected_flow();
+    let d = DeregistrationRequestUeTerminated {
+        dereg_type: DeregistrationType { access_type: 1, reregistration_required: true, switch_off: false },
+        cause: None,
+        t3346: None,
+    };
+    let dl = core.tx(d.encode(), SecurityHeaderType::IntegrityCiphered);
+    let out = u.on_dl_nas(&dl).unwrap();
+    assert_eq!(out.len(), 2, "DEREGISTRATION ACCEPT then REGISTRATION REQUEST");
+    let plain = core.rx(&out[1]);
+    let rr = RegistrationRequest::decode(&plain).unwrap();
+    assert_eq!(rr.reg_type, mm::RegistrationType::Initial);
+    assert!(matches!(rr.mobile_identity, MobileIdentity::Guti(_)), "context kept: GUTI used");
+    assert_eq!(u.state(), MmState::RegistrationInitiated);
+    // Without re-registration and with cause #7 the USIM is invalid: nothing follows.
+    let (mut u, mut core) = connected_flow();
+    let d = DeregistrationRequestUeTerminated {
+        dereg_type: DeregistrationType { access_type: 1, reregistration_required: false, switch_off: false },
+        cause: Some(7),
+        t3346: None,
+    };
+    let dl = core.tx(d.encode(), SecurityHeaderType::IntegrityCiphered);
+    assert_eq!(u.on_dl_nas(&dl).unwrap().len(), 1);
+    assert_eq!(u.state(), MmState::Deregistered(DeregisteredSub::NoSupi));
+    assert!(u.guti().is_none() && u.security_context().is_none());
+    u.on_connection_released();
+    assert!(u.tick(10_000_000).is_empty());
+    assert!(!u.events().iter().any(|e| matches!(e, NasEvent::ConnectionNeeded { .. })));
+}
+
+#[test]
+fn configuration_update_registration_requested_after_release() {
+    let (mut u, mut core) = connected_flow();
+    let c = ConfigurationUpdateCommand { ack_requested: true, registration_requested: true, ..Default::default() };
+    let dl = core.tx(c.encode(), SecurityHeaderType::IntegrityCiphered);
+    assert_eq!(u.on_dl_nas(&dl).unwrap().len(), 1, "CONFIGURATION UPDATE COMPLETE");
+    assert!(u.is_registered());
+    let _ = u.events();
+    // The registration starts once the network releases the connection.
+    u.on_connection_released();
+    assert_eq!(u.events(), vec![NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling }]);
+    let rr = RegistrationRequest::decode(&core.rx(&u.take_pending_initial_message().unwrap())).unwrap();
+    assert_eq!(rr.reg_type, mm::RegistrationType::MobilityUpdating);
+}
+
+#[test]
+fn new_tracking_area_triggers_a_mobility_update() {
+    let (mut u, mut core) = connected_flow();
+    let inside = u.tai_list()[0];
+    u.set_current_tai(inside);
+    assert!(u.events().is_empty());
+    let outside = Tai { plmn: inside.plmn, tac: inside.tac.wrapping_add(1) };
+    u.set_current_tai(outside);
+    // Connected: the request goes out through the NAS directly? No — set_current_tai
+    // queues it like any procedure started by the UE; connected → nothing pending.
+    let ev = u.events();
+    assert!(ev.is_empty(), "{ev:?}");
+    assert_eq!(u.state(), MmState::RegistrationInitiated);
+    // Idle UE: a connection is requested.
+    let (mut u, _core) = full_flow(0, 2);
+    let inside = u.tai_list()[0];
+    u.set_current_tai(Tai { plmn: inside.plmn, tac: inside.tac.wrapping_add(1) });
+    assert_eq!(u.events(), vec![NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling }]);
+    let rr = RegistrationRequest::decode(&core.rx(&u.take_pending_initial_message().unwrap())).unwrap();
+    assert_eq!(rr.reg_type, mm::RegistrationType::MobilityUpdating);
+}
+
+#[test]
+fn notification_is_answered_with_the_session_status() {
+    let (mut u, mut core) = connected_flow();
+    let dl = core.tx(mm::Notification { access_type: 1 }.encode(), SecurityHeaderType::IntegrityCiphered);
+    let out = u.on_dl_nas(&dl).unwrap();
+    assert_eq!(out.len(), 1);
+    let plain = core.rx(&out[0]);
+    assert_eq!(plain[2], mm::msg_type::NOTIFICATION_RESPONSE);
+    assert_eq!(&plain[3..], &[0x50, 2, 0x20, 0x00], "PDU session 5 active");
+}
+
+#[test]
+fn pdu_session_modification_command_is_completed() {
+    let (mut u, mut core) = connected_flow();
+    // PDU SESSION MODIFICATION COMMAND psi 5 pti 0 with a session AMBR IE.
+    let sm = vec![0x2e, 5, 0, 0xcb, 0x2a, 6, 0x06, 0x00, 0x01, 0x06, 0x00, 0x01];
+    let t = DlNasTransport { payload_container_type: 1, payload_container: sm, pdu_session_id: Some(5), cause: None, additional_information: None, back_off_timer: None };
+    let dl = core.tx(t.encode(), SecurityHeaderType::IntegrityCiphered);
+    let out = u.on_dl_nas(&dl).unwrap();
+    assert_eq!(out.len(), 1);
+    let plain = core.rx(&out[0]);
+    let ul = mm::UlNasTransport::decode(&plain).unwrap();
+    assert_eq!(ul.payload_container, vec![0x2e, 5, 0, 0xcc], "PDU SESSION MODIFICATION COMPLETE");
+    assert_eq!(ul.pdu_session_id, Some(5));
+}
+
+// ---------------------------------------------------------------------------
+// Independent decoder: every uplink message is read back with oxirush-nas.
+// ---------------------------------------------------------------------------
+
+mod oracle {
+    use super::*;
+    use oxirush_nas::nas_5gs::{GmmMessage, Message, RegistrationTypeValue, ServiceTypeValue};
+    use oxirush_nas::Validate;
+
+    fn decode(plain: &[u8]) -> Message {
+        let m = Message::decode(plain).unwrap_or_else(|e| panic!("oxirush-nas rejects {plain:02x?}: {e}"));
+        let findings = m.validate();
+        assert!(findings.is_empty(), "{m}: {findings:?}");
+        m
+    }
+
+    #[test]
+    fn initial_registration_request() {
+        let mut u = ue(NasConfig::default());
+        let rr = u.start_registration();
+        let m = decode(&rr);
+        let Message::Gmm(_, GmmMessage::RegistrationRequest(r)) = &m else { panic!("{m}") };
+        assert_eq!(r.fgs_registration_type.registration_type(), Some(RegistrationTypeValue::InitialRegistration));
+        assert!(r.fgs_mobile_identity.as_suci().is_some(), "{m}");
+        assert!(m.to_string().contains("EA0 EA2 / IA0 IA2"), "{m}");
+    }
+
+    #[test]
+    fn protected_uplink_messages() {
+        let (mut u, mut core) = connected_flow();
+        // SERVICE REQUEST (mo-Data) with the 5G-S-TMSI.
+        u.on_connection_released();
+        let sr = core.rx(&u.service_request(1).unwrap());
+        let m = decode(&sr);
+        let Message::Gmm(_, GmmMessage::ServiceRequest(r)) = &m else { panic!("{m}") };
+        assert_eq!(r.service_type.service_type(), Some(ServiceTypeValue::Data));
+        assert_eq!(r.fg_s_tmsi.as_s_tmsi().map(|t| t.tmsi()), Some(guti().tmsi));
+        u.on_connection_established();
+        let _ = u.on_dl_nas(&core.tx(mm::ServiceAccept { pdu_session_status: None, pdu_session_reactivation_result: None, t3448: None }.encode(), SecurityHeaderType::IntegrityCiphered));
+        // Periodic REGISTRATION REQUEST with the GUTI.
+        u.on_connection_released();
+        u.tick(1_000 + 60_000);
+        let rr = core.rx(&u.take_pending_initial_message().unwrap());
+        let m = decode(&rr);
+        let Message::Gmm(_, GmmMessage::RegistrationRequest(r)) = &m else { panic!("{m}") };
+        assert_eq!(r.fgs_registration_type.registration_type(), Some(RegistrationTypeValue::PeriodicRegistrationUpdating));
+        assert_eq!(r.fgs_mobile_identity.as_guti().map(|g| g.tmsi()), Some(guti().tmsi));
+        // DEREGISTRATION REQUEST (switch off).
+        let (mut u, mut core) = connected_flow();
+        let d = core.rx(&u.deregister_with(true).unwrap());
+        let m = decode(&d);
+        let Message::Gmm(_, GmmMessage::DeregistrationRequestUeOriginating(r)) = &m else { panic!("{m}") };
+        assert!(r.de_registration_type.switch_off());
+        assert!(r.fgs_mobile_identity.as_guti().is_some());
+        // NOTIFICATION RESPONSE and PDU SESSION MODIFICATION COMPLETE in UL NAS TRANSPORT.
+        let (mut u, mut core) = connected_flow();
+        let out = u.on_dl_nas(&core.tx(mm::Notification { access_type: 1 }.encode(), SecurityHeaderType::IntegrityCiphered)).unwrap();
+        let m = decode(&core.rx(&out[0]));
+        assert!(matches!(m, Message::Gmm(_, GmmMessage::NotificationResponse(_))), "{m}");
+        let sm = vec![0x2e, 5, 0, 0xcb];
+        let t = DlNasTransport { payload_container_type: 1, payload_container: sm, pdu_session_id: Some(5), cause: None, additional_information: None, back_off_timer: None };
+        let out = u.on_dl_nas(&core.tx(t.encode(), SecurityHeaderType::IntegrityCiphered)).unwrap();
+        let m = decode(&core.rx(&out[0]));
+        let Message::Gmm(_, GmmMessage::UlNasTransport(ul)) = &m else { panic!("{m}") };
+        let inner = ul.payload_container.decode_as_n1_sm_message().expect("5GSM payload");
+        assert!(matches!(inner, Message::Gsm(_, oxirush_nas::nas_5gs::GsmMessage::PduSessionModificationComplete(_))), "{inner}");
+    }
 }

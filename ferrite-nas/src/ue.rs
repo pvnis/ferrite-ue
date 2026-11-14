@@ -34,7 +34,8 @@ use crate::ie::NasError;
 use crate::milenage::k_gnb;
 use crate::mm::{
     cause, configuration_update_complete, decode_mm, deregistration_accept, identity_type,
-    mm_message_type, msg_type, payload_container_type, registration_complete, request_type,
+    mm_message_type, msg_type, notification_response, payload_container_type,
+    registration_complete, request_type,
     security_mode_reject, split_security_header, AuthenticationFailure, AuthenticationRequest,
     AuthenticationResponse, ConfigurationUpdateCommand, DeregistrationRequestUeOriginating,
     DeregistrationRequestUeTerminated, DeregistrationType, DlNasTransport, Guti, IdentityRequest,
@@ -45,8 +46,8 @@ use crate::mm::{
 };
 use crate::security::{run_5g_aka, AkaOutcome, NasSecurityContext, UsimKeys};
 use crate::sm::{
-    self, decode_sm, PduSessionEstablishmentRequest, PduSessionReleaseComplete,
-    PduSessionReleaseRequest, PduSessionType, SmMessage, SmStatus,
+    self, decode_sm, modification_complete, PduSessionEstablishmentRequest,
+    PduSessionReleaseComplete, PduSessionReleaseRequest, PduSessionType, SmMessage, SmStatus,
 };
 
 /// Subscriber identity and credentials.
@@ -152,6 +153,8 @@ pub struct NasConfig {
     pub initial_sqn_ms: Option<u64>,
     /// Maximum registration / deregistration / PDU session attempts.
     pub max_attempts: u8,
+    /// Test aid: run T3512 with this length instead of the network's value.
+    pub t3512_override_ms: Option<u64>,
 }
 
 impl Default for NasConfig {
@@ -172,25 +175,91 @@ impl Default for NasConfig {
             sqn_check: true,
             initial_sqn_ms: None,
             max_attempts: 5,
+            t3512_override_ms: None,
         }
     }
 }
 
-/// 5GMM state (TS 24.501 §5.1.3.2, UE side, collapsed to what the UE runs).
+/// 5GMM-DEREGISTERED substates (TS 24.501 §5.1.3.2.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeregisteredSub {
+    /// A suitable cell is available; registration can be started.
+    NormalService,
+    /// Only limited service (forbidden TA, no suitable cells): no automatic
+    /// registration on this cell.
+    LimitedService,
+    /// A registration failed; T3511 / T3502 / T3346 runs before the next try.
+    AttemptingRegistration,
+    /// The PLMN is forbidden: another PLMN has to be selected.
+    PlmnSearch,
+    /// The USIM is considered invalid for 5GS (reject #3 / #6 / #7, N1 mode
+    /// not allowed): no registration until switch off.
+    NoSupi,
+    /// Registration has not been attempted yet (power on).
+    InitialRegistrationNeeded,
+}
+
+/// 5GMM-REGISTERED substates (TS 24.501 §5.1.3.2.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisteredSub {
+    NormalService,
+    /// SERVICE REJECT #28 (restricted service area).
+    NonAllowedService,
+    /// A registration update failed; T3511 / T3502 / T3346 runs.
+    AttemptingRegistrationUpdate,
+    LimitedService,
+    PlmnSearch,
+    /// A mobility / periodic registration update is due (new TAI, T3512,
+    /// CONFIGURATION UPDATE "registration requested") and waits for a
+    /// connection.
+    UpdateNeeded,
+}
+
+/// 5GMM state (TS 24.501 §5.1.3.2, UE side) with the procedure states the
+/// UE spends time in.
+///
+/// ```text
+///  Deregistered(_) ──REGISTRATION REQUEST (T3510)──▶ RegistrationInitiated
+///  RegistrationInitiated ──AUTHENTICATION RESPONSE──▶ Authenticating ──SMC──▶ SecurityMode
+///  {RegistrationInitiated, Authenticating, SecurityMode} ──REGISTRATION ACCEPT──▶ Registered(NormalService)
+///  RegistrationInitiated ──T3510 ×5 / REJECT──▶ Deregistered(AttemptingRegistration | LimitedService | PlmnSearch | NoSupi)
+///  Registered(_) ──SERVICE REQUEST (T3517)──▶ ServiceRequestInitiated ──ACCEPT / T3517──▶ Registered(_)
+///  Registered(_) ──T3512 (CM-IDLE) / new TAI / "registration requested"──▶ Registered(UpdateNeeded) ──REGISTRATION REQUEST──▶ RegistrationInitiated
+///  Registered(_) ──DEREGISTRATION REQUEST (T3521)──▶ DeregistrationInitiated ──ACCEPT / T3521 ×5──▶ Deregistered(NormalService)
+///  any ──network DEREGISTRATION REQUEST / AUTHENTICATION REJECT──▶ Deregistered(_)
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmState {
-    Deregistered,
+    Deregistered(DeregisteredSub),
     /// REGISTRATION REQUEST sent, waiting for the network (T3510 running).
     RegistrationInitiated,
     /// AUTHENTICATION RESPONSE sent.
     Authenticating,
     /// SECURITY MODE COMPLETE sent, waiting for REGISTRATION ACCEPT.
     SecurityMode,
-    Registered,
+    Registered(RegisteredSub),
     /// SERVICE REQUEST sent (T3517 running).
     ServiceRequestInitiated,
     /// DEREGISTRATION REQUEST sent (T3521 running).
     DeregistrationInitiated,
+}
+
+/// 5GMM-CONNECTED / 5GMM-IDLE (TS 24.501 §5.1.3.2.2): whether an N1 NAS
+/// signalling connection (an RRC connection) exists. The stack reports the
+/// transitions; they decide whether a NAS message can be sent now or needs a
+/// connection first, and whether T3512 runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmState {
+    Idle,
+    Connected,
+}
+
+/// Why the NAS needs an N1 signalling connection (the RRC establishment
+/// cause the stack should use, TS 24.501 §4.5 / TS 38.331 §6.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionCause {
+    /// A registration, registration update or deregistration: mo-Signalling.
+    MoSignalling,
 }
 
 /// 5GSM state of one PDU session (TS 24.501 §6.1.3.2).
@@ -249,8 +318,21 @@ pub enum NasEvent {
     AuthenticationFailed,
     /// SECURITY MODE REJECT sent with this cause.
     SecurityModeRejected { cause: u8 },
-    /// CONFIGURATION UPDATE COMMAND processed.
-    ConfigurationUpdated,
+    /// CONFIGURATION UPDATE COMMAND processed; the 5G-GUTI in force after
+    /// it (a new one changes the 5G-S-TMSI RRC and paging use).
+    ConfigurationUpdated { guti: Option<Guti> },
+    /// SERVICE ACCEPT received.
+    ServiceAccepted,
+    /// SERVICE REJECT with this 5GMM cause.
+    ServiceRejected(u8),
+    /// The NAS has a message to send but no N1 signalling connection
+    /// (5GMM-IDLE): the stack establishes an RRC connection with this cause
+    /// and carries [`NasUe::take_pending_initial_message`] in
+    /// RRCSetupComplete.
+    ConnectionNeeded { cause: ConnectionCause },
+    /// A registration update (periodic / mobility / requested by the
+    /// network) was accepted, with the 5G-GUTI now in force.
+    RegistrationUpdated { guti: Option<Guti> },
 }
 
 /// TS 24.501 Table 10.2.1 timer values (milliseconds).
@@ -266,6 +348,8 @@ pub mod timers {
     pub const T3582_MS: u64 = 16_000;
     /// Default T3512 when the network does not provide one (54 min).
     pub const T3512_DEFAULT_MS: u64 = 54 * 60_000;
+    /// Registration attempts before T3502 instead of T3511 (§5.5.1.2.7).
+    pub const MAX_REGISTRATION_ATTEMPTS: u8 = 5;
 }
 
 /// The NAS UE.
@@ -299,6 +383,23 @@ pub struct NasUe {
     reg_attempts: u8,
     dereg_attempts: u8,
     periodic_update: bool,
+    cm: CmState,
+    /// T3511 (retry after a failed registration attempt) / T3502 (after the
+    /// fifth) / T3346 (network congestion back-off) expiries.
+    t3511: Option<u64>,
+    t3502: Option<u64>,
+    t3346: Option<u64>,
+    /// T3519: the SUCI in use stays the same while it runs (§5.5.1.2.2).
+    t3519: Option<u64>,
+    /// What the next (re)attempt is: an initial registration or an update.
+    next_registration: RegistrationType,
+    /// CONFIGURATION UPDATE COMMAND asked for a registration once the
+    /// connection is released (§5.4.4.3).
+    registration_requested: bool,
+    /// Network DEREGISTRATION REQUEST with "re-registration required".
+    reregister: bool,
+    /// The initial NAS message waiting for an N1 connection (5GMM-IDLE).
+    pending_initial: Option<Vec<u8>>,
 }
 
 impl NasUe {
@@ -308,7 +409,7 @@ impl NasUe {
         NasUe {
             id,
             cfg,
-            state: MmState::Deregistered,
+            state: MmState::Deregistered(DeregisteredSub::InitialRegistrationNeeded),
             now: 0,
             ctx: None,
             pending_keys: None,
@@ -332,6 +433,15 @@ impl NasUe {
             reg_attempts: 0,
             dereg_attempts: 0,
             periodic_update: false,
+            cm: CmState::Idle,
+            t3511: None,
+            t3502: None,
+            t3346: None,
+            t3519: None,
+            next_registration: RegistrationType::Initial,
+            registration_requested: false,
+            reregister: false,
+            pending_initial: None,
         }
     }
 
@@ -340,6 +450,68 @@ impl NasUe {
     /// Current 5GMM state.
     pub fn state(&self) -> MmState {
         self.state
+    }
+
+    pub fn is_registered(&self) -> bool {
+        matches!(self.state, MmState::Registered(_))
+    }
+
+    pub fn is_deregistered(&self) -> bool {
+        matches!(self.state, MmState::Deregistered(_))
+    }
+
+    /// 5GMM-CONNECTED / 5GMM-IDLE.
+    pub fn cm_state(&self) -> CmState {
+        self.cm
+    }
+
+    /// The stack established the N1 signalling connection (RRC connected):
+    /// T3512 stops (§5.3.7).
+    pub fn on_connection_established(&mut self) {
+        self.set_cm(CmState::Connected);
+        self.t3512 = None;
+    }
+
+    /// The N1 signalling connection is gone (RRC released or lost): T3512
+    /// restarts while registered; a registration the network asked for
+    /// (CONFIGURATION UPDATE "registration requested") or that became due
+    /// while connected starts now.
+    pub fn on_connection_released(&mut self) {
+        self.set_cm(CmState::Idle);
+        if matches!(self.state, MmState::ServiceRequestInitiated) {
+            self.t3517 = None;
+            self.state = MmState::Registered(RegisteredSub::NormalService);
+        }
+        if self.is_registered() {
+            self.t3512 = Some(self.now + self.t3512_len());
+            if self.registration_requested {
+                self.registration_requested = false;
+                self.initiate_registration(RegistrationType::MobilityUpdating);
+            } else if self.state == MmState::Registered(RegisteredSub::UpdateNeeded) {
+                self.initiate_registration(self.next_registration);
+            }
+        }
+    }
+
+    fn set_cm(&mut self, cm: CmState) {
+        if cm != self.cm {
+            log::info!("NAS: 5GMM-{}", if cm == CmState::Connected { "CONNECTED" } else { "IDLE" });
+            self.cm = cm;
+        }
+    }
+
+    fn t3512_len(&self) -> u64 {
+        self.cfg.t3512_override_ms.unwrap_or(self.t3512_len)
+    }
+
+    /// The message that needs a connection (after `NasEvent::ConnectionNeeded`).
+    pub fn take_pending_initial_message(&mut self) -> Option<Vec<u8>> {
+        self.pending_initial.take()
+    }
+
+    /// Whether registration / service requests are barred by T3346.
+    pub fn barred(&self) -> bool {
+        self.t3346.is_some_and(|t| self.now < t)
     }
 
     /// The current 5G-GUTI, if any.
@@ -391,9 +563,16 @@ impl NasUe {
             .unwrap_or_else(|| self.id.plmn().serving_network_name())
     }
 
-    /// Set the current TAI (from SIB1) for the Last visited registered TAI IE.
+    /// The current TAI (from SIB1): the Last visited registered TAI IE, and
+    /// §5.5.1.3.2: a TAI outside the registration area while registered
+    /// triggers a mobility registration update.
     pub fn set_current_tai(&mut self, tai: Tai) {
+        let changed = self.last_tai != Some(tai);
         self.last_tai = Some(tai);
+        if changed && self.is_registered() && !self.tai_list.is_empty() && !self.tai_list.contains(&tai) {
+            log::info!("NAS: TAI {tai:?} outside the registration area: mobility registration update");
+            self.initiate_registration(RegistrationType::MobilityUpdating);
+        }
     }
 
     /// Drain queued events.
@@ -484,15 +663,53 @@ impl NasUe {
     pub fn start_registration(&mut self) -> Vec<u8> {
         self.reg_attempts = 0;
         self.periodic_update = false;
+        self.pending_initial = None;
         self.send_registration_request(RegistrationType::Initial)
+    }
+
+    /// Start a registration of `reg_type` from wherever the UE is: sent at
+    /// once in 5GMM-CONNECTED, else queued behind a `ConnectionNeeded` event.
+    /// Returns the PDU when it can go out now.
+    fn initiate_registration(&mut self, reg_type: RegistrationType) -> Option<Vec<u8>> {
+        if self.barred() {
+            log::info!("NAS: registration deferred: T3346 running");
+            self.next_registration = reg_type;
+            return None;
+        }
+        if matches!(self.state, MmState::Deregistered(DeregisteredSub::NoSupi | DeregisteredSub::PlmnSearch | DeregisteredSub::LimitedService)) {
+            log::info!("NAS: no registration in {:?}", self.state);
+            return None;
+        }
+        self.periodic_update = reg_type == RegistrationType::PeriodicUpdating;
+        let pdu = self.send_registration_request(reg_type);
+        self.dispatch_initial(pdu)
+    }
+
+    /// A message that starts a procedure: out now when connected, else kept
+    /// for the connection the stack is asked to establish.
+    fn dispatch_initial(&mut self, pdu: Vec<u8>) -> Option<Vec<u8>> {
+        if self.cm == CmState::Connected {
+            Some(pdu)
+        } else {
+            self.pending_initial = Some(pdu);
+            self.events.push(NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling });
+            None
+        }
     }
 
     fn send_registration_request(&mut self, reg_type: RegistrationType) -> Vec<u8> {
         let plain = self.build_registration_request(reg_type).encode();
         self.initial_message = Some(plain.clone());
+        self.next_registration = reg_type;
         self.state = MmState::RegistrationInitiated;
         self.t3510 = Some(self.now + timers::T3510_MS);
+        self.t3511 = None;
+        self.t3502 = None;
         self.t3512 = None;
+        if self.ctx.is_none() || self.guti.is_none() {
+            // §5.5.1.2.2: the SUCI sent now is reused while T3519 runs.
+            self.t3519 = Some(self.now + timers::T3519_MS);
+        }
         log::info!(
             "NAS: REGISTRATION REQUEST ({reg_type:?}, attempt {})",
             self.reg_attempts + 1
@@ -500,11 +717,33 @@ impl NasUe {
         self.tx_sht(plain, SecurityHeaderType::Integrity)
     }
 
+    /// §5.5.1.2.7 (abnormal cases) / §5.5.1.3.7: a registration attempt
+    /// failed without a definitive reject. Attempt counter < 5: T3511, then
+    /// retry; 5: T3502 (12 min, or the network's value) first.
+    fn registration_attempt_failed(&mut self, t3502_ms: Option<u64>) {
+        self.reg_attempts = self.reg_attempts.saturating_add(1);
+        let update = self.next_registration != RegistrationType::Initial;
+        self.state = if update && self.guti.is_some() && self.ctx.is_some() {
+            MmState::Registered(RegisteredSub::AttemptingRegistrationUpdate)
+        } else {
+            MmState::Deregistered(DeregisteredSub::AttemptingRegistration)
+        };
+        if self.reg_attempts < timers::MAX_REGISTRATION_ATTEMPTS.min(self.cfg.max_attempts.max(1)) {
+            log::warn!("NAS: registration attempt {} failed: T3511 ({} s)", self.reg_attempts, timers::T3511_MS / 1000);
+            self.t3511 = Some(self.now + timers::T3511_MS);
+        } else {
+            let t = t3502_ms.unwrap_or(timers::T3502_MS);
+            log::warn!("NAS: registration attempt {} failed: T3502 ({} s)", self.reg_attempts, t / 1000);
+            self.t3502 = Some(self.now + t);
+            self.reg_attempts = 0;
+        }
+    }
+
     /// Request a PDU session (TS 24.501 §6.4.1.2): returns the UL NAS
     /// TRANSPORT carrying a PDU SESSION ESTABLISHMENT REQUEST, or `None`
     /// when not registered or the session already exists.
     pub fn request_pdu_session(&mut self, psi: u8) -> Option<Vec<u8>> {
-        if self.state != MmState::Registered || !(1..=15).contains(&psi) {
+        if !self.is_registered() || !(1..=15).contains(&psi) {
             return None;
         }
         if self
@@ -556,7 +795,7 @@ impl NasUe {
     /// Release a PDU session (TS 24.501 §6.4.3): UL NAS TRANSPORT with a
     /// PDU SESSION RELEASE REQUEST.
     pub fn release_pdu_session(&mut self, psi: u8) -> Option<Vec<u8>> {
-        if self.state != MmState::Registered {
+        if !self.is_registered() {
             return None;
         }
         let pti = self.alloc_pti();
@@ -597,15 +836,19 @@ impl NasUe {
 
     /// Deregistration with an explicit switch-off flag; with `switch_off`
     /// the UE deregisters locally without waiting for an accept.
+    /// In 5GMM-IDLE the request is queued behind a `ConnectionNeeded` event
+    /// and `None` is returned (§5.5.2.2.1: the UE first establishes the N1
+    /// signalling connection).
     pub fn deregister_with(&mut self, switch_off: bool) -> Option<Vec<u8>> {
         if !matches!(
             self.state,
-            MmState::Registered | MmState::ServiceRequestInitiated
+            MmState::Registered(_) | MmState::ServiceRequestInitiated
         ) {
             return None;
         }
         self.dereg_attempts = 0;
-        Some(self.send_deregistration_request(switch_off))
+        let pdu = self.send_deregistration_request(switch_off);
+        self.dispatch_initial(pdu)
     }
 
     fn send_deregistration_request(&mut self, switch_off: bool) -> Vec<u8> {
@@ -635,9 +878,10 @@ impl NasUe {
             ngksi,
             mobile_identity: identity,
         };
+        log::info!("NAS: DEREGISTRATION REQUEST ({})", if switch_off { "switch off" } else { "normal" });
         let pdu = self.tx(req.encode());
         if switch_off {
-            self.local_deregister();
+            self.local_deregister(DeregisteredSub::NormalService);
         } else {
             self.state = MmState::DeregistrationInitiated;
             self.t3521 = Some(self.now + timers::T3521_MS);
@@ -649,7 +893,11 @@ impl NasUe {
     /// 5G-S-TMSI and the status of the active PDU sessions. `None` when
     /// there is no security context or GUTI.
     pub fn service_request(&mut self, service_type: u8) -> Option<Vec<u8>> {
-        if self.state != MmState::Registered {
+        if !self.is_registered() {
+            return None;
+        }
+        if self.barred() {
+            log::info!("NAS: service request barred by T3346");
             return None;
         }
         let g = self.guti?;
@@ -672,23 +920,48 @@ impl NasUe {
         };
         self.state = MmState::ServiceRequestInitiated;
         self.t3517 = Some(self.now + timers::T3517_MS);
+        log::info!("NAS: SERVICE REQUEST (type {service_type})");
         Some(self.tx_sht(sr.encode(), SecurityHeaderType::Integrity))
     }
 
-    fn local_deregister(&mut self) {
+    fn local_deregister(&mut self, sub: DeregisteredSub) {
         for s in self.sessions.iter_mut() {
             if s.state != SmState::Inactive {
                 s.state = SmState::Inactive;
                 self.events.push(NasEvent::PduSessionDown { psi: s.psi });
             }
         }
-        self.state = MmState::Deregistered;
+        self.state = MmState::Deregistered(sub);
         self.t3510 = None;
         self.t3512 = None;
         self.t3517 = None;
         self.t3520 = None;
         self.t3521 = None;
+        self.registration_requested = false;
         self.events.push(NasEvent::Deregistered);
+    }
+
+    /// §5.5.1.2.5 / §5.5.2.3.2 / §5.6.1.5: what a 5GMM cause from the
+    /// network means for the UE's state. Returns the substate to enter and
+    /// whether the 5G-GUTI / security context are deleted.
+    fn cause_outcome(cause: u8) -> (DeregisteredSub, bool) {
+        match cause {
+            // Illegal UE / ME, 5GS services not allowed, N1 mode not allowed:
+            // the USIM is invalid for 5GS until switch off.
+            3 | 6 | 7 | 27 => (DeregisteredSub::NoSupi, true),
+            // PLMN not allowed, non-3GPP / 5GC not allowed in this PLMN...
+            11 | 73 | 74 => (DeregisteredSub::PlmnSearch, true),
+            // Tracking area not allowed / roaming not allowed / no suitable
+            // cells / restricted: limited service in this TA.
+            12 | 13 | 15 | 72 | 75 | 76 => (DeregisteredSub::LimitedService, true),
+            // Congestion: back-off (T3346), then try again.
+            22 => (DeregisteredSub::AttemptingRegistration, false),
+            // Implicitly de-registered / identity cannot be derived: a fresh
+            // initial registration.
+            9 | 10 => (DeregisteredSub::NormalService, true),
+            // Everything else (incl. protocol errors #95..#111): abnormal case.
+            _ => (DeregisteredSub::AttemptingRegistration, false),
+        }
     }
 
     // -- downlink -----------------------------------------------------------
@@ -749,7 +1022,7 @@ impl NasUe {
                 self.ctx = None;
                 self.guti = None;
                 self.events.push(NasEvent::AuthenticationFailed);
-                self.local_deregister();
+                self.local_deregister(DeregisteredSub::NoSupi);
                 vec![]
             }
             MmMessage::AuthenticationResult(_) => {
@@ -761,7 +1034,7 @@ impl NasUe {
             MmMessage::DeregistrationRequestUeTerminated(d) => self.on_deregistration_request(d),
             MmMessage::DeregistrationAcceptUeOriginating => {
                 log::info!("NAS: DEREGISTRATION ACCEPT");
-                self.local_deregister();
+                self.local_deregister(DeregisteredSub::NormalService);
                 vec![]
             }
             MmMessage::IdentityRequest(r) => self.on_identity_request(r),
@@ -769,33 +1042,28 @@ impl NasUe {
             MmMessage::ServiceAccept(a) => {
                 log::info!("NAS: SERVICE ACCEPT");
                 self.t3517 = None;
-                self.state = MmState::Registered;
+                self.state = MmState::Registered(RegisteredSub::NormalService);
                 if let Some(status) = a.pdu_session_status {
                     self.sync_pdu_session_status(status);
                 }
+                self.events.push(NasEvent::ServiceAccepted);
                 vec![]
             }
-            MmMessage::ServiceReject(r) => {
-                log::warn!("NAS: SERVICE REJECT cause #{}", r.cause);
-                self.t3517 = None;
-                self.state = MmState::Registered;
-                if matches!(
-                    r.cause,
-                    3 | 6 | 7 | 11 | 12 | 13 | 15 | 27 | 72 | 73 | 74 | 75 | 76
-                ) {
-                    self.guti = None;
-                    self.ctx = None;
-                    self.local_deregister();
-                }
-                vec![]
+            MmMessage::ServiceReject(r) => self.on_service_reject(r),
+            MmMessage::Notification(n) => {
+                // §5.6.3: the network has pending data on the other access;
+                // the response carries the PDU session status.
+                log::info!("NAS: NOTIFICATION access type {}", n.access_type);
+                let active: u16 = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.state == SmState::Active && s.psi < 16)
+                    .fold(0, |a, s| a | (1 << s.psi));
+                vec![self.tx(notification_response((active != 0).then_some(active)))]
             }
             MmMessage::DlNasTransport(t) => self.on_dl_nas_transport(t),
             MmMessage::Status(s) => {
                 log::warn!("NAS: 5GMM STATUS cause #{}", s.cause);
-                vec![]
-            }
-            MmMessage::Notification(n) => {
-                log::info!("NAS: NOTIFICATION access type {}", n.access_type);
                 vec![]
             }
             MmMessage::SecurityModeCommand(_) => {
@@ -984,7 +1252,7 @@ impl NasUe {
             MmState::RegistrationInitiated
                 | MmState::Authenticating
                 | MmState::SecurityMode
-                | MmState::Registered
+                | MmState::Registered(_)
         ) {
             log::warn!(
                 "NAS: REGISTRATION ACCEPT in state {:?}; ignored",
@@ -1012,18 +1280,26 @@ impl NasUe {
             self.sync_pdu_session_status(status);
         }
         self.t3510 = None;
-        self.t3512 = Some(self.now + self.t3512_len);
+        self.t3511 = None;
+        self.t3502 = None;
+        self.t3519 = None;
+        self.t3512 = (self.cm == CmState::Idle).then(|| self.now + self.t3512_len());
         self.reg_attempts = 0;
-        let was_periodic = self.periodic_update;
+        let was_update = self.next_registration != RegistrationType::Initial;
         self.periodic_update = false;
-        self.state = MmState::Registered;
+        self.next_registration = RegistrationType::Initial;
+        self.reregister = false;
+        self.state = MmState::Registered(RegisteredSub::NormalService);
         log::info!(
-            "NAS: REGISTRATION ACCEPT (result {}, GUTI {:?})",
+            "NAS: REGISTRATION ACCEPT ({}, result {}, GUTI {:?})",
+            if was_update { "registration update complete" } else { "initial registration complete" },
             ra.result,
             ra.guti.is_some()
         );
         let mut out = vec![self.tx(registration_complete())];
-        if !was_periodic {
+        if was_update {
+            self.events.push(NasEvent::RegistrationUpdated { guti: self.guti });
+        } else {
             self.events
                 .push(NasEvent::RegistrationComplete { guti: self.guti });
             if let Some(psi) = self.cfg.auto_pdu_session {
@@ -1039,30 +1315,104 @@ impl NasUe {
         log::warn!("NAS: REGISTRATION REJECT cause #{}", rj.cause);
         self.t3510 = None;
         self.pending_keys = None;
-        if matches!(
-            rj.cause,
-            3 | 6 | 7 | 11 | 12 | 13 | 15 | 27 | 72 | 73 | 74 | 75 | 76
-        ) {
+        self.events.push(NasEvent::RegistrationRejected(rj.cause));
+        let (sub, forget) = Self::cause_outcome(rj.cause);
+        if forget {
             self.guti = None;
             self.ctx = None;
+            self.tai_list.clear();
         }
-        self.events.push(NasEvent::RegistrationRejected(rj.cause));
-        self.local_deregister();
+        match rj.cause {
+            22 => {
+                // §5.5.1.2.5 #22: T3346 from the message (a missing or zero
+                // value counts as a T3511-style retry).
+                let was_update = self.next_registration != RegistrationType::Initial;
+                self.local_deregister(sub);
+                if was_update && self.guti.is_some() {
+                    self.state = MmState::Registered(RegisteredSub::AttemptingRegistrationUpdate);
+                }
+                match rj.t3346.and_then(|t| t.to_ms()).filter(|&t| t > 0) {
+                    Some(t) => {
+                        log::warn!("NAS: congestion: T3346 {} s", t / 1000);
+                        self.t3346 = Some(self.now + t);
+                    }
+                    None => self.registration_attempt_failed(None),
+                }
+            }
+            _ if sub == DeregisteredSub::AttemptingRegistration => {
+                self.local_deregister(sub);
+                self.registration_attempt_failed(rj.t3502.and_then(|t| t.to_ms()));
+            }
+            _ => self.local_deregister(sub),
+        }
         vec![]
     }
 
+    /// §5.6.1.5: SERVICE REJECT.
+    fn on_service_reject(&mut self, r: crate::mm::ServiceReject) -> Vec<Vec<u8>> {
+        log::warn!("NAS: SERVICE REJECT cause #{}", r.cause);
+        self.t3517 = None;
+        self.state = MmState::Registered(RegisteredSub::NormalService);
+        self.events.push(NasEvent::ServiceRejected(r.cause));
+        if let Some(status) = r.pdu_session_status {
+            self.sync_pdu_session_status(status);
+        }
+        match r.cause {
+            // Implicitly de-registered / identity unknown: register afresh.
+            9 | 10 => {
+                self.guti = None;
+                self.ctx = None;
+                self.local_deregister(DeregisteredSub::NormalService);
+                self.reg_attempts = 0;
+                self.initiate_registration(RegistrationType::Initial).into_iter().collect()
+            }
+            22 => {
+                if let Some(t) = r.t3346.and_then(|t| t.to_ms()).filter(|&t| t > 0) {
+                    log::warn!("NAS: congestion: T3346 {} s", t / 1000);
+                    self.t3346 = Some(self.now + t);
+                }
+                vec![]
+            }
+            28 => {
+                self.state = MmState::Registered(RegisteredSub::NonAllowedService);
+                vec![]
+            }
+            3 | 6 | 7 | 11 | 12 | 13 | 15 | 27 | 72 | 73 | 74 | 75 | 76 => {
+                let (sub, _) = Self::cause_outcome(r.cause);
+                self.guti = None;
+                self.ctx = None;
+                self.tai_list.clear();
+                self.local_deregister(sub);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// §5.5.2.3: network-initiated deregistration. With "re-registration
+    /// required" the UE registers again (at once on this connection).
     fn on_deregistration_request(&mut self, d: DeregistrationRequestUeTerminated) -> Vec<Vec<u8>> {
         log::info!(
             "NAS: network DEREGISTRATION REQUEST (cause {:?}, re-registration {})",
             d.cause,
             d.dereg_type.reregistration_required
         );
-        let out = vec![self.tx(deregistration_accept(true))];
-        if matches!(d.cause, Some(3 | 6 | 7 | 11 | 12 | 13 | 15 | 27)) {
+        let mut out = vec![self.tx(deregistration_accept(true))];
+        let (sub, forget) = d.cause.map_or((DeregisteredSub::NormalService, false), Self::cause_outcome);
+        if forget {
             self.guti = None;
             self.ctx = None;
+            self.tai_list.clear();
         }
-        self.local_deregister();
+        if let Some(t) = d.t3346.and_then(|t| t.to_ms()).filter(|&t| t > 0) {
+            self.t3346 = Some(self.now + t);
+        }
+        self.local_deregister(sub);
+        if d.dereg_type.reregistration_required && !matches!(sub, DeregisteredSub::NoSupi | DeregisteredSub::PlmnSearch | DeregisteredSub::LimitedService) {
+            self.reg_attempts = 0;
+            self.reregister = true;
+            out.extend(self.initiate_registration(RegistrationType::Initial));
+        }
         out
     }
 
@@ -1105,7 +1455,10 @@ impl NasUe {
             c.ack_requested,
             c.registration_requested
         );
-        self.events.push(NasEvent::ConfigurationUpdated);
+        // §5.4.4.3: "registration requested" → a registration once the
+        // network releases the connection (see `on_connection_released`).
+        self.registration_requested |= c.registration_requested;
+        self.events.push(NasEvent::ConfigurationUpdated { guti: self.guti });
         if c.ack_requested {
             vec![self.tx(configuration_update_complete())]
         } else {
@@ -1246,6 +1599,12 @@ impl NasUe {
                 log::warn!("NAS: 5GSM STATUS psi {} cause #{}", s.psi, s.cause);
                 vec![]
             }
+            SmMessage::ModificationCommand(h) => {
+                // §6.3.2.3: the modification is accepted as a whole (the QoS
+                // rules are not applied beyond the default rule).
+                log::info!("NAS: PDU SESSION MODIFICATION COMMAND psi {} → COMPLETE", h.psi);
+                vec![self.ul_transport_sm(h.psi, modification_complete(h.psi, h.pti))]
+            }
             SmMessage::Unknown(h) => {
                 log::warn!(
                     "NAS: unknown 5GSM message type {:#04x}; sending 5GSM STATUS #97",
@@ -1274,53 +1633,61 @@ impl NasUe {
         let mut out = Vec::new();
         if self.t3510.is_some_and(|t| now_ms >= t) {
             self.t3510 = None;
-            self.reg_attempts += 1;
-            if self.reg_attempts < self.cfg.max_attempts {
-                log::warn!("NAS: T3510 expired, retrying registration");
-                let rt = if self.periodic_update {
-                    RegistrationType::PeriodicUpdating
-                } else {
-                    RegistrationType::Initial
-                };
-                out.push(self.send_registration_request(rt));
-            } else {
-                log::error!(
-                    "NAS: registration abandoned after {} attempts",
-                    self.reg_attempts
-                );
-                self.pending_keys = None;
-                self.events.push(NasEvent::RegistrationTimeout);
-                self.local_deregister();
+            log::warn!("NAS: T3510 expired");
+            self.pending_keys = None;
+            self.registration_attempt_failed(None);
+        }
+        if self.t3511.is_some_and(|t| now_ms >= t) {
+            self.t3511 = None;
+            log::info!("NAS: T3511 expired: registration attempt {}", self.reg_attempts + 1);
+            out.extend(self.initiate_registration(self.next_registration));
+        }
+        if self.t3502.is_some_and(|t| now_ms >= t) {
+            self.t3502 = None;
+            log::info!("NAS: T3502 expired: registration again");
+            out.extend(self.initiate_registration(self.next_registration));
+        }
+        if self.t3346.is_some_and(|t| now_ms >= t) {
+            self.t3346 = None;
+            log::info!("NAS: T3346 expired");
+            if self.is_deregistered() || self.state == MmState::Registered(RegisteredSub::AttemptingRegistrationUpdate) {
+                out.extend(self.initiate_registration(self.next_registration));
             }
+        }
+        if self.t3519.is_some_and(|t| now_ms >= t) {
+            self.t3519 = None;
         }
         if self.t3520.is_some_and(|t| now_ms >= t) {
             self.t3520 = None;
             log::error!("NAS: T3520 expired, authentication aborted");
             self.events.push(NasEvent::AuthenticationFailed);
-            self.local_deregister();
+            self.local_deregister(DeregisteredSub::AttemptingRegistration);
+            self.registration_attempt_failed(None);
         }
         if self.t3521.is_some_and(|t| now_ms >= t) {
             self.t3521 = None;
             self.dereg_attempts += 1;
             if self.dereg_attempts < self.cfg.max_attempts {
                 log::warn!("NAS: T3521 expired, retrying deregistration");
-                out.push(self.send_deregistration_request(false));
+                let pdu = self.send_deregistration_request(false);
+                out.extend(self.dispatch_initial(pdu));
             } else {
                 log::warn!("NAS: deregistration not acknowledged, deregistering locally");
-                self.local_deregister();
+                self.local_deregister(DeregisteredSub::NormalService);
             }
         }
         if self.t3517.is_some_and(|t| now_ms >= t) {
             self.t3517 = None;
             log::warn!("NAS: T3517 expired");
-            self.state = MmState::Registered;
+            self.state = MmState::Registered(RegisteredSub::NormalService);
         }
-        if self.t3512.is_some_and(|t| now_ms >= t) && self.state == MmState::Registered {
+        // T3512 (§5.3.7): only in 5GMM-IDLE; expiry → periodic registration update.
+        if self.cm == CmState::Idle && self.t3512.is_some_and(|t| now_ms >= t) && self.is_registered() {
             self.t3512 = None;
             log::info!("NAS: T3512 expired, periodic registration update");
             self.reg_attempts = 0;
-            self.periodic_update = true;
-            out.push(self.send_registration_request(RegistrationType::PeriodicUpdating));
+            self.state = MmState::Registered(RegisteredSub::UpdateNeeded);
+            out.extend(self.initiate_registration(RegistrationType::PeriodicUpdating));
         }
         // 5GSM timers.
         let mut retries = Vec::new();
@@ -1402,16 +1769,21 @@ mod tests {
     }
 
     #[test]
-    fn t3510_retries_then_gives_up() {
+    fn t3510_retries_with_t3511_then_t3502() {
         let mut u = ue();
         let _ = u.start_registration();
+        u.on_connection_established();
         let mut sent = 0;
-        for i in 1..=10u64 {
-            sent += u.tick(i * timers::T3510_MS).len();
+        let mut t = 0;
+        for _ in 0..10 {
+            t += timers::T3510_MS;
+            u.tick(t);
+            t += timers::T3511_MS;
+            sent += u.tick(t).len();
         }
-        assert_eq!(sent, 4);
-        assert_eq!(u.state(), MmState::Deregistered);
-        assert!(u.events().contains(&NasEvent::RegistrationTimeout));
+        // T3510 expiry → T3511 (10 s) → retry, four times; the fifth failure starts T3502.
+        assert_eq!(sent, 4, "retries after each T3511");
+        assert_eq!(u.state(), MmState::Deregistered(DeregisteredSub::AttemptingRegistration));
     }
 
     #[test]

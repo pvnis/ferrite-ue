@@ -131,6 +131,23 @@ fi
 if grep -q "re-establishing" "$UE"; then
   grep -q "RRC re-established" "$UE" && pass "S19 RRC re-establishment" || fail "S19 RRC re-establishment"
 fi
+# S26: deregistration at exit (whenever the UE registered): the UE sends a
+# DEREGISTRATION REQUEST (switch off) before it stops; the core logs the
+# deregistration when the request reached it before the radio stopped.
+if grep -q "registered" "$UE"; then
+  if grep -q "DEREGISTRATION REQUEST (switch off)" "$UE"; then
+    if grep -q "UE deregistration" "$OUT/qcore.log" 2>/dev/null; then pass "S26 deregistration on exit (core acknowledged)"; else pass "S26 deregistration on exit (sent)"; fi
+  else
+    fail "S26 deregistration on exit"
+  fi
+fi
+# S27: periodic registration update (only when the UE ran with
+# `UE_ARGS="--t3512-s 8 --ping-rounds 2 --ping-round-gap-s 25"`; needs the
+# gNB's inactivity release so the UE is in 5GMM-IDLE when T3512 expires):
+# REGISTRATION REQUEST (periodic) from idle, accepted by the core.
+if grep -q "PeriodicUpdating" "$UE"; then
+  grep -q "registration update complete" "$UE" && pass "S27 periodic registration update" || fail "S27 periodic registration update"
+fi
 # S25: connected-mode DRX (only when the gNB config has a `drx` section): the
 # UE applies the DRX-Config, spends slots outside Active Time (no C-RNTI PDCCH
 # monitoring) and still completes the ping probe.

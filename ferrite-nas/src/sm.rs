@@ -857,8 +857,18 @@ pub enum SmMessage {
     ReleaseCommand(PduSessionReleaseCommand),
     ReleaseComplete(PduSessionReleaseComplete),
     Status(SmStatus),
+    /// PDU SESSION MODIFICATION COMMAND (TS 24.501 §8.3.9): the header only;
+    /// the authorized QoS rules / flow descriptions it carries are accepted
+    /// unread (the default QoS rule stays in force) and answered with a
+    /// PDU SESSION MODIFICATION COMPLETE.
+    ModificationCommand(SmHeader),
     /// A 5GSM message this decoder does not implement (header only).
     Unknown(SmHeader),
+}
+
+/// PDU SESSION MODIFICATION COMPLETE (TS 24.501 §8.3.10), no optional IEs.
+pub fn modification_complete(psi: u8, pti: u8) -> Vec<u8> {
+    sm_header(psi, pti, msg_type::PDU_SESSION_MODIFICATION_COMPLETE).into_vec()
 }
 
 /// Decode any 5GSM message by its type.
@@ -888,6 +898,7 @@ pub fn decode_sm(pdu: &[u8]) -> Result<SmMessage, NasError> {
             SmMessage::ReleaseComplete(PduSessionReleaseComplete::decode(pdu)?)
         }
         SM_STATUS => SmMessage::Status(SmStatus::decode(pdu)?),
+        PDU_SESSION_MODIFICATION_COMMAND => SmMessage::ModificationCommand(h),
         _ => SmMessage::Unknown(h),
     })
 }
@@ -1090,6 +1101,11 @@ mod tests {
         ));
         assert!(matches!(
             decode_sm(&[0x2e, 1, 2, 0xcb]),
+            Ok(SmMessage::ModificationCommand(SmHeader { psi: 1, pti: 2, .. }))
+        ));
+        assert_eq!(modification_complete(1, 2), vec![0x2e, 1, 2, 0xcc]);
+        assert!(matches!(
+            decode_sm(&[0x2e, 1, 2, 0xc9]),
             Ok(SmMessage::Unknown(_))
         ));
         assert!(decode_sm(&[0x2e, 1]).is_err());
