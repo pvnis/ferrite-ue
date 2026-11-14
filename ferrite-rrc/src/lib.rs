@@ -383,7 +383,10 @@ impl RrcUe {
     /// context); without security the connection is simply lost.
     fn start_reestablishment(&mut self) {
         let (Some(sec), Some(c_rnti), Some(cell)) = (self.security, self.c_rnti, self.cell.as_ref()) else {
+            // §5.3.7.2: without AS security the UE goes to RRC_IDLE instead.
             self.meas.clear();
+            self.security = None;
+            self.set_state(RrcState::Idle);
             self.events.push(RrcEvent::Failed("radio link failure"));
             return;
         };
@@ -501,8 +504,6 @@ impl RrcUe {
                     c.mac = mac.clone();
                 }
                 for b in bearers {
-                    if let RbId::Srb(1) = b.rb {
-                    }
                     if let Some(c) = self.cell.as_mut() {
                         c.rlc_bearers.insert(b.lcid, b.rlc.clone());
                     }

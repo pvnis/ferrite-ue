@@ -776,56 +776,8 @@ impl<'a> Engine<'a> {
 /// The minimal PHY configuration for SIB1 reception, from the MIB.
 #[allow(clippy::too_many_arguments)]
 fn initial_config(p: &EngineParams, mib: &Mib, cs0: &Coreset0Config, numerology: Numerology, cell_id: u16, _cs0_idx: u8, ss0_idx: u8, k_ssb: u8) -> PhyConfig {
-    use crate::config::*;
-    PhyConfig {
-        duplex: p.duplex,
-        paging: None,
-        numerology,
-        ssb: SsbConfig {
-            pci: cell_id,
-            scs: Numerology::from_scs_khz(p.ssb_scs_khz).unwrap_or(numerology),
-            period_ms: 20,
-            ssb_index: 0,
-            k_ssb,
-            dmrs_typea_pos: if mib.dmrs_typea_pos3 { 3 } else { 2 },
-        },
-        dl_carrier: Carrier { offset_crb: 0, n_rb: 0 },
-        ul_carrier: Carrier { offset_crb: 0, n_rb: 0 },
-        ssb_crb: 0,
-        dl_bwp: Bwp { start_crb: 0, n_rb: cs0.n_rb as u16, scs: numerology },
-        ul_bwp: Bwp { start_crb: 0, n_rb: cs0.n_rb as u16, scs: numerology },
-        tdd: None,
-        coresets: vec![CoresetConfig {
-            id: 0,
-            start_crb: 0,
-            rb_mask: vec![true; cs0.n_rb],
-            duration: cs0.n_symb as u8,
-            interleaved: Some((6, 2, cell_id)),
-            dmrs_scrambling_id: None,
-            ref_lowest_rb: true,
-        }],
-        search_spaces: Vec::new(),
-        ss0_index: ss0_idx,
-        pdsch_tdra_common: Vec::new(),
-        pusch_tdra_common: Vec::new(),
-        prach: PrachConfig {
-            phy: ferrite_phy::prach_config::PrachConfig { index: 0, duplex: p.duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
-            zero_correlation_zone: 0,
-            root_sequence_index: 0,
-            restricted_set: 0,
-            total_preambles: 64,
-            target_power_dbm: -100,
-            power_ramping_step_db: 0,
-        },
-        n_ta_offset_tc: 25600,
-        pdsch: PdschConfig::default(),
-        pusch: PuschConfig::default(),
-        pucch: PucchConfig::default(),
-        csi_reports: Vec::new(),
-        srs: Vec::new(),
-        harq_codebook_dynamic: true,
-        ul_amplitude: 0.5,
-    }
+    let ssb_scs = Numerology::from_scs_khz(p.ssb_scs_khz).unwrap_or(numerology);
+    PhyConfig::initial(p.duplex, numerology, ssb_scs, cell_id, cs0.n_rb, cs0.n_symb as u8, if mib.dmrs_typea_pos3 { 3 } else { 2 }, k_ssb, ss0_idx)
 }
 
 fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Coreset0Config, configured: bool) -> WorkerConfig {

@@ -124,10 +124,20 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       (whole matrix runs with link adaptation; 64-QAM both ways).
 - [x] 2026-11-13 `lab.sh`: `UE_LOG` filter honoured, S14/S16/S17 stages,
       `DL_PING=1` host-side paging trigger.
-- [ ] Warning and clippy cleanup (`left` in `ferrite-mac/src/entity.rs`,
-      irrefutable `if let` in `ferrite-ue/src/stack.rs`).
-- [ ] README update for the layered crates.
-- [ ] Lab matrix in CI form (gNB + qcore scripted, pass/fail from `lab.sh`).
+- [x] 2026-11-14 Warning and clippy cleanup: zero warnings with
+      `cargo clippy --workspace --all-targets` (range loops over several
+      arrays allowed in `ferrite-phy` / `ferrite-l1`).
+- [x] 2026-11-14 README update for the layered crates.
+- [x] 2026-11-14 Unit tests for `DciResolver` (every format, RAR grant, TDRA
+      fallbacks, transform precoding), the RRC state machine
+      (`ferrite-rrc/tests/state_machine.rs`: establishment, T300, SMC,
+      RLF/T301, release, paging, NAS transport against hand-built UPER
+      messages) and the stack glue (`ferrite-ue/tests/stack.rs`: SIB1 →
+      CONFIG → registration → PRACH, retry after a failed attempt).
+- [x] 2026-11-14 GitHub Actions CI (`.github/workflows/ci.yml`): build,
+      clippy, release tests, rustdoc with `-D warnings`.
+- [ ] Lab matrix in CI form (gNB + qcore scripted, pass/fail from `lab.sh`):
+      needs a runner with OCUDU and qcore installed.
 
 ## Architecture audit 2026-11-14 (done)
 
@@ -215,9 +225,8 @@ ASN.1: encoders for CellGroupConfig / SIB1 (round-trip tests), extension
 additions decoded (120 sites skip them), critical-extension futures / CHOICE
 extensions as `Raw` instead of failures, fuzz targets.
 
-Tooling: `cargo clippy` clean-up, `#![warn(missing_docs)]`, unit tests for
-`DciResolver`, `RrcUe` and the stack (none today), a crate-level MAC↔RLC↔PDCP
-chain test, CI form of the lab matrix.
+Tooling: `#![warn(missing_docs)]`, a crate-level MAC↔RLC↔PDCP chain test,
+CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
 
 ## Over the air (deferred until an SDR is on the bench)
 

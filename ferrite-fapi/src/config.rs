@@ -459,3 +459,55 @@ pub struct PhyConfig {
     /// applies the actual gain.
     pub ul_amplitude: f32,
 }
+
+impl PhyConfig {
+    /// The configuration known right after the MIB, before SIB1: the initial
+    /// DL/UL BWP equals CORESET#0, the Type0-PDCCH CSS is `ss0_index`, every
+    /// dedicated part is at its default. The engine starts from this and RRC
+    /// replaces it once SIB1 and the dedicated configuration are decoded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initial(duplex: DuplexMode, numerology: Numerology, ssb_scs: Numerology, pci: u16, coreset0_n_rb: usize, coreset0_n_symb: u8, dmrs_typea_pos: u8, k_ssb: u8, ss0_index: u8) -> Self {
+        PhyConfig {
+            duplex,
+            paging: None,
+            numerology,
+            ssb: SsbConfig { pci, scs: ssb_scs, period_ms: 20, ssb_index: 0, k_ssb, dmrs_typea_pos },
+            dl_carrier: Carrier { offset_crb: 0, n_rb: 0 },
+            ul_carrier: Carrier { offset_crb: 0, n_rb: 0 },
+            ssb_crb: 0,
+            dl_bwp: Bwp { start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            ul_bwp: Bwp { start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            tdd: None,
+            coresets: vec![CoresetConfig {
+                id: 0,
+                start_crb: 0,
+                rb_mask: vec![true; coreset0_n_rb],
+                duration: coreset0_n_symb,
+                interleaved: Some((6, 2, pci)),
+                dmrs_scrambling_id: None,
+                ref_lowest_rb: true,
+            }],
+            search_spaces: Vec::new(),
+            ss0_index,
+            pdsch_tdra_common: Vec::new(),
+            pusch_tdra_common: Vec::new(),
+            prach: PrachConfig {
+                phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                zero_correlation_zone: 0,
+                root_sequence_index: 0,
+                restricted_set: 0,
+                total_preambles: 64,
+                target_power_dbm: -100,
+                power_ramping_step_db: 0,
+            },
+            n_ta_offset_tc: 25600,
+            pdsch: PdschConfig::default(),
+            pusch: PuschConfig::default(),
+            pucch: PucchConfig::default(),
+            csi_reports: Vec::new(),
+            srs: Vec::new(),
+            harq_codebook_dynamic: true,
+            ul_amplitude: 0.5,
+        }
+    }
+}
