@@ -198,6 +198,32 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let rach = s.rach_config_common().ok_or("SIB1 without rach-ConfigCommon")?;
     let g = &rach.rach_config_generic;
     let msg1_scs_mu = rach.msg1_subcarrier_spacing.map_or(mu, |s| s.mu());
+    // Transmitted SS/PBCH blocks (symbols at the data numerology) for the
+    // PRACH occasion validity rule (TS 38.211 §6.3.3.2).
+    let ssb_symbols: Vec<SsbSlotSymbols> = ferrite_ran::ssb::SsbCase::from_scs(mib.ssb_scs_khz, radio.duplex)
+        .map(|case| {
+            let carrier_hz = ferrite_common::arfcn_to_hz(mib.ssb_arfcn);
+            let cands = case.candidate_symbols(carrier_hz);
+            let l_max = cands.len() as u8;
+            let (ssb_mu, data_mu) = (u32::from(case.mu()), u32::from(mu));
+            cands
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| sc.ssb_positions_in_burst.is_transmitted(*i as u8, l_max))
+                .map(|(_, &first)| {
+                    let last = first + ferrite_ran::ssb::SSB_SYMBOLS - 1;
+                    let (f, l) = if data_mu >= ssb_mu {
+                        let sh = data_mu - ssb_mu;
+                        (first << sh, ((last + 1) << sh) - 1)
+                    } else {
+                        let sh = ssb_mu - data_mu;
+                        (first >> sh, last >> sh)
+                    };
+                    SsbSlotSymbols { slot_in_half_frame: (f / 14) as u8, first_symbol: (f % 14) as u8, last_symbol: (l % 14) as u8 }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let prach = PrachConfig {
         phy: ferrite_ran::prach_config::PrachConfig {
             index: g.prach_configuration_index as u16,
@@ -207,6 +233,9 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
             msg1_fdm: g.msg1_fdm,
             msg1_frequency_start: g.msg1_frequency_start,
         },
+        tdd: tdd.clone(),
+        ssb_symbols,
+        ssb_period_ms: u16::from(sc.ssb_periodicity_ms),
         zero_correlation_zone: g.zero_correlation_zone_config,
         root_sequence_index: match rach.prach_root_sequence_index {
             sib1::PrachRootSequenceIndex::L839(v) => v,

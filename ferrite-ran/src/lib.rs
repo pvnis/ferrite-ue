@@ -16,5 +16,6 @@ pub mod prach_config;
 pub mod prach_tables;
 pub mod riv;
 pub mod srs;
+pub mod ssb;
 pub mod tbs;
 pub mod tdra;

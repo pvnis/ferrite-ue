@@ -524,6 +524,9 @@ fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, t
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
                 phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                tdd: None,
+                ssb_symbols: Vec::new(),
+                ssb_period_ms: 20,
                 zero_correlation_zone: 0,
                 root_sequence_index: 0,
                 restricted_set: 0,

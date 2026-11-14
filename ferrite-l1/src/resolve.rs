@@ -1,7 +1,7 @@
 //! DCI resolution: raw DCI fields (TS 38.212 §7.3.1) → FAPI grants, using the
 //! PHY configuration (TDRA tables, k1 list, BWP sizes, DMRS/MCS config).
 
-use crate::config::{McsTableSel, PhyConfig, SearchSpaceKind, TdraRow};
+use crate::config::{McsTableSel, PhyConfig, SearchSpaceKind, TddConfig, TdraRow};
 use crate::fapi::{Dci, DlGrant, Mcs, RarUlGrant, TimeAlloc, TransformPrecoding, UlGrant};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 use ferrite_phy::coding::dci::{self as dci, DciSizeConfig, DciSizes, HarqAckCodebook};
@@ -36,6 +36,9 @@ pub struct DciResolver {
     pub ul_dmrs_add_pos: u8,
     pub mu: u8,
     pub msg3_delta: u8,
+    /// TDD pattern: a grant whose PDSCH lies in UL symbols or whose PUSCH lies
+    /// in DL symbols cannot be meant for this cell and is dropped.
+    pub tdd: Option<TddConfig>,
 }
 
 fn sel(t: McsTableSel) -> McsTable {
@@ -109,6 +112,7 @@ impl DciResolver {
             }),
             dl_dmrs_add_pos: cfg.pdsch.dmrs_type_a.additional_position,
             ul_dmrs_add_pos: cfg.pusch.dmrs_type_a.additional_position,
+            tdd: cfg.tdd.clone(),
             mu: cfg.numerology.mu,
             msg3_delta: match cfg.numerology.mu {
                 0 => 2,
@@ -150,6 +154,19 @@ impl DciResolver {
             start_symbol: r.s as u8,
             n_symbols: r.l as u8,
         })
+    }
+
+    /// TS 38.213 §11.1: a PDSCH must not be in UL symbols, a PUSCH not in DL
+    /// symbols (flexible symbols are fine when scheduled by a DCI).
+    fn direction_ok(&self, slot: SlotPoint, row: &TdraRow, ul: bool) -> bool {
+        use crate::config::LinkDirection;
+        let Some(t) = &self.tdd else { return true };
+        let dir = if ul { LinkDirection::Ul } else { LinkDirection::Dl };
+        if t.conflicts(slot.index(), slot.numerology, row.start_symbol, row.n_symbols, dir) {
+            log::debug!("{} at {slot} symbols {}+{} conflicts with the TDD pattern: grant dropped", if ul { "PUSCH" } else { "PDSCH" }, row.start_symbol, row.n_symbols);
+            return false;
+        }
+        true
     }
 
     fn mcs(&self, table: McsTable, i: u8) -> Mcs {
@@ -244,6 +261,9 @@ impl DciResolver {
             self.pdsch_tbs(&row, n_rb, &mcs, cdm)
         };
         let pdsch_slot = slot.add(row.k as u64);
+        if !self.direction_ok(pdsch_slot, &row, false) {
+            return None;
+        }
         let (ack_slot, harq_id, ndi, rv, dai, pri, tpc, k1) = match kind {
             RntiKind::Tc | RntiKind::C => {
                 let k1 = d.k1_idx.map_or(4, |i| i + 1); // DCI 1_0: field value + 1
@@ -287,6 +307,9 @@ impl DciResolver {
         // Common PUSCH DMRS: pos2, 2 CDM groups (1 for ≤2 symbols).
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, 2);
+        if !self.direction_ok(slot.add(row.k as u64), &row, true) {
+            return None;
+        }
         Some(Dci::Ul(UlGrant {
             rnti,
             rnti_kind: kind,
@@ -320,6 +343,9 @@ impl DciResolver {
         let cdm = ports.nof_cdm_groups_without_data;
         let tbs = self.pdsch_tbs(&row, n_rb, &mcs, cdm);
         let pdsch_slot = slot.add(row.k as u64);
+        if !self.direction_ok(pdsch_slot, &row, false) {
+            return None;
+        }
         let k1 = d.k1_idx.and_then(|i| self.k1_list.get(i as usize).copied()).unwrap_or(*self.k1_list.first().unwrap_or(&4));
         let r_pucch = ((2 * cce0) / n_cce.max(1) + 2 * d.pri as usize) as u8;
         Some(Dci::Dl(DlGrant {
@@ -367,10 +393,14 @@ impl DciResolver {
         let mcs = self.pusch_mcs_of(table, g.mcs, false);
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, 2);
+        let pusch_slot = rar_slot.add(row.k as u64 + self.msg3_delta as u64);
+        if !self.direction_ok(pusch_slot, &row, true) {
+            return None;
+        }
         Some(UlGrant {
             rnti: tc_rnti,
             rnti_kind: RntiKind::Tc,
-            pusch_slot: rar_slot.add(row.k as u64 + self.msg3_delta as u64),
+            pusch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
             time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
@@ -400,6 +430,9 @@ impl DciResolver {
         // CDM groups without data, port = value), Table 7.3.1.1.2-8 otherwise.
         let cdm = if self.ded_tp.is_some() { 2 } else { dmrs::dci_0_1_antenna_ports_type1_len1_rank1(d.antenna_ports).map_or(2, |p| p.nof_cdm_groups_without_data) };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, self.ul_dmrs_add_pos);
+        if !self.direction_ok(slot.add(row.k as u64), &row, true) {
+            return None;
+        }
         Some(Dci::Ul(UlGrant {
             rnti,
             rnti_kind: RntiKind::C,
@@ -758,6 +791,36 @@ mod tests {
         let g = ul(r.resolve_0_1(&dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 1, 1, 0, 9, 1, 0, 1), Rnti(0x4601), slot(50)));
         assert_eq!((g.mcs.qm, g.mcs.r_x1024), (1, Some(314)));
         assert_eq!(g.transform_precoding.map(|t| t.pi2_bpsk), Some(true));
+    }
+
+    /// T1's pattern: 5 ms = 10 slots, 6 DL, special (8 DL symbols), 3 UL.
+    fn tdd_6d_s_3u() -> crate::config::TddConfig {
+        use crate::config::{TddConfig, TddPattern};
+        TddConfig { reference_scs: MU, pattern1: TddPattern { period_slots: 10, dl_slots: 6, dl_symbols: 8, ul_slots: 3, ul_symbols: 0 }, pattern2: None }
+    }
+
+    #[test]
+    fn grants_against_the_tdd_pattern_are_dropped() {
+        let mut c = cfg();
+        c.tdd = Some(tdd_6d_s_3u());
+        let r = DciResolver::new(&c, false);
+        // PDSCH (k0 = 0) in a DL slot: fine; in a UL slot (7): dropped.
+        let bits = dci_1_0_c(&r, riv_encode(0, 4, N_RB), 0, 3, 0, 0, 0, 0, 1, 0, 0);
+        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(2), 0, 4).is_some());
+        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4).is_none());
+        // PDSCH symbols 2..14 in the special slot (6): symbols 8..14 are flexible → allowed.
+        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(6), 0, 4).is_some());
+        // PUSCH (k2 = 1 → slot + 1): DCI at slot 6 → PUSCH in UL slot 7: fine; DCI at 2 → slot 3 (DL): dropped.
+        let ul = dci_0_0(&r, riv_encode(0, 4, N_RB), 1, 2, 1, 0, 3, 1);
+        assert!(r.resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(6)).is_some());
+        assert!(r.resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(2)).is_none());
+        // Msg3: RAR at slot 3 → PUSCH at 3 + 1 + 3 = 7 (UL): fine; RAR at 5 → 9 (UL): fine; RAR at 6 → 10 (DL): dropped.
+        let g = RarUlGrant { freq_hopping: false, fdra: riv_encode(0, 3, N_RB) as u16, time_resource: 0, mcs: 0, tpc: 0, csi_request: false };
+        assert!(r.resolve_rar_grant(slot(3), Rnti(1), &g).is_some());
+        assert!(r.resolve_rar_grant(slot(6), Rnti(1), &g).is_none());
+        // FDD: never dropped.
+        let r = DciResolver::new(&cfg(), false);
+        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4).is_some());
     }
 
     #[test]

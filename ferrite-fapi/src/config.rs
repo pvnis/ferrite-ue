@@ -34,7 +34,30 @@ pub struct SlotDirection {
     pub ul_symbols: u8,
 }
 
+/// Link direction of a transmission checked against the TDD pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkDirection {
+    Dl,
+    Ul,
+}
+
 impl TddConfig {
+    /// Whether symbols `[start, start + n)` of `slot` conflict with the
+    /// pattern for a transmission in `dir`: DL symbols block an uplink, UL
+    /// symbols block a downlink; flexible symbols block neither (TS 38.213
+    /// §11.1: a DCI may schedule in flexible symbols).
+    pub fn conflicts(&self, slot_index: u64, mu: Numerology, start: u8, n: u8, dir: LinkDirection) -> bool {
+        let d = self.slot_direction(slot_index, mu);
+        let end = start.saturating_add(n).min(14);
+        let (lo, hi) = match dir {
+            // Symbols [0, dl_symbols) are DL.
+            LinkDirection::Ul => (0u8, d.dl_symbols),
+            // Symbols [14 − ul_symbols, 14) are UL.
+            LinkDirection::Dl => (14u8.saturating_sub(d.ul_symbols), 14),
+        };
+        start < hi && end > lo && lo < hi
+    }
+
     /// Direction of `slot` (absolute slot index at the data numerology `mu`).
     pub fn slot_direction(&self, slot_index: u64, mu: Numerology) -> SlotDirection {
         // Scale the pattern (given at the reference SCS) to the data numerology.
@@ -167,12 +190,31 @@ pub enum SearchSpaceKind {
     UeSpecificNonFallback,
 }
 
+/// Symbols of one transmitted SS/PBCH block, at the data numerology: used
+/// for the PRACH occasion validity rule of TS 38.211 §6.3.3.2 (an occasion in
+/// flexible symbols must not precede an SSB of its slot and must start
+/// `N_gap` symbols after the SSB's last symbol).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SsbSlotSymbols {
+    /// Slot within the half frame carrying the burst.
+    pub slot_in_half_frame: u8,
+    pub first_symbol: u8,
+    pub last_symbol: u8,
+}
+
 /// `RACH-ConfigCommon` + `RACH-ConfigGeneric` (the PHY-relevant subset).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrachConfig {
     /// Index/duplex/numerology/FDM/frequency start — the occasion pattern
     /// (TS 38.211 Table 6.3.3.2-2/-3) is enumerated by `ferrite_ran::prach_config`.
     pub phy: ferrite_ran::prach_config::PrachConfig,
+    /// The cell's TDD pattern (`None` on FDD): PRACH occasions overlapping
+    /// DL symbols are invalid (TS 38.211 §6.3.3.2).
+    pub tdd: Option<TddConfig>,
+    /// The transmitted SS/PBCH blocks of a burst and the burst period, for
+    /// the occasion validity rule in flexible symbols.
+    pub ssb_symbols: Vec<SsbSlotSymbols>,
+    pub ssb_period_ms: u16,
     pub zero_correlation_zone: u8,
     pub root_sequence_index: u16,
     pub restricted_set: u8,
@@ -183,11 +225,50 @@ pub struct PrachConfig {
 }
 
 impl PrachConfig {
-    /// All PRACH occasions whose transmission starts in data-numerology slot `slot`.
+    /// Duration of an occasion of `format` in data-numerology symbols
+    /// (rounded up; long formats longer than a slot count as the whole slot).
+    fn occasion_symbols(&self, format: ferrite_ran::prach_config::PreambleFormat, mu: u8) -> u8 {
+        let Ok(p) = ferrite_ran::prach_config::format_params(format, self.phy.msg1_scs_mu) else { return 14 };
+        // Normal-CP symbol at mu: (2048 + 144) · 64 / 2^mu T_c.
+        let symbol_tc = (2048u64 + 144) * 64 >> mu;
+        p.nominal_tc.div_ceil(symbol_tc).clamp(1, 14) as u8
+    }
+
+    /// TS 38.211 §6.3.3.2 (TDD): an occasion is valid when it lies within UL
+    /// symbols, or when it is in flexible symbols, does not precede an SS/PBCH
+    /// block of its slot and starts at least `N_gap` symbols after the last
+    /// SSB symbol (`N_gap` = 0 for the long preamble formats, 2 otherwise).
+    /// Always valid on FDD.
+    pub fn occasion_valid(&self, slot: ferrite_common::SlotPoint, start_symbol: u8, n_symbols: u8, format: ferrite_ran::prach_config::PreambleFormat) -> bool {
+        let Some(tdd) = &self.tdd else { return true };
+        let d = tdd.slot_direction(slot.index(), slot.numerology);
+        let end = start_symbol.saturating_add(n_symbols).min(14);
+        if start_symbol >= 14u8.saturating_sub(d.ul_symbols) {
+            return true; // within UL symbols
+        }
+        if start_symbol < d.dl_symbols {
+            return false; // overlaps DL symbols
+        }
+        // Flexible symbols: the SSB rule, for the half frames that carry a burst.
+        let spf = slot.numerology.slots_per_frame() as u16;
+        let frames_per_burst = u16::from(self.ssb_period_ms / 10).max(1);
+        let burst_frame = slot.sfn % frames_per_burst == 0;
+        if !burst_frame || slot.slot >= spf / 2 {
+            return true;
+        }
+        use ferrite_ran::prach_config::PreambleFormat as F;
+        let n_gap = if matches!(format, F::F0 | F::F1 | F::F2 | F::F3) { 0 } else { 2 };
+        let _ = end;
+        self.ssb_symbols.iter().filter(|s| u16::from(s.slot_in_half_frame) == slot.slot).all(|s| start_symbol >= s.last_symbol + 1 + n_gap)
+    }
+
+    /// All valid PRACH occasions whose transmission starts in data-numerology slot `slot`.
     pub fn occasions_in_slot(&self, slot: ferrite_common::SlotPoint) -> Vec<crate::PrachOccasion> {
+        let mu = slot.numerology.mu;
         ferrite_ran::prach_config::prach_occasions_in_slot(&self.phy, slot)
             .map(|v| {
                 v.into_iter()
+                    .filter(|o| self.occasion_valid(slot, o.start_symbol, self.occasion_symbols(o.format, mu), o.format))
                     .map(|o| crate::PrachOccasion {
                         slot,
                         start_symbol: o.start_symbol,
@@ -417,6 +498,20 @@ pub struct Carrier {
     pub n_rb: u16,
 }
 
+impl PhyConfig {
+    /// Whether a downlink reception in symbols `[start, start + n)` of `slot`
+    /// is compatible with the TDD pattern (always on FDD).
+    pub fn dl_allowed(&self, slot: ferrite_common::SlotPoint, start: u8, n: u8) -> bool {
+        self.tdd.as_ref().is_none_or(|t| !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Dl))
+    }
+
+    /// Whether an uplink transmission in symbols `[start, start + n)` of `slot`
+    /// is compatible with the TDD pattern (always on FDD).
+    pub fn ul_allowed(&self, slot: ferrite_common::SlotPoint, start: u8, n: u8) -> bool {
+        self.tdd.as_ref().is_none_or(|t| !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Ul))
+    }
+}
+
 /// Everything the PHY needs. `dedicated` fields are `None`/empty until RRC
 /// connected; the common part is complete after SIB1.
 #[derive(Clone, Debug, PartialEq)]
@@ -493,6 +588,9 @@ impl PhyConfig {
             pusch_tdra_common: Vec::new(),
             prach: PrachConfig {
                 phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                tdd: None,
+                ssb_symbols: Vec::new(),
+                ssb_period_ms: 20,
                 zero_correlation_zone: 0,
                 root_sequence_index: 0,
                 restricted_set: 0,
@@ -509,5 +607,79 @@ impl PhyConfig {
             harq_codebook_dynamic: true,
             ul_amplitude: 0.5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrite_common::SlotPoint;
+
+    const MU: Numerology = Numerology::KHZ30;
+
+    fn tdd() -> TddConfig {
+        // 6 DL + special (8 DL symbols, 2 UL symbols) + 3 UL in 10 slots.
+        TddConfig { reference_scs: MU, pattern1: TddPattern { period_slots: 10, dl_slots: 6, dl_symbols: 8, ul_slots: 3, ul_symbols: 2 }, pattern2: None }
+    }
+
+    #[test]
+    fn tdd_conflicts_follow_the_pattern() {
+        let t = tdd();
+        // DL slot 2: uplink conflicts, downlink does not.
+        assert!(t.conflicts(2, MU, 0, 14, LinkDirection::Ul));
+        assert!(!t.conflicts(2, MU, 0, 14, LinkDirection::Dl));
+        // UL slot 7.
+        assert!(t.conflicts(7, MU, 0, 14, LinkDirection::Dl));
+        assert!(!t.conflicts(7, MU, 0, 14, LinkDirection::Ul));
+        // Special slot 6: symbols 0..8 DL, 8..12 flexible, 12..14 UL.
+        assert!(t.conflicts(6, MU, 0, 10, LinkDirection::Ul));
+        assert!(!t.conflicts(6, MU, 8, 4, LinkDirection::Ul));
+        assert!(!t.conflicts(6, MU, 8, 4, LinkDirection::Dl));
+        assert!(t.conflicts(6, MU, 10, 4, LinkDirection::Dl));
+        assert!(!t.conflicts(6, MU, 12, 2, LinkDirection::Ul));
+        // Second period.
+        assert!(t.conflicts(17, MU, 0, 14, LinkDirection::Dl));
+    }
+
+    fn prach(tdd: Option<TddConfig>, ssb: Vec<SsbSlotSymbols>) -> PrachConfig {
+        PrachConfig {
+            phy: ferrite_ran::prach_config::PrachConfig { index: 159, duplex: DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 0 },
+            tdd,
+            ssb_symbols: ssb,
+            ssb_period_ms: 20,
+            zero_correlation_zone: 0,
+            root_sequence_index: 1,
+            restricted_set: 0,
+            total_preambles: 64,
+            target_power_dbm: -100,
+            power_ramping_step_db: 4,
+        }
+    }
+
+    #[test]
+    fn prach_occasion_validity() {
+        use ferrite_ran::prach_config::PreambleFormat as F;
+        let slot = |n: u64| SlotPoint::from_index(MU, n);
+        let ssb = vec![SsbSlotSymbols { slot_in_half_frame: 6, first_symbol: 2, last_symbol: 5 }];
+        let p = prach(Some(tdd()), ssb.clone());
+        // UL slot: valid; DL slot: invalid; FDD: always valid.
+        assert!(p.occasion_valid(slot(7), 0, 12, F::B4));
+        assert!(!p.occasion_valid(slot(2), 0, 12, F::B4));
+        assert!(prach(None, Vec::new()).occasion_valid(slot(2), 0, 12, F::B4));
+        // Special slot 6 (DL 0..8, flexible 8..12, UL 12..14) in an SSB frame
+        // with an SSB in symbols 2..5: an occasion at 8 is ≥ 5 + 1 + 2 → valid;
+        // one at symbol 4 overlaps DL → invalid.
+        assert!(p.occasion_valid(slot(6), 8, 2, F::A1));
+        assert!(!p.occasion_valid(slot(6), 4, 2, F::A1));
+        // An SSB later in the slot than the occasion makes it invalid (gap rule).
+        let late = vec![SsbSlotSymbols { slot_in_half_frame: 6, first_symbol: 8, last_symbol: 11 }];
+        let p2 = prach(Some(tdd()), late);
+        assert!(!p2.occasion_valid(slot(6), 8, 2, F::A1));
+        // Not an SSB frame (period 20 ms = every other frame): the SSB rule is off.
+        assert!(p2.occasion_valid(slot(20 + 6), 8, 2, F::A1));
+        // T1's configuration (index 159, B4, slot 19 is UL) keeps its occasions.
+        let p = prach(Some(tdd()), ssb);
+        assert!(!p.occasions_in_slot(slot(19)).is_empty());
+        assert!(p.occasions_in_slot(slot(18)).is_empty() || p.occasions_in_slot(slot(18)).iter().all(|o| o.start_symbol >= 12));
     }
 }
