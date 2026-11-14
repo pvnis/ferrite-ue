@@ -1,10 +1,13 @@
-//! PUSCH (uplink shared channel) modulation — CP-OFDM, no transform
-//! precoding. Scramble the UL-SCH bits (TS 38.211 §6.3.1.1), map them to
-//! QPSK/16/64/256-QAM (§5.1), place data and DM-RS on the allocated
-//! RBs/symbols, and IFFT each OFDM symbol.
+//! PUSCH (uplink shared channel) modulation — CP-OFDM or DFT-s-OFDM (transform
+//! precoding). Scramble the UL-SCH bits (TS 38.211 §6.3.1.1), map them to
+//! π/2-BPSK/QPSK/16/64/256-QAM (§5.1), place data and DM-RS on the allocated
+//! RBs/symbols, optionally DFT every data symbol (§6.3.1.4), and IFFT each
+//! OFDM symbol.
 //!
-//! UL-SCH channel coding is identical to DL-SCH (reuse `coding::dlsch`), and the
-//! PUSCH DM-RS sequence uses the same `c_init` as PDSCH (reuse `pdsch_dmrs`).
+//! UL-SCH channel coding is identical to DL-SCH (reuse `coding::dlsch`). Without
+//! transform precoding the PUSCH DM-RS sequence uses the same `c_init` as PDSCH
+//! (reuse `pdsch_dmrs`); with it the DM-RS is the low-PAPR sequence of
+//! §6.4.1.1.1.2 (group / sequence hopping per §6.4.1.1.1.2).
 
 use crate::pdsch::{pdsch_dmrs, pdsch_scramble_c_init};
 use crate::sequence::gold_sequence;
@@ -33,6 +36,70 @@ pub struct PuschAlloc {
     /// sequence is referenced to CRB 0 / point A (§6.4.1.1.1.2), so the sequence
     /// index is `6·(crb_offset + PRB) + j`, not `6·PRB + j`.
     pub crb_offset: usize,
+    /// Transform precoding (DFT-s-OFDM, TS 38.211 §6.3.1.4): `Some` enables
+    /// the DFT over the `12·n_rb` subcarriers of every data symbol and replaces
+    /// the gold-sequence DM-RS by the low-PAPR DM-RS of §6.4.1.1.1.2.
+    pub transform_precoding: Option<TransformPrecoding>,
+}
+
+/// Transform-precoded PUSCH DM-RS parameters (TS 38.211 §6.4.1.1.1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransformPrecoding {
+    /// `n_ID^RS`: `nPUSCH-Identity` when configured, else the cell id.
+    pub n_id_rs: u16,
+    /// Group hopping (`groupHoppingEnabledTransformPrecoding` and not
+    /// disabled by `sequenceGroupHopping`).
+    pub group_hopping: bool,
+    /// Sequence hopping (`sequenceHopping`), only effective for ≥ 6 PRBs... per
+    /// the spec, for `M_ZC ≥ 6·N_RB^sc` i.e. 12 PRBs and more.
+    pub sequence_hopping: bool,
+}
+
+/// Low-PAPR DM-RS sequence `r(n)`, `n = 0..6·n_rb`, of one transform-precoded
+/// PUSCH DM-RS symbol `l` in slot `n_slot` (TS 38.211 §6.4.1.1.1.2 with §6.3.1.4
+/// group `u = (f_gh + n_ID^RS) mod 30` and sequence number `v`). `None` when
+/// `6·n_rb` is not a supported low-PAPR length (`n_rb` not of the form 2^a·3^b·5^c).
+pub fn tp_dmrs_sequence(tp: &TransformPrecoding, n_rb: usize, n_slot: u32, l: usize) -> Option<Vec<Complex32>> {
+    let n_id = tp.n_id_rs as u32;
+    let f_gh = if tp.group_hopping {
+        let c = gold_sequence(n_id / 30, 8 * (14 * n_slot as usize + l) + 8);
+        (0..8).map(|m| (c[8 * (14 * n_slot as usize + l) + m] as u32) << m).sum::<u32>() % 30
+    } else {
+        0
+    };
+    let u = ((f_gh + n_id) % 30) as u8;
+    let m_zc = 6 * n_rb;
+    let v = if tp.sequence_hopping && !tp.group_hopping && m_zc >= 72 {
+        let c = gold_sequence((n_id / 30) * 32 + n_id % 30, 14 * n_slot as usize + l + 1);
+        c[14 * n_slot as usize + l]
+    } else {
+        0
+    };
+    crate::srs::low_papr_base_sequence(u, v, m_zc)
+}
+
+/// Whether `n_rb` PRBs can carry a transform-precoded PUSCH (TS 38.211
+/// §6.3.1.4: `2^a·3^b·5^c`).
+pub fn tp_prb_valid(n_rb: usize) -> bool {
+    let mut n = n_rb;
+    for p in [2, 3, 5] {
+        while n % p == 0 {
+            n /= p;
+        }
+    }
+    n_rb > 0 && n == 1
+}
+
+/// π/2-BPSK (TS 38.211 §5.1.1): bit `b` at modulation-symbol index `i`.
+fn pi2_bpsk(b: u8, i: usize) -> Complex32 {
+    let v = (1 - 2 * b as i32) as f32 * std::f32::consts::FRAC_1_SQRT_2;
+    let d = Complex32::new(v, v);
+    if i % 2 == 1 { Complex32::new(-d.im, d.re) } else { d }
+}
+
+/// Modulate one RE's bits: π/2-BPSK (`Q_m = 1`, needs the symbol index) or QAM.
+fn modulate_re(bits: &[u8], i: usize) -> Complex32 {
+    if bits.len() == 1 { pi2_bpsk(bits[0], i) } else { qam_modulate(bits) }
 }
 
 /// Map `Q_m = bits.len()` bits (2, 4, 6 or 8) to one QPSK / 16-QAM / 64-QAM /
@@ -169,21 +236,32 @@ pub fn pusch_modulate_slot_uci_csi(
             for i in 0..qm {
                 re_bits[i] = rm_csi[qm * ci + i] ^ c[qm * di + i];
             }
-            grids[l][bin(sc)] = qam_modulate(&re_bits);
+            grids[l][bin(sc)] = modulate_re(&re_bits, di);
         } else if src + qm <= ulsch.len() {
             for i in 0..qm {
                 re_bits[i] = ulsch[src + i] ^ c[qm * di + i];
             }
-            grids[l][bin(sc)] = qam_modulate(&re_bits);
+            grids[l][bin(sc)] = modulate_re(&re_bits, di);
             src += qm;
         }
     }
-    // DM-RS (config type 1, CDM group 0: even subcarriers). Sequence referenced
-    // to CRB 0 (point A): index by 6·(crb_offset + PRB) + j. The DM-RS symbols
+    // DM-RS (config type 1, CDM group 0: even subcarriers). The DM-RS symbols
     // carry no data (two CDM groups without data, TS 38.214 §6.2.2), so the
     // DM-RS EPRE is 3 dB above the data EPRE (Table 6.2.2-1).
     let dmrs_boost = std::f32::consts::SQRT_2;
     for &l in &alloc.dmrs_symbols {
+        if let Some(tp) = &alloc.transform_precoding {
+            // Low-PAPR sequence over the allocation (§6.4.1.1.1.2): r(n) on the
+            // n-th even subcarrier of the allocated PRBs.
+            if let Some(seq) = tp_dmrs_sequence(tp, alloc.n_rb, slot_in_frame, l) {
+                for (i, r) in seq.iter().enumerate() {
+                    grids[l][bin(12 * alloc.rb_start + 2 * i)] = r * dmrs_boost;
+                }
+            }
+            continue;
+        }
+        // Gold sequence referenced to CRB 0 (point A): index by
+        // 6·(crb_offset + PRB) + j.
         let refs = pdsch_dmrs(cell_id, slot_in_frame, l as u32, 6 * (alloc.crb_offset + alloc.carrier_rb));
         for rb in 0..alloc.n_rb {
             for j in 0..6 {
@@ -218,12 +296,18 @@ pub fn pusch_modulate_slot_uci_csi(
                 1 => {
                     let b = harq_ack[0] ^ m[0];
                     re_bits[0] = b;
-                    re_bits[1] = b; // y: repeat the previous scrambled bit
+                    if qm > 1 {
+                        re_bits[1] = b; // y: repeat the previous scrambled bit
+                    }
                 }
                 2 => {
                     let seq = [harq_ack[0], harq_ack[1], harq_ack[0] ^ harq_ack[1]];
-                    re_bits[0] = seq[(2 * i) % 3] ^ m[0];
-                    re_bits[1] = seq[(2 * i + 1) % 3] ^ m[1];
+                    if qm == 1 {
+                        re_bits[0] = seq[i % 3] ^ m[0];
+                    } else {
+                        re_bits[0] = seq[(2 * i) % 3] ^ m[0];
+                        re_bits[1] = seq[(2 * i + 1) % 3] ^ m[1];
+                    }
                 }
                 _ => {
                     for k in 0..qm {
@@ -231,7 +315,25 @@ pub fn pusch_modulate_slot_uci_csi(
                     }
                 }
             }
-            grids[l][bin(12 * alloc.rb_start + sc_a)] = qam_modulate(&re_bits);
+            grids[l][bin(12 * alloc.rb_start + sc_a)] = modulate_re(&re_bits, di);
+        }
+    }
+
+    // Transform precoding (§6.3.1.4): y(k) = Σ_i x(i)·e^{−j2πik/M_sc} / √M_sc
+    // over the allocated subcarriers of each data symbol (DM-RS symbols are
+    // not precoded).
+    if alloc.transform_precoding.is_some() {
+        let dft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n_sc);
+        let scale = 1.0 / (n_sc as f32).sqrt();
+        let mut block = vec![Complex32::new(0.0, 0.0); n_sc];
+        for &l in &data_syms {
+            for (k, b) in block.iter_mut().enumerate() {
+                *b = grids[l][bin(12 * alloc.rb_start + k)];
+            }
+            dft.process(&mut block);
+            for (k, y) in block.iter().enumerate() {
+                grids[l][bin(12 * alloc.rb_start + k)] = y * scale;
+            }
         }
     }
 
@@ -476,6 +578,72 @@ mod tests {
         }
     }
 
+    /// Transform-precoded PUSCH: inverse-DFT each data symbol at the receiver,
+    /// demap, descramble, decode; the DM-RS symbols carry the low-PAPR sequence
+    /// on the even subcarriers (and nothing on the odd ones).
+    #[test]
+    fn pusch_transform_precoding_round_trip() {
+        let ofdm = Ofdm::new(512);
+        let (cell_id, rnti) = (1u16, 0x4601u16);
+        let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
+        let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
+        let tp = TransformPrecoding { n_id_rs: 1, group_hopping: false, sequence_hopping: false };
+        for (qm, n_rb) in [(1usize, 5usize), (2, 5), (4, 6), (6, 8)] {
+            let alloc = PuschAlloc { rb_start: 2, n_rb, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0, transform_precoding: Some(tp) };
+            let e = pusch_e_len(&alloc);
+            let r = 0.05 * qm as f64;
+            let ulsch = dlsch_encode_single(&tb, e, r, qm.max(2), 0);
+            let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, rnti, 0.0, 15.36e6);
+            let center = alloc.carrier_rb as i32 * 6;
+            let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
+            let n_sc = 12 * n_rb;
+            let idft = rustfft::FftPlanner::<f32>::new().plan_fft_inverse(n_sc);
+            let mut off = 0;
+            let mut llr: Vec<f32> = Vec::new();
+            let demapper = crate::pdsch::Demapper::new(qm.max(2));
+            let mut i = 0usize;
+            for l in 0..14 {
+                let cp = ofdm.cp_len(14 + l, 1);
+                let g = ofdm.demodulate_symbol(&slot[off..], cp);
+                off += cp + 512;
+                if alloc.dmrs_symbols.contains(&l) {
+                    let seq = tp_dmrs_sequence(&tp, n_rb, 5, l).unwrap();
+                    for (k, r) in seq.iter().enumerate() {
+                        assert!((g[bin(12 * 2 + 2 * k)] - r * 2f32.sqrt()).norm() < 1e-3, "dmrs l={l} k={k}");
+                        assert!(g[bin(12 * 2 + 2 * k + 1)].norm() < 1e-4);
+                    }
+                    continue;
+                }
+                let mut block: Vec<Complex32> = (0..n_sc).map(|k| g[bin(24 + k)]).collect();
+                idft.process(&mut block);
+                let scale = 1.0 / (n_sc as f32).sqrt();
+                for x in &block {
+                    let x = x * scale;
+                    if qm == 1 {
+                        // Undo the π/2 rotation, then read the BPSK sign.
+                        let d = if i % 2 == 1 { Complex32::new(x.im, -x.re) } else { x };
+                        llr.push(d.re + d.im);
+                        i += 1;
+                    } else {
+                        demapper.demap(x, 1.0, &mut llr);
+                    }
+                }
+            }
+            descramble_llrs(&mut llr, pdsch_scramble_c_init(rnti, cell_id));
+            if qm == 1 {
+                // π/2-BPSK codeword: hard bits must equal the scrambled-then-descrambled UL-SCH.
+                let hard: Vec<u8> = llr.iter().map(|&v| u8::from(v < 0.0)).collect();
+                assert_eq!(&hard[..ulsch.len()], &ulsch[..], "pi/2-BPSK bits");
+            } else {
+                let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40).unwrap_or_else(|| panic!("decode failed at qm {qm}"));
+                let out_bytes: Vec<u8> = out.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+                assert_eq!(out_bytes, tb_bytes, "qm {qm}");
+            }
+        }
+        assert!(tp_prb_valid(1) && tp_prb_valid(6) && tp_prb_valid(45) && tp_prb_valid(160));
+        assert!(!tp_prb_valid(7) && !tp_prb_valid(14) && !tp_prb_valid(0));
+    }
+
     /// Modulate a TB at every modulation order and decode it with the PDSCH
     /// demapper (the gNB side): the mapper and the demapper must agree on the
     /// constellation and on the bit order.
@@ -486,7 +654,7 @@ mod tests {
         let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
         let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
         for qm in [2usize, 4, 6, 8] {
-            let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0 };
+            let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0, transform_precoding: None };
             let e = pusch_e_len(&alloc);
             assert_eq!(e, 396 * qm);
             let r = 0.117 * qm as f64 / 2.0;

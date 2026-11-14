@@ -145,6 +145,13 @@ if grep -q "formats: f1_and_f3" "$ROOT/test/$CFG.yml" 2>/dev/null; then
   ALL=$(grep -c "PUCCH format 2/3/4 format=3" "$OUT/gnb.log" 2>/dev/null || echo 0)
   [ "$OK" -gt 0 ] && [ $((OK * 10)) -ge $((ALL * 9)) ] && pass "S21 PUCCH F3 decoded by gNB ($OK/$ALL)" || fail "S21 PUCCH F3 decoded by gNB ($OK/$ALL)"
 fi
+# S22: transform-precoded PUSCH (only when the gNB config enables it): the
+# gNB must decode the DFT-s-OFDM uplink (≥90 % PUSCH CRC OK).
+if grep -q "enable_transform_precoding: true" "$ROOT/test/$CFG.yml" 2>/dev/null; then
+  OK=$(grep -c "PUSCH: rnti.*crc=OK" "$OUT/gnb.log" 2>/dev/null || echo 0)
+  ALL=$(grep -c "PUSCH: rnti" "$OUT/gnb.log" 2>/dev/null || echo 0)
+  [ "$OK" -gt 0 ] && [ $((OK * 10)) -ge $((ALL * 9)) ] && pass "S22 transform-precoded PUSCH decoded by gNB ($OK/$ALL)" || fail "S22 transform-precoded PUSCH decoded by gNB ($OK/$ALL)"
+fi
 # S18: other system information (only when SIB1 schedules SI messages).
 if grep -q "SI scheduling:" "$UE"; then
   grep -q "acquired SIB" "$UE" && pass "S18 other SI ($(grep -o 'acquired SIB[0-9]*' "$UE" | sort -u | tr '\n' ' '))" || fail "S18 other SI"

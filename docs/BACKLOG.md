@@ -49,8 +49,13 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       and the gNB decodes 569/570 format-3 occasions (S21). Payloads above
       11 bits (polar-coded UCI) and format 4 (block-wise OCC) are still
       missing.
-- [ ] Transform precoding (DFT-s-OFDM) PUSCH transmit path; the MCS table
-      exists, the modulator does not.
+- [x] 2026-11-14 Transform precoding (DFT-s-OFDM) PUSCH: DFT per data symbol,
+      low-PAPR DM-RS with group/sequence hopping, π/2-BPSK rows, Table
+      6.1.4.1-1 / antenna-port Table 7.3.1.1.2-6 selection, `msg3-transformPrecoder`
+      for RAR / DCI 0_0 and `transformPrecoder` for DCI 0_1 (falls back to the
+      Msg3 setting). T3 runs OCUDU with `enable_transform_precoding` (S22,
+      98/99 PUSCH CRC OK at 64-QAM). `dataScramblingIdentityPUSCH` is parsed
+      but not applied (OCUDU never sets it).
 - [ ] Two-layer PDSCH (2x2 DL MIMO), multi-antenna receive, RI/PMI in the CSI
       report (type-I single-panel codebook).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).

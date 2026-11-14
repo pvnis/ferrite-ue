@@ -108,6 +108,21 @@ pub struct UlGrant {
     pub dmrs_add_pos: u8,
     /// Frequency hopping requested (unsupported by the modulator: MAC refuses).
     pub freq_hopping: bool,
+    /// Transform precoding (DFT-s-OFDM) with its DM-RS parameters; `None` =
+    /// CP-OFDM.
+    pub transform_precoding: Option<TransformPrecoding>,
+}
+
+/// Transform-precoded PUSCH parameters (FAPI PUSCH PDU `transformPrecoding`,
+/// `nIdPusch`-style identities; TS 38.211 §6.3.1.4 / §6.4.1.1.1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransformPrecoding {
+    /// `n_ID^RS` of the low-PAPR DM-RS (`nPUSCH-Identity` or the cell id).
+    pub n_id_rs: u16,
+    pub group_hopping: bool,
+    pub sequence_hopping: bool,
+    /// Table 6.1.4.1-1 `q = 1` rows modulate as π/2-BPSK (`tp-pi2BPSK`).
+    pub pi2_bpsk: bool,
 }
 
 /// The payload of a decoded DCI, per format.

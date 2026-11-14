@@ -119,6 +119,9 @@ impl UlBuilder {
             // 1-group mapping would need data on the odd subcarriers.
             return Err("PUSCH with 1 CDM group without data is not supported by the modulator".into());
         }
+        if grant.transform_precoding.is_some() && !pusch::tp_prb_valid(grant.n_prb as usize) {
+            return Err(format!("transform-precoded PUSCH over {} PRBs (not 2^a·3^b·5^c)", grant.n_prb));
+        }
         let alloc = PuschAlloc {
             rb_start: self.cfg.ul_bwp.start_crb as usize - self.geom.ul.offset_crb as usize + grant.prb_start as usize,
             n_rb: grant.n_prb as usize,
@@ -128,6 +131,7 @@ impl UlBuilder {
             qm: grant.mcs.qm as usize,
             carrier_rb: self.geom.ul.n_rb as usize,
             crb_offset: self.geom.ul.offset_crb as usize,
+            transform_precoding: grant.transform_precoding.map(|t| pusch::TransformPrecoding { n_id_rs: t.n_id_rs, group_hopping: t.group_hopping, sequence_hopping: t.sequence_hopping }),
         };
         let r_x1024 = grant.mcs.r_x1024.ok_or("reserved MCS without a stored code rate")?;
         let r = r_x1024 as f64 / 1024.0;
@@ -167,7 +171,7 @@ impl UlBuilder {
             &csi_res,
         );
         self.normalise(&mut w);
-        Ok(Waveform { start: clock.ul_index(slot), samples: w, tag: "pusch" })
+        Ok(Waveform { start: clock.ul_index(slot), samples: w, tag: if grant.transform_precoding.is_some() { "pusch-tp" } else { "pusch" } })
     }
 
     /// Resolve a PUCCH resource reference to a concrete resource.

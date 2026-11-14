@@ -2,7 +2,7 @@
 //! PHY configuration (TDRA tables, k1 list, BWP sizes, DMRS/MCS config).
 
 use crate::config::{McsTableSel, PhyConfig, SearchSpaceKind, TdraRow};
-use crate::fapi::{Dci, DlGrant, Mcs, TimeAlloc, UlGrant};
+use crate::fapi::{TransformPrecoding, Dci, DlGrant, Mcs, TimeAlloc, UlGrant};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 use ferrite_phy::coding::dci::{self as dci, DciSizeConfig, DciSizes, HarqAckCodebook};
 use ferrite_phy::dmrs::{self, MappingType};
@@ -27,7 +27,13 @@ pub struct DciResolver {
     pub k1_list: Vec<u8>,
     pub dmrs_typea_pos: u8,
     pub pdsch_mcs: McsTable,
+    /// PUSCH MCS table for DCI 0_1 (TS 38.214 §6.1.4.1, transform precoding
+    /// taken into account).
     pub pusch_mcs: McsTable,
+    /// Transform precoding for RAR / DCI 0_0 scheduled PUSCH (`msg3-transformPrecoder`).
+    pub msg3_tp: Option<TransformPrecoding>,
+    /// Transform precoding for DCI 0_1 scheduled PUSCH.
+    pub ded_tp: Option<TransformPrecoding>,
     pub dl_dmrs_add_pos: u8,
     pub ul_dmrs_add_pos: u8,
     pub mu: u8,
@@ -84,7 +90,27 @@ impl DciResolver {
             k1_list: cfg.pucch.k1_list.clone(),
             dmrs_typea_pos: cfg.ssb.dmrs_typea_pos,
             pdsch_mcs: sel(cfg.pdsch.mcs_table),
-            pusch_mcs: sel(cfg.pusch.mcs_table),
+            pusch_mcs: if cfg.pusch.transform_precoder {
+                match cfg.pusch.mcs_table_tp {
+                    McsTableSel::Qam256 => McsTable::Qam256,
+                    // Table 6.1.4.1-2 (qam64LowSE with transform precoding) not implemented: use 6.1.4.1-1.
+                    _ => McsTable::Qam64TransformPrecoding,
+                }
+            } else {
+                sel(cfg.pusch.mcs_table)
+            },
+            msg3_tp: cfg.pusch.msg3_transform_precoder.then_some(TransformPrecoding {
+                n_id_rs: cfg.ssb.pci,
+                group_hopping: cfg.pusch.msg3_group_hopping,
+                sequence_hopping: false,
+                pi2_bpsk: false,
+            }),
+            ded_tp: cfg.pusch.transform_precoder.then_some(TransformPrecoding {
+                n_id_rs: cfg.pusch.tp_dmrs.n_pusch_identity.unwrap_or(cfg.ssb.pci),
+                group_hopping: cfg.pusch.msg3_group_hopping && !cfg.pusch.tp_dmrs.group_hopping_disabled,
+                sequence_hopping: cfg.pusch.tp_dmrs.sequence_hopping,
+                pi2_bpsk: cfg.pusch.tp_pi2_bpsk,
+            }),
             dl_dmrs_add_pos: cfg.pdsch.dmrs_type_a.additional_position,
             ul_dmrs_add_pos: cfg.pusch.dmrs_type_a.additional_position,
             mu: cfg.numerology.mu,
@@ -136,6 +162,17 @@ impl DciResolver {
             None => (mcs::mcs_modulation_order(table, i).unwrap_or(2), None),
         };
         Mcs { index: i, qm, r_x1024: r }
+    }
+
+    /// PUSCH MCS: the `q` rows of Table 6.1.4.1-1 are `Q_m = 1` (π/2-BPSK) only
+    /// with `tp-pi2BPSK`; otherwise `q = 2` (QPSK at half the rate, same TBS).
+    fn pusch_mcs_of(&self, table: McsTable, i: u8, pi2_bpsk: bool) -> Mcs {
+        let m = self.mcs(table, i);
+        if m.qm == 1 && !pi2_bpsk {
+            Mcs { index: i, qm: 2, r_x1024: m.r_x1024.map(|r| r / 2) }
+        } else {
+            m
+        }
     }
 
     fn pdsch_tbs(&self, row: &TdraRow, n_prb: usize, mcs: &Mcs, cdm: u8) -> u32 {
@@ -248,7 +285,8 @@ impl DciResolver {
         let d = dci::parse_dci_0_0(bits, rk, size, self.ul_bwp_rb).ok()?;
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.ul_bwp_rb)?;
         let row = self.pusch_tdra_row(d.tdra as usize, false)?;
-        let mcs = self.mcs(McsTable::Qam64, d.mcs);
+        let table = if self.msg3_tp.is_some() { McsTable::Qam64TransformPrecoding } else { McsTable::Qam64 };
+        let mcs = self.pusch_mcs_of(table, d.mcs, false);
         // Common PUSCH DMRS: pos2, 2 CDM groups (1 for ≤2 symbols).
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, 2);
@@ -271,6 +309,7 @@ impl DciResolver {
             cdm_groups_wo_data: cdm,
             dmrs_add_pos: 2,
             freq_hopping: d.frequency_hopping,
+            transform_precoding: self.msg3_tp,
         }))
     }
 
@@ -314,8 +353,10 @@ impl DciResolver {
         let d = dci::parse_dci_0_1(bits, size).ok()?;
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.ul_bwp_rb)?;
         let row = self.pusch_tdra_row(d.tdra as usize, true)?;
-        let mcs = self.mcs(self.pusch_mcs, d.mcs);
-        let cdm = dmrs::dci_0_1_antenna_ports_type1_len1_rank1(d.antenna_ports).map_or(2, |p| p.nof_cdm_groups_without_data);
+        let mcs = self.pusch_mcs_of(self.pusch_mcs, d.mcs, self.ded_tp.is_some_and(|t| t.pi2_bpsk));
+        // Antenna ports: Table 7.3.1.1.2-6 with transform precoding (always 2
+        // CDM groups without data, port = value), Table 7.3.1.1.2-8 otherwise.
+        let cdm = if self.ded_tp.is_some() { 2 } else { dmrs::dci_0_1_antenna_ports_type1_len1_rank1(d.antenna_ports).map_or(2, |p| p.nof_cdm_groups_without_data) };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, self.ul_dmrs_add_pos);
         Some(Dci::Ul(UlGrant {
             rnti,
@@ -336,6 +377,7 @@ impl DciResolver {
             cdm_groups_wo_data: cdm,
             dmrs_add_pos: self.ul_dmrs_add_pos,
             freq_hopping: d.frequency_hopping.unwrap_or(false),
+            transform_precoding: self.ded_tp,
         }))
     }
 }

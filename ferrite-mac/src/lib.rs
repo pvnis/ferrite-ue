@@ -126,6 +126,8 @@ pub struct RachConfig {
     pub msg3_delta: u8,
     /// Common PUSCH TDRA list for the RAR grant's time-resource field.
     pub pusch_tdra_common: Vec<ferrite_l1::config::TdraRow>,
+    /// `msg3-transformPrecoder`: Msg3 (and its DM-RS parameters) uses DFT-s-OFDM.
+    pub msg3_transform_precoding: Option<ferrite_l1::fapi::TransformPrecoding>,
 }
 
 /// PUCCH facts MAC needs to pick a resource for UCI.

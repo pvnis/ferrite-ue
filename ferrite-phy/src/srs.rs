@@ -201,9 +201,9 @@ fn prime_below(n: usize) -> usize {
 }
 
 /// The low-PAPR base sequence r̄_{u,v}(n), n = 0..M_ZC (TS 38.211 §5.2.2):
-/// φ-table sequences for lengths 6, 12, 18, 24 and Zadoff-Chu for ≥ 36
-/// (`q` from `u`, `v`, N_ZC = largest prime below M_ZC). Returns `None` for
-/// an unsupported length (30 and below not in the tables).
+/// φ-table sequences for lengths 6, 12, 18, 24, the length-30 closed form
+/// `exp(−jπ(u+1)(n+1)(n+2)/31)` and Zadoff-Chu for ≥ 36 (`q` from `u`, `v`,
+/// N_ZC = largest prime below M_ZC). Returns `None` for an unsupported length.
 pub fn low_papr_base_sequence(u: u8, v: u8, m_zc: usize) -> Option<Vec<Complex32>> {
     let u = (u % 30) as usize;
     let from_phi = |phi: &[i8]| phi.iter().map(|&p| Complex32::from_polar(1.0, PI * p as f32 / 4.0)).collect::<Vec<_>>();
@@ -212,6 +212,7 @@ pub fn low_papr_base_sequence(u: u8, v: u8, m_zc: usize) -> Option<Vec<Complex32
         12 => Some(from_phi(&PHI_12[u])),
         18 => Some(from_phi(&PHI_18[u])),
         24 => Some(from_phi(&PHI_24[u])),
+        30 => Some((0..30).map(|n| Complex32::from_polar(1.0, -PI * ((u + 1) * (n + 1) * (n + 2)) as f32 / 31.0)).collect()),
         n if n >= 36 => {
             let n_zc = prime_below(n);
             let q_bar = n_zc as f64 * (u as f64 + 1.0) / 31.0;

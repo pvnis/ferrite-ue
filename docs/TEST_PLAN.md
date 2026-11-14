@@ -55,6 +55,7 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S16 | Measurement reporting | gNB configured with a periodical serving-cell report (`cu_cp.mobility`): the UE applies `measConfig`, sends `MeasurementReport` (SS-RSRP/RSRQ/SINR) every `reportInterval`; the gNB RRC log shows `Rx SRB1 DCCH UL measurementReport` |
 | S19 | RRC re-establishment | With a radio link failure (lab: `UE_ARGS="--rlf-at-s 8"` injects one while connected) the UE sends RRCReestablishmentRequest, receives RRCReestablishment, refreshes the keys and completes; the gNB reconfigures the bearers and the ping probe finishes without a new registration |
 | S20 | SRS | gNB with `cell_cfg.srs.type_enabled: periodic`: the UE transmits its periodic SRS resource; the gNB PHY log shows `SRS:` detections with a sane SINR/EPRE for the UE's C-RNTI |
+| S22 | Transform-precoded PUSCH | gNB with `pusch.enable_transform_precoding: true` (T3): Msg3, fallback-DCI and DCI 0_1 PUSCHs are DFT-s-OFDM with the low-PAPR DM-RS and the Table 6.1.4.1-1 MCS mapping; ≥90 % of the gNB's PUSCH CRCs pass |
 | S21 | PUCCH format 3 | gNB with `pucch.formats: f1_and_f3` (T2): CSI reports and >2-bit HARQ feedback are sent on PUCCH format 3 (DFT-s-OFDM, RM(32,O) for ≤11 bits); ≥90 % of the gNB's format-3 UCI indications are `detection=4` (no DTX) with the expected payload |
 | S18 | Other SI | gNB broadcasting SIB2 (`cell_cfg.sib.si_sched_info`): the UE logs the SI scheduling from SIB1 and acquires SIB2 within one SI period (`acquired SIB2` with the reselection parameters) |
 | S17 | Paging | With the UE idle (S14), a host-side ping to the UE IP (`DL_PING=1`) makes the AMF page: the UE decodes the P-RNTI DCI/PCCH in its paging frame, sends a Service Request (cause mt-Access), the DRB is restored and the echo request is answered (0 % loss on the host ping) |
@@ -106,7 +107,7 @@ cargo run --release -p ferrite-ue -- --dl-arfcn <arfcn> --srate <MHz> --ping 20
 starts qcore and the gNB, waits for the NG setup, starts the UE with the
 matching ARFCN and sample rate, collects `/tmp/ferrite_gnb_zmq.log`, the UE
 log and the gNB stdout metrics into `test/results/<id>-<timestamp>/`, and
-evaluates S1–S8 from the logs (plus S14/S16/S17/S18/S19/S20/S21 when the run exercised them), printing a pass/fail table. `UE_ARGS` adds UE
+evaluates S1–S8 from the logs (plus S14/S16/S17/S18/S19/S20/S21/S22 when the run exercised them), printing a pass/fail table. `UE_ARGS` adds UE
 flags, `UE_LOG` sets the UE log filter.
 
 Prerequisites on the host: qcore's network (`cd /home/dmd/qcore &&

@@ -288,6 +288,7 @@ mod tests {
             ul_bwp_rb: 24,
             msg3_delta: 3,
             pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
+        msg3_transform_precoding: None,
         }
     }
 

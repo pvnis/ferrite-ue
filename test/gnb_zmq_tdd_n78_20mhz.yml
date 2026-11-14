@@ -65,6 +65,8 @@ cell_cfg:
   mcs_table: qam64
  pusch:
   mcs_table: qam64
+  # DFT-s-OFDM uplink: Msg3 and every PUSCH use transform precoding (S22).
+  enable_transform_precoding: true
  # PUCCH: at 20 MHz (carrier_bw > 10) the gNB uses the full-width PUCCH layout;
  # just shorten the SR period (5 ms) to keep the idle-UE ping RTT down.
  pucch:

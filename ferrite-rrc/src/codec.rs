@@ -227,6 +227,16 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     };
     let pusch_tdra_common = tdra_rows_pusch(s.pusch_tdra(), mu);
     let pucch_common = s.pucch_config_common();
+    let msg3_group_hopping = s
+        .initial_uplink_bwp()
+        .and_then(|b| b.pusch_config_common.as_ref()?.setup())
+        .is_some_and(|p| p.group_hopping_enabled_transform_precoding);
+    let msg3_tp = rach.msg3_transform_precoder.then_some(ferrite_l1::fapi::TransformPrecoding {
+        n_id_rs: mib.pci,
+        group_hopping: msg3_group_hopping,
+        sequence_hopping: false,
+        pi2_bpsk: false,
+    });
 
     let paging = {
         let pc = &sc.downlink_config_common.pcch_config;
@@ -258,7 +268,12 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         prach: prach.clone(),
         n_ta_offset_tc: sc.n_timing_advance_offset.unwrap_or(25600),
         pdsch: PdschConfig { nof_harq_processes: 8, ..PdschConfig::default() },
-        pusch: PuschConfig::default(),
+        pusch: PuschConfig {
+            transform_precoder: rach.msg3_transform_precoder,
+            msg3_transform_precoder: rach.msg3_transform_precoder,
+            msg3_group_hopping,
+            ..PuschConfig::default()
+        },
         srs: Vec::new(),
         pucch: PucchConfig {
             resource_common: pucch_common.and_then(|p| p.pucch_resource_common),
@@ -289,6 +304,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
             ul_bwp_rb: ul_bwp.n_rb,
             msg3_delta: msg3_delta(mu),
             pusch_tdra_common,
+            msg3_transform_precoding: msg3_tp,
         },
         tx_lead,
     );
@@ -502,7 +518,14 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
         if let Some(rows) = p.tdra_list() {
             phy.pusch.tdra = tdra_rows_pusch(rows, mu);
         }
-        phy.pusch.transform_precoder = p.transform_precoder_enabled.unwrap_or(false);
+        // TS 38.214 §6.1.3: without `transformPrecoder` the UE follows `msg3-transformPrecoder`.
+        phy.pusch.transform_precoder = p.transform_precoder_enabled.unwrap_or(phy.pusch.msg3_transform_precoder);
+        phy.pusch.mcs_table_tp = mcs_table_of(p.mcs_table_transform_precoder);
+        phy.pusch.tp_pi2_bpsk = p.tp_pi2_bpsk;
+        phy.pusch.data_scrambling_identity = p.data_scrambling_identity_pusch;
+        if let Some(t) = p.dmrs_uplink_for_pusch_mapping_type_a.as_ref().and_then(|s| s.setup()).and_then(|c| c.transform_precoding_enabled) {
+            phy.pusch.tp_dmrs = TpDmrsConfig { n_pusch_identity: t.n_pusch_identity, group_hopping_disabled: t.sequence_group_hopping_disabled, sequence_hopping: t.sequence_hopping_enabled };
+        }
         phy.pusch.frequency_hopping = p.frequency_hopping_intra_slot.is_some();
         if let Some(u) = p.uci_on_pusch.as_ref().and_then(|s| s.setup()) {
             phy.pusch.uci_scaling = u.scaling;

@@ -645,6 +645,7 @@ impl MacEntity {
             cdm_groups_wo_data: 2,
             dmrs_add_pos: 2,
             freq_hopping: rar.grant.freq_hopping,
+            transform_precoding: r.msg3_transform_precoding,
         };
         let tbs = (tbs_bits / 8) as usize;
         let mut tb = Vec::with_capacity(tbs);

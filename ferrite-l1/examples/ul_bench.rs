@@ -9,7 +9,7 @@ fn main() {
         assert!(!w.is_empty());
     }
     println!("pucch f1: {:.2} ms per call", t.elapsed().as_secs_f64() * 100.0);
-    let alloc = pusch::PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
+    let alloc = pusch::PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0, transform_precoding: None };
     let tb = vec![0u8; 11];
     let t = std::time::Instant::now();
     for _ in 0..10 {
@@ -18,7 +18,7 @@ fn main() {
     }
     println!("pusch: {:.2} ms per call", t.elapsed().as_secs_f64() * 100.0);
     for (n_rb, tbs_bytes) in [(5usize, 80usize), (10, 200), (20, 500), (24, 1000)] {
-        let alloc = pusch::PuschAlloc { rb_start: 0, n_rb, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0 };
+        let alloc = pusch::PuschAlloc { rb_start: 0, n_rb, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm: 2, carrier_rb: 24, crb_offset: 0, transform_precoding: None };
         let tb = vec![0x5au8; tbs_bytes];
         let t = std::time::Instant::now();
         let w = pusch::pusch_modulate_slot_uci_csi(&ofdm, &tb, &alloc, 1, 9, 1, 1, 0x4601, 3390e6, 15.36e6, &[], 20.0, tbs_bytes * 8, &[], &[]);

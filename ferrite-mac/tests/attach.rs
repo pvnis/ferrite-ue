@@ -52,6 +52,7 @@ fn config() -> MacConfig {
             ul_bwp_rb: 24,
             msg3_delta: 3,
             pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
+        msg3_transform_precoding: None,
         },
         3,
     );
@@ -192,6 +193,7 @@ fn attach_flow() {
         cdm_groups_wo_data: 2,
         dmrs_add_pos: 1,
         freq_hopping: false,
+        transform_precoding: None,
     };
     step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s }));
     step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: s, dci: Dci::Ul(ul.clone()) }));

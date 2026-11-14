@@ -763,6 +763,7 @@ fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, t
             ul_bwp_rb: 24,
             msg3_delta: if numerology.mu == 0 { 2 } else { 3 },
             pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
+        msg3_transform_precoding: None,
         },
         tx_lead,
     )

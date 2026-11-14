@@ -249,13 +249,41 @@ pub struct PuschConfig {
     pub dmrs_type_b: DmrsConfig,
     pub mcs_table: McsTableSel,
     pub tdra: Vec<TdraRow>,
+    /// Transform precoding for PUSCH scheduled by DCI 0_1: `transformPrecoder`
+    /// of PUSCH-Config when present, else `msg3_transform_precoder`.
     pub transform_precoder: bool,
+    /// `msg3-transformPrecoder` (SIB1 RACH-ConfigCommon): transform precoding
+    /// for Msg3 and every PUSCH scheduled by a RAR grant or DCI 0_0.
+    pub msg3_transform_precoder: bool,
+    /// `groupHoppingEnabledTransformPrecoding` (SIB1 PUSCH-ConfigCommon).
+    pub msg3_group_hopping: bool,
+    /// `mcs-TableTransformPrecoder` (TS 38.214 §6.1.4.1: qam256 selects Table
+    /// 5.1.3.1-2, otherwise Table 6.1.4.1-1 applies when transform precoding
+    /// is enabled).
+    pub mcs_table_tp: McsTableSel,
+    /// `tp-pi2BPSK`: the `q = 1` rows of Table 6.1.4.1-1 use π/2-BPSK.
+    pub tp_pi2_bpsk: bool,
+    /// `DMRS-UplinkConfig.transformPrecodingEnabled` (mapping type A).
+    pub tp_dmrs: TpDmrsConfig,
+    /// `dataScramblingIdentityPUSCH` (not yet applied: OCUDU leaves it absent).
+    pub data_scrambling_identity: Option<u16>,
     /// `uci-OnPUSCH` beta offsets (semi-static set): (ack idx, csi1 idx, csi2 idx).
     pub beta_offsets: Option<BetaOffsets>,
     /// `uci-OnPUSCH.scaling`: 0=0.5, 1=0.65, 2=0.8, 3=1.0.
     pub uci_scaling: u8,
     /// `frequencyHopping` configured (affects the DCI 0_1 size).
     pub frequency_hopping: bool,
+}
+
+/// `DMRS-UplinkConfig.transformPrecodingEnabled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TpDmrsConfig {
+    /// `nPUSCH-Identity` (None → cell id).
+    pub n_pusch_identity: Option<u16>,
+    /// `sequenceGroupHopping = disabled` present.
+    pub group_hopping_disabled: bool,
+    /// `sequenceHopping = enabled` present.
+    pub sequence_hopping: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
