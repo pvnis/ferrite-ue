@@ -13,13 +13,11 @@ use ferrite_phy::pdsch_params;
 #[derive(Clone, Debug)]
 pub struct DciResolver {
     pub sizes: DciSizes,
-    pub size_cfg: DciSizeConfig,
     pub coreset0_rb: Option<usize>,
     pub coreset0_first_crb: usize,
     pub dl_bwp_rb: usize,
     pub ul_bwp_rb: usize,
     pub dl_bwp_start: usize,
-    pub ul_bwp_start: usize,
     pub pdsch_tdra: Vec<TdraRow>,
     pub pusch_tdra: Vec<TdraRow>,
     pub pdsch_tdra_common: Vec<TdraRow>,
@@ -76,13 +74,11 @@ impl DciResolver {
         let sizes = dci::dci_sizes(&sc);
         Self {
             sizes,
-            size_cfg: sc,
             coreset0_rb,
             coreset0_first_crb: coreset0.map_or(0, |c| c.start_crb as usize),
             dl_bwp_rb: cfg.dl_bwp.n_rb as usize,
             ul_bwp_rb: cfg.ul_bwp.n_rb as usize,
             dl_bwp_start: cfg.dl_bwp.start_crb as usize,
-            ul_bwp_start: cfg.ul_bwp.start_crb as usize,
             pdsch_tdra: cfg.pdsch.tdra.clone(),
             pusch_tdra: cfg.pusch.tdra.clone(),
             pdsch_tdra_common: cfg.pdsch_tdra_common.clone(),
@@ -229,7 +225,8 @@ impl DciResolver {
         let (rb_start, n_rb) = if in_css && self.coreset0_rb.is_some() {
             let n = self.coreset0_rb.unwrap();
             let (s, l) = dci::riv_decode(d.fdra, n)?;
-            (self.coreset0_first_crb + s - self.dl_bwp_start, l)
+            // A dedicated BWP starting above CORESET#0 cannot carry this PDSCH.
+            ((self.coreset0_first_crb + s).checked_sub(self.dl_bwp_start)?, l)
         } else {
             dci::riv_decode(d.fdra, self.dl_bwp_rb)?
         };

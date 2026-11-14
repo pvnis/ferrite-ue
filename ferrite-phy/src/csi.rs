@@ -123,7 +123,9 @@ pub fn measure_csi_rs_sinr(grid: &[Complex32], sc_to_bin: impl Fn(usize) -> usiz
     let density = match res.row {
         CsiRsRow::Row1 => 3,
         CsiRsRow::Row2 => 1,
-        CsiRsRow::Row4 => panic!("row 4 is a 4-port resource; not a single-port SINR measurement"),
+        // A 4-port resource is not a single-port SINR measurement: report
+        // "no signal" rather than abort the timeline thread.
+        CsiRsRow::Row4 => return f32::NEG_INFINITY,
     };
     let seq = csi_rs_sequence(res.n_id, slot, res.symbol as u32, density * (res.start_rb + res.n_rb));
     let rbs = res.start_rb..res.start_rb + res.n_rb;

@@ -42,35 +42,56 @@ pub struct SampleClock {
     /// Per-symbol sample offsets within a slot, for each slot-in-subframe
     /// position (index = slot_in_subframe), including the long CP of symbol 0
     /// and symbol 7·2^µ of the subframe.
+    #[cfg(test)]
     symbol_offsets: Vec<[usize; 15]>,
 }
 
 impl SampleClock {
+    /// The same clock with another N_TA (the PRACH is sent with N_TA = 0,
+    /// TS 38.211 §4.3.1).
+    pub fn with_n_ta(&self, n_ta_tc: i64) -> Self {
+        let mut c = self.clone();
+        c.n_ta_tc = n_ta_tc;
+        c
+    }
+
     /// `fft` is `fs / SCS`; the FFT size must be a multiple of 128.
     pub fn new(fs: f64, numerology: Numerology, anchor_slot: SlotPoint, anchor_index: i64) -> Self {
-        let fft = (fs / numerology.scs_hz() as f64).round() as usize;
-        let spsf = numerology.slots_per_subframe() as usize;
-        let mut symbol_offsets = Vec::with_capacity(spsf);
-        for sis in 0..spsf {
-            let mut offs = [0usize; 15];
-            let mut acc = 0usize;
-            for l in 0..14 {
-                offs[l] = acc;
-                acc += cp_len(fft, sis * 14 + l, numerology.mu) + fft;
+        #[cfg(test)]
+        let symbol_offsets = {
+            let fft = (fs / numerology.scs_hz() as f64).round() as usize;
+            let spsf = numerology.slots_per_subframe() as usize;
+            let mut symbol_offsets = Vec::with_capacity(spsf);
+            for sis in 0..spsf {
+                let mut offs = [0usize; 15];
+                let mut acc = 0usize;
+                for l in 0..14 {
+                    offs[l] = acc;
+                    acc += cp_len(fft, sis * 14 + l, numerology.mu) + fft;
+                }
+                offs[14] = acc;
+                symbol_offsets.push(offs);
             }
-            offs[14] = acc;
-            symbol_offsets.push(offs);
+            symbol_offsets
+        };
+        Self {
+            fs,
+            numerology,
+            anchor_index,
+            anchor_slot,
+            n_ta_offset_tc: 25600,
+            n_ta_tc: 0,
+            tx_rx_offset: 0,
+            ul_guard: 0,
+            #[cfg(test)]
+            symbol_offsets,
         }
-        Self { fs, numerology, anchor_index, anchor_slot, n_ta_offset_tc: 25600, n_ta_tc: 0, tx_rx_offset: 0, ul_guard: 0, symbol_offsets }
     }
 
     pub fn samples_per_slot(&self) -> i64 {
         self.numerology.samples_per_slot(self.fs) as i64
     }
 
-    pub fn samples_per_frame(&self) -> i64 {
-        self.numerology.samples_per_frame(self.fs) as i64
-    }
 
     /// DL stream index of the start of `slot`.
     pub fn dl_index(&self, slot: SlotPoint) -> i64 {
@@ -89,6 +110,7 @@ impl SampleClock {
 
     /// Sample offset of symbol `l` (0..=14) from the start of a slot at
     /// slot-in-subframe position `sis`. `l = 14` is the slot end.
+    #[cfg(test)]
     pub fn symbol_offset(&self, slot: SlotPoint, l: usize) -> usize {
         self.symbol_offsets[slot.slot_in_subframe() as usize][l]
     }
@@ -103,10 +125,6 @@ impl SampleClock {
         self.dl_index(slot) - self.ta_samples() - self.tx_rx_offset + self.ul_guard
     }
 
-    /// UL stream index of symbol `l` of `slot`.
-    pub fn ul_symbol_index(&self, slot: SlotPoint, l: usize) -> i64 {
-        self.ul_index(slot) + self.symbol_offset(slot, l) as i64
-    }
 
     /// Re-anchor after a measured timing error: the SSB at `slot` was found
     /// `err` samples later than predicted → shift the anchor by `err`.
@@ -119,14 +137,12 @@ impl SampleClock {
         self.anchor_slot = slot;
         self.anchor_index = index;
     }
-
-    pub fn anchor(&self) -> (SlotPoint, i64) {
-        (self.anchor_slot, self.anchor_index)
-    }
 }
 
 /// Normal-CP length in samples for `symbol_in_subframe` at numerology `mu`
-/// (TS 38.211 §5.3.1), FFT size `fft`.
+/// (TS 38.211 §5.3.1), FFT size `fft`. Test reference for the symbol offsets;
+/// the engine uses `Ofdm::cp_len`.
+#[cfg(test)]
 pub fn cp_len(fft: usize, symbol_in_subframe: usize, mu: u8) -> usize {
     let normal = 144 * fft / 2048;
     if symbol_in_subframe == 0 || symbol_in_subframe == 7 * (1usize << mu) {

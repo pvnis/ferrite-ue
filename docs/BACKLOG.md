@@ -129,6 +129,96 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [ ] README update for the layered crates.
 - [ ] Lab matrix in CI form (gNB + qcore scripted, pass/fail from `lab.sh`).
 
+## Architecture audit 2026-11-14 (done)
+
+- [x] 2026-11-14 Layering: `ferrite-ran` (spec tables), `ferrite-fapi` (PHY↔MAC
+      messages + PhyConfig) and `ferrite-security` (one NIA/NEA/KDF/MILENAGE
+      implementation) split out; MAC and RRC no longer link the DSP crate; the
+      RAR UL grant is resolved by the PHY (`MacToPhy::RarGrant`); dead
+      `*_legacy.rs` files removed.
+- [x] 2026-11-14 UP keys derived with the UP distinguishers (TS 33.501 A.8
+      0x05/0x06; were the NAS ones) — verified with NEA2/NIA2 on DRBs (F1).
+- [x] 2026-11-14 State machines made explicit: L1 `CellPhase` / `tx_enabled`
+      (START/STOP honoured) / `RlmState`; MAC `RaState::Msg3Pending`, `SrState`,
+      `TaState` with timeAlignmentTimer expiry (HARQ flush, PRACH-only uplink),
+      `MacEvent::{SrFailure, TimeAlignmentExpired}`; RRC `state()` private with
+      logged transitions, RRCSetup only while Connecting, RA failure while
+      connected = RLF, T301 armed by RRC; stack split into `bearers.rs` /
+      `userplane.rs` / `stack.rs` (default DRB derived from the table, NAS
+      events drained after ticks, PDU-session-down / deregistration tear the
+      user plane down, PDCP security errors logged).
+- [x] 2026-11-14 Reachable panics removed: DCI payload larger than the
+      candidate, CSS RIV above a dedicated BWP, UL BWP below the carrier, common
+      PUCCH on a narrow BWP, ICMP echo with a lying Total Length, PUCCH F0 with
+      a bad symbol count, CSI-RS row 4 SINR.
+- [x] 2026-11-14 DL MAC CE parsing per Table 6.2.1-1 (fixed-size CEs 47–52
+      no longer mis-parsed as L-field CEs); PDSCH soft buffers reset on NDI
+      toggle (combining across different TBs was possible); NAS T3582 for the
+      release retry; SR configurations triggered per `schedulingRequestID`.
+
+## Gaps found by the audit (open, non-OTA)
+
+PHY/L1: extended CP and 60/120 kHz data numerology; SSB cases D/E (FR2);
+FR2 CORESET#0; TDD pattern not used for PRACH/UL validity or SFI; single BWP
+(indicator ignored, no bwp-InactivityTimer); DCI formats 2_x and 0_2/1_2;
+MCS-C/CS/SP-CSI RNTIs; DCI-size inputs fixed to one profile (DM-RS type/len,
+TCI, rate-match groups, CBG, two codewords…); RA type 0; `ra-SearchSpace` /
+`searchSpaceOtherSystemInformation` not distinguished; TDRA default tables
+B/C; single-layer / port-0 only (no ports 1001+, n_SCID, DM-RS type 2 /
+maxLength 2, PT-RS, TB2); PDSCH rate matching around the SSB / rateMatchPatterns
+/ CSI-RS rows other than 1/2/4; LBRM; multi-CB soft combining; CBG;
+`dataScramblingIdentityPDSCH/PUSCH`; UCI ≥3 ACK bits puncture instead of
+rate-matching the UL-SCH; CSI part 2 / polar UCI; PUCCH F4, F2/F3 intra-slot
+hopping and group hopping; PRACH restricted sets, FR2 table, MsgA;
+aperiodic/semi-persistent SRS; RI/PMI/CSI-IM/L1-RSRP reports; TRS not used
+for tracking; PDCCH precoder granularity allContiguousRBs; neighbour cell
+search; `EngineEvent::CellFound` / `Measurement` bypass FAPI (MIB and SSB
+measurements should be PHY→MAC indications).
+
+MAC: DRX; BWP switching; 2-step / contention-free RA (PDCCH order is
+`Dci::Other`); SSB-based preamble/occasion selection; preamble group B; Long
+Truncated BSR, Multiple-Entry PHR, BFR, Recommended bit rate CEs; BSR
+truncation picks the lowest LCG id; padding BSR only with remaining data; LCP
+restrictions; logicalChannelSR-DelayTimer; contention-resolution identity
+mismatch not failed immediately; configured grants / SPS; semi-static HARQ-ACK
+codebook; PDCCH-order RA.
+
+RLC/PDCP: SDU discard from PDCP, delivery indication to PDCP, in-place
+reconfiguration, STATUS validation; PDCP TX queue / discard timer, status
+report trigger and reception, out-of-order delivery, duplication, ROHC, AM-DRB
+re-establishment semantics, COUNT wrap handling, data volume for BSR; SDAP as
+its own layer (QoS flows beyond the default, reflective QoS).
+
+RRC: `reconfigurationWithSync` (handover, T304), RRC_INACTIVE (suspend /
+resume, T380), T310/N310/N311 and T311 (RLF detection from L1 indications,
+cell selection before re-establishment), T302 / `waitTime`, vertical NH key
+derivation (`masterKeyUpdate`), `fullConfig`, CounterCheck response,
+UECapabilityEnquiry filters, SIB4–9 (a SIB that fails aborts the whole SI
+message), SI modification / valueTag, paging short messages, fullI-RNTI
+paging, SecurityModeFailure on undecodable SMC, RRCSetup with the registered
+PLMN / `registeredAMF`, decode failures of individual optional IEs abort the
+whole message (sCellToAddModList, configuredGrantConfig,
+beamFailureRecoveryConfig, slotFormatIndicator, crossCarrierSchedulingConfig,
+codebookConfig, aperiodicTriggerStateList, …), unified access control.
+
+NAS: 5GMM substates and the CM-IDLE/CM-CONNECTED distinction (RRC release not
+told to NAS), T3502/T3511/T3519/T3346 handling and the attempt counter, EAP-AKA',
+registration update types (mobility, emergency), per-cause reject handling,
+network-initiated deregistration re-registration, service request types other
+than data/MT, SERVICE ACCEPT/REJECT events, NOTIFICATION response,
+CONFIGURATION UPDATE `registrationRequested`, PDU session modification (answered
+with 5GSM STATUS today), QoS rules installation, IPv6/IPv4v6/Ethernet user plane,
+EPCO (DNS/MTU), SUCI profiles A/B, TUAK, SQN persistence, UE-initiated
+deregistration on exit; NAS runs on wall-clock time while RRC/MAC run on slots.
+
+ASN.1: encoders for CellGroupConfig / SIB1 (round-trip tests), extension
+additions decoded (120 sites skip them), critical-extension futures / CHOICE
+extensions as `Raw` instead of failures, fuzz targets.
+
+Tooling: `cargo clippy` clean-up, `#![warn(missing_docs)]`, unit tests for
+`DciResolver`, `RrcUe` and the stack (none today), a crate-level MAC↔RLC↔PDCP
+chain test, CI form of the lab matrix.
+
 ## Over the air (deferred until an SDR is on the bench)
 
 - [ ] Wire the SoapySDR (seify) backend into the `ferrite-ue` binary

@@ -222,6 +222,13 @@ pub struct Guti {
 }
 
 impl Guti {
+    /// The 48-bit 5G-S-TMSI as a number: AMF Set ID (10) | AMF Pointer (6) |
+    /// 5G-TMSI (32) (TS 23.003 §2.10.1), the RRC identity for paging and
+    /// connection requests.
+    pub fn s_tmsi_u64(&self) -> u64 {
+        (u64::from(self.amf_set_id & 0x3ff) << 38) | (u64::from(self.amf_pointer & 0x3f) << 32) | u64::from(self.tmsi)
+    }
+
     /// The 5G-S-TMSI: AMF set ID (10 bits) | AMF pointer (6 bits) | 5G-TMSI.
     pub fn s_tmsi(&self) -> [u8; 6] {
         let sp = ((self.amf_set_id & 0x3ff) << 6) | (self.amf_pointer as u16 & 0x3f);

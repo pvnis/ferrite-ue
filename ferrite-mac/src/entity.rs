@@ -31,7 +31,14 @@ pub enum MacEvent {
     Pcch(Vec<u8>),
     /// Msg4 CCCH SDU (RRCSetup / RRCReject) received.
     Ccch(Vec<u8>),
-    /// Radio link problem: SR failure / TA timer expiry (RRC decides what to do).
+    /// SR_COUNTER reached sr-TransMax (§5.4.4): the entity started a C-RNTI
+    /// random access; RRC may release the PUCCH/SRS configuration.
+    SrFailure,
+    /// The timeAlignmentTimer expired (§5.2): HARQ buffers flushed, no uplink
+    /// but PRACH until the next random access.
+    TimeAlignmentExpired,
+    /// The PHY lost synchronisation or the radio failed: RRC treats it as a
+    /// radio link failure.
     RadioLinkFailure,
 }
 
@@ -58,19 +65,19 @@ struct PendingPusch {
 
 /// The UE MAC entity.
 pub struct MacEntity {
-    pub cfg: MacConfig,
-    pub ra: RaProcedure,
-    pub dl_harq: DlHarqEntity,
-    pub ul_harq: UlHarqEntity,
-    pub ack_book: AckBook,
-    pub bsr: crate::bsr::BsrProcedure,
+    cfg: MacConfig,
+    ra: RaProcedure,
+    dl_harq: DlHarqEntity,
+    ul_harq: UlHarqEntity,
+    ack_book: AckBook,
+    bsr: crate::bsr::BsrProcedure,
     phr: PhrProcedure,
     power: PowerHeadroom,
-    pub sr: Vec<SrProcedure>,
-    pub lcp: Lcp,
-    pub ta: TimingAdvance,
-    pub c_rnti: Option<Rnti>,
-    pub tc_rnti: Option<Rnti>,
+    sr: Vec<SrProcedure>,
+    lcp: Lcp,
+    ta: TimingAdvance,
+    c_rnti: Option<Rnti>,
+    tc_rnti: Option<Rnti>,
     pending_pusch: BTreeMap<u64, PendingPusch>,
     /// Latest CSI measurement (cqi, slot measured).
     pending_cqi: Option<(u8, SlotPoint)>,
@@ -149,6 +156,26 @@ impl MacEntity {
         self.cfg = cfg;
     }
 
+    /// Random-access procedure state (diagnostics).
+    pub fn ra_state(&self) -> &RaState {
+        &self.ra.state
+    }
+
+    /// Time-alignment state (diagnostics).
+    pub fn ta_state(&self) -> crate::ta::TaState {
+        self.ta.state()
+    }
+
+    /// State of every configured SR procedure (diagnostics).
+    pub fn sr_states(&self) -> Vec<crate::sr::SrState> {
+        self.sr.iter().map(|s| s.state()).collect()
+    }
+
+    /// Current C-RNTI, if connected.
+    pub fn c_rnti(&self) -> Option<Rnti> {
+        self.c_rnti
+    }
+
     /// Power headroom quantities to report (from L1 power control / the stack).
     pub fn set_power_headroom(&mut self, p: PowerHeadroom) {
         self.power = p;
@@ -194,19 +221,31 @@ impl MacEntity {
         }
         self.ack_book.prune(now);
         self.lcp.tick(now);
-        self.pending_pusch.retain(|&k, _| k as i64 - now.index() as i64 >= -(self.cfg.tx_lead_slots as i64));
+        let lead = self.cfg.tx_lead_slots as i64;
+        self.pending_pusch.retain(|&k, _| SlotPoint::from_index(now.numerology, k).diff(&now) >= -lead);
+        // timeAlignmentTimer (§5.2): on expiry flush the HARQ buffers and stop
+        // every uplink but the PRACH until a random access re-aligns us.
+        if self.ta.on_slot(now) {
+            log::warn!("timeAlignmentTimer expired: uplink not aligned");
+            self.dl_harq.reset();
+            self.ul_harq.reset();
+            self.pending_pusch.clear();
+            self.ack_book = AckBook::default();
+            self.events.push(MacEvent::TimeAlignmentExpired);
+        }
 
         // Start a RA if RRC asked for one.
         if let Some(ccch) = self.ra_start.take() {
             self.ra.start(now, Some(ccch), None);
         }
-        // Buffer status → BSR / SR triggers (§5.4.5).
-        let prios: Vec<u8> = self
+        // Buffer status → BSR / SR triggers (§5.4.5): one snapshot per slot.
+        let with_data: Vec<(u8, Option<u8>)> = self
             .lcp
             .channels()
             .filter(|c| upper.ul_buffer_status(c.lcid) > 0)
-            .map(|c| c.priority)
+            .map(|c| (c.priority, c.sr_id))
             .collect();
+        let prios: Vec<u8> = with_data.iter().map(|&(p, _)| p).collect();
         self.bsr.evaluate(now, &prios);
         self.phr.tick(now, self.power.pathloss_db);
         if self.bsr.sr_pending && self.c_rnti.is_some() {
@@ -215,21 +254,24 @@ impl MacEntity {
                 self.ra.start(now, None, self.c_rnti);
                 self.crnti_ce_pending = true;
             }
+            // §5.4.4: the SR configuration of the logical channel that triggered
+            // the BSR (a channel without schedulingRequestID may use any).
             for s in &mut self.sr {
-                s.trigger();
+                if with_data.iter().any(|&(_, id)| id.map_or(true, |i| i == s.sr_id)) {
+                    s.trigger();
+                }
             }
         }
         // SR failure (sr-TransMax) → RA + notify RRC (§5.4.4).
-        if self.sr.iter().any(|s| s.failed) {
+        if self.sr.iter_mut().fold(false, |f, s| s.take_failed() || f) {
             for s in &mut self.sr {
-                s.failed = false;
                 s.cancel();
             }
             if !self.ra.is_running() {
                 self.ra.start(now, None, self.c_rnti);
                 self.crnti_ce_pending = true;
             }
-            self.events.push(MacEvent::RadioLinkFailure);
+            self.events.push(MacEvent::SrFailure);
         }
 
         // Random access (§5.1).
@@ -237,9 +279,12 @@ impl MacEntity {
         let actions = self.ra.on_slot(now, self.cfg.tx_lead_slots, &|s| occ_cfg.occasions_in_slot(s));
         self.apply_ra_actions(actions, phy);
 
-        // Uplink due in the target slot.
+        // Uplink due in the target slot (§5.2: nothing but PRACH while not
+        // time-aligned).
         let target = now.add(self.cfg.tx_lead_slots as u64);
-        self.build_target_slot(target, now, phy);
+        if self.ta.aligned() {
+            self.build_target_slot(target, now, phy);
+        }
     }
 
     fn apply_ra_actions(&mut self, actions: Vec<RaAction>, phy: &mut dyn MacToPhySink) {
@@ -415,7 +460,7 @@ impl MacEntity {
         if !matches!(g.rnti_kind, RntiKind::C | RntiKind::Tc) {
             return; // SI/RA/P: the PHY decodes; nothing to book.
         }
-        let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi, g.tbs_bits);
+        let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
         if let Some(ack_slot) = g.ack_slot {
             self.ack_book_common_r = Some(g.r_pucch_common);
             self.ack_book.book(
@@ -487,7 +532,6 @@ impl MacEntity {
         let budget = if reserve_bsr { left - bsr_size } else { left };
         // LCP over the budget (subheaders counted per SDU as 2/3 bytes).
         let alloc = self.lcp.allocate(budget.saturating_sub(2), &mut |lcid| upper.ul_buffer_status(lcid));
-        let mut sdu_bytes_total = 0usize;
         for (lcid, bytes) in alloc {
             let room = left.saturating_sub(if reserve_bsr { bsr_size } else { 0 });
             if room < 3 {
@@ -501,20 +545,20 @@ impl MacEntity {
                 }
                 push_sdu_subpdu(&mut out, lcid, &pdu);
                 left -= cost;
-                sdu_bytes_total += pdu.len();
             }
         }
         // BSR (regular/periodic, or padding BSR when ≥ the CE size remains).
-        let remaining: BTreeMap<u8, usize> = {
-            let mut m = BTreeMap::new();
-            for c in self.lcp.channels().copied().collect::<Vec<_>>() {
-                let b = upper.ul_buffer_status(c.lcid);
-                if b > 0 {
-                    *m.entry(c.lcg).or_default() += b;
-                }
+        // Bytes per LCG and the best (lowest) channel priority in each LCG.
+        let mut remaining: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut lcg_priority: BTreeMap<u8, u8> = BTreeMap::new();
+        for c in self.lcp.channels().copied().collect::<Vec<_>>() {
+            let b = upper.ul_buffer_status(c.lcid);
+            if b > 0 {
+                *remaining.entry(c.lcg).or_default() += b;
+                let p = lcg_priority.entry(c.lcg).or_insert(u8::MAX);
+                *p = (*p).min(c.priority);
             }
-            m
-        };
+        }
         let any_left = remaining.values().any(|&b| b > 0);
         if (bsr_due || (any_left && left >= 2)) && left >= 2 {
             let entries: Vec<(u8, usize)> = remaining.iter().map(|(&l, &b)| (l, b)).collect();
@@ -524,14 +568,14 @@ impl MacEntity {
             } else if left >= 3 + entries.len() {
                 push_long_bsr(&mut out, &entries, false);
             } else {
-                // Not enough room for the long BSR: truncated short BSR of the highest-priority LCG.
-                let (lcg, b) = entries[0];
+                // Not enough room for the long BSR (§5.4.5): a Short Truncated BSR
+                // for the LCG holding the highest-priority channel with data.
+                let (lcg, b) = *entries.iter().min_by_key(|(l, _)| lcg_priority.get(l).copied().unwrap_or(u8::MAX)).unwrap_or(&entries[0]);
                 push_short_bsr(&mut out, lcg, b, true);
                 bsr_truncated = true;
             }
             bsr_included = true;
         }
-        let _ = sdu_bytes_total;
         pad_to(&mut out, tbs);
         out.truncate(tbs);
         (out, bsr_included, bsr_truncated)
@@ -638,23 +682,6 @@ fn cqi_bits(cqi: u8) -> Vec<u8> {
 
 /// Resource allocation type 1 RIV decode (TS 38.214 §6.1.2.2.2).
 
-impl MacHandler for MacEntity {
-    fn handle(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink) {
-        // The entity is driven through `MacEntity::handle_with` so the upper
-        // layers can be borrowed; this bare path is for configuration-only use.
-        struct NoUpper;
-        impl UpperLayers for NoUpper {
-            fn dl_sdu(&mut self, _: u8, _: &[u8], _: SlotPoint) {}
-            fn ul_pull(&mut self, _: u8, _: usize, _: SlotPoint) -> Option<Vec<u8>> {
-                None
-            }
-            fn ul_buffer_status(&mut self, _: u8) -> usize {
-                0
-            }
-        }
-        self.handle_with(msg, phy, &mut NoUpper);
-    }
-}
 
 impl MacEntity {
     /// Handle one PHY → MAC message with access to the RLC bearers.

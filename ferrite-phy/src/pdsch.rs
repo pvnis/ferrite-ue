@@ -611,7 +611,6 @@ mod tests {
 
     /// Modulate random bits at every Q_m, demap the clean symbols and check the
     /// LLR signs recover the bits in §5.1.3 bit order.
-    #[test]
     /// A rate-0.93 256-QAM single-codeblock TB (the MCS 27 / 2-PRB case OCUDU
     /// schedules at CQI 15) must decode from a clean and from a 34 dB SNR
     /// (EVM 2 %) constellation within the worker's iteration budget.

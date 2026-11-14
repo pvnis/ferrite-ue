@@ -57,6 +57,23 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
                 out.push(DlSubPdu::Other { lcid, payload: vec![v] });
                 i += 1;
             }
+            // Fixed-size CEs without an L field (TS 38.321 Table 6.2.1-1):
+            // 47 Recommended bit rate (2), 48 SP ZP CSI-RS Resource Set
+            // Activation (2), 49 PUCCH spatial relation Activation (3),
+            // 51 SP CSI reporting on PUCCH Activation (2), 52 TCI State
+            // Indication for UE-specific PDCCH (2).
+            47 | 48 | 51 | 52 | 49 => {
+                let n = if lcid == 49 { 3 } else { 2 };
+                let Some(p) = pdu.get(i..i + n) else { break };
+                out.push(DlSubPdu::Other { lcid, payload: p.to_vec() });
+                i += n;
+            }
+            // eLCID subheaders (33: 1-octet eLCID, 34: 2-octet eLCID) and the
+            // reserved range 35..=46: unknown layout, stop parsing here.
+            33..=46 => {
+                log::debug!("DL MAC subPDU with LCID {lcid} (eLCID / reserved) not supported; rest of the PDU dropped");
+                break;
+            }
             _ => {
                 // Variable-length: an L field (8 or 16 bits) follows.
                 let len = if f == 1 {

@@ -84,6 +84,12 @@ pub fn dci_encode(a: &[u8], rnti: u16, e: usize) -> Vec<u8> {
 pub fn dci_decode(llrs: &[f32], rnti: u16, a_len: usize) -> Option<Vec<u8>> {
     let k = a_len + 24;
     let e = llrs.len();
+    // The polar code needs K ≤ E and K ≤ N_max = 512: a payload that does not
+    // fit the candidate (e.g. a wide-BWP DCI 0_1 on an AL1 candidate) cannot
+    // be there.
+    if k > e.min(512) {
+        return None;
+    }
     let n = code_length(k, e, 9);
     let d_llr = de_rate_match(llrs, n, k);
     let mask = info_mask_rm(n, k, e);

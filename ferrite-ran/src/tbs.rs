@@ -2,34 +2,14 @@
 //! PUSCH §6.1.4.2) and the PDSCH-side helpers around it: the quantised TBS
 //! table (Table 5.1.3.2-1), the RE-per-PRB count and the DM-RS overhead term.
 //!
-//! The MCS tables live in [`crate::mcs`]; [`mcs_params`] here is a thin wrapper
-//! over MCS table 1 kept for the SIB1 / fallback (DCI 1_0) path.
+//! The MCS tables live in [`crate::mcs`].
 
-use crate::mcs::{self, McsTable};
-
-/// MCS index table 1: `(Qm, R×1024)` for `I_MCS` in `0..=28` (Table 5.1.3.1-1).
-pub const MCS_TABLE_1: [(u8, u16); 29] = [
-    (2, 120), (2, 157), (2, 193), (2, 251), (2, 308), (2, 379), (2, 449), (2, 526), (2, 602), (2, 679),
-    (4, 340), (4, 378), (4, 434), (4, 490), (4, 553), (4, 616), (4, 658),
-    (6, 438), (6, 466), (6, 517), (6, 567), (6, 616), (6, 666), (6, 719), (6, 772), (6, 822),
-    (6, 873), (6, 910), (6, 948),
-];
 
 /// Quantized TBS values (Table 5.1.3.2-1) for `N_info ≤ 3824`, ascending.
 #[rustfmt::skip]
 pub const TBS_TABLE: [u32; 93] = [
     24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,208,224,240,256,272,288,304,320,336,352,368,384,408,432,456,480,504,528,552,576,608,640,672,704,736,768,808,848,888,928,984,1032,1064,1128,1160,1192,1224,1256,1288,1320,1352,1416,1480,1544,1608,1672,1736,1800,1864,1928,2024,2088,2152,2216,2280,2408,2472,2536,2600,2664,2728,2792,2856,2976,3104,3240,3368,3496,3624,3752,3824,
 ];
-
-/// Modulation order and code rate for `I_MCS` from MCS table 1 (fallback DCI
-/// 1_0 scheduling always uses table 1). Panics for the reserved rows 29..=31
-/// — those never schedule a new transmission; use
-/// [`mcs::mcs_params`] for a checked lookup.
-pub fn mcs_params(i_mcs: u8) -> (u8, f64) {
-    let (qm, r1024) = mcs::mcs_params(McsTable::Qam64, i_mcs)
-        .unwrap_or_else(|| panic!("I_MCS {i_mcs} is reserved in MCS table 1"));
-    (qm, f64::from(r1024) / 1024.0)
-}
 
 /// DM-RS overhead REs per PRB when **all 12 subcarriers** of each of
 /// `n_dmrs_symbols` DM-RS symbols are reserved: DCI format 1_0 scheduling
@@ -110,13 +90,14 @@ pub fn transport_block_size(n_re_per_prb: usize, n_prb: usize, qm: u8, r: f64, l
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcs::{self, McsTable};
 
     #[test]
     fn mcs5_is_qpsk() {
-        let (qm, r) = mcs_params(5);
+        let (qm, r1024) = mcs::mcs_params(McsTable::Qam64, 5).unwrap();
+        let r = f64::from(r1024) / 1024.0;
         assert_eq!(qm, 2);
         assert!((r - 379.0 / 1024.0).abs() < 1e-9);
-        assert_eq!(MCS_TABLE_1[7], mcs::mcs_params(McsTable::Qam64, 7).unwrap());
     }
 
     #[test]
@@ -132,7 +113,8 @@ mod tests {
     fn sib1_like_tbs_is_tabulated() {
         let n_re_prb = n_re_per_prb(12, ndmrs_per_prb(3), 0);
         assert_eq!(n_re_prb, 108);
-        let (qm, r) = mcs_params(5);
+        let (qm, r1024) = mcs::mcs_params(McsTable::Qam64, 5).unwrap();
+        let r = f64::from(r1024) / 1024.0;
         let t = transport_block_size(n_re_prb, 10, qm, r, 1);
         assert!(TBS_TABLE.contains(&(t as u32)), "TBS {t} not in table");
         assert!((24..=3824).contains(&t));

@@ -199,7 +199,9 @@ pub fn pucch_f0_modulate_slot(
     center_freq_hz: f64,
     fs: f64,
 ) -> Option<Vec<Complex32>> {
-    assert!(matches!(cfg.nof_symbols, 1 | 2), "PUCCH format 0 spans 1 or 2 symbols");
+    if !matches!(cfg.nof_symbols, 1 | 2) {
+        return None; // format 0 spans 1 or 2 symbols
+    }
     let m_cs = pucch_f0_cyclic_shift(ack_bits, sr)?;
     let n = ofdm.fft_size();
     let center = cfg.carrier_rb * 6;

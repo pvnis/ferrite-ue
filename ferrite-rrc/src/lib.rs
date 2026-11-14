@@ -1,12 +1,9 @@
 //! Ferrite RRC (TS 38.331) — the UE RRC entity.
 //!
-//! State machine:
-//! ```text
-//!  Idle ──connect(nas)──▶ Connecting{SetupRequest sent / RA running}
-//!    ▲                        │ RRCSetup (Msg4)
-//!    │ RRCRelease / RLF       ▼
-//!    └──────────────────── Connected { security: Off → Activated, bearers }
-//! ```
+//! The state machine is [`RrcState`] (Idle / Connecting / Connected /
+//! Reestablishing, transitions in its documentation, every change logged by
+//! `set_state`). Timers: T300 (connection establishment) and T301
+//! (re-establishment) run on the slot clock passed to [`RrcUe::tick`].
 //! Procedures: system information (MIB/SIB1 → cell configuration), connection
 //! establishment (§5.3.3), security mode (§5.3.4), UE capability (§5.6.1),
 //! reconfiguration (§5.3.5: bearers, dedicated PHY/MAC), DL/UL information
@@ -21,18 +18,32 @@ pub mod codec;
 pub mod derive;
 pub mod meas;
 
-use ferrite_common::{Numerology, SlotPoint};
+use ferrite_common::SlotPoint;
 pub use ferrite_security::{CipherAlg, IntegrityAlg};
 use ferrite_fapi::config::PhyConfig;
 use ferrite_mac::MacConfig;
 
 /// RRC states (§4.2.1).
+/// RRC state (TS 38.331 §4.2.1 `RRC_IDLE` / `RRC_CONNECTED`, with the two
+/// procedure sub-states the UE spends time in).
+///
+/// ```text
+///  Idle ──connect/connect_for (RRCSetupRequest, T300)──▶ Connecting
+///  Connecting ──RRCSetup──▶ Connected          Connecting ──T300 / RRCReject / RA failure──▶ Idle
+///  Connected ──RRCRelease──▶ Idle              Connected ──RLF with AS security (T301)──▶ Reestablishing
+///  Connected ──RLF without security──▶ Idle    Reestablishing ──RRCReestablishment verified──▶ Connected
+///  Reestablishing ──T301 / RRCReject / RRCSetup fallback / RA failure──▶ Idle
+/// ```
+/// `RRC_INACTIVE` (suspend / resume) is not implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RrcState {
+    /// No RRC connection; SIB1 may be known (`cell()`), paging is monitored.
     Idle,
+    /// RRCSetupRequest sent (random access + Msg3), T300 running.
     Connecting,
+    /// SRB1 established; SRB2/DRBs and AS security follow by reconfiguration.
     Connected,
-    /// RRCReestablishmentRequest sent (T301 running), §5.3.7.
+    /// RRCReestablishmentRequest sent after a radio link failure, T301 running.
     Reestablishing,
 }
 
@@ -148,16 +159,17 @@ pub enum RrcEvent {
 #[derive(Clone, Debug)]
 pub enum MacNotification {
     RaSucceeded { c_rnti: u16 },
+    /// Random access problem (preambleTransMax): a radio link failure while
+    /// connected (TS 38.331 §5.3.10.3), a failed connection attempt otherwise.
     RaFailed,
+    /// SR failure: MAC already started a C-RNTI random access (TS 38.321 §5.4.4).
+    SrFailure,
+    /// timeAlignmentTimer expired: the uplink is not aligned until the next RA.
+    TimeAlignmentExpired,
+    /// RLC reached maxRetxThreshold on an SRB/DRB (TS 38.331 §5.3.10.3).
+    RlcMaxRetx { lcid: u8 },
+    /// The PHY lost synchronisation (or the radio failed).
     RadioLinkFailure,
-}
-
-/// The dedicated-bearer state RRC tracks.
-#[derive(Clone, Debug, Default)]
-struct Bearers {
-    srb1: bool,
-    srb2: bool,
-    drbs: Vec<u8>,
 }
 
 /// RRC configuration knobs.
@@ -173,29 +185,29 @@ pub struct RrcConfig {
     pub t300_ms: u32,
     /// Transmit lead for MAC/PHY (slots).
     pub tx_lead_slots: u16,
-    pub numerology_hint: Option<Numerology>,
 }
 
 impl Default for RrcConfig {
     fn default() -> Self {
-        Self { bands: vec![3, 78], establishment_cause: 3, ue_random_id: None, t300_ms: 1000, tx_lead_slots: 3, numerology_hint: None }
+        Self { bands: vec![3, 78], establishment_cause: 3, ue_random_id: None, t300_ms: 1000, tx_lead_slots: 3 }
     }
 }
 
 /// The UE RRC entity.
 pub struct RrcUe {
     pub cfg: RrcConfig,
-    pub state: RrcState,
+    state: RrcState,
+    /// Slot clock of the last `tick` (the RRC timers run on it).
+    now: Option<SlotPoint>,
     events: Vec<RrcEvent>,
     cell: Option<derive::CellInfo>,
     /// The RRCSetupRequest CCCH SDU (for contention resolution / re-tries).
     setup_request: Option<[u8; 6]>,
     pending_nas: Option<Vec<u8>>,
     /// SecurityModeCommand awaiting verification: (transaction id, PDCP PDU).
-    pending_smc: Option<(u8, u8, u8)>,
+    pending_smc: Option<u8>,
     k_gnb: Option<[u8; 32]>,
     security: Option<AsSecurity>,
-    bearers: Bearers,
     t300_expiry: Option<SlotPoint>,
     /// The 5G-S-TMSI from the NAS registration (for paging and the
     /// RRCSetupRequest identity).
@@ -228,6 +240,7 @@ impl RrcUe {
         Self {
             cfg,
             state: RrcState::Idle,
+            now: None,
             events: Vec::new(),
             cell: None,
             setup_request: None,
@@ -235,7 +248,6 @@ impl RrcUe {
             pending_smc: None,
             k_gnb: None,
             security: None,
-            bearers: Bearers::default(),
             t300_expiry: None,
             s_tmsi: None,
             setup_used_s_tmsi: false,
@@ -298,6 +310,18 @@ impl RrcUe {
         }
     }
 
+    /// Current RRC state (TS 38.331 §4.2.1 plus the two procedure sub-states).
+    pub fn state(&self) -> RrcState {
+        self.state
+    }
+
+    fn set_state(&mut self, to: RrcState) {
+        if self.state != to {
+            log::info!("RRC: {:?} → {:?}", self.state, to);
+            self.state = to;
+        }
+    }
+
     /// The NAS-assigned 5G-S-TMSI (48 bits), or `None` once it is lost.
     pub fn set_s_tmsi(&mut self, s_tmsi: Option<u64>) {
         self.s_tmsi = s_tmsi;
@@ -324,7 +348,7 @@ impl RrcUe {
         let ccch = derive::encode_setup_request(id, self.s_tmsi, cause);
         self.setup_request = Some(ccch);
         self.pending_nas = Some(nas_pdu);
-        self.state = RrcState::Connecting;
+        self.set_state(RrcState::Connecting);
         let t300 = self.cell.as_ref().map_or(self.cfg.t300_ms, |c| c.t300_ms);
         let slots = t300 * now.numerology.slots_per_subframe();
         self.t300_expiry = Some(now.add(slots as u64));
@@ -334,15 +358,19 @@ impl RrcUe {
     pub fn on_mac(&mut self, n: MacNotification) {
         match n {
             MacNotification::RaSucceeded { c_rnti } => self.c_rnti = Some(c_rnti),
-            MacNotification::RaFailed => {
-                if self.state == RrcState::Connecting {
-                    self.state = RrcState::Idle;
+            MacNotification::RaFailed => match self.state {
+                RrcState::Connecting => {
+                    self.set_state(RrcState::Idle);
                     self.events.push(RrcEvent::Failed("random access failed"));
-                } else if self.state == RrcState::Reestablishing {
-                    self.abort_reestablishment("random access failed during re-establishment");
                 }
-            }
-            MacNotification::RadioLinkFailure => {
+                RrcState::Reestablishing => self.abort_reestablishment("random access failed during re-establishment"),
+                // §5.3.10.3: a random access problem while connected is an RLF.
+                RrcState::Connected => self.start_reestablishment(),
+                RrcState::Idle => {}
+            },
+            MacNotification::SrFailure => log::info!("SR failure: MAC runs a C-RNTI random access"),
+            MacNotification::TimeAlignmentExpired => log::warn!("uplink time alignment lost"),
+            MacNotification::RlcMaxRetx { .. } | MacNotification::RadioLinkFailure => {
                 if self.state == RrcState::Connected {
                     self.start_reestablishment();
                 }
@@ -365,7 +393,7 @@ impl RrcUe {
         let (common_phy, common_mac) = (cell.common_phy.clone(), cell.common_mac.clone());
         log::info!("radio link failure: RRC re-establishment (C-RNTI {c_rnti:#x}, PCI {pci}, shortMAC-I {smac:#06x})");
         self.stats.reestablishments += 1;
-        self.state = RrcState::Reestablishing;
+        self.set_state(RrcState::Reestablishing);
         self.pending_reest = None;
         self.t301_expiry = None;
         // §5.3.7.4: back to the default L1/MAC (common) configuration — the
@@ -380,21 +408,23 @@ impl RrcUe {
         self.events.push(RrcEvent::Reestablishing);
         self.events.push(RrcEvent::Reconfigure { phy: Box::new(common_phy), mac: Box::new(common_mac) });
         self.events.push(RrcEvent::StartRa { ccch });
+        // §5.3.7.2: T301 starts with the RRCReestablishmentRequest.
+        if let Some(now) = self.now {
+            self.arm_t301(now);
+        }
     }
 
-    /// T301 must be armed by the stack's slot clock: called when the request is
-    /// sent (the stack does it on `StartRa` while re-establishing).
-    pub fn arm_t301(&mut self, now: SlotPoint) {
+    /// Arm T301 (§5.3.7.2) from the slot clock.
+    fn arm_t301(&mut self, now: SlotPoint) {
         let t301 = self.cell.as_ref().map_or(1000, |c| c.t301_ms);
         self.t301_expiry = Some(now.add(u64::from(t301 * now.numerology.slots_per_subframe())));
     }
 
     fn abort_reestablishment(&mut self, why: &'static str) {
-        self.state = RrcState::Idle;
+        self.set_state(RrcState::Idle);
         self.t301_expiry = None;
         self.pending_reest = None;
         self.security = None;
-        self.bearers = Bearers::default();
         self.meas.clear();
         self.events.push(RrcEvent::Failed(why));
     }
@@ -406,19 +436,19 @@ impl RrcUe {
             self.abort_reestablishment("RRCReestablishment integrity check failed");
             return;
         }
-        self.state = RrcState::Connected;
+        self.set_state(RrcState::Connected);
         self.t301_expiry = None;
-        self.bearers = Bearers { srb1: true, ..Bearers::default() };
         self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_reestablishment_complete(tid) });
         self.events.push(RrcEvent::Reestablished);
         log::info!("RRC re-established");
     }
 
     pub fn tick(&mut self, now: SlotPoint) {
+        self.now = Some(now);
         if let Some(t) = self.t300_expiry {
             if self.state == RrcState::Connecting && now.diff(&t) >= 0 {
                 self.t300_expiry = None;
-                self.state = RrcState::Idle;
+                self.set_state(RrcState::Idle);
                 self.events.push(RrcEvent::Failed("T300 expired"));
             }
         }
@@ -458,9 +488,12 @@ impl RrcUe {
                 log::warn!("RRCSetup instead of RRCReestablishment: the network fell back; reconnecting");
                 self.abort_reestablishment("re-establishment fallback to RRCSetup");
             }
+            Ok(derive::DlCcch::Setup { .. }) if self.state != RrcState::Connecting => {
+                log::warn!("RRCSetup received in state {:?} without a pending request: ignored", self.state);
+            }
             Ok(derive::DlCcch::Setup { tid, phy, mac, bearers }) => {
                 self.t300_expiry = None;
-                self.state = RrcState::Connected;
+                self.set_state(RrcState::Connected);
                 // The dedicated configuration becomes the baseline later
                 // reconfigurations are applied on top of.
                 if let Some(c) = self.cell.as_mut() {
@@ -469,7 +502,6 @@ impl RrcUe {
                 }
                 for b in bearers {
                     if let RbId::Srb(1) = b.rb {
-                        self.bearers.srb1 = true;
                     }
                     if let Some(c) = self.cell.as_mut() {
                         c.rlc_bearers.insert(b.lcid, b.rlc.clone());
@@ -483,7 +515,7 @@ impl RrcUe {
                 self.events.push(RrcEvent::Connected);
             }
             Ok(derive::DlCcch::Reject) => {
-                self.state = RrcState::Idle;
+                self.set_state(RrcState::Idle);
                 self.events.push(RrcEvent::Failed("RRCReject"));
             }
             Err(e) => log::warn!("DL-CCCH decode failed: {e}"),
@@ -525,7 +557,7 @@ impl RrcUe {
                     }
                 };
                 let sec = AsSecurity::derive(&k, ia, ea);
-                self.pending_smc = Some((tid, integrity_alg, ciphering_alg));
+                self.pending_smc = Some(tid);
                 self.security = Some(sec);
                 self.events.push(RrcEvent::VerifySecurity(sec));
             }
@@ -540,15 +572,6 @@ impl RrcUe {
                     log::info!("measConfig applied: {} objects, {} report configs, {} measIds", mc.meas_object_to_add_mod_list.len(), mc.report_config_to_add_mod_list.len(), mc.meas_id_to_add_mod_list.len());
                 }
                 for b in bearers {
-                    match b.rb {
-                        RbId::Srb(2) => self.bearers.srb2 = true,
-                        RbId::Drb(id) => {
-                            if !self.bearers.drbs.contains(&id) {
-                                self.bearers.drbs.push(id);
-                            }
-                        }
-                        _ => {}
-                    }
                     if let Some(c) = self.cell.as_mut() {
                         c.rlc_bearers.insert(b.lcid, b.rlc.clone());
                     }
@@ -597,9 +620,8 @@ impl RrcUe {
                 self.events.push(RrcEvent::VerifyReestablishment(sec));
             }
             derive::DlDcch::Release => {
-                self.state = RrcState::Idle;
+                self.set_state(RrcState::Idle);
                 self.security = None;
-                self.bearers = Bearers::default();
                 self.meas.clear();
                 self.events.push(RrcEvent::Released);
             }
@@ -626,7 +648,7 @@ impl RrcUe {
 
     /// The stack verified (or not) the pending SecurityModeCommand.
     pub fn security_verified(&mut self, ok: bool) {
-        let Some((tid, _, _)) = self.pending_smc.take() else { return };
+        let Some(tid) = self.pending_smc.take() else { return };
         let pdu = if ok { derive::encode_security_mode_complete(tid) } else { derive::encode_security_mode_failure(tid) };
         if !ok {
             self.security = None;

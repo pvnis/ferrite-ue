@@ -43,7 +43,6 @@ pub struct DlMonitor {
     /// Receive-side TS 38.211 §5.4 phase compensation for the DL carrier.
     comp: PhaseCompensation,
     pub geom: CellGeometry,
-    pub cell_id: u16,
     coresets: Vec<Coreset>,
     spaces: Vec<MonitoredSs>,
     type0: Option<Type0Monitoring>,
@@ -112,7 +111,6 @@ impl DlMonitor {
             ofdm,
             comp,
             geom,
-            cell_id,
             coresets,
             spaces,
             type0: type0.map(|t| t.1),
@@ -401,6 +399,8 @@ pub struct WorkerConfig {
 
 struct SoftBuffer {
     tbs: usize,
+    /// NDI of the transmission the buffer belongs to: a toggle means a new TB.
+    ndi: u8,
     acc: Vec<f32>,
     n_rx: u32,
 }
@@ -580,9 +580,11 @@ impl PdschWorker {
         if cb.is_empty() {
             return fail(sinr);
         }
-        let e = self.buffers.entry(key).or_insert_with(|| SoftBuffer { tbs, acc: vec![0.0; cb.len()], n_rx: 0 });
-        if e.tbs != tbs || e.acc.len() != cb.len() || g.rv == 0 && g.ndi != 0xff && e.n_rx > 0 && g.rv == 0 && false {
-            *e = SoftBuffer { tbs, acc: vec![0.0; cb.len()], n_rx: 0 };
+        let e = self.buffers.entry(key).or_insert_with(|| SoftBuffer { tbs, ndi: g.ndi, acc: vec![0.0; cb.len()], n_rx: 0 });
+        // A new transport block on this process (NDI toggled, or a different
+        // size) starts a fresh soft buffer; same NDI = retransmission to combine.
+        if e.tbs != tbs || e.acc.len() != cb.len() || e.ndi != g.ndi {
+            *e = SoftBuffer { tbs, ndi: g.ndi, acc: vec![0.0; cb.len()], n_rx: 0 };
         }
         for (a, c) in e.acc.iter_mut().zip(&cb) {
             *a += c;
@@ -596,11 +598,6 @@ impl PdschWorker {
             }
         }
         fail(sinr)
-    }
-
-    /// Forget the soft buffer of a process (new TB on it).
-    pub fn new_tb(&mut self, kind: RntiKind, harq_id: u8) {
-        self.buffers.remove(&(kind, harq_id));
     }
 }
 

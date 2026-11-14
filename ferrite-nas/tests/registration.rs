@@ -329,10 +329,7 @@ fn full_flow(ea: u8, ia: u8) -> (NasUe, FakeCore) {
     let ev = u.events();
     assert_eq!(
         ev[0],
-        NasEvent::SecurityActivated {
-            k_amf: core.k_amf.unwrap(),
-            ul_nas_count_at_activation: 0
-        }
+        NasEvent::SecurityActivated { ul_nas_count_at_activation: 0 }
     );
     assert_eq!(ev[1], NasEvent::RegistrationComplete { guti: Some(guti()) });
     assert_eq!(

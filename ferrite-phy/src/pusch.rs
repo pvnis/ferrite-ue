@@ -81,6 +81,9 @@ pub fn tp_dmrs_sequence(tp: &TransformPrecoding, n_rb: usize, n_slot: u32, l: us
 /// Whether `n_rb` PRBs can carry a transform-precoded PUSCH (TS 38.211
 /// §6.3.1.4: `2^a·3^b·5^c`).
 pub fn tp_prb_valid(n_rb: usize) -> bool {
+    if n_rb == 0 {
+        return false;
+    }
     let mut n = n_rb;
     for p in [2, 3, 5] {
         while n % p == 0 {

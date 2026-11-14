@@ -66,8 +66,8 @@ pub fn parse_ipv4_icmp_echo_reply(pkt: &[u8]) -> Option<IcmpEchoReply> {
         return None;
     }
     let ihl = (pkt[0] & 0x0f) as usize * 4;
-    if pkt[9] != 1 || pkt.len() < ihl + 8 {
-        return None; // not ICMP
+    if ihl < 20 || pkt[9] != 1 || pkt.len() < ihl + 8 {
+        return None; // not ICMP (or a corrupt header)
     }
     let icmp = &pkt[ihl..];
     if icmp[0] != 0 {
@@ -89,10 +89,13 @@ pub fn ipv4_icmp_echo_reply_for(pkt: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let ihl = (pkt[0] & 0x0f) as usize * 4;
-    if pkt[9] != 1 || pkt.len() < ihl + 8 || pkt[ihl] != 8 {
+    if ihl < 20 || pkt[9] != 1 || pkt.len() < ihl + 8 || pkt[ihl] != 8 {
         return None;
     }
     let total_len = (u16::from_be_bytes([pkt[2], pkt[3]]) as usize).min(pkt.len());
+    if total_len < ihl + 8 {
+        return None; // Total Length lies about the ICMP header
+    }
     let mut icmp = pkt[ihl..total_len].to_vec();
     icmp[0] = 0; // echo reply
     icmp[2] = 0;

@@ -25,7 +25,7 @@ Configs live in `test/` and point at qcore (AMF 127.0.0.1, PLMN 001/01, TAC 7).
 | T1 | `gnb_zmq_tdd_n78_10mhz.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 5 ms: 6D+S(8)+3U | idx 159 (short, B4/C-class) |
 | T2 | `gnb_zmq_tdd_n78_10mhz_dddsu.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 2.5 ms: DDDSU | idx 159 |
 | T3 | `gnb_zmq_tdd_n78_20mhz.yml` | TDD | n78 | 30 kHz | 20 MHz | 30.72 | 5 ms | idx 159 |
-| F1 | `gnb_zmq_fdd_n3_10mhz.yml` | FDD | n3 | 15 kHz | 10 MHz | 11.52 | – | OCUDU default (idx 16, long format 0) |
+| F1 | `gnb_zmq_fdd_n3_10mhz.yml` | FDD | n3 | 15 kHz | 10 MHz | 11.52 | – | OCUDU default (idx 16, long format 0) Full AS security (`cu_cp.security`: NEA2 ciphering + NIA2 integrity on SRBs and DRBs). |
 | F2 | `gnb_zmq_fdd_n3_20mhz.yml` | FDD | n3 | 15 kHz | 20 MHz | 23.04 | – | default |
 | F3 (stretch) | `gnb_zmq_fdd_n3_20mhz_30khz.yml` | FDD | n3 | 30 kHz (SSB 15) | 20 MHz | 30.72 | – | default |
 

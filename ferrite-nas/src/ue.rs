@@ -241,12 +241,10 @@ pub enum NasEvent {
     PduSessionRejected { psi: u8, cause: u8 },
     /// The UE is deregistered (network or UE initiated, or after a reject).
     Deregistered,
-    /// SECURITY MODE COMPLETE was sent: K_AMF and the UL NAS COUNT it was
-    /// protected with (TS 33.501 A.9 K_gNB input).
-    SecurityActivated {
-        k_amf: [u8; 32],
-        ul_nas_count_at_activation: u32,
-    },
+    /// SECURITY MODE COMPLETE was sent with this UL NAS COUNT: the input of
+    /// the K_gNB derivation (TS 33.501 A.9, see `NasUe::k_gnb`). Key material
+    /// itself never travels on the event bus.
+    SecurityActivated { ul_nas_count_at_activation: u32 },
     /// AUTHENTICATION REJECT received, or authentication aborted.
     AuthenticationFailed,
     /// SECURITY MODE REJECT sent with this cause.
@@ -976,10 +974,7 @@ impl NasUe {
         ) {
             self.state = MmState::SecurityMode;
         }
-        self.events.push(NasEvent::SecurityActivated {
-            k_amf,
-            ul_nas_count_at_activation: count,
-        });
+        self.events.push(NasEvent::SecurityActivated { ul_nas_count_at_activation: count });
         Ok(vec![out])
     }
 
@@ -1334,7 +1329,7 @@ impl NasUe {
                 s.timer = None;
                 s.attempts += 1;
                 if s.attempts < self.cfg.max_attempts {
-                    s.timer = Some(now_ms + timers::T3580_MS);
+                    s.timer = Some(now_ms + if s.state == SmState::InactivePending { timers::T3582_MS } else { timers::T3580_MS });
                     retries.push((s.psi, s.pti, s.state));
                 } else {
                     let psi = s.psi;

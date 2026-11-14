@@ -15,8 +15,6 @@ pub struct DlHarqProcess {
     pub ndi: Option<u8>,
     /// The TB with that NDI was delivered to the disassembly entity.
     pub delivered: bool,
-    /// TBS of the TB in flight (bits).
-    pub tbs_bits: u32,
 }
 
 /// Downlink HARQ entity.
@@ -33,21 +31,18 @@ impl DlHarqEntity {
     /// Classify a DL assignment: returns `(is_new_data, already_delivered)`.
     /// A toggled (or first) NDI means a new TB; the same NDI is a retransmission,
     /// which may already have been delivered (then it is ACKed without decode).
-    pub fn on_assignment(&mut self, harq_id: u8, ndi: u8, tbs_bits: u32) -> (bool, bool) {
+    pub fn on_assignment(&mut self, harq_id: u8, ndi: u8) -> (bool, bool) {
         let n = self.processes.len();
         let p = &mut self.processes[harq_id as usize % n];
         match p.ndi {
             Some(prev) if prev == ndi => (false, p.delivered),
             _ => {
-                *p = DlHarqProcess { ndi: Some(ndi), delivered: false, tbs_bits };
+                *p = DlHarqProcess { ndi: Some(ndi), delivered: false };
                 (true, false)
             }
         }
     }
 
-    pub fn tbs_bits(&self, harq_id: u8) -> u32 {
-        self.processes[harq_id as usize % self.processes.len()].tbs_bits
-    }
 
     pub fn is_delivered(&self, harq_id: u8) -> bool {
         self.processes[harq_id as usize % self.processes.len()].delivered
@@ -229,12 +224,12 @@ mod tests {
     #[test]
     fn dl_ndi_classification() {
         let mut h = DlHarqEntity::new(16);
-        assert_eq!(h.on_assignment(3, 1, 100), (true, false));
-        assert_eq!(h.on_assignment(3, 1, 100), (false, false));
+        assert_eq!(h.on_assignment(3, 1), (true, false));
+        assert_eq!(h.on_assignment(3, 1), (false, false));
         h.mark_delivered(3);
-        assert_eq!(h.on_assignment(3, 1, 100), (false, true));
-        assert_eq!(h.on_assignment(3, 0, 200), (true, false));
-        assert_eq!(h.tbs_bits(3), 200);
+        assert_eq!(h.on_assignment(3, 1), (false, true));
+        assert_eq!(h.on_assignment(3, 0), (true, false));
+        assert!(!h.is_delivered(3));
     }
 
     #[test]

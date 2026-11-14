@@ -176,18 +176,28 @@ soft-combining — is the T0 loop + RX-PHY worker in `main.rs`, not a framing he
 ## Workspace layout
 
 ```
-ferrite-common   shared types, errors, IQ sample type
-ferrite-phy      physical layer: numerology, sync (PSS/SSS/SSB), PBCH, PDCCH,
-                 PDSCH/PUSCH, PUCCH, PRACH, CSI, LDPC/polar coding
-ferrite-radio    radio HAL (SampleSource/SampleSink): file, SoapySDR [feature],
-                 ZMQ [feature] backends
-ferrite-ue       the UE: entry point `ferrite-ue` (main.rs = timeline + MAC
-                 scheduler + HARQ). Modules: rrc (RRC + SRB1 PDCP/RLC-AM/MAC),
-                 userplane (DRB PDCP/RLC-UM/MAC + IP/ICMP), sib1 + cellgroup +
-                 uper (UPER decode of SIB1 / masterCellGroup), nas, milenage,
-                 sync, rt (pipeline), stream, tun. Plus milestone/debug
-                 harnesses (ssb-scan, sync-track, sib1, pdsch-*, prach-*, …)
+ferrite-common    shared types: Iq, Numerology / SlotPoint clock, RNTIs, bands
+ferrite-ran       TS 38.21x tables and arithmetic (MCS, TBS, DM-RS positions,
+                  PRACH configuration, RIV, default TDRA, SRS bandwidth)
+ferrite-phy       signal processing: OFDM, sync (PSS/SSS/SSB/PBCH), PDCCH, PDSCH,
+                  PUSCH (CP-OFDM / DFT-s-OFDM), PUCCH F0-F3, PRACH, SRS, CSI,
+                  LDPC / polar coding
+ferrite-radio     IQ transports (SampleSource / SampleSink): ZMQ, file, SDR [feature]
+ferrite-fapi      the PHY <-> MAC interface (FAPI-style messages) and PhyConfig
+ferrite-l1        the slot engine: cell search, PDCCH monitoring, PDSCH + HARQ,
+                  DCI -> grant resolution, UL timing, PRACH/PUSCH/PUCCH/SRS tx
+ferrite-mac       MAC entity: random access, HARQ, BSR/SR, LCP, TA, PHR
+ferrite-rlc       RLC TM / UM / AM entities
+ferrite-pdcp      PDCP entities (SN 12/18, reordering, integrity, ciphering)
+ferrite-security  NIA/NEA algorithms, TS 33.501 key hierarchy, MILENAGE
+ferrite-rrc       RRC entity, measurements, ASN.1 -> PHY/MAC configuration
+ferrite-nas       5GMM / 5GSM, 5G-AKA, NAS security
+ferrite-asn1      UPER codec and TS 38.331 message coders
+ferrite-ue        the binary: config, engine wiring, stack glue, bearers, user plane
 ```
+
+See `docs/ARCHITECTURE.md` for the layer contracts and state machines and
+`docs/TEST_PLAN.md` for the lab matrix (`scripts/lab.sh`).
 
 ## Roadmap
 

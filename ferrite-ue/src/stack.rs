@@ -1,50 +1,23 @@
-//! The L2/L3 stack: MAC ↔ (RLC, PDCP) bearers ↔ RRC ↔ NAS, plus the user
-//! plane (TUN / built-in ping). Implements the PHY's `MacHandler`, so the
-//! whole stack runs synchronously on the PHY timeline thread, one event at a
-//! time — no shared mutable state between layers.
+//! The L2/L3 stack: MAC ↔ bearers (RLC + PDCP, [`crate::bearers`]) ↔ RRC ↔ NAS,
+//! plus the user plane ([`crate::userplane`]). Implements the PHY's
+//! [`MacHandler`], so the whole stack runs synchronously on the PHY timeline
+//! thread, one event at a time — no shared mutable state between layers.
+//!
+//! The stack itself keeps no protocol state machine: RRC ([`RrcUe::state`]),
+//! NAS (`MmState` / `SmState`) and MAC own theirs. What lives here is glue:
+//! the AS-security hand-over between RRC and PDCP (`security`, the two pending
+//! PDUs awaiting MAC-I verification), the connection retry policy, the uplink
+//! queue of an idle UE and the paging identity handed to the PHY.
 
+use crate::bearers::Bearers;
 use crate::config::UeConfig;
-use crate::ip;
+use crate::userplane::{UserPlane, UserPlaneEvent};
 use ferrite_common::{Numerology, SlotPoint};
 use ferrite_fapi::*;
-use ferrite_mac::{MacConfig, MacEntity, MacEvent, UpperLayers};
+use ferrite_mac::{MacConfig, MacEntity, MacEvent, MacStats};
 use ferrite_nas::{NasConfig, NasEvent, NasUe, UeIdentity};
-use ferrite_pdcp::{PdcpConfig, PdcpEntity, SecurityConfig, SnLen};
-use ferrite_rlc::{AmConfig, RlcEntity, RlcEvent, RlcMode, UmConfig};
-use ferrite_rrc::{derive, AsSecurity, BearerSetup, MacNotification, RbId, RlcSetup, RrcConfig, RrcEvent, RrcUe};
-use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
-
-/// One radio bearer: its RLC and PDCP entities.
-pub struct Bearer {
-    pub lcid: u8,
-    pub rb: RbId,
-    pub rlc: RlcEntity,
-    pub pdcp: PdcpEntity,
-    pub pdu_session: Option<u8>,
-}
-
-/// Bearer table + the MAC-facing SAP.
-#[derive(Default)]
-pub struct Bearers {
-    pub by_lcid: BTreeMap<u8, Bearer>,
-}
-
-impl UpperLayers for Bearers {
-    fn dl_sdu(&mut self, lcid: u8, sdu: &[u8], now: SlotPoint) {
-        if let Some(b) = self.by_lcid.get_mut(&lcid) {
-            b.rlc.rx_pdu(sdu, now);
-        } else {
-            log::debug!("DL SDU on unknown LCID {lcid} ({} B)", sdu.len());
-        }
-    }
-    fn ul_pull(&mut self, lcid: u8, max_bytes: usize, now: SlotPoint) -> Option<Vec<u8>> {
-        self.by_lcid.get_mut(&lcid).and_then(|b| b.rlc.pull_pdu(max_bytes, now))
-    }
-    fn ul_buffer_status(&mut self, lcid: u8) -> usize {
-        self.by_lcid.get(&lcid).map_or(0, |b| b.rlc.buffer_status())
-    }
-}
+use ferrite_rrc::{derive, AsSecurity, MacNotification, RbId, RrcConfig, RrcEvent, RrcState, RrcUe};
+use std::collections::VecDeque;
 
 /// Application-level events the stack reports.
 #[derive(Clone, Debug)]
@@ -65,48 +38,43 @@ pub enum StackEvent {
     Reestablished,
 }
 
+/// Connection-establishment retry (an RRC failure is not final; TS 38.331
+/// leaves the retry to the upper layers).
+#[derive(Default)]
+struct ConnectionRetry {
+    started: bool,
+    attempts: u32,
+    retry_at: Option<SlotPoint>,
+}
+
 /// The UE stack.
 pub struct Stack {
-    pub cfg: UeConfig,
-    pub mac: MacEntity,
-    pub bearers: Bearers,
-    pub rrc: RrcUe,
-    pub nas: NasUe,
+    cfg: UeConfig,
+    mac: MacEntity,
+    bearers: Bearers,
+    rrc: RrcUe,
+    nas: NasUe,
+    user_plane: UserPlane,
     numerology: Numerology,
     mib: Option<derive::MibInfo>,
     radio: derive::RadioInfo,
-    /// Pending SecurityModeCommand PDCP PDU (to verify once keys are known).
-    pending_smc_pdu: Option<Vec<u8>>,
+    /// AS security in force (`None` before the SecurityModeCommand is verified
+    /// and after release / re-establishment until the new keys are verified).
     security: Option<AsSecurity>,
-    ue_ip: Option<[u8; 4]>,
-    drb_lcid: Option<u8>,
-    tun: Option<std::fs::File>,
-    ping_seq: u16,
-    ping_sent: Vec<std::time::Instant>,
-    ping_recv: u32,
-    next_ping: std::time::Instant,
-    ping_id: u16,
-    pub events: VecDeque<StackEvent>,
-    start: std::time::Instant,
-    registration_started: bool,
-    last_slot: Option<SlotPoint>,
-    /// `(sent, received)` once the built-in ping probe has finished.
-    pub ping_result: Option<(u32, u32)>,
-    /// Slot at which to retry the connection after an RRC failure.
-    retry_at: Option<SlotPoint>,
-    connect_attempts: u32,
+    /// Raw PDCP PDU of the SecurityModeCommand, verified once the keys are known.
+    pending_smc_pdu: Option<Vec<u8>>,
+    /// Raw PDCP PDU of the RRCReestablishment, verified with the refreshed keys.
+    pending_reest_pdu: Option<Vec<u8>>,
+    conn: ConnectionRetry,
     /// Uplink IP packets waiting for the DRB to come back (idle → service request).
     idle_pending_ul: Vec<Vec<u8>>,
-    /// Paging identity to hand to the PHY on the next slot (`Some(None)` stops).
+    /// Paging identity to hand to the PHY on the next message (`Some(None)` stops).
     pending_paging_cfg: Option<Option<u16>>,
-    /// First SRB1 PDCP PDU received while re-establishing (the
-    /// RRCReestablishment, verified once the new keys are known).
-    pending_reest_pdu: Option<Vec<u8>>,
+    events: VecDeque<StackEvent>,
+    start: std::time::Instant,
+    last_slot: Option<SlotPoint>,
     /// Test aid: an RLF injected once at `--rlf-at-s`.
     rlf_injected: bool,
-    /// Between a re-establishment and the reconfiguration that restores the
-    /// bearers: every RLC entity is renewed, PDCP state is kept.
-    reestablishing_bearers: bool,
 }
 
 impl Stack {
@@ -120,34 +88,23 @@ impl Stack {
         let mac = MacEntity::new(placeholder_mac(numerology, cfg.duplex, cfg.tx_lead));
         Self {
             mac,
-            bearers: Bearers::default(),
+            bearers: Bearers::new(numerology),
             rrc,
             nas: NasUe::new(id, nas_cfg),
+            user_plane: UserPlane::new(&cfg),
             numerology,
             mib,
             radio,
-            pending_smc_pdu: None,
             security: None,
-            ue_ip: None,
-            drb_lcid: None,
-            tun: None,
-            ping_seq: 0,
-            ping_sent: Vec::new(),
-            ping_recv: 0,
-            next_ping: std::time::Instant::now(),
-            ping_id: 0xfe11,
-            events: VecDeque::new(),
-            start: std::time::Instant::now(),
-            registration_started: false,
-            last_slot: None,
-            ping_result: None,
-            retry_at: None,
-            connect_attempts: 0,
+            pending_smc_pdu: None,
+            pending_reest_pdu: None,
+            conn: ConnectionRetry::default(),
             idle_pending_ul: Vec::new(),
             pending_paging_cfg: None,
-            pending_reest_pdu: None,
+            events: VecDeque::new(),
+            start: std::time::Instant::now(),
+            last_slot: None,
             rlf_injected: false,
-            reestablishing_bearers: false,
             cfg,
         }
     }
@@ -163,259 +120,179 @@ impl Stack {
         self.rrc.on_measurement(slot, &m);
     }
 
-    // ------------------------------------------------------------- bearers
-
-    fn setup_bearer(&mut self, b: BearerSetup) {
-        let n = self.numerology;
-        let rlc = match &b.rlc {
-            RlcSetup::Tm => RlcEntity::new(RlcMode::Tm, n),
-            RlcSetup::Um { sn_len, t_reassembly_ms } => RlcEntity::new(RlcMode::Um(UmConfig { sn_len: rlc_sn(*sn_len), t_reassembly_ms: *t_reassembly_ms }), n),
-            RlcSetup::Am { sn_len, t_poll_retransmit_ms, poll_pdu, poll_byte, max_retx, t_reassembly_ms, t_status_prohibit_ms } => RlcEntity::new(
-                RlcMode::Am(AmConfig {
-                    sn_len: rlc_sn(*sn_len),
-                    t_poll_retransmit_ms: *t_poll_retransmit_ms,
-                    poll_pdu: *poll_pdu,
-                    poll_byte: *poll_byte,
-                    max_retx_threshold: *max_retx,
-                    t_reassembly_ms: *t_reassembly_ms,
-                    t_status_prohibit_ms: *t_status_prohibit_ms,
-                }),
-                n,
-            ),
-        };
-        let mut pcfg = match b.rb {
-            RbId::Srb(id) => PdcpConfig::srb(id),
-            RbId::Drb(id) => PdcpConfig::drb(id, if b.pdcp_sn_len == 18 { SnLen::Len18 } else { SnLen::Len12 }),
-        };
-        pcfg.integrity_on_drb = b.pdcp_integrity;
-        pcfg.sdap_header_ul = b.sdap_header_ul;
-        pcfg.sdap_header_dl = b.sdap_header_dl;
-        pcfg.qfi = b.qfi;
-        pcfg.t_reordering_ms = b.t_reordering_ms.or(pcfg.t_reordering_ms);
-        pcfg.discard_timer_ms = b.discard_timer_ms;
-        // An existing bearer keeps its PDCP entity (COUNTs, reordering state)
-        // unless the network asks for a PDCP re-establishment; its RLC entity
-        // is kept unless reestablishRLC (a re-establishment already renewed
-        // every RLC entity).
-        let existing = self.bearers.by_lcid.iter().find(|(_, x)| x.rb == b.rb).map(|(l, _)| *l);
-        let mut pdcp = match existing.and_then(|l| self.bearers.by_lcid.remove(&l)) {
-            Some(old) => {
-                let mut p = old.pdcp;
-                if b.reestablish_pdcp {
-                    p.reestablish();
-                }
-                if !b.reestablish_rlc && !self.reestablishing_bearers {
-                    // Keep the RLC entity too: only the configuration is refreshed.
-                    log::info!("bearer {:?} on LCID {} reconfigured ({:?})", b.rb, b.lcid, b.rlc);
-                    if let RbId::Drb(_) = b.rb {
-                        self.drb_lcid.get_or_insert(b.lcid);
-                    }
-                    self.bearers.by_lcid.insert(b.lcid, Bearer { lcid: b.lcid, rb: b.rb, rlc: old.rlc, pdcp: p, pdu_session: b.pdu_session.or(old.pdu_session) });
-                    return;
-                }
-                p
-            }
-            None => PdcpEntity::new(pcfg, n),
-        };
-        if let (Some(sec), RbId::Drb(_)) = (self.security, b.rb) {
-            let _ = pdcp.configure_security(SecurityConfig {
-                integrity: b.pdcp_integrity.then_some((sec.integrity_alg, sec.k_up_int)),
-                cipher: Some((sec.ciphering_alg, sec.k_up_enc)),
-            });
-        }
-        if let (Some(sec), RbId::Srb(_)) = (self.security, b.rb) {
-            let _ = pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
-        }
-        if let RbId::Drb(_) = b.rb {
-            self.drb_lcid.get_or_insert(b.lcid);
-        }
-        log::info!("bearer {:?} on LCID {} ({:?})", b.rb, b.lcid, b.rlc);
-        self.bearers.by_lcid.insert(b.lcid, Bearer { lcid: b.lcid, rb: b.rb, rlc, pdcp, pdu_session: b.pdu_session });
+    /// Next application event, if any.
+    pub fn take_event(&mut self) -> Option<StackEvent> {
+        self.events.pop_front()
     }
 
-    fn tx_srb(&mut self, srb: u8, pdu: &[u8], now: SlotPoint) {
-        let Some(b) = self.bearers.by_lcid.values_mut().find(|b| b.rb == RbId::Srb(srb)) else {
-            log::warn!("no SRB{srb} bearer for an RRC PDU");
-            return;
-        };
-        let pdcp_pdu = b.pdcp.tx_sdu(pdu, now);
-        b.rlc.tx_sdu(pdcp_pdu);
+    /// `(sent, received)` once the built-in ping probe has finished.
+    pub fn ping_result(&self) -> Option<(u32, u32)> {
+        self.user_plane.ping_result()
     }
+
+    pub fn mac_stats(&self) -> MacStats {
+        self.mac.stats()
+    }
+
+    pub fn rrc_state(&self) -> RrcState {
+        self.rrc.state()
+    }
+
+    pub fn uptime(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+
+    // ---------------------------------------------------------- RRC events
 
     fn apply_rrc_events(&mut self, phy: &mut dyn MacToPhySink, now: SlotPoint) {
         for ev in self.rrc.take_events() {
-            match ev {
-                RrcEvent::CellConfigured { phy: p, mac: m, plmn, tac, cell_id } => {
-                    log::info!("SIB1: PLMN {plmn} TAC {tac} cell {cell_id:#x}");
-                    self.numerology = p.numerology;
-                    phy.send(MacToPhy::Config(p));
-                    self.mac.reconfigure(*m);
-                    self.events.push_back(StackEvent::CellConfigured { plmn, tac });
-                    // Start registration: NAS → RRC connection request.
-                    if !self.registration_started {
-                        self.registration_started = true;
-                        self.start_connection(now);
+            self.on_rrc_event(ev, phy, now);
+        }
+    }
+
+    fn on_rrc_event(&mut self, ev: RrcEvent, phy: &mut dyn MacToPhySink, now: SlotPoint) {
+        match ev {
+            RrcEvent::CellConfigured { phy: p, mac: m, plmn, tac, cell_id } => {
+                log::info!("SIB1: PLMN {plmn} TAC {tac} cell {cell_id:#x}");
+                self.numerology = p.numerology;
+                self.bearers.set_numerology(p.numerology);
+                phy.send(MacToPhy::Config(p));
+                self.mac.reconfigure(*m);
+                self.events.push_back(StackEvent::CellConfigured { plmn, tac });
+                // Start registration: NAS → RRC connection request.
+                if !self.conn.started {
+                    self.conn.started = true;
+                    self.start_connection(now);
+                }
+            }
+            // SRB0 (CCCH) is transparent: MAC carries the SDU in Msg3.
+            RrcEvent::StartRa { ccch } => self.mac.start_ra(ccch),
+            RrcEvent::Reestablishing => self.on_reestablishing(phy),
+            RrcEvent::VerifyReestablishment(sec) => self.on_verify_reestablishment(sec),
+            RrcEvent::Reestablished => {
+                // §5.3.7.5: the refreshed keys apply to every bearer (COUNTs kept);
+                // SRB1 already has them.
+                if let Some(sec) = self.security {
+                    self.bearers.install_security(&sec, |rb| rb != RbId::Srb(1));
+                }
+                self.events.push_back(StackEvent::Reestablished);
+            }
+            RrcEvent::Reconfigure { phy: p, mac: m } => {
+                phy.send(MacToPhy::Config(p));
+                self.mac.reconfigure(*m);
+                if self.rrc.state() == RrcState::Connected {
+                    self.bearers.end_reestablishment();
+                }
+            }
+            RrcEvent::SetupBearer(b) => {
+                self.bearers.setup(b, self.security.as_ref());
+                // Data that queued up while idle goes out as soon as the DRB is back.
+                if self.bearers.drb_lcid().is_some() && !self.idle_pending_ul.is_empty() {
+                    let q = std::mem::take(&mut self.idle_pending_ul);
+                    log::info!("DRB restored: sending {} queued packet(s)", q.len());
+                    for pkt in q {
+                        self.drb_tx(&pkt, now);
                     }
                 }
-                RrcEvent::StartRa { ccch } => {
-                    // SRB0 (CCCH) is transparent: MAC carries the SDU in Msg3.
-                    self.mac.start_ra(ccch);
-                    if self.rrc.state == ferrite_rrc::RrcState::Reestablishing {
-                        self.rrc.arm_t301(now);
-                    }
+            }
+            RrcEvent::ReleaseBearer { lcid } => {
+                self.bearers.remove(lcid);
+            }
+            RrcEvent::VerifySecurity(sec) => self.on_verify_security(sec, phy, now),
+            RrcEvent::TxSrb { srb, pdu } => {
+                if !self.bearers.tx_srb(srb, &pdu, now) {
+                    log::warn!("no SRB{srb} bearer for an RRC PDU");
                 }
-                RrcEvent::Reestablishing => {
-                    // §5.3.7.2/3: MAC reset, SRB1 PDCP/RLC re-established (no
-                    // security until the new keys are verified), other bearers
-                    // suspended until the network reconfigures them.
-                    // §5.3.7.4: MAC reset; RLC re-established for every bearer;
-                    // SRB1 PDCP re-established (no security until the new keys
-                    // are verified); SRB2/DRB PDCP state kept, suspended until
-                    // the network reconfigures them.
-                    log::info!("RRC re-establishment: resetting MAC, suspending DRBs");
-                    self.mac.reset(phy);
-                    self.drb_lcid = None;
-                    self.security = None;
-                    self.pending_reest_pdu = None;
-                    self.reestablishing_bearers = true;
-                    let n = self.numerology;
-                    for b in self.bearers.by_lcid.values_mut() {
-                        let mode = b.rlc.mode().clone();
-                        b.rlc = RlcEntity::new(mode, n);
-                        if b.rb == RbId::Srb(1) {
-                            b.pdcp = PdcpEntity::new(PdcpConfig::srb(1), n);
-                        }
-                    }
-                    self.events.push_back(StackEvent::Reestablishing);
-                }
-                RrcEvent::VerifyReestablishment(sec) => {
-                    let ok = match (self.pending_reest_pdu.as_ref(), self.bearers.by_lcid.values_mut().find(|b| b.rb == RbId::Srb(1))) {
-                        (Some(pdu), Some(b)) => {
-                            let ok = b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some();
-                            if ok {
-                                let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
-                            }
-                            ok
-                        }
-                        _ => false,
-                    };
-                    if ok {
-                        self.security = Some(sec);
-                        log::info!("RRCReestablishment verified; SRB1 keys refreshed");
-                    } else {
-                        log::warn!("RRCReestablishment MAC-I check failed");
-                    }
-                    self.pending_reest_pdu = None;
-                    self.rrc.reestablishment_verified(ok);
-                }
-                RrcEvent::Reestablished => {
-                    // §5.3.7.5: the refreshed keys apply to every bearer (COUNTs kept).
-                    if let Some(sec) = self.security {
-                        for b in self.bearers.by_lcid.values_mut() {
-                            match b.rb {
-                                RbId::Srb(1) => {}
-                                RbId::Srb(_) => {
-                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
-                                }
-                                RbId::Drb(_) => {
-                                    let integ = b.pdcp.config().integrity_on_drb;
-                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: integ.then_some((sec.integrity_alg, sec.k_up_int)), cipher: Some((sec.ciphering_alg, sec.k_up_enc)) });
-                                }
-                            }
-                        }
-                    }
-                    self.events.push_back(StackEvent::Reestablished);
-                }
-                RrcEvent::Reconfigure { phy: p, mac: m } => {
-                    phy.send(MacToPhy::Config(p));
-                    self.mac.reconfigure(*m);
-                    if self.rrc.state == ferrite_rrc::RrcState::Connected {
-                        self.reestablishing_bearers = false;
-                    }
-                }
-                RrcEvent::SetupBearer(b) => {
-                    self.setup_bearer(b);
-                    // Data that queued up while idle goes out as soon as the DRB is back.
-                    if self.drb_lcid.is_some() && !self.idle_pending_ul.is_empty() {
-                        let q = std::mem::take(&mut self.idle_pending_ul);
-                        log::info!("DRB restored: sending {} queued packet(s)", q.len());
-                        for pkt in q {
-                            self.drb_tx(&pkt, now);
-                        }
-                    }
-                }
-                RrcEvent::ReleaseBearer { lcid } => {
-                    self.bearers.by_lcid.remove(&lcid);
-                }
-                RrcEvent::VerifySecurity(sec) => {
-                    // §5.3.4.3: check the SMC MAC-I with K_RRCint, then activate.
-                    let ok = match (self.pending_smc_pdu.as_ref(), self.bearers.by_lcid.values().find(|b| b.rb == RbId::Srb(1))) {
-                        (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
-                        _ => false,
-                    };
-                    if ok {
-                        self.security = Some(sec);
-                        for b in self.bearers.by_lcid.values_mut() {
-                            if matches!(b.rb, RbId::Srb(_)) {
-                                let _ = b.pdcp.configure_security(SecurityConfig {
-                                    integrity: Some((sec.integrity_alg, sec.k_rrc_int)),
-                                    cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)),
-                                });
-                                // The SecurityModeComplete itself is integrity protected but not ciphered.
-                                b.pdcp.set_tx_cipher_enabled(false);
-                            }
-                        }
-                        log::info!("AS security activated ({} / {})", sec.integrity_alg.name(), sec.ciphering_alg.name());
-                    } else {
-                        log::warn!("SecurityModeCommand MAC-I check failed");
-                    }
-                    self.rrc.security_verified(ok);
-                    // The SecurityModeComplete is queued by RRC now; re-enable ciphering after it.
-                    self.apply_rrc_events(phy, now);
-                    for b in self.bearers.by_lcid.values_mut() {
-                        if matches!(b.rb, RbId::Srb(_)) {
-                            b.pdcp.set_tx_cipher_enabled(true);
-                        }
-                    }
-                    self.pending_smc_pdu = None;
-                }
-                RrcEvent::TxSrb { srb, pdu } => self.tx_srb(srb, &pdu, now),
-                RrcEvent::DlNas(nas) => self.on_dl_nas(&nas, now),
-                RrcEvent::Connected => {
-                    log::info!("RRC connected");
-                    self.events.push_back(StackEvent::RrcConnected);
-                }
-                RrcEvent::Released => {
-                    // §5.3.8.3: to idle; the NAS stays registered, the PDU
-                    // session stays active, and the PHY keeps monitoring paging.
-                    log::info!("RRC released (idle)");
-                    self.bearers.by_lcid.clear();
-                    self.drb_lcid = None;
-                    self.security = None;
-                    self.mac.reset(phy);
-                    self.events.push_back(StackEvent::RrcReleased);
-                }
-                RrcEvent::Paged => {
-                    log::info!("paged: requesting service (mt-Access)");
-                    self.service_request(now, 2, 2);
-                }
-                RrcEvent::Failed(why) => {
-                    log::warn!("RRC failure: {why}");
-                    self.events.push_back(StackEvent::Failed(why.to_string()));
-                    // Back off and try again (a failed RA / T300 is not final).
-                    self.bearers.by_lcid.clear();
-                    self.security = None;
-                    self.mac.reset(phy);
-                    let backoff_slots = 200 * self.numerology.slots_per_subframe() as u64 * (1 + self.connect_attempts.min(4) as u64);
-                    self.retry_at = Some(now.add(backoff_slots));
-                }
+            }
+            RrcEvent::DlNas(nas) => self.on_dl_nas(&nas, now),
+            RrcEvent::Connected => {
+                log::info!("RRC connected");
+                self.events.push_back(StackEvent::RrcConnected);
+            }
+            RrcEvent::Released => {
+                // §5.3.8.3: to idle; the NAS stays registered, the PDU
+                // session stays active, and the PHY keeps monitoring paging.
+                log::info!("RRC released (idle)");
+                self.bearers.clear();
+                self.security = None;
+                self.mac.reset(phy);
+                self.events.push_back(StackEvent::RrcReleased);
+            }
+            RrcEvent::Paged => {
+                log::info!("paged: requesting service (mt-Access)");
+                self.service_request(now, 2, 2);
+            }
+            RrcEvent::Failed(why) => {
+                log::warn!("RRC failure: {why}");
+                self.events.push_back(StackEvent::Failed(why.to_string()));
+                // Back off and try again (a failed RA / T300 is not final).
+                self.bearers.clear();
+                self.security = None;
+                self.mac.reset(phy);
+                let backoff_slots = 200 * self.numerology.slots_per_subframe() as u64 * (1 + self.conn.attempts.min(4) as u64);
+                self.conn.retry_at = Some(now.add(backoff_slots));
             }
         }
     }
 
+    /// §5.3.7.4: MAC reset; RLC re-established for every bearer; SRB1 PDCP
+    /// re-established (no security until the new keys are verified); SRB2 /
+    /// DRB PDCP state kept, suspended until the network reconfigures them.
+    fn on_reestablishing(&mut self, phy: &mut dyn MacToPhySink) {
+        log::info!("RRC re-establishment: resetting MAC, suspending DRBs");
+        self.mac.reset(phy);
+        self.security = None;
+        self.pending_reest_pdu = None;
+        self.bearers.begin_reestablishment();
+        self.events.push_back(StackEvent::Reestablishing);
+    }
+
+    /// §5.3.7.5: verify the RRCReestablishment MAC-I with the refreshed K_RRCint,
+    /// then install the new keys on SRB1.
+    fn on_verify_reestablishment(&mut self, sec: AsSecurity) {
+        let ok = match (self.pending_reest_pdu.as_ref(), self.bearers.srb(1)) {
+            (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
+            _ => false,
+        };
+        if ok {
+            self.bearers.install_security(&sec, |rb| rb == RbId::Srb(1));
+            self.security = Some(sec);
+            log::info!("RRCReestablishment verified; SRB1 keys refreshed");
+        } else {
+            log::warn!("RRCReestablishment MAC-I check failed");
+        }
+        self.pending_reest_pdu = None;
+        self.rrc.reestablishment_verified(ok);
+    }
+
+    /// §5.3.4.3: check the SecurityModeCommand MAC-I with K_RRCint, then
+    /// activate integrity and ciphering on the SRBs. The SecurityModeComplete
+    /// itself is integrity protected but not ciphered.
+    fn on_verify_security(&mut self, sec: AsSecurity, phy: &mut dyn MacToPhySink, now: SlotPoint) {
+        let ok = match (self.pending_smc_pdu.as_ref(), self.bearers.srb(1)) {
+            (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
+            _ => false,
+        };
+        if ok {
+            self.security = Some(sec);
+            self.bearers.install_security(&sec, |rb| matches!(rb, RbId::Srb(_)));
+            self.bearers.set_srb_tx_cipher(false);
+            log::info!("AS security activated ({} / {})", sec.integrity_alg.name(), sec.ciphering_alg.name());
+        } else {
+            log::warn!("SecurityModeCommand MAC-I check failed");
+        }
+        self.rrc.security_verified(ok);
+        // RRC queued the SecurityModeComplete: send it before ciphering is on.
+        self.apply_rrc_events(phy, now);
+        self.bearers.set_srb_tx_cipher(true);
+        self.pending_smc_pdu = None;
+    }
+
+    // ------------------------------------------------------- connection / NAS
+
     /// NAS registration request → RRC connection establishment.
     fn start_connection(&mut self, now: SlotPoint) {
-        self.connect_attempts += 1;
+        self.conn.attempts += 1;
         let nas = self.nas.start_registration();
         self.rrc.connect(nas, now);
     }
@@ -424,7 +301,7 @@ impl Stack {
     /// data, 2 = mobile terminated) inside an RRC connection with
     /// `establishmentCause` `cause` (mo-Data = 4, mt-Access = 2).
     fn service_request(&mut self, now: SlotPoint, service_type: u8, cause: u8) {
-        if self.rrc.state != ferrite_rrc::RrcState::Idle {
+        if self.rrc.state() != RrcState::Idle {
             return;
         }
         match self.nas.service_request(service_type) {
@@ -450,6 +327,11 @@ impl Stack {
             }
             Err(e) => log::warn!("NAS: {e}"),
         }
+        self.on_nas_events(now);
+    }
+
+    /// Drain the NAS events (after a DL NAS message and after every NAS tick).
+    fn on_nas_events(&mut self, _now: SlotPoint) {
         for ev in self.nas.events() {
             match ev {
                 NasEvent::SecurityActivated { ul_nas_count_at_activation, .. } => {
@@ -459,184 +341,101 @@ impl Stack {
                 }
                 NasEvent::RegistrationComplete { guti } => {
                     log::info!("registered");
-                    // 5G-S-TMSI = AMF Set ID (10) | AMF Pointer (6) | 5G-TMSI (32):
-                    // the RRC identity for paging and later connection requests;
-                    // the PHY monitors paging for UE_ID = 5G-S-TMSI mod 1024.
-                    let s_tmsi = guti.map(|g| (u64::from(g.amf_set_id & 0x3ff) << 38) | (u64::from(g.amf_pointer & 0x3f) << 32) | u64::from(g.tmsi));
+                    // The 5G-S-TMSI is the RRC identity for paging and later
+                    // connection requests; the PHY monitors paging for
+                    // UE_ID = 5G-S-TMSI mod 1024.
+                    let s_tmsi = guti.map(|g| g.s_tmsi_u64());
                     self.rrc.set_s_tmsi(s_tmsi);
                     self.pending_paging_cfg = Some(s_tmsi.map(|v| (v & 0x3ff) as u16));
                     self.events.push_back(StackEvent::Registered);
                 }
-                NasEvent::PduSessionUp { ipv4, psi, .. } => {
-                    if let Some(ip) = ipv4 {
-                        log::info!("PDU session {psi} up: {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-                        self.next_ping = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                        self.ue_ip = Some(ip);
-                        self.events.push_back(StackEvent::PduSessionUp { ip });
-                        self.open_tun(ip);
-                    }
+                NasEvent::PduSessionUp { ipv4: Some(ip), psi, .. } => {
+                    log::info!("PDU session {psi} up: {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                    self.user_plane.session_up(ip);
+                    self.events.push_back(StackEvent::PduSessionUp { ip });
                 }
+                NasEvent::PduSessionUp { psi, .. } => log::warn!("PDU session {psi} without an IPv4 address: no user plane (IPv6 not supported yet)"),
+                NasEvent::PduSessionDown { psi } => {
+                    log::info!("PDU session {psi} released");
+                    self.user_plane.session_down();
+                    self.idle_pending_ul.clear();
+                }
+                NasEvent::PduSessionRejected { psi, cause } => self.events.push_back(StackEvent::Failed(format!("PDU session {psi} rejected: 5GSM cause {cause}"))),
                 NasEvent::RegistrationRejected(c) => self.events.push_back(StackEvent::Failed(format!("registration rejected: cause {c}"))),
+                NasEvent::RegistrationTimeout => self.events.push_back(StackEvent::Failed("registration abandoned (T3510)".into())),
                 NasEvent::AuthenticationFailed => self.events.push_back(StackEvent::Failed("authentication failed".into())),
+                NasEvent::Deregistered => {
+                    log::info!("deregistered");
+                    self.user_plane.session_down();
+                    self.idle_pending_ul.clear();
+                    self.rrc.set_s_tmsi(None);
+                    self.pending_paging_cfg = Some(None);
+                }
                 other => log::info!("NAS event: {other:?}"),
             }
-        }
-        let _ = now;
-    }
-
-    fn open_tun(&mut self, ip: [u8; 4]) {
-        let Some(name) = self.cfg.tun.clone() else { return };
-        match crate::tun::open_tun(&name) {
-            Ok(f) => {
-                let _ = crate::tun::configure_tun(&name, ip, 1400, self.cfg.netns.as_deref());
-                self.tun = Some(f);
-                log::info!("TUN {name} up");
-            }
-            Err(e) => log::warn!("TUN {name}: {e}"),
         }
     }
 
     // ---------------------------------------------------------- user plane
 
     fn drb_tx(&mut self, ip_packet: &[u8], now: SlotPoint) {
-        let Some(lcid) = self.drb_lcid else {
+        let Some(lcid) = self.bearers.drb_lcid() else {
             // No DRB: idle (or re-connecting). Queue the packet and ask for service.
-            if self.ue_ip.is_some() && self.rrc.state != ferrite_rrc::RrcState::Connected {
+            if self.user_plane.ip().is_some() && self.rrc.state() != RrcState::Connected {
                 if self.idle_pending_ul.len() < 32 {
                     self.idle_pending_ul.push(ip_packet.to_vec());
                 }
-                if self.rrc.state == ferrite_rrc::RrcState::Idle {
+                if self.rrc.state() == RrcState::Idle {
                     log::info!("uplink data while idle: requesting service (mo-Data)");
                     self.service_request(now, 1, 4);
                 }
             }
             return;
         };
-        if let Some(b) = self.bearers.by_lcid.get_mut(&lcid) {
-            let pdu = b.pdcp.tx_sdu(ip_packet, now);
-            b.rlc.tx_sdu(pdu);
-        }
+        self.bearers.tx_drb(lcid, ip_packet, now);
     }
 
     fn user_plane_slot(&mut self, now: SlotPoint) {
-        // TUN → DRB.
-        if let Some(t) = self.tun.as_mut() {
-            let mut buf = [0u8; 2048];
-            let mut pkts = Vec::new();
-            for _ in 0..16 {
-                match t.read(&mut buf) {
-                    Ok(n) if n > 0 => pkts.push(buf[..n].to_vec()),
-                    _ => break,
-                }
-            }
-            for p in pkts {
-                self.drb_tx(&p, now);
-            }
+        for p in self.user_plane.poll_uplink() {
+            self.drb_tx(&p, now);
         }
-        // Built-in ping.
-        if self.tun.is_none() && self.cfg.ping_count > 0 {
-            if let Some(ip) = self.ue_ip {
-                let total = self.cfg.ping_count * self.cfg.ping_rounds.max(1);
-                if (self.ping_seq as u32) < total && std::time::Instant::now() >= self.next_ping {
-                    let pkt = ip::ipv4_icmp_echo_request(ip, self.cfg.ping_target, self.ping_id, self.ping_seq, b"ferrite-ping");
-                    self.ping_sent.push(std::time::Instant::now());
-                    self.ping_seq += 1;
-                    let round_done = self.ping_seq as u32 % self.cfg.ping_count == 0 && (self.ping_seq as u32) < total;
-                    let wait = if round_done && self.cfg.ping_round_gap_s > 0 {
-                        log::info!("ping round {} of {} done; next round in {} s", self.ping_seq as u32 / self.cfg.ping_count, self.cfg.ping_rounds, self.cfg.ping_round_gap_s);
-                        std::time::Duration::from_secs(self.cfg.ping_round_gap_s)
-                    } else {
-                        std::time::Duration::from_millis(self.cfg.ping_interval_ms)
-                    };
-                    self.next_ping = std::time::Instant::now() + wait;
-                    self.drb_tx(&pkt, now);
-                }
-                if self.ping_seq as u32 >= total && self.ping_sent.last().map_or(false, |t| t.elapsed() > std::time::Duration::from_secs(2)) {
-                    if !self.ping_done_reported() {
-                        self.ping_result = Some((self.ping_seq as u32, self.ping_recv));
-                        self.events.push_back(StackEvent::PingDone { sent: self.ping_seq as u32, received: self.ping_recv });
-                    }
-                }
-            }
+        self.drain_user_plane_events();
+    }
+
+    fn drain_user_plane_events(&mut self) {
+        for ev in self.user_plane.take_events() {
+            self.events.push_back(match ev {
+                UserPlaneEvent::PingReply { seq, rtt_ms } => StackEvent::PingReply { seq, rtt_ms },
+                UserPlaneEvent::PingDone { sent, received } => StackEvent::PingDone { sent, received },
+            });
         }
     }
 
-    fn ping_done_reported(&mut self) -> bool {
-        if self.ping_id == 0 {
-            return true;
-        }
-        self.ping_id = 0;
-        false
-    }
-
-    /// Deliver reassembled RLC SDUs up: SRB → PDCP → RRC, DRB → PDCP → TUN/ping.
+    /// Deliver reassembled RLC SDUs up: SRB → PDCP → RRC, DRB → PDCP → user plane.
     fn deliver_rx(&mut self, now: SlotPoint) {
-        let lcids: Vec<u8> = self.bearers.by_lcid.keys().copied().collect();
-        for lcid in lcids {
-            let mut rrc_pdus = Vec::new();
-            let mut ip_pkts = Vec::new();
-            {
-                let b = self.bearers.by_lcid.get_mut(&lcid).unwrap();
-                while let Some(sdu) = b.rlc.pop_rx_sdu() {
-                    // Keep the raw PDU of a would-be SecurityModeCommand for MAC-I verification.
-                    let raw = sdu.clone();
-                    match b.pdcp.rx_pdu(&sdu, now) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log::warn!("PDCP rx on LCID {lcid}: {e}");
-                            continue;
-                        }
-                    }
-                    while let Some(s) = b.pdcp.pop_rx_sdu() {
-                        match b.rb {
-                            RbId::Srb(id) => rrc_pdus.push((id, s, raw.clone())),
-                            RbId::Drb(_) => ip_pkts.push(s),
-                        }
-                    }
-                }
-                for ev in b.rlc.events() {
-                    let RlcEvent::MaxRetxReached { .. } = ev;
-                    log::warn!("RLC max retransmissions on LCID {lcid}");
-                    self.rrc.on_mac(MacNotification::RadioLinkFailure);
+        let d = self.bearers.deliver_rx(now);
+        for lcid in d.rlc_max_retx {
+            log::warn!("RLC max retransmissions on LCID {lcid}");
+            self.rrc.on_mac(MacNotification::RlcMaxRetx { lcid });
+        }
+        for (srb, pdu, raw) in d.srb {
+            // A SecurityModeCommand needs the raw PDCP PDU for verification;
+            // so does the RRCReestablishment (with the refreshed keys).
+            if self.security.is_none() {
+                if self.rrc.state() == RrcState::Reestablishing && srb == 1 {
+                    self.pending_reest_pdu = Some(raw);
+                } else {
+                    self.pending_smc_pdu = Some(raw);
                 }
             }
-            for (srb, pdu, raw) in rrc_pdus {
-                // A SecurityModeCommand needs the raw PDCP PDU for verification;
-                // so does the RRCReestablishment (with the refreshed keys).
-                if !self.security.is_some() {
-                    if self.rrc.state == ferrite_rrc::RrcState::Reestablishing && srb == 1 {
-                        self.pending_reest_pdu = Some(raw);
-                    } else {
-                        self.pending_smc_pdu = Some(raw);
-                    }
-                }
-                self.rrc.on_dl_dcch(srb, &pdu);
-            }
-            for pkt in ip_pkts {
-                self.on_dl_ip(&pkt, now);
+            self.rrc.on_dl_dcch(srb, &pdu);
+        }
+        for pkt in d.ip {
+            if let Some(reply) = self.user_plane.on_downlink(&pkt) {
+                self.drb_tx(&reply, now);
             }
         }
-    }
-
-    fn on_dl_ip(&mut self, pkt: &[u8], now: SlotPoint) {
-        if let Some(t) = self.tun.as_mut() {
-            let _ = t.write(pkt);
-            return;
-        }
-        // Without a TUN the built-in stack still answers pings to the UE.
-        if let Some(reply) = ip::ipv4_icmp_echo_reply_for(pkt) {
-            log::info!("echo request from {}.{}.{}.{}: replying", pkt[12], pkt[13], pkt[14], pkt[15]);
-            self.drb_tx(&reply, now);
-            return;
-        }
-        if let Some(r) = ip::parse_ipv4_icmp_echo_reply(pkt) {
-            if let Some(t0) = self.ping_sent.get(r.seq as usize) {
-                let rtt = t0.elapsed().as_secs_f64() * 1e3;
-                self.ping_recv += 1;
-                log::info!("ping reply seq={} rtt={rtt:.1} ms", r.seq);
-                self.events.push_back(StackEvent::PingReply { seq: r.seq, rtt_ms: rtt });
-            }
-        }
+        self.drain_user_plane_events();
     }
 
     fn on_mac_events(&mut self, phy: &mut dyn MacToPhySink, now: SlotPoint) {
@@ -654,14 +453,12 @@ impl Stack {
                     self.rrc.on_mac(MacNotification::RaSucceeded { c_rnti: c_rnti.0 });
                 }
                 MacEvent::RaFailed => self.rrc.on_mac(MacNotification::RaFailed),
+                MacEvent::SrFailure => self.rrc.on_mac(MacNotification::SrFailure),
+                MacEvent::TimeAlignmentExpired => self.rrc.on_mac(MacNotification::TimeAlignmentExpired),
                 MacEvent::RadioLinkFailure => self.rrc.on_mac(MacNotification::RadioLinkFailure),
             }
         }
         self.apply_rrc_events(phy, now);
-    }
-
-    pub fn uptime(&self) -> std::time::Duration {
-        self.start.elapsed()
     }
 }
 
@@ -680,7 +477,7 @@ impl MacHandler for Stack {
         if let Some(ue_id) = self.pending_paging_cfg.take() {
             phy.send(MacToPhy::Paging { ue_id });
         }
-        if is_slot && self.cfg.rlf_at_s > 0 && !self.rlf_injected && self.rrc.state == ferrite_rrc::RrcState::Connected && self.start.elapsed().as_secs() >= self.cfg.rlf_at_s {
+        if is_slot && self.cfg.rlf_at_s > 0 && !self.rlf_injected && self.rrc.state() == RrcState::Connected && self.start.elapsed().as_secs() >= self.cfg.rlf_at_s {
             self.rlf_injected = true;
             log::warn!("test: injecting a radio link failure");
             self.rrc.on_mac(MacNotification::RadioLinkFailure);
@@ -690,15 +487,12 @@ impl MacHandler for Stack {
         self.deliver_rx(now);
         self.apply_rrc_events(phy, now);
         if is_slot {
-            for b in self.bearers.by_lcid.values_mut() {
-                b.rlc.tick(now);
-                b.pdcp.tick(now);
-            }
+            self.bearers.tick(now);
             self.rrc.tick(now);
-            if let Some(t) = self.retry_at {
-                if now.diff(&t) >= 0 && self.rrc.state == ferrite_rrc::RrcState::Idle && self.rrc.cell().is_some() {
-                    self.retry_at = None;
-                    log::info!("retrying the connection (attempt {})", self.connect_attempts + 1);
+            if let Some(t) = self.conn.retry_at {
+                if now.diff(&t) >= 0 && self.rrc.state() == RrcState::Idle && self.rrc.cell().is_some() {
+                    self.conn.retry_at = None;
+                    log::info!("retrying the connection (attempt {})", self.conn.attempts + 1);
                     self.start_connection(now);
                 }
             }
@@ -706,20 +500,14 @@ impl MacHandler for Stack {
             for ul in self.nas.tick(ms) {
                 self.rrc.send_nas(&ul);
             }
+            self.on_nas_events(now);
             self.user_plane_slot(now);
             self.apply_rrc_events(phy, now);
         }
     }
 }
 
-fn rlc_sn(bits: u8) -> ferrite_rlc::SnLen {
-    match bits {
-        6 => ferrite_rlc::SnLen::Bits6,
-        18 => ferrite_rlc::SnLen::Bits18,
-        _ => ferrite_rlc::SnLen::Bits12,
-    }
-}
-
+/// MAC configuration before SIB1 is known (nothing to do yet).
 fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, tx_lead: u16) -> MacConfig {
     use ferrite_fapi::config::PrachConfig;
     MacConfig::initial(

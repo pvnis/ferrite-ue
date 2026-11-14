@@ -11,21 +11,6 @@
 
 use num_complex::Complex32;
 
-/// Re-export the queue primitives so the rest of the UE depends on `ferrite_ue::rt`
-/// rather than `crossbeam_channel` directly (one place to swap the transport later).
-pub use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
-
-/// One downlink slot handed from the timeline thread (T0) to the RX-PHY stage (T1):
-/// the raw baseband samples plus the timing context T1 needs to demodulate and to
-/// compute uplink injection positions. `slot_start_ul` is the absolute uplink sample
-/// index of this slot's start (the phase reference for the frequency shift and the
-/// base for every UL position derived from it).
-pub struct SlotRx {
-    pub slot_idx: u32,
-    pub slot_start_ul: i64,
-    pub samples: Vec<Complex32>,
-}
-
 /// An uplink waveform tagged with the absolute uplink sample position where it must be
 /// injected. Produced by the TX-build stage, consumed by the timeline thread.
 pub struct ReadyWaveform {

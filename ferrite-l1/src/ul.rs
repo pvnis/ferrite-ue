@@ -103,9 +103,7 @@ impl UlBuilder {
         // TS 38.211 §4.3.1: the PRACH is transmitted with N_TA = 0 (the
         // uplink guard and N_TA_offset still apply); the RAR's TA command is
         // what sets N_TA for the connection.
-        let mut prach_clock = clock.clone();
-        prach_clock.n_ta_tc = 0;
-        let start = prach_clock.ul_index(subframe_slot) + tc_to_samples(occ.start_tc as i64, self.geom.fs);
+        let start = clock.with_n_ta(0).ul_index(subframe_slot) + tc_to_samples(occ.start_tc as i64, self.geom.fs);
         Ok(Waveform { start, samples: w, tag: "prach" })
     }
 
@@ -123,7 +121,7 @@ impl UlBuilder {
             return Err(format!("transform-precoded PUSCH over {} PRBs (not 2^a·3^b·5^c)", grant.n_prb));
         }
         let alloc = PuschAlloc {
-            rb_start: self.cfg.ul_bwp.start_crb as usize - self.geom.ul.offset_crb as usize + grant.prb_start as usize,
+            rb_start: (self.cfg.ul_bwp.start_crb as usize + grant.prb_start as usize).checked_sub(self.geom.ul.offset_crb as usize).ok_or("UL BWP starts below the UL carrier")?,
             n_rb: grant.n_prb as usize,
             sym_start: grant.time.start_symbol as usize,
             n_sym: grant.time.n_symbols as usize,
@@ -150,7 +148,7 @@ impl UlBuilder {
             let sp = seg_params(tbs_bits, r);
             pusch::csi1_pusch_res(&alloc.dmrs_symbols, (alloc.sym_start, alloc.n_sym), alloc.n_rb, uci.csi1.len(), beta_csi, alpha, sp.c * sp.k)
         };
-        e -= alloc.qm * csi_res.len();
+        e = e.checked_sub(alloc.qm * csi_res.len()).ok_or("CSI part 1 does not fit the PUSCH")?;
         let ulsch = dlsch_encode(&bits, e, r, alloc.qm, grant.rv);
         let slot = grant.pusch_slot;
         let mut w = pusch::pusch_modulate_slot_uci_csi(
@@ -184,11 +182,14 @@ impl UlBuilder {
                 let rb_off = row.3.unwrap_or(n_bwp / 4);
                 let n_cs = row.4.len() as u16;
                 let r = r_pucch as u16;
+                // TS 38.213 §9.2.1: the two hops mirror around the BWP; a BWP too
+                // narrow for the row has no such resource.
+                let mirror = |x: u16| n_bwp.checked_sub(1 + rb_off + x);
                 let (prb1, prb2, cs) = if r / 8 == 0 {
-                    (rb_off + r / n_cs, n_bwp - 1 - rb_off - r / n_cs, row.4[(r % n_cs) as usize])
+                    (rb_off + r / n_cs, mirror(r / n_cs)?, row.4[(r % n_cs) as usize])
                 } else {
                     let r8 = r - 8;
-                    (n_bwp - 1 - rb_off - r8 / n_cs, rb_off + r8 / n_cs, row.4[(r8 % n_cs) as usize])
+                    (mirror(r8 / n_cs)?, rb_off + r8 / n_cs, row.4[(r8 % n_cs) as usize])
                 };
                 let format = if row.0 == 0 { PucchFormat::F0 { initial_cyclic_shift: cs } } else { PucchFormat::F1 { initial_cyclic_shift: cs, time_domain_occ: 0 } };
                 Some(PucchResource { id: 255, starting_prb: prb1, second_hop_prb: Some(prb2), format, start_symbol: row.1, n_symbols: row.2 })
@@ -200,7 +201,7 @@ impl UlBuilder {
     pub fn pucch(&self, clock: &SampleClock, slot: SlotPoint, resource: PucchResourceRef, uci: &UciPayload, crnti: u16) -> Result<Waveform, String> {
         let res = self.pucch_resource(resource).ok_or("unknown PUCCH resource")?;
         let n_id = self.cfg.pucch.hopping_id.unwrap_or(self.cell_id);
-        let bwp0 = self.cfg.ul_bwp.start_crb as usize - self.geom.ul.offset_crb as usize;
+        let bwp0 = (self.cfg.ul_bwp.start_crb as usize).checked_sub(self.geom.ul.offset_crb as usize).ok_or("UL BWP starts below the UL carrier")?;
         let carrier_rb = self.geom.ul.n_rb as usize;
         let mu = self.geom.numerology.mu;
         let sr = uci.sr == Some(true);

@@ -125,7 +125,7 @@ fn main() {
     let _ = reporter.join();
     match result {
         Ok(stats) => {
-            log::info!("engine stopped: {stats:?}; MAC {:?}", stack.mac.stats());
+            log::info!("engine stopped: {stats:?}; MAC {:?}", stack.mac_stats());
             std::process::exit(if ping_succeeded(&stack) { 0 } else { 1 });
         }
         Err(e) => {
@@ -136,7 +136,7 @@ fn main() {
 }
 
 fn ping_succeeded(stack: &Stack) -> bool {
-    stack.ping_result.is_some_and(|(_, received)| received > 0)
+    stack.ping_result().is_some_and(|(_, received)| received > 0)
 }
 
 /// Wraps the stack to print application events and stop the engine when done.
@@ -158,7 +158,7 @@ impl ferrite_fapi::MacHandler for Reporting<'_> {
             self.stack.on_measurement(pci, slot, rsrp, rsrq, sinr);
         }
         self.stack.handle(msg, phy);
-        while let Some(ev) = self.stack.events.pop_front() {
+        while let Some(ev) = self.stack.take_event() {
             match &ev {
                 StackEvent::CellConfigured { plmn, tac } => log::info!("★ cell configured: PLMN {plmn} TAC {tac}"),
                 StackEvent::RrcConnected => log::info!("★ RRC connected"),

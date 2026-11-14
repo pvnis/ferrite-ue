@@ -29,9 +29,6 @@ impl Lcp {
         self.buckets.iter().map(|b| &b.cfg)
     }
 
-    pub fn config(&self, lcid: u8) -> Option<&LogicalChannelConfig> {
-        self.buckets.iter().map(|b| &b.cfg).find(|c| c.lcid == lcid)
-    }
 
     /// Advance the token buckets to `now` (§5.4.3.1: Bj += PBR × elapsed, capped).
     pub fn tick(&mut self, now: SlotPoint) {

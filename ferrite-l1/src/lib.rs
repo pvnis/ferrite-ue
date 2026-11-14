@@ -12,12 +12,12 @@
 pub use ferrite_fapi as fapi;
 pub use ferrite_fapi::config;
 
-pub mod cell;
-pub mod dl;
+pub(crate) mod cell;
+pub(crate) mod dl;
 pub mod engine;
-pub mod resolve;
-pub mod ul;
+pub(crate) mod resolve;
+pub(crate) mod ul;
 pub mod radio;
-pub mod rt;
+pub(crate) mod rt;
 pub mod stream;
-pub mod timing;
+pub(crate) mod timing;

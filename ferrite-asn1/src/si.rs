@@ -106,6 +106,9 @@ pub enum Sib {
     /// A SIB carried as an extension alternative: the SIB number (10..) and
     /// its UPER octets.
     Raw { sib_type: u8, octets: Vec<u8> },
+    /// A SIB type without a decoder (SIB4–SIB9) ended the decoding of the
+    /// message; the SIBs before it are valid.
+    Unsupported { sib_type: u8 },
 }
 
 impl Sib {
@@ -114,7 +117,7 @@ impl Sib {
         match self {
             Sib::Sib2(_) => 2,
             Sib::Sib3(_) => 3,
-            Sib::Raw { sib_type, .. } => *sib_type,
+            Sib::Raw { sib_type, .. } | Sib::Unsupported { sib_type } => *sib_type,
         }
     }
 }
@@ -148,21 +151,31 @@ impl SystemInformation {
             return r.unsupported("criticalExtensionsFuture-r16");
         }
         let [_late, _non_crit] = r.opt_bits::<2>()?;
-        let sibs = r.seq_of(1, 32, |r| {
+        // sib-TypeAndInfo SEQUENCE (SIZE (1..32)) OF CHOICE. SIB4–SIB9 have
+        // no decoder yet and, being non-extension alternatives, cannot be
+        // skipped: the SIBs decoded before one are kept and the rest of the
+        // message is dropped (`Sib::Unsupported` marks the cut).
+        let n = r.uint(1, 32)? as usize;
+        let mut sibs = Vec::with_capacity(n);
+        for _ in 0..n {
             let ext = r.bit()?;
             if ext {
                 // Extension alternative: open type (length-prefixed octets).
                 let idx = r.normally_small()? as usize;
                 let octets = r.octet_string()?;
                 let sib_type = EXT_SIB_TYPES.get(idx).copied().unwrap_or(0);
-                return Ok(Sib::Raw { sib_type, octets });
+                sibs.push(Sib::Raw { sib_type, octets });
+                continue;
             }
             match r.enu(8)? {
-                0 => Ok(Sib::Sib2(Sib2::decode(r).ctx("sib2")?)),
-                1 => Ok(Sib::Sib3(Sib3::decode(r).ctx("sib3")?)),
-                n => r.unsupported(["sib4", "sib5", "sib6", "sib7", "sib8", "sib9"][n as usize - 2]),
+                0 => sibs.push(Sib::Sib2(Sib2::decode(r).ctx("sib2")?)),
+                1 => sibs.push(Sib::Sib3(Sib3::decode(r).ctx("sib3")?)),
+                n => {
+                    sibs.push(Sib::Unsupported { sib_type: n as u8 + 2 });
+                    break;
+                }
             }
-        })?;
+        }
         Ok(Self { sibs })
     }
 }

@@ -1,12 +1,18 @@
 //! The slot engine: cell search → synchronisation → the per-slot loop that
 //! drives the PHY ↔ MAC interface.
 //!
-//! State machine:
+//! State machine (one `Synced` cell at a time):
 //! ```text
-//!  CellSearch ──SSB + MIB──▶ Synced(Type0 CSS only) ──CONFIG.request──▶ Synced(configured)
-//!      ▲                           │ sync lost                               │
-//!      └───────────────────────────┴───────────────────────────────────────◀┘
+//!  CellSearch ──SSB + MIB──▶ Synced { phase: AwaitSib1 } ──CONFIG.request (SIB1)──▶ Synced { phase: Common }
+//!      ▲                           │                                                   │ CONFIG.request (dedicated)
+//!      │ RLM: PSS missed for        │                                                   ▼
+//!      │ RLM_MAX_MISSED_SSB periods ◀───────────────────────────────────────── Synced { phase: Dedicated }
 //! ```
+//! Orthogonal to the phase: `tx_enabled` (START/STOP.request from MAC gates
+//! every UL_TTI request) and the uplink timing (`SampleClock`, N_TA from MAC).
+//! After a sync loss the engine re-searches and rebuilds `Synced` from the
+//! MIB alone: MAC receives `ErrorIndication::SyncLost` and RRC must send a new
+//! CONFIG.request and SetRntis once the cell is found again.
 //! Threads: DL drain (inside `BufferedStream`), UL serve ([`crate::radio`]),
 //! the timeline (this loop), one PDSCH worker, one TX builder.
 
@@ -100,8 +106,48 @@ struct Synced {
     half_frame: u8,
     cfo_hz: f64,
     ssb_period_ms: u16,
-    configured: bool,
+    /// Where the cell is in its life: SIB1 pending, common configuration
+    /// (CSS only) or dedicated (RRC connected).
+    phase: CellPhase,
 }
+
+/// Configuration phase of the synchronised cell (set by CONFIG.request).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellPhase {
+    /// Only the MIB-derived CORESET#0 / Type0 CSS: waiting for SIB1.
+    AwaitSib1,
+    /// SIB1 applied: common search spaces, no dedicated resources.
+    Common,
+    /// Dedicated RRC configuration applied (UE-specific search spaces / PUCCH).
+    Dedicated,
+}
+
+impl CellPhase {
+    /// A CONFIG.request has been applied (SIB1 known).
+    fn configured(self) -> bool {
+        self != CellPhase::AwaitSib1
+    }
+}
+
+/// Radio link monitoring on the serving SSB (TS 38.213 §5, simplified: the
+/// PSS must be found at the expected position).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RlmState {
+    InSync,
+    OutOfSync { misses: u32 },
+}
+
+impl RlmState {
+    fn miss(self) -> Self {
+        match self {
+            RlmState::InSync => RlmState::OutOfSync { misses: 1 },
+            RlmState::OutOfSync { misses } => RlmState::OutOfSync { misses: misses + 1 },
+        }
+    }
+}
+
+/// Consecutive SSB periods without the PSS before synchronisation is declared lost.
+const RLM_MAX_MISSED_SSB: u32 = 8;
 
 pub struct Engine<'a> {
     pub params: EngineParams,
@@ -120,6 +166,8 @@ pub struct Engine<'a> {
     pending_prach: Vec<(SlotPoint, PrachOccasion, u8)>,
     /// PDSCH jobs handed to the worker whose RX_Data has not come back yet.
     outstanding_jobs: usize,
+    /// START/STOP.request: whether UL_TTI requests are transmitted.
+    tx_enabled: bool,
     prach_sweep: Option<Vec<i64>>,
     prach_sweep_idx: usize,
     pusch_sweep: Option<Vec<i64>>,
@@ -271,6 +319,7 @@ pub fn run(
         pending_dl: BTreeMap::new(),
         pending_prach: Vec::new(),
         outstanding_jobs: 0,
+            tx_enabled: false,
         prach_sweep: std::env::var("FERRITE_PRACH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
         prach_sweep_idx: 0,
         pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
@@ -384,7 +433,7 @@ impl<'a> Engine<'a> {
                 half_frame: acq.half_frame,
                 cfo_hz: acq.cfo_hz,
                 ssb_period_ms: 20,
-                configured: false,
+                phase: CellPhase::AwaitSib1,
             };
             log::info!(
                 "synced PCI {} SFN {} i_ssb {} hf {} cfo {:.0} Hz ssb df {:.0} Hz mu {} CORESET0 idx {} ({} RB, {} sym) ss0 {}",
@@ -397,7 +446,7 @@ impl<'a> Engine<'a> {
     }
 
     fn configure_threads(&mut self, s: &Synced) {
-        let wc = worker_config(&s.geom, &s.cfg, s.cell_id, &s.coreset0, s.configured);
+        let wc = worker_config(&s.geom, &s.cfg, s.cell_id, &s.coreset0, s.phase.configured());
         let _ = self.wk_cmd.send(WorkerCmd::Reconfigure(Box::new(wc)));
         let _ = self.tx_cmd.send(TxCmd::Reconfigure(Box::new((s.geom.clone(), s.cfg.clone(), s.cell_id))));
     }
@@ -472,7 +521,7 @@ impl<'a> Engine<'a> {
         let searcher = CellSearcher::new(ofdm_ssb.fft_size(), s.ssb_case.mu(), ssb::l_max_fr1(self.params.dl_center_hz));
         let ssb_first_symbol = s.ssb_case.candidate_symbols(self.params.dl_center_hz).get(s.i_ssb as usize).copied().unwrap_or(2);
         let ssb_off_in_frame = ssb::ssb_sample_offset_in_frame(ssb_first_symbol, s.half_frame, s.ssb_case.mu(), &ofdm_ssb) as i64;
-        let mut missed_ssb = 0u32;
+        let mut rlm = RlmState::InSync;
         let mut outbox: Vec<MacToPhy> = Vec::new();
         loop {
             if self.stopped() {
@@ -504,16 +553,18 @@ impl<'a> Engine<'a> {
                             self.stats.timing_slews += 1;
                         }
                         s.cfo_hz = 0.9 * s.cfo_hz + 0.1 * (s.cfo_hz + r.cfo_hz);
-                        missed_ssb = 0;
+                        rlm = RlmState::InSync;
                         if let Some(m) = ferrite_phy::sync::measure::ssb_measure(&ofdm_ssb, &shifted, r.timing_index, s.ssb_case.mu(), r.n_id_1, r.n_id_2) {
                             let _ = self.events.try_send(EngineEvent::Measurement { pci: s.cell_id, slot, rsrp_dbfs: m.rsrp_db(), rsrq_db: m.rsrq_db(), sinr_db: m.sinr_db() });
                         }
                     }
                     _ => {
-                        missed_ssb += 1;
-                        if missed_ssb >= 8 {
-                            log::warn!("SSB not found for {missed_ssb} periods: sync lost");
-                            return Ok(true);
+                        rlm = rlm.miss();
+                        if let RlmState::OutOfSync { misses } = rlm {
+                            if misses >= RLM_MAX_MISSED_SSB {
+                                log::warn!("SSB not found for {misses} periods: sync lost");
+                                return Ok(true);
+                            }
                         }
                     }
                 }
@@ -581,7 +632,7 @@ impl<'a> Engine<'a> {
 
             // --- PDSCH jobs for this slot (+ CSI measurement occasions).
             let grants = self.pending_dl.remove(&slot.index()).unwrap_or_default();
-            let has_csi = s.configured && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot));
+            let has_csi = s.phase.configured() && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot));
             if grants.is_empty() && has_csi {
                 let _ = self.wk_cmd.try_send(WorkerCmd::Measure { slot, samples: arc_samples.clone() });
             }
@@ -646,11 +697,20 @@ impl<'a> Engine<'a> {
                     s.monitor = DlMonitor::new(s.geom.clone(), &cfg, s.cell_id, t0.map(|t| (s.coreset0, t)), dedicated);
                     s.monitor.rntis = rntis;
                     s.cfg = cfg;
-                    s.configured = true;
+                    s.phase = if dedicated { CellPhase::Dedicated } else { CellPhase::Common };
                     self.configure_threads(s);
                     log::info!("PHY configured: dl carrier {:?} ul carrier {:?} coresets {} search spaces {} dedicated {}", s.cfg.dl_carrier, s.cfg.ul_carrier, s.cfg.coresets.len(), s.cfg.search_spaces.len(), dedicated);
                 }
-                MacToPhy::Start | MacToPhy::Stop => {}
+                MacToPhy::Start => {
+                    if !self.tx_enabled {
+                        log::info!("START.request: uplink transmissions enabled");
+                    }
+                    self.tx_enabled = true;
+                }
+                MacToPhy::Stop => {
+                    log::info!("STOP.request: uplink transmissions disabled");
+                    self.tx_enabled = false;
+                }
                 MacToPhy::SetRntis { c_rnti, tc_rnti, ra_rnti } => {
                     s.monitor.rntis.c = c_rnti;
                     s.monitor.rntis.tc = tc_rnti;
@@ -663,6 +723,10 @@ impl<'a> Engine<'a> {
                     s.monitor.rntis.p_ue_id = ue_id;
                 }
                 MacToPhy::UlTti(req) => {
+                    if !self.tx_enabled {
+                        self.mac.handle(PhyToMac::Error(ErrorIndication::TxDropped { slot: req.slot, pdu: "ul_tti (STOP)" }), &mut followups);
+                        continue;
+                    }
                     let lead = req.slot.diff(&now);
                     if lead < 1 {
                         self.stats.late_ul += 1;

@@ -16,18 +16,21 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bsr;
+pub(crate) mod bsr;
 pub mod entity;
-pub mod harq;
-pub mod lcp;
+pub(crate) mod harq;
+pub(crate) mod lcp;
 pub mod pdu;
 pub mod phr;
-pub mod ra;
-pub mod rar;
-pub mod sr;
-pub mod ta;
+pub(crate) mod ra;
+pub(crate) mod rar;
+pub(crate) mod sr;
+pub(crate) mod ta;
 
-pub use entity::{MacEntity, MacEvent, UpperLayers};
+pub use entity::{MacEntity, MacEvent, MacStats, UpperLayers};
+pub use ra::RaState;
+pub use sr::SrState;
+pub use ta::TaState;
 pub use ferrite_fapi as fapi;
 
 use ferrite_common::Numerology;
