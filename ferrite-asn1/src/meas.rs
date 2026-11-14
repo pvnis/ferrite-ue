@@ -753,7 +753,7 @@ impl MeasResults {
         if !self.neigh_cells_nr.is_empty() {
             w.bit(false); // measResultNeighCells extension
             w.bit(false); // measResultListNR
-            w.seq_of(&self.neigh_cells_nr, 1, 8, |w, m| encode_result_nr(w, m));
+            w.seq_of(&self.neigh_cells_nr, 1, 8, encode_result_nr);
         }
     }
 

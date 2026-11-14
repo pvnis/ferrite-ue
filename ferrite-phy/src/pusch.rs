@@ -86,7 +86,7 @@ pub fn tp_prb_valid(n_rb: usize) -> bool {
     }
     let mut n = n_rb;
     for p in [2, 3, 5] {
-        while n % p == 0 {
+        while n.is_multiple_of(p) {
             n /= p;
         }
     }

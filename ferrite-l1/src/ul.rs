@@ -20,7 +20,9 @@ use ferrite_phy::Ofdm;
 
 /// TS 38.213 Table 9.2.1-1: common PUCCH resources before dedicated config —
 /// (format, first symbol, nof symbols, PRB offset (None = ⌊N_BWP/4⌋), initial CS set).
-const PUCCH_COMMON: [(u8, u8, u8, Option<u16>, &[u8]); 16] = [
+/// One row of Table 9.2.1-1.
+type PucchCommonRow = (u8, u8, u8, Option<u16>, &'static [u8]);
+const PUCCH_COMMON: [PucchCommonRow; 16] = [
     (0, 12, 2, Some(0), &[0, 3]),
     (0, 12, 2, Some(0), &[0, 4, 8]),
     (0, 12, 2, Some(3), &[0, 4, 8]),

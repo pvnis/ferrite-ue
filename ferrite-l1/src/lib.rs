@@ -6,6 +6,10 @@
 //!
 //! The engine itself (sync, PDCCH monitoring, PDSCH/HARQ receive, UL placement)
 //! lives in the remaining modules.
+// Signal-processing loops index several arrays (grids, offsets, masks) by the same
+// symbol / subcarrier index; the iterator rewrite clippy suggests reads worse.
+#![allow(clippy::needless_range_loop)]
+
 
 // The PHY↔MAC interface and the PHY configuration are `ferrite-fapi`;
 // re-exported under their historical paths.

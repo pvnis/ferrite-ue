@@ -61,7 +61,7 @@ pub fn info_mask_rm(n: usize, k: usize, e: usize) -> Vec<bool> {
 /// `n1 = ⌈log2 E⌉ − 1` if `E ≤ (9/8)·2^(⌈log2 E⌉−1)` and `K/E < 9/16`, else
 /// `⌈log2 E⌉`, and `n2 = ⌈log2(8K)⌉` (from `R_min = 1/8`).
 pub fn code_length(k: usize, e: usize, n_max: u32) -> usize {
-    let ceil_log2 = |v: usize| (usize::BITS - (v - 1).leading_zeros()) as u32;
+    let ceil_log2 = |v: usize| usize::BITS - (v - 1).leading_zeros();
     let l = ceil_log2(e);
     let n1 = if 8 * e <= 9 * (1usize << (l - 1)) && 16 * k < 9 * e {
         l - 1

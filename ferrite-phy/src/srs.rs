@@ -93,7 +93,7 @@ const PHI_24: [[i8; 24]; 30] = [
 fn prime_below(n: usize) -> usize {
     let mut p = n - 1;
     while p > 2 {
-        if (2..).take_while(|d| d * d <= p).all(|d| p % d != 0) {
+        if (2..).take_while(|d| d * d <= p).all(|d| !p.is_multiple_of(d)) {
             return p;
         }
         p -= 1;

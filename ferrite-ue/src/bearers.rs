@@ -159,7 +159,7 @@ impl Bearers {
     pub fn begin_reestablishment(&mut self) {
         let n = self.numerology;
         for b in self.by_lcid.values_mut() {
-            let mode = b.rlc.mode().clone();
+            let mode = b.rlc.mode();
             b.rlc = RlcEntity::new(mode, n);
             if b.rb == RbId::Srb(1) {
                 b.pdcp = PdcpEntity::new(PdcpConfig::srb(1), n);

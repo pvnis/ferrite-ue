@@ -58,7 +58,7 @@ impl ZmqSource {
         self.socket.send(&[0u8][..], 0).map_err(zerr)?;
         let msg = self.socket.recv_msg(0).map_err(zerr)?;
         let bytes: &[u8] = &msg;
-        if bytes.len() % 8 != 0 {
+        if !bytes.len().is_multiple_of(8) {
             return Err(Error::Radio(format!(
                 "zmq: block of {} bytes is not a whole number of complex<f32>",
                 bytes.len()

@@ -5,6 +5,10 @@
 //! and TS 38.214 (data procedures). Pure functions over slices: no threads, no
 //! I/O, no cell state beyond the arguments. Generalised over numerology
 //! (`mu` 0/1 for FR1) and sample rate.
+// Signal-processing loops index several arrays (grids, offsets, masks) by the same
+// symbol / subcarrier index; the iterator rewrite clippy suggests reads worse.
+#![allow(clippy::needless_range_loop)]
+
 
 pub mod coding;
 // Spec tables shared with the upper layers live in `ferrite_ran`; re-exported

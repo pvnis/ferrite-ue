@@ -216,7 +216,7 @@ pub fn push_ccch(out: &mut Vec<u8>, ccch: &[u8]) {
 /// A decoded TB is a plausible DL-SCH MAC PDU (every subheader understood and
 /// in-bounds). Used only for diagnostics.
 pub fn plausible_dl_pdu(tb: &[u8]) -> bool {
-    !parse_dl_pdu(tb).is_empty() || tb.first().map_or(false, |&b| b & 0x3f == LCID_PADDING)
+    !parse_dl_pdu(tb).is_empty() || tb.first().is_some_and(|&b| b & 0x3f == LCID_PADDING)
 }
 
 #[cfg(test)]

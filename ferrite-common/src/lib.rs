@@ -100,7 +100,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// odd length.
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return None;
     }
     (0..clean.len() / 2).map(|i| u8::from_str_radix(&clean[2 * i..2 * i + 2], 16).ok()).collect()

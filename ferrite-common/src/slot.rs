@@ -185,7 +185,7 @@ pub mod ta {
 
     /// Updated `N_TA` from a 6-bit TA command MAC CE: `N_TA + (T_A − 31) · 16 · 64 / 2^mu`.
     pub fn n_ta_apply_ce(n_ta: i64, ta_cmd: u8, numerology: Numerology) -> i64 {
-        n_ta + (((ta_cmd as i64) - 31) * 16 * KAPPA as i64 >> numerology.mu)
+        n_ta + ((((ta_cmd as i64) - 31) * 16 * KAPPA as i64) >> numerology.mu)
     }
 
     /// Convert a count of `T_c` units into samples at `fs` (rounded).

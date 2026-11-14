@@ -501,7 +501,7 @@ mod tests {
         let slot = pucch_f3_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1, 0], 7, 1, 0.0, 15.36e6).unwrap();
         let n = 512;
         let center = 24 * 6;
-        let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
+        let bin = |sc: usize| (sc as i32 - center).rem_euclid(n as i32) as usize;
         let mut off = 0;
         for l in 0..14 {
             let cp = ofdm.cp_len(14 + l, 1);

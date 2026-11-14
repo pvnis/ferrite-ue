@@ -193,7 +193,7 @@ impl MeasProcedure {
                     // measurement exists, then every reportInterval, reportAmount times.
                     if report.report_amount.is_some_and(|n| st.reports_sent >= u32::from(n)) {
                         // Done.
-                    } else if st.next_report.map_or(true, |t| now.diff(&t) >= 0) {
+                    } else if st.next_report.is_none_or(|t| now.diff(&t) >= 0) {
                         send = true;
                         st.next_report = Some(now.add(u64::from(report.report_interval_ms) * spm));
                     }
@@ -241,7 +241,7 @@ impl MeasProcedure {
                         } else {
                             st.leaving_since = None;
                         }
-                        if st.triggered && !report.report_amount.is_some_and(|n| st.reports_sent >= u32::from(n)) && st.next_report.is_some_and(|t| now.diff(&t) >= 0) {
+                        if st.triggered && report.report_amount.is_none_or(|n| st.reports_sent < u32::from(n)) && st.next_report.is_some_and(|t| now.diff(&t) >= 0) {
                             send = true;
                             st.next_report = Some(now.add(u64::from(report.report_interval_ms) * spm));
                         }

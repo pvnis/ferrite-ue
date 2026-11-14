@@ -649,6 +649,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn demapper_roundtrip_all_orders() {
         let mut seed = 0x1234_5678_9ABCu64;
         let mut bit = || {

@@ -44,11 +44,11 @@ impl BufferedStream {
                     Err(e) => {
                         errs += 1;
                         total_errs += 1;
-                        if errs == 1 || errs % 500 == 0 {
+                        if errs == 1 || errs.is_multiple_of(500) {
                             log::warn!("radio read error ({errs} consecutive): {e}");
                         }
                         std::thread::sleep(std::time::Duration::from_micros(200));
-                        if overrun_dbg && total_errs % 50 == 0 {
+                        if overrun_dbg && total_errs.is_multiple_of(50) {
                             eprintln!("[sdr-rx] {total_errs} overruns / {total_ok} samples read");
                         }
                         if errs > 2000 {

@@ -32,7 +32,7 @@ fn is_puncturing(k: usize, e: usize) -> bool {
 /// Sub-block interleave `d` (length `N`, a multiple of 32): `y(n) = d(J(n))`.
 pub fn subblock_interleave(d: &[u8]) -> Vec<u8> {
     let n = d.len();
-    assert!(n % 32 == 0);
+    assert!(n.is_multiple_of(32));
     (0..n).map(|i| d[j_index(i, n)]).collect()
 }
 
@@ -81,7 +81,7 @@ pub fn rate_match(y: &[u8], e_len: usize, k: usize) -> Vec<u8> {
 /// punctured positions get LLR 0; shortened positions get a huge positive LLR
 /// (the bit is known to be 0).
 pub fn de_rate_match(llr_e: &[f32], big_n: usize, k: usize) -> Vec<f32> {
-    assert!(big_n % 32 == 0);
+    assert!(big_n.is_multiple_of(32));
     let e = llr_e.len();
     let mut y = vec![0f32; big_n];
     if e >= big_n {

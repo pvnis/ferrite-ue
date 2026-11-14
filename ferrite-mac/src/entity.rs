@@ -257,7 +257,7 @@ impl MacEntity {
             // §5.4.4: the SR configuration of the logical channel that triggered
             // the BSR (a channel without schedulingRequestID may use any).
             for s in &mut self.sr {
-                if with_data.iter().any(|&(_, id)| id.map_or(true, |i| i == s.sr_id)) {
+                if with_data.iter().any(|&(_, id)| id.is_none_or(|i| i == s.sr_id)) {
                     s.trigger();
                 }
             }
@@ -407,10 +407,9 @@ impl MacEntity {
         let set_for = |bits: usize| -> Option<&(u8, Vec<u8>, u16)> {
             self.cfg.pucch.resource_sets.iter().find(|(id, _, max)| (*id == 0 && bits <= 2) || (*id != 0 && bits > 2 && bits <= *max as usize))
         };
-        if n_ack == 0 && csi.is_some() && !sr_positive {
+        if let (0, false, Some(&(_, r))) = (n_ack, sr_positive, csi.as_ref()) {
             // CSI only → the report's resource (F2).
             self.pending_cqi = None;
-            let r = csi.unwrap().1;
             return (PucchResourceRef::Dedicated(r), UciPayload { harq_ack: Vec::new(), sr: sr_res.map(|_| false), csi1: csi_bits });
         }
         if n_ack == 0 && sr_positive {
@@ -560,7 +559,7 @@ impl MacEntity {
             }
         }
         let any_left = remaining.values().any(|&b| b > 0);
-        if (bsr_due || (any_left && left >= 2)) && left >= 2 {
+        if left >= 2 && (bsr_due || any_left) {
             let entries: Vec<(u8, usize)> = remaining.iter().map(|(&l, &b)| (l, b)).collect();
             if entries.len() <= 1 {
                 let (lcg, b) = entries.first().copied().unwrap_or((0, 0));
@@ -679,9 +678,6 @@ impl MacEntity {
 fn cqi_bits(cqi: u8) -> Vec<u8> {
     vec![(cqi >> 3) & 1, (cqi >> 2) & 1, (cqi >> 1) & 1, cqi & 1]
 }
-
-/// Resource allocation type 1 RIV decode (TS 38.214 §6.1.2.2.2).
-
 
 impl MacEntity {
     /// Handle one PHY → MAC message with access to the RLC bearers.

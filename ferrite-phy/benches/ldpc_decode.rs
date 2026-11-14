@@ -69,7 +69,7 @@ fn main() {
     );
 
     let lifting = all_lifting_sizes();
-    let mut rng = Rng(0xF3441_1CDC_0001);
+    let mut rng = Rng(0x000F_3441_1CDC_0001);
 
     for bg in [BaseGraph::Bg2, BaseGraph::Bg1] {
         for &zc in &lifting {

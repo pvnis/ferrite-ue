@@ -46,7 +46,7 @@ pub fn select_lifting(base_info_cols: usize, k: usize) -> Option<(usize, u16)> {
     let mut best: Option<(usize, u16)> = None;
     for (ils, set) in LIFTING_SETS.iter().enumerate() {
         for &z in *set {
-            if z >= need && best.map_or(true, |(_, b)| z < b) {
+            if z >= need && best.is_none_or(|(_, b)| z < b) {
                 best = Some((ils, z));
             }
         }
@@ -670,7 +670,7 @@ mod tests {
         let span = g.n() - 2 * g.zc();
         for _ in 0..20 {
             let i = 2 * g.zc() + ((rng.uniform() * span as f32) as usize).min(span - 1);
-            llr[i] = -0.5 * llr[i];
+            llr[i] *= -0.5;
         }
         let (dec, ok) = g.decode(&llr, 40, 0.75);
         assert!(ok, "decoder failed to correct bit flips");

@@ -202,6 +202,7 @@ impl DciResolver {
     }
 
     /// Resolve a DCI 1_0 payload decoded in a CSS (`in_css`) or USS.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_1_0(&self, bits: &[u8], rnti: Rnti, kind: RntiKind, in_css: bool, slot: SlotPoint, cce0: usize, n_cce: usize) -> Option<Dci> {
         let size = if in_css { &self.sizes.f1_0_css } else { self.sizes.f1_0_uss.as_ref().unwrap_or(&self.sizes.f1_0_css) };
         let rk = match kind {
@@ -217,13 +218,12 @@ impl DciResolver {
         }
         // P-RNTI: only a DCI whose short-messages indicator says "scheduling
         // information for paging present" (bit 0) schedules a PDSCH.
-        if matches!(kind, RntiKind::P) && d.short_messages_indicator.map_or(true, |v| v & 1 == 0) {
+        if matches!(kind, RntiKind::P) && d.short_messages_indicator.is_none_or(|v| v & 1 == 0) {
             return Some(Dci::Other { format: "1_0 paging (short message only)" });
         }
         // Frequency domain: in a CSS with CORESET0 the RIV spans CORESET0 and is
         // numbered from its lowest RB; else the active BWP.
-        let (rb_start, n_rb) = if in_css && self.coreset0_rb.is_some() {
-            let n = self.coreset0_rb.unwrap();
+        let (rb_start, n_rb) = if let Some(n) = self.coreset0_rb.filter(|_| in_css) {
             let (s, l) = dci::riv_decode(d.fdra, n)?;
             // A dedicated BWP starting above CORESET#0 cannot carry this PDSCH.
             ((self.coreset0_first_crb + s).checked_sub(self.dl_bwp_start)?, l)

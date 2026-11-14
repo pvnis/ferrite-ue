@@ -39,7 +39,7 @@ impl BsrProcedure {
         let best = prios_with_data.iter().copied().min();
         if let Some(b) = best {
             // New data on a channel with higher priority than all that had data.
-            if self.last_prio_with_data.map_or(true, |p| b < p) {
+            if self.last_prio_with_data.is_none_or(|p| b < p) {
                 self.trigger_regular();
             }
         }

@@ -96,7 +96,7 @@ fn attach_flow() {
     assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { ra_rnti: Some(r), .. } if *r == occ.ra_rnti)));
     // RAR: TA 5, grant fdra RIV for 3 RBs at RB 4 (N=24), time 0, mcs 0, tpc 7, tc-rnti 0x4601.
     let riv = (3 - 1) * 24 + 4; // RIV = N(L-1)+S for L-1 <= N/2
-    let g: u32 = ((riv as u32) << 12) | (0 << 8) | (0 << 4) | (7 << 1);
+    let g: u32 = ((riv as u32) << 12) | (7 << 1);
     let ta: u16 = 5;
     let mut rar = vec![0x40 | preamble];
     rar.push(((ta >> 5) & 0x7f) as u8);

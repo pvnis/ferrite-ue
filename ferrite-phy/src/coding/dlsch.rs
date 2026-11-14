@@ -203,9 +203,9 @@ fn encode_cb(cb_bits: &[u8], p: &SegParams, e_r: usize, rv: u8, qm: usize) -> Ve
     // codeword positions [K', K) → d-index [K'-2Zc, K-2Zc).
     let mut filler = vec![false; ncb];
     let fstart = cb_bits.len().saturating_sub(2 * p.zc);
-    for f in fstart..(p.k - 2 * p.zc) {
-        filler[f] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     rate_match_cb(d, &filler, e_r, k0, qm)
 }
@@ -271,9 +271,9 @@ pub fn dlsch_decode_single(
 
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
 
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
@@ -311,9 +311,9 @@ pub fn dlsch_decode_single_dbg(
     let ncb = g.n() - 2 * p.zc;
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];
@@ -343,9 +343,9 @@ pub fn dlsch_decode_single_bits(
     let ncb = g.n() - 2 * p.zc;
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];
@@ -377,9 +377,9 @@ fn dlsch_decode_multi(
     let k_prime = p.k_info + p.l; // K' = info + CB-CRC (24)
     let mut filler = vec![false; ncb];
     let fstart = k_prime.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let mut b = Vec::with_capacity(p.c * p.k_info);
     let mut all_conv = true;
@@ -424,9 +424,9 @@ pub fn dlsch_cb_llr(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> Vec<f32
     let ncb = g.n() - 2 * p.zc;
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     // Scatter E soft bits into the buffer, skipping (untransmitted) filler positions;
     // do NOT pin filler to 1e6 (that happens once, at decode, after summing).
@@ -462,9 +462,9 @@ pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<
     let mut cbf = cb.to_vec();
     cbf.resize(ncb, 0.0);
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for pos in fstart..(p.k - 2 * p.zc) {
-        cbf[pos] = 1e6; // filler = known 0
-    }
+    for v in cbf.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *v = 1e6; // filler = known 0
+        }
     let mut full = vec![0f32; g.n()];
     full[2 * p.zc..].copy_from_slice(&cbf);
     let (info, converged) = g.decode(&full, max_iter, 0.75);
@@ -483,9 +483,9 @@ pub fn de_rate_match_full(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> (
     let b_len = tbs + tb_crc(tbs).width();
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
-    for fi in fstart..(p.k - 2 * p.zc) {
-        filler[fi] = true;
-    }
+    for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
+        *f = true;
+        }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];

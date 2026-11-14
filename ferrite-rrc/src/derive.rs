@@ -64,12 +64,14 @@ pub struct CellInfo {
 }
 
 /// Decoded DL-CCCH messages the state machine acts on.
+#[allow(clippy::large_enum_variant)] // one message at a time; boxing the configs buys nothing
 pub enum DlCcch {
     Setup { tid: u8, phy: PhyConfig, mac: MacConfig, bearers: Vec<BearerSetup> },
     Reject,
 }
 
 /// Decoded DL-DCCH messages the state machine acts on.
+#[allow(clippy::large_enum_variant)]
 pub enum DlDcch {
     SecurityModeCommand { tid: u8, integrity_alg: u8, ciphering_alg: u8 },
     UeCapabilityEnquiry { tid: u8 },

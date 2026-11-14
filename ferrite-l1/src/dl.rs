@@ -128,10 +128,10 @@ impl DlMonitor {
     fn type0_monitored(&self, slot: SlotPoint) -> bool {
         let Some(t) = &self.type0 else { return false };
         let parity_ok = match t.sfn_parity {
-            SfnParity::Even => slot.sfn % 2 == 0,
+            SfnParity::Even => slot.sfn.is_multiple_of(2),
             SfnParity::Odd => slot.sfn % 2 == 1,
         };
-        parity_ok && (slot.slot as u32 == t.n0 as u32 || slot.slot as u32 == (t.n0 as u32 + 1) % slot.slots_per_frame())
+        parity_ok && (slot.slot as u32 == t.n0 || slot.slot as u32 == (t.n0 + 1) % slot.slots_per_frame())
     }
 
     /// Search all monitored search spaces of `slot` in `samples` (one slot,
@@ -141,12 +141,12 @@ impl DlMonitor {
         let sis = slot.slot_in_subframe() as usize;
         let mut sym_grids: HashMap<usize, Vec<Iq>> = HashMap::new();
         let demod = |l: usize, grids: &mut HashMap<usize, Vec<Iq>>| {
-            if !grids.contains_key(&l) {
+            if let std::collections::hash_map::Entry::Vacant(e) = grids.entry(l) {
                 let off = self.ofdm.slot_symbol_offsets(self.geom.numerology.mu, sis)[l];
                 let cp = self.ofdm.cp_len(sis * 14 + l, self.geom.numerology.mu);
                 let mut g = self.ofdm.demodulate_symbol(&samples[off..], cp);
                 self.comp.apply(&mut g, sis * 14 + l);
-                grids.insert(l, g);
+                e.insert(g);
             }
         };
         let sc_to_bin = self.geom.dl_sc_to_bin();

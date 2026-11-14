@@ -571,7 +571,7 @@ impl<'a> Engine<'a> {
             }
             // --- CFO correction for the data path.
             let data: &[Iq] = if self.params.cfo_correction && s.cfo_hz.abs() > 1.0 {
-                if shifter.as_ref().map_or(true, |f| (f.shift_hz() + s.cfo_hz).abs() > 0.5) {
+                if shifter.as_ref().is_none_or(|f| (f.shift_hz() + s.cfo_hz).abs() > 0.5) {
                     shifter = Some(FreqShifter::new(-s.cfo_hz, fs, sps as usize));
                 }
                 shifter.as_ref().unwrap().shift_into(&samples, start as usize, &mut shifted);

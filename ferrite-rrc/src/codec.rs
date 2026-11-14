@@ -466,12 +466,12 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
     // --- NZP CSI-RS (rate matching + TRS/CQI measurement) and periodic reports.
     if let Some(m) = c.csi_meas_config() {
         for id in &m.nzp_csi_rs_resource_to_release_list {
-            phy.pdsch.csi_rs_rate_match.retain(|r| !(!r.zero_power && r.id == *id));
+            phy.pdsch.csi_rs_rate_match.retain(|r| r.zero_power || r.id != *id);
         }
         let trs_ids: Vec<u8> = m.nzp_csi_rs_resource_set_to_add_mod_list.iter().filter(|s| s.trs_info).flat_map(|s| s.nzp_csi_rs_resources.iter().copied()).collect();
         for r in &m.nzp_csi_rs_resource_to_add_mod_list {
             let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id) || phy.pdsch.csi_rs_rate_match.iter().any(|x| !x.zero_power && x.id == r.nzp_csi_rs_resource_id && x.trs);
-            phy.pdsch.csi_rs_rate_match.retain(|x| !(!x.zero_power && x.id == r.nzp_csi_rs_resource_id));
+            phy.pdsch.csi_rs_rate_match.retain(|x| x.zero_power || x.id != r.nzp_csi_rs_resource_id);
             phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(r.nzp_csi_rs_resource_id, &r.resource_mapping, r.periodicity_and_offset, false, r.scrambling_id, trs));
         }
         for id in &m.csi_report_config_to_release_list {

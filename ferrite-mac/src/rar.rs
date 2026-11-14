@@ -74,7 +74,7 @@ mod tests {
         // E=0,T=1,RAPID=0 | TA=5 (0x000 0101 → bytes 0x00, 0x28 | grant MSB bits) ...
         // Build: TA=5, grant = hop 0, fdra 0x0123, time 0, mcs 0, tpc 7, csi 0; tc=0x4601.
         let ta: u16 = 5;
-        let g: u32 = (0 << 26) | (0x0123u32 << 12) | (0 << 8) | (0 << 4) | (7 << 1);
+        let g: u32 = (0x0123u32 << 12) | (7 << 1);
         let mut pdu = vec![0x40u8];
         pdu.push(((ta >> 5) & 0x7f) as u8);
         pdu.push((((ta & 0x1f) as u8) << 3) | ((g >> 24) & 7) as u8);

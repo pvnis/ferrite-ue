@@ -189,9 +189,7 @@ fn codebook_from(entries: &[AckEntry], total_dai: Option<u8>) -> Vec<u8> {
     let mut bits: Vec<u8> = Vec::new();
     let mut expected_dai = sorted[0].dai & 3;
     // If the first DCI's counter isn't 0 we missed the earlier ones.
-    for _ in 0..(expected_dai as usize) {
-        bits.push(0);
-    }
+    bits.resize(bits.len() + expected_dai as usize, 0);
     for e in &sorted {
         while (e.dai & 3) != expected_dai {
             bits.push(0); // a missed PDSCH between consecutive DAIs

@@ -22,7 +22,7 @@ impl MacHandler for Probe {
         match msg {
             PhyToMac::Slot(s) => {
                 self.slots += 1;
-                if self.slots % 200 == 0 {
+                if self.slots.is_multiple_of(200) {
                     log::info!("slot {} ({} processed)", s.slot, self.slots);
                 }
                 if self.slots > 1200 && !self.got {
