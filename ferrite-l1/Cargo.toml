@@ -8,12 +8,10 @@ license.workspace = true
 ferrite-common.workspace = true
 log.workspace = true
 ferrite-phy.workspace = true
-ferrite-radio = { workspace = true, features = ["zmq"] }
-ferrite-asn1.workspace = true
+ferrite-radio.workspace = true
+ferrite-fapi.workspace = true
 num-complex.workspace = true
 crossbeam-channel.workspace = true
-rayon.workspace = true
-libc.workspace = true
 
 [features]
 default = ["zmq"]
@@ -21,3 +19,4 @@ zmq = ["ferrite-radio/zmq"]
 
 [dev-dependencies]
 env_logger.workspace = true
+ferrite-asn1.workspace = true

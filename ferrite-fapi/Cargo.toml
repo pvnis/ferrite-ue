@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-fapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PHY <-> MAC interface (FAPI-style messages) and PHY configuration of the Ferrite UE"
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-ran.workspace = true

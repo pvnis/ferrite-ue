@@ -7,7 +7,7 @@
 
 use crate::{BearerSetup, RlcSetup};
 use ferrite_common::{DuplexMode, Numerology};
-use ferrite_l1::config::*;
+use ferrite_fapi::config::*;
 use ferrite_mac::MacConfig;
 
 /// What the PHY learned from the MIB / SSB.
@@ -79,16 +79,6 @@ pub enum DlDcch {
     /// `RRCReestablishment` (§5.3.7.5) with its `nextHopChainingCount`.
     Reestablishment { tid: u8, ncc: u8 },
     Other(&'static str),
-}
-
-/// TS 33.501 A.8: RRC/UP algorithm keys from K_gNB.
-pub fn algo_key(k_gnb: &[u8; 32], algo_type: u8, algo_id: u8) -> [u8; 16] {
-    use hmac::{Hmac, Mac};
-    let s = [0x69, algo_type, 0x00, 0x01, algo_id, 0x00, 0x01];
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(k_gnb).expect("hmac key");
-    mac.update(&s);
-    let out = mac.finalize().into_bytes();
-    out[16..32].try_into().unwrap()
 }
 
 pub use crate::codec::*;

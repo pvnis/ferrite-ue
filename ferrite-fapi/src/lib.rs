@@ -1,12 +1,18 @@
 //! FAPI — the PHY ↔ MAC interface (modelled on the SCF-222 5G FAPI PHY API,
-//! adapted to the UE direction).
+//! adapted to the UE direction). This crate holds only plain data: the
+//! messages exchanged between `ferrite-l1` (the PHY) and `ferrite-mac`, and
+//! the PHY configuration ([`config::PhyConfig`], the CONFIG.request payload)
+//! that RRC derives from the broadcast and dedicated signalling. It depends
+//! on `ferrite-common` and the spec tables in `ferrite-ran` only, so the MAC
+//! and RRC never link the signal-processing crate.
 //!
 //! Message families, mirroring FAPI naming:
 //!
 //! | direction | FAPI message | here |
 //! |---|---|---|
 //! | MAC → PHY | CONFIG.request / START.request / STOP.request | [`MacToPhy::Config`], [`MacToPhy::Start`], [`MacToPhy::Stop`] |
-//! | MAC → PHY | UL_TTI.request (PRACH / PUSCH / PUCCH PDUs for one slot) | [`MacToPhy::UlTti`] |
+//! | MAC → PHY | UL_TTI.request (PRACH / PUSCH / PUCCH / SRS PDUs for one slot) | [`MacToPhy::UlTti`] |
+//! | MAC → PHY | RAR UL grant → Msg3 grant resolution (UE-side; answered by a DCI indication) | [`MacToPhy::RarGrant`] |
 //! | MAC → PHY | TX_Data.request (the PUSCH transport block payload) | carried inside [`UlTtiPdu::Pusch`] |
 //! | PHY → MAC | SLOT.indication | [`PhyToMac::Slot`] |
 //! | PHY → MAC | DCI (UE-side: the decoded PDCCH, not in gNB FAPI) | [`PhyToMac::Dci`] |
@@ -21,6 +27,10 @@
 //! lists, PUCCH resources, …) and therefore *resolves* raw DCI fields into
 //! grants (PRBs, symbols, TBS, HARQ info, timing) before handing them to MAC —
 //! MAC never sees DCI bit fields. Sample indices never appear here.
+
+#![forbid(unsafe_code)]
+
+pub mod config;
 
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 
@@ -123,6 +133,22 @@ pub struct TransformPrecoding {
     pub sequence_hopping: bool,
     /// Table 6.1.4.1-1 `q = 1` rows modulate as π/2-BPSK (`tp-pi2BPSK`).
     pub pi2_bpsk: bool,
+}
+
+/// The UL grant fields of a Random Access Response (TS 38.213 Table 8.2-1),
+/// as parsed by MAC from the RAR MAC PDU. The PHY resolves them into the Msg3
+/// [`UlGrant`] ([`MacToPhy::RarGrant`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RarUlGrant {
+    pub freq_hopping: bool,
+    /// 14-bit frequency-domain resource allocation (RIV, possibly with hopping bits).
+    pub fdra: u16,
+    /// 4-bit PUSCH time resource allocation (row of the common PUSCH TDRA list).
+    pub time_resource: u8,
+    pub mcs: u8,
+    /// 3-bit TPC command for Msg3 PUSCH.
+    pub tpc: u8,
+    pub csi_request: bool,
 }
 
 /// The payload of a decoded DCI, per format.
@@ -279,6 +305,11 @@ pub enum MacToPhy {
     TimingAdvance { n_ta_tc: i64 },
     /// Monitor paging for this UE_ID (5G-S-TMSI mod 1024); `None` stops.
     Paging { ue_id: Option<u16> },
+    /// Resolve a RAR UL grant (TS 38.213 §8.2 / §8.3) into the Msg3 PUSCH
+    /// grant. The PHY answers with a [`PhyToMac::Dci`] carrying
+    /// `Dci::Ul(UlGrant { rnti_kind: Tc, harq_id: 0, ndi: 0, .. })` for the
+    /// slot `rar_slot + k2 + Δ`; MAC then builds Msg3 like any other PUSCH.
+    RarGrant { rar_slot: SlotPoint, tc_rnti: Rnti, grant: RarUlGrant },
 }
 
 /// What MAC implements: the PHY calls this on its timeline thread.

@@ -10,6 +10,15 @@
 gnb_id: 334
 
 cu_cp:
+  # Full AS security on F1: NEA2 ciphering and NIA2 integrity on SRBs and
+  # DRBs, so the UE's K_RRC* and K_UP* derivations and the PDCP DRB
+  # integrity path are exercised (the other configs keep OCUDU's default
+  # NEA0 / RRC-only integrity).
+  security:
+    integrity: required
+    confidentiality: required
+    nea_pref_list: "nea2,nea0"
+    nia_pref_list: "nia2"
   # Measurement reporting (the UE must decode measConfig and send
   # MeasurementReport): a periodical report of the serving cell.
   mobility:

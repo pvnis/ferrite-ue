@@ -628,11 +628,12 @@ pub struct UeSecurityCapability {
 }
 
 impl Default for UeSecurityCapability {
-    /// 5G-EA0..2 and 5G-IA0..2 (`0xe0 0xe0`), the proven baseline.
+    /// 5G-EA0 + 5G-EA2 and 5G-IA0 + 5G-IA2 (`0xa0 0xa0`): exactly the
+    /// algorithms `ferrite-security` implements (no SNOW 3G / ZUC).
     fn default() -> Self {
         UeSecurityCapability {
-            ea: 0xe0,
-            ia: 0xe0,
+            ea: 0xa0,
+            ia: 0xa0,
             eps_ea: None,
             eps_ia: None,
         }
@@ -2401,7 +2402,7 @@ mod tests {
             abba: Some(vec![0, 0]),
         };
         let e = smc.encode();
-        assert_eq!(&e[..7], &[0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0]);
+        assert_eq!(&e[..7], &[0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xa0]);
         assert_eq!(SecurityModeCommand::decode(&e).unwrap(), smc);
         assert!(SecurityModeCommand::decode(&e[..5]).is_err());
     }

@@ -627,8 +627,14 @@ impl<'a> Engine<'a> {
 
     /// Apply MAC → PHY messages.
     fn drain_outbox(&mut self, s: &mut Synced, outbox: &mut Vec<MacToPhy>, now: SlotPoint) -> Result<()> {
+        // Messages MAC sends while handling our answers to this batch.
+        let mut followups: Vec<MacToPhy> = Vec::new();
         for m in outbox.drain(..) {
             match m {
+                MacToPhy::RarGrant { rar_slot, tc_rnti, grant } => match s.monitor.resolver.resolve_rar_grant(rar_slot, tc_rnti, &grant) {
+                    Some(ul) => self.mac.handle(PhyToMac::Dci(DciIndication { slot: rar_slot, dci: Dci::Ul(ul) }), &mut followups),
+                    None => log::warn!("RAR UL grant {grant:?} could not be resolved (BWP {} RBs)", s.cfg.ul_bwp.n_rb),
+                },
                 MacToPhy::Config(cfg) => {
                     let cfg = *cfg;
                     s.geom = CellGeometry::new(self.params.fs, self.params.dl_center_hz, &cfg);
@@ -695,6 +701,9 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+        }
+        if !followups.is_empty() {
+            self.drain_outbox(s, &mut followups, now)?;
         }
         Ok(())
     }

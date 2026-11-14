@@ -57,11 +57,11 @@ pub fn registration_request(imsi: &str) -> Vec<u8> {
     m.push(0x01);
     m.push(0x07);
     // UE security capability (IEI 0x2e), length 2: 5G-EA0 + 128-5G-EA1/2 and
-    // 5G-IA0 + 128-5G-IA1/2 (bit7..: EA0,EA1,EA2 / IA0,IA1,IA2). 0xe0 0xe0.
+    // 5G-EA0 + 128-5G-EA2 / 5G-IA0 + 128-5G-IA2 (bit7..: EA0,EA1,EA2 / IA0,IA1,IA2). 0xa0 0xa0.
     m.push(0x2e);
     m.push(0x02);
-    m.push(0xe0);
-    m.push(0xe0);
+    m.push(0xa0);
+    m.push(0xa0);
     m
 }
 

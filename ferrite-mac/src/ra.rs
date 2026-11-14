@@ -1,18 +1,21 @@
 //! Random Access procedure (TS 38.321 §5.1), contention-based 4-step RA.
 //!
 //! ```text
-//!  Idle ─start─▶ SelectResource ─occasion found─▶ PreambleRequested ─PRACH sent─▶ RarWindow
-//!    ▲                                                                          │  RAR(RAPID) matched
-//!    │   window expired / Msg3 limit ──▶ Backoff ──▶ SelectResource             ▼
-//!    │                                                           Msg3Scheduled ──▶ ContentionResolution
-//!    │ preambleTransMax reached                                                   │ ConRes CE matches Msg3
-//!    └──── Failed                            Succeeded ◀───────────────────────────┘
+//!             start                occasion found           RACH.indication
+//!  Idle ───────────▶ SelectResource ─────────────▶ PreambleRequested ─────────▶ RarWindow
+//!    ▲                     ▲                                                        │ RAR(RAPID) matched
+//!    │                     │ window / timer expired, backoff, counter < max          ▼
+//!    │                     └──────────────────────────────────────────────────── Msg3Pending
+//!    │  preambleTransMax                                                            │ PHY resolved the grant
+//!    │  reached                                                                     ▼
+//!    └─ Failed                        Succeeded ◀── ConRes CE / C-RNTI PDCCH ── ContentionResolution
 //! ```
 //! Power ramping, backoff, the RAR window and the contention-resolution timer
-//! are all here; the PHY only ever sees "send preamble p on occasion o".
+//! are all here; the PHY only ever sees "send preamble p on occasion o" and
+//! resolves the RAR UL grant into a Msg3 PUSCH grant (`MacToPhy::RarGrant`).
 
 use ferrite_common::{Rnti, SlotPoint};
-use ferrite_l1::fapi::PrachOccasion;
+use ferrite_fapi::PrachOccasion;
 
 /// RA procedure state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,8 +27,12 @@ pub enum RaState {
     PreambleRequested { occasion: PrachOccasion, preamble: u8 },
     /// Preamble transmitted; RAR window open until `window_end` (exclusive).
     RarWindow { ra_rnti: Rnti, preamble: u8, window_end: SlotPoint },
-    /// RAR received; Msg3 handed to the PHY; contention resolution timer runs
-    /// from the Msg3 slot (`timer_end`).
+    /// RAR matched; the PHY is resolving its UL grant into the Msg3 PUSCH
+    /// grant (a TC-RNTI UL grant). Treated as a RAR-window failure if nothing
+    /// arrives by `deadline`.
+    Msg3Pending { tc_rnti: Rnti, deadline: SlotPoint },
+    /// Msg3 handed to the PHY; contention resolution timer runs from the Msg3
+    /// slot (`timer_end`).
     ContentionResolution { tc_rnti: Rnti, timer_end: SlotPoint },
     Succeeded { c_rnti: Rnti },
     Failed,
@@ -66,9 +73,6 @@ pub struct RaProcedure {
     pub backoff_ms: u16,
     /// Pseudo-random state for preamble selection / backoff draw.
     rng: u64,
-    /// Slot the Msg3 PUSCH was scheduled in (contention resolution timer start).
-    pub msg3_slot: Option<SlotPoint>,
-    pub tc_rnti: Option<Rnti>,
 }
 
 impl RaProcedure {
@@ -86,8 +90,6 @@ impl RaProcedure {
             crnti_ra: None,
             backoff_ms: 0,
             rng: seed | 1,
-            msg3_slot: None,
-            tc_rnti: None,
         }
     }
 
@@ -114,8 +116,6 @@ impl RaProcedure {
         self.backoff_ms = 0;
         self.msg3_ccch = ccch;
         self.crnti_ra = crnti;
-        self.msg3_slot = None;
-        self.tc_rnti = None;
         self.state = RaState::SelectResource { not_before: now };
     }
 
@@ -159,6 +159,13 @@ impl RaProcedure {
                     self.retry(now, &mut actions);
                 }
             }
+            RaState::Msg3Pending { deadline, .. } => {
+                if now.diff(&deadline) >= 0 {
+                    // The PHY never resolved the RAR grant: treat as no RAR.
+                    log::warn!("RA: Msg3 grant not resolved by slot {now}");
+                    self.retry(now, &mut actions);
+                }
+            }
             RaState::ContentionResolution { timer_end, .. } => {
                 if now.diff(&timer_end) >= 0 {
                     // §5.1.5: contention resolution timer expiry.
@@ -185,8 +192,6 @@ impl RaProcedure {
         } else {
             0
         };
-        self.msg3_slot = None;
-        self.tc_rnti = None;
         self.state = RaState::SelectResource { not_before: now.add(backoff_slots) };
     }
 
@@ -202,24 +207,29 @@ impl RaProcedure {
     }
 
     /// A RAR PDU addressed to our RA-RNTI arrived (§5.1.4). Returns the matching
-    /// RAR (the caller then builds Msg3 from its grant) if the RAPID matches.
+    /// RAR (the caller hands its UL grant to the PHY for resolution) if the
+    /// RAPID matches; the procedure then waits for the Msg3 grant.
     pub fn on_rar(&mut self, pdu: &crate::rar::RarPdu) -> Option<(crate::rar::Rar, Vec<RaAction>)> {
-        let RaState::RarWindow { preamble, .. } = self.state else { return None };
+        let RaState::RarWindow { preamble, window_end, .. } = self.state else { return None };
         if let Some(bi) = pdu.backoff_ms {
             self.backoff_ms = bi;
         }
         let rar = pdu.rars.iter().find(|r| r.rapid == preamble)?;
         let actions = vec![RaAction::MonitorRaRnti(None), RaAction::MonitorTcRnti(Rnti(rar.tc_rnti))];
-        self.tc_rnti = Some(Rnti(rar.tc_rnti));
+        self.state = RaState::Msg3Pending { tc_rnti: Rnti(rar.tc_rnti), deadline: window_end.add(self.ra_response_window_slots as u64) };
         Some((*rar, actions))
+    }
+
+    /// Waiting for the PHY to resolve the RAR grant into the Msg3 grant.
+    pub fn msg3_pending(&self) -> bool {
+        matches!(self.state, RaState::Msg3Pending { .. })
     }
 
     /// Msg3 was handed to the PHY for `msg3_slot`: start the contention
     /// resolution timer (§5.1.5, from the Msg3 transmission).
     pub fn on_msg3_scheduled(&mut self, msg3_slot: SlotPoint) {
-        if let Some(tc) = self.tc_rnti {
-            self.msg3_slot = Some(msg3_slot);
-            self.state = RaState::ContentionResolution { tc_rnti: tc, timer_end: msg3_slot.add(1 + self.contention_resolution_slots as u64) };
+        if let RaState::Msg3Pending { tc_rnti, .. } = self.state {
+            self.state = RaState::ContentionResolution { tc_rnti, timer_end: msg3_slot.add(1 + self.contention_resolution_slots as u64) };
         }
     }
 
@@ -258,7 +268,7 @@ impl RaProcedure {
 mod tests {
     use super::*;
     use ferrite_common::Numerology;
-    use ferrite_l1::config::{PrachConfig, TdraRow};
+    use ferrite_fapi::config::PrachConfig;
 
     fn cfg() -> crate::RachConfig {
         crate::RachConfig {
@@ -270,7 +280,7 @@ mod tests {
             nof_cb_preambles: 64,
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
-                phy: ferrite_phy::prach_config::PrachConfig {
+                phy: ferrite_ran::prach_config::PrachConfig {
                     index: 159,
                     duplex: ferrite_common::DuplexMode::Tdd,
                     mu: 1,
@@ -285,10 +295,6 @@ mod tests {
                 target_power_dbm: -100,
                 power_ramping_step_db: 4,
             },
-            ul_bwp_rb: 24,
-            msg3_delta: 3,
-            pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
-        msg3_transform_precoding: None,
         }
     }
 

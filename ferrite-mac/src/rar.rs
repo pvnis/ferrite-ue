@@ -12,19 +12,7 @@ pub struct Rar {
     pub tc_rnti: u16,
 }
 
-/// The RAR UL grant fields (TS 38.213 Table 8.2-1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RarUlGrant {
-    pub freq_hopping: bool,
-    /// 14-bit frequency-domain resource allocation (RIV, possibly with hopping bits).
-    pub fdra: u16,
-    /// 4-bit PUSCH time resource allocation (row of the common PUSCH TDRA list).
-    pub time_resource: u8,
-    pub mcs: u8,
-    /// 3-bit TPC command for Msg3 PUSCH.
-    pub tpc: u8,
-    pub csi_request: bool,
-}
+pub use ferrite_fapi::RarUlGrant;
 
 /// Result of parsing a RAR MAC PDU for a given RAPID.
 #[derive(Clone, Debug, PartialEq, Eq)]

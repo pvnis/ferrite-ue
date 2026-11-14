@@ -14,7 +14,7 @@ use ferrite_asn1::csi as acsi;
 use ferrite_asn1::rrc;
 use ferrite_asn1::sib1;
 use ferrite_common::{DuplexMode, Numerology};
-use ferrite_l1::config::*;
+use ferrite_fapi::config::*;
 use ferrite_mac::{CsiReportMacConfig, LogicalChannelConfig, MacConfig, PucchMacConfig, RachConfig, SrConfig};
 
 // ---------------------------------------------------------------------------
@@ -123,10 +123,6 @@ fn tdd_of(t: &sib1::TddUlDlConfigCommon) -> Result<TddConfig, String> {
 }
 
 /// TS 38.214 Table 6.1.2.1.1-5: Msg3 slot delay Δ per µ.
-fn msg3_delta(mu: u8) -> u8 {
-    [2, 3, 4, 6][mu.min(3) as usize]
-}
-
 /// Build the PHY and MAC configuration of a cell from its SIB1 (TS 38.331
 /// `ServingCellConfigCommonSIB`) and the MIB-derived CORESET#0 facts.
 pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16) -> Result<CellInfo, String> {
@@ -203,7 +199,7 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let g = &rach.rach_config_generic;
     let msg1_scs_mu = rach.msg1_subcarrier_spacing.map_or(mu, |s| s.mu());
     let prach = PrachConfig {
-        phy: ferrite_phy::prach_config::PrachConfig {
+        phy: ferrite_ran::prach_config::PrachConfig {
             index: g.prach_configuration_index as u16,
             duplex: radio.duplex,
             mu,
@@ -231,12 +227,6 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         .initial_uplink_bwp()
         .and_then(|b| b.pusch_config_common.as_ref()?.setup())
         .is_some_and(|p| p.group_hopping_enabled_transform_precoding);
-    let msg3_tp = rach.msg3_transform_precoder.then_some(ferrite_l1::fapi::TransformPrecoding {
-        n_id_rs: mib.pci,
-        group_hopping: msg3_group_hopping,
-        sequence_hopping: false,
-        pi2_bpsk: false,
-    });
 
     let paging = {
         let pc = &sc.downlink_config_common.pcch_config;
@@ -301,10 +291,6 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
             nof_cb_preambles: rach.group_b_configured.as_ref().map_or(prach.total_preambles, |b| b.number_of_ra_preambles_group_a),
             cb_preambles_per_ssb: rach.ssb_per_rach_occasion_and_cb_preambles_per_ssb.map_or(64, |(_, n)| n),
             prach,
-            ul_bwp_rb: ul_bwp.n_rb,
-            msg3_delta: msg3_delta(mu),
-            pusch_tdra_common,
-            msg3_transform_precoding: msg3_tp,
         },
         tx_lead,
     );
@@ -647,7 +633,7 @@ pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::Cell
             };
             let cfg = SrsResourceConfig {
                 id: r.srs_resource_id,
-                params: ferrite_phy::srs::SrsResourceParams {
+                params: ferrite_ran::srs::SrsResourceParams {
                     k_tc,
                     comb_offset,
                     cyclic_shift,
@@ -939,16 +925,13 @@ pub fn encode_reestablishment_request(c_rnti: u16, pci: u16, short_mac_i: u16, c
 /// the current K_RRCint / integrity algorithm over the UPER-encoded
 /// `VarShortMAC-Input { sourcePhysCellId, targetCellIdentity, source-c-RNTI }`
 /// with COUNT = 2^32 − 1, BEARER = 31 and DIRECTION = 1.
-pub fn short_mac_i(k_rrc_int: &[u8; 16], integrity_alg: u8, source_pci: u16, target_cell_identity: u64, source_c_rnti: u16) -> u16 {
+pub fn short_mac_i(k_rrc_int: &[u8; 16], integrity_alg: ferrite_security::IntegrityAlg, source_pci: u16, target_cell_identity: u64, source_c_rnti: u16) -> u16 {
     let mut w = ferrite_asn1::uper::BitWriter::new();
     w.uint(u32::from(source_pci), 0, 1007);
     w.bitstring(target_cell_identity & ((1 << 36) - 1), 36);
     w.uint(u32::from(source_c_rnti), 0, 65535);
     let input = w.finish();
-    let mac = match integrity_alg {
-        2 => ferrite_pdcp::security::nia2_mac(k_rrc_int, 0xffff_ffff, 0x1f, 1, &input),
-        _ => [0u8; 4],
-    };
+    let mac = ferrite_security::integrity_mac(integrity_alg, k_rrc_int, 0xffff_ffff, 0x1f, 1, &input).unwrap_or([0u8; 4]);
     u16::from_be_bytes([mac[2], mac[3]])
 }
 
@@ -957,19 +940,7 @@ pub fn encode_reestablishment_complete(tid: u8) -> Vec<u8> {
     rrc::UlDcchMessage::RrcReestablishmentComplete { rrc_transaction_identifier: tid }.encode()
 }
 
-/// K_NG-RAN* for the cell `pci` / SSB `arfcn` by horizontal derivation from
-/// the current K_gNB (TS 33.501 §A.11, FC = 0x70).
-pub fn k_ng_ran_star(k_gnb: &[u8; 32], pci: u16, arfcn: u32) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    let mut s = vec![0x70u8];
-    s.extend_from_slice(&pci.to_be_bytes());
-    s.extend_from_slice(&[0x00, 0x02]);
-    s.extend_from_slice(&arfcn.to_be_bytes()[1..]);
-    s.extend_from_slice(&[0x00, 0x03]);
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(k_gnb).expect("hmac key");
-    mac.update(&s);
-    mac.finalize().into_bytes().into()
-}
+pub use ferrite_security::kdf::k_ng_ran_star;
 
 /// `MeasurementReport` on SRB1.
 pub fn encode_measurement_report(results: &ferrite_asn1::meas::MeasResults) -> Vec<u8> {

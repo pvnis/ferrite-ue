@@ -26,7 +26,6 @@ use crate::coding::polar::{
     code_length, info_mask_rm, input_deinterleave, input_interleave, polar_encode, sc_decode,
 };
 use crate::coding::ratematch::{de_rate_match, rate_match, subblock_interleave};
-use crate::dmrs::MappingType;
 
 /// Coded bits per CCE: 6 REGs × 9 data REs × 2 bits (QPSK).
 pub const BITS_PER_CCE: usize = 108;
@@ -1281,149 +1280,12 @@ pub fn parse_dci_0_1(bits: &[u8], size: &Dci0_1Size) -> Result<Dci0_1, DciParseE
     })
 }
 
-// ---------------------------------------------------------------------------
-// Resource allocation helpers
-// ---------------------------------------------------------------------------
-
-/// Decode a resource-allocation-type-1 RIV over a BWP of `n_bwp` RBs
-/// (38.214 §5.1.2.2.2 / §6.1.2.2.2) into `(rb_start, n_rb)`:
-/// `RIV = N(L−1) + S` if `L−1 ≤ ⌊N/2⌋`, else `N(N−L+1) + (N−1−S)`.
-/// `None` when the RIV does not describe a valid allocation.
-pub fn riv_decode(riv: u32, n_bwp: usize) -> Option<(usize, usize)> {
-    if n_bwp == 0 || riv as usize >= n_bwp * (n_bwp + 1) / 2 {
-        return None;
-    }
-    let riv = riv as usize;
-    let mut l = riv / n_bwp + 1;
-    let mut s = riv % n_bwp;
-    if l + s > n_bwp {
-        l = n_bwp - l + 2;
-        s = n_bwp - 1 - s;
-    }
-    (l >= 1 && s + l <= n_bwp).then_some((s, l))
-}
-
-/// Encode `(rb_start, n_rb)` to a type-1 RIV over `n_bwp` RBs.
-pub fn riv_encode(rb_start: usize, n_rb: usize, n_bwp: usize) -> u32 {
-    let (s, l, n) = (rb_start, n_rb, n_bwp);
-    (if l - 1 <= n / 2 { n * (l - 1) + s } else { n * (n - l + 1) + (n - 1 - s) }) as u32
-}
-
-/// RIV of a DCI 1_0 received in a **common search space** (38.214 §5.1.2.2.2):
-/// `N_BWP` is the CORESET#0 size and RB numbering starts at the lowest RB of
-/// CORESET#0, which may sit above the BWP's lowest RB. Returns the allocation
-/// as `(crb_start, n_rb)` in the numbering of `coreset0_first_crb`.
-pub fn riv_decode_css(riv: u32, coreset0_rb: usize, coreset0_first_crb: usize) -> Option<(usize, usize)> {
-    riv_decode(riv, coreset0_rb).map(|(s, l)| (coreset0_first_crb + s, l))
-}
-
-/// Decode a SLIV (`startSymbolAndLength`, 38.214 §5.1.2.1) into `(S, L)`.
-pub fn sliv_decode(sliv: u8) -> Option<(usize, usize)> {
-    let sliv = usize::from(sliv);
-    if sliv >= 14 * 15 / 2 {
-        return None;
-    }
-    let (mut l, mut s) = (sliv / 14 + 1, sliv % 14);
-    if l + s > 14 {
-        l = 14 - l + 2;
-        s = 13 - s;
-    }
-    (l >= 1 && s + l <= 14).then_some((s, l))
-}
-
-// ---------------------------------------------------------------------------
-// Default time-domain allocation tables (TS 38.214 §5.1.2.1.1, §6.1.2.1.1)
-// ---------------------------------------------------------------------------
-
-/// One row of a default time-domain allocation table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TdraRow {
-    /// Slot offset `K0` (PDSCH) or `K2` (PUSCH).
-    pub k: u8,
-    pub mapping: MappingType,
-    /// First symbol `S`.
-    pub s: usize,
-    /// Length `L` in symbols.
-    pub l: usize,
-}
-
-const fn tr(k: u8, mapping: MappingType, s: usize, l: usize) -> TdraRow {
-    TdraRow { k, mapping, s, l }
-}
-
-/// Table 5.1.2.1.1-2, default PDSCH time-domain allocation A, normal CP,
-/// `dmrs-TypeA-Position = pos2`; rows 1..=16 at indices 0..=15.
-const PDSCH_DEFAULT_A_POS2: [TdraRow; 16] = [
-    tr(0, MappingType::TypeA, 2, 12),
-    tr(0, MappingType::TypeA, 2, 10),
-    tr(0, MappingType::TypeA, 2, 9),
-    tr(0, MappingType::TypeA, 2, 7),
-    tr(0, MappingType::TypeA, 2, 5),
-    tr(0, MappingType::TypeB, 9, 4),
-    tr(0, MappingType::TypeB, 4, 4),
-    tr(0, MappingType::TypeB, 5, 7),
-    tr(0, MappingType::TypeB, 5, 2),
-    tr(0, MappingType::TypeB, 9, 2),
-    tr(0, MappingType::TypeB, 12, 2),
-    tr(0, MappingType::TypeA, 1, 13),
-    tr(0, MappingType::TypeA, 1, 6),
-    tr(0, MappingType::TypeA, 2, 4),
-    tr(0, MappingType::TypeB, 4, 7),
-    tr(0, MappingType::TypeB, 8, 4),
-];
-
-/// Row `row` (0-based, i.e. the TDRA field value) of the default PDSCH table A
-/// (Table 5.1.2.1.1-2, normal CP) for `dmrs-TypeA-Position` 2 or 3. With pos3
-/// the type-A rows 1–5 start one symbol later (same end) and rows 6–7 shift by
-/// 1 and 2 symbols. `None` for `row ≥ 16` or an invalid position.
-pub fn default_pdsch_tdra(row: u8, typea_pos: u8) -> Option<TdraRow> {
-    let mut r = *PDSCH_DEFAULT_A_POS2.get(usize::from(row))?;
-    match typea_pos {
-        2 => {}
-        3 => match row {
-            0..=4 => {
-                r.s += 1;
-                r.l -= 1;
-            }
-            5 => r.s += 1,
-            6 => r.s += 2,
-            _ => {}
-        },
-        _ => return None,
-    }
-    Some(r)
-}
-
-/// Table 6.1.2.1.1-2, default PUSCH time-domain allocation A, normal CP, with
-/// `K2` expressed as an offset to `j` (Table 6.1.2.1.1-4: `j = 1, 1, 2, 3` for
-/// µ = 0..3).
-const PUSCH_DEFAULT_A: [TdraRow; 16] = [
-    tr(0, MappingType::TypeA, 0, 14),
-    tr(0, MappingType::TypeA, 0, 12),
-    tr(0, MappingType::TypeA, 0, 10),
-    tr(0, MappingType::TypeB, 2, 10),
-    tr(0, MappingType::TypeB, 4, 10),
-    tr(0, MappingType::TypeB, 4, 8),
-    tr(0, MappingType::TypeB, 4, 6),
-    tr(1, MappingType::TypeA, 0, 14),
-    tr(1, MappingType::TypeA, 0, 12),
-    tr(1, MappingType::TypeA, 0, 10),
-    tr(2, MappingType::TypeA, 0, 14),
-    tr(2, MappingType::TypeA, 0, 12),
-    tr(2, MappingType::TypeA, 0, 10),
-    tr(0, MappingType::TypeB, 8, 6),
-    tr(3, MappingType::TypeA, 0, 14),
-    tr(3, MappingType::TypeA, 0, 10),
-];
-
-/// Row `row` (0-based) of the default PUSCH table A (Table 6.1.2.1.1-2, normal
-/// CP) at numerology `mu`; `k` is `K2 = j + offset`.
-pub fn default_pusch_tdra(row: u8, mu: u8) -> Option<TdraRow> {
-    let j = [1u8, 1, 2, 3].get(usize::from(mu)).copied()?;
-    let mut r = *PUSCH_DEFAULT_A.get(usize::from(row))?;
-    r.k += j;
-    Some(r)
-}
+// Resource allocation (RIV) and default TDRA tables live in `ferrite_ran`;
+// re-exported here so DCI users keep one import path.
+pub use ferrite_ran::riv::{riv_decode, riv_decode_css, riv_encode, sliv_decode};
+#[cfg(test)]
+use crate::dmrs::MappingType;
+pub use ferrite_ran::tdra::{default_pdsch_tdra, default_pusch_tdra, TdraRow};
 
 #[cfg(test)]
 mod tests {

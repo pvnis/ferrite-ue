@@ -22,7 +22,8 @@ pub mod derive;
 pub mod meas;
 
 use ferrite_common::{Numerology, SlotPoint};
-use ferrite_l1::config::PhyConfig;
+pub use ferrite_security::{CipherAlg, IntegrityAlg};
+use ferrite_fapi::config::PhyConfig;
 use ferrite_mac::MacConfig;
 
 /// RRC states (§4.2.1).
@@ -36,15 +37,36 @@ pub enum RrcState {
 }
 
 /// AS security configuration requested by a SecurityModeCommand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AsSecurity {
-    /// NIA / NEA algorithm identifiers (0..3).
-    pub integrity_alg: u8,
-    pub ciphering_alg: u8,
+    pub integrity_alg: IntegrityAlg,
+    pub ciphering_alg: CipherAlg,
     pub k_rrc_int: [u8; 16],
     pub k_rrc_enc: [u8; 16],
     pub k_up_int: [u8; 16],
     pub k_up_enc: [u8; 16],
+}
+
+impl AsSecurity {
+    /// The RRC and UP keys for `k_gnb` with the given algorithms (TS 33.501 §A.8).
+    pub fn derive(k_gnb: &[u8; 32], integrity_alg: IntegrityAlg, ciphering_alg: CipherAlg) -> Self {
+        use ferrite_security::kdf::{algo_key, algo_type};
+        Self {
+            integrity_alg,
+            ciphering_alg,
+            k_rrc_int: algo_key(k_gnb, algo_type::RRC_INT, integrity_alg.id()),
+            k_rrc_enc: algo_key(k_gnb, algo_type::RRC_ENC, ciphering_alg.id()),
+            k_up_int: algo_key(k_gnb, algo_type::UP_INT, integrity_alg.id()),
+            k_up_enc: algo_key(k_gnb, algo_type::UP_ENC, ciphering_alg.id()),
+        }
+    }
+}
+
+impl std::fmt::Debug for AsSecurity {
+    /// Keys are never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AsSecurity({} / {})", self.integrity_alg.name(), self.ciphering_alg.name())
+    }
 }
 
 /// A radio bearer the stack must create or reconfigure.
@@ -492,14 +514,17 @@ impl RrcUe {
                     self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_security_mode_failure(tid) });
                     return;
                 };
-                let sec = AsSecurity {
-                    integrity_alg,
-                    ciphering_alg,
-                    k_rrc_int: derive::algo_key(&k, 4, integrity_alg),
-                    k_rrc_enc: derive::algo_key(&k, 3, ciphering_alg),
-                    k_up_int: derive::algo_key(&k, 2, integrity_alg),
-                    k_up_enc: derive::algo_key(&k, 1, ciphering_alg),
+                // §5.3.4.3: an algorithm the UE cannot run is a SecurityModeFailure.
+                let algs = IntegrityAlg::try_from(integrity_alg).and_then(|i| i.check_supported()).and_then(|i| CipherAlg::try_from(ciphering_alg).and_then(|c| c.check_supported()).map(|c| (i, c)));
+                let (ia, ea) = match algs {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("SecurityModeCommand with NIA{integrity_alg} / NEA{ciphering_alg}: {e}");
+                        self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_security_mode_failure(tid) });
+                        return;
+                    }
                 };
+                let sec = AsSecurity::derive(&k, ia, ea);
                 self.pending_smc = Some((tid, integrity_alg, ciphering_alg));
                 self.security = Some(sec);
                 self.events.push(RrcEvent::VerifySecurity(sec));
@@ -565,14 +590,7 @@ impl RrcUe {
                 // §5.3.7.5 / TS 33.501 §6.11: K_NG-RAN* from the current K_gNB,
                 // then fresh RRC/UP keys with the configured algorithms.
                 let k_star = derive::k_ng_ran_star(&k, cell.phy.ssb.pci, cell.ssb_arfcn);
-                let sec = AsSecurity {
-                    integrity_alg: old.integrity_alg,
-                    ciphering_alg: old.ciphering_alg,
-                    k_rrc_int: derive::algo_key(&k_star, 4, old.integrity_alg),
-                    k_rrc_enc: derive::algo_key(&k_star, 3, old.ciphering_alg),
-                    k_up_int: derive::algo_key(&k_star, 2, old.integrity_alg),
-                    k_up_enc: derive::algo_key(&k_star, 1, old.ciphering_alg),
-                };
+                let sec = AsSecurity::derive(&k_star, old.integrity_alg, old.ciphering_alg);
                 self.k_gnb = Some(k_star);
                 self.security = Some(sec);
                 self.pending_reest = Some(tid);

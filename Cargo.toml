@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "ferrite-common",
+    "ferrite-ran",
+    "ferrite-fapi",
+    "ferrite-security",
     "ferrite-phy",
     "ferrite-radio",
     "ferrite-asn1",
@@ -39,6 +42,9 @@ hmac = "0.12"
 libc = "0.2"
 
 ferrite-common = { path = "ferrite-common" }
+ferrite-ran = { path = "ferrite-ran" }
+ferrite-fapi = { path = "ferrite-fapi" }
+ferrite-security = { path = "ferrite-security" }
 ferrite-phy = { path = "ferrite-phy" }
 ferrite-radio = { path = "ferrite-radio" }
 ferrite-asn1 = { path = "ferrite-asn1" }

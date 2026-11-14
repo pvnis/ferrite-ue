@@ -7,11 +7,14 @@
 //! The engine itself (sync, PDCCH monitoring, PDSCH/HARQ receive, UL placement)
 //! lives in the remaining modules.
 
+// The PHY↔MAC interface and the PHY configuration are `ferrite-fapi`;
+// re-exported under their historical paths.
+pub use ferrite_fapi as fapi;
+pub use ferrite_fapi::config;
+
 pub mod cell;
-pub mod config;
 pub mod dl;
 pub mod engine;
-pub mod fapi;
 pub mod resolve;
 pub mod ul;
 pub mod radio;

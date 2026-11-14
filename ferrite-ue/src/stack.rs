@@ -6,10 +6,10 @@
 use crate::config::UeConfig;
 use crate::ip;
 use ferrite_common::{Numerology, SlotPoint};
-use ferrite_l1::fapi::*;
+use ferrite_fapi::*;
 use ferrite_mac::{MacConfig, MacEntity, MacEvent, UpperLayers};
 use ferrite_nas::{NasConfig, NasEvent, NasUe, UeIdentity};
-use ferrite_pdcp::{CipherAlg, IntegrityAlg, PdcpConfig, PdcpEntity, SecurityConfig, SnLen};
+use ferrite_pdcp::{PdcpConfig, PdcpEntity, SecurityConfig, SnLen};
 use ferrite_rlc::{AmConfig, RlcEntity, RlcEvent, RlcMode, UmConfig};
 use ferrite_rrc::{derive, AsSecurity, BearerSetup, MacNotification, RbId, RlcSetup, RrcConfig, RrcEvent, RrcUe};
 use std::collections::{BTreeMap, VecDeque};
@@ -219,12 +219,12 @@ impl Stack {
         };
         if let (Some(sec), RbId::Drb(_)) = (self.security, b.rb) {
             let _ = pdcp.configure_security(SecurityConfig {
-                integrity: b.pdcp_integrity.then_some((int_alg(sec.integrity_alg), sec.k_up_int)),
-                cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_up_enc)),
+                integrity: b.pdcp_integrity.then_some((sec.integrity_alg, sec.k_up_int)),
+                cipher: Some((sec.ciphering_alg, sec.k_up_enc)),
             });
         }
         if let (Some(sec), RbId::Srb(_)) = (self.security, b.rb) {
-            let _ = pdcp.configure_security(SecurityConfig { integrity: Some((int_alg(sec.integrity_alg), sec.k_rrc_int)), cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_rrc_enc)) });
+            let _ = pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
         }
         if let RbId::Drb(_) = b.rb {
             self.drb_lcid.get_or_insert(b.lcid);
@@ -291,9 +291,9 @@ impl Stack {
                 RrcEvent::VerifyReestablishment(sec) => {
                     let ok = match (self.pending_reest_pdu.as_ref(), self.bearers.by_lcid.values_mut().find(|b| b.rb == RbId::Srb(1))) {
                         (Some(pdu), Some(b)) => {
-                            let ok = b.pdcp.verify_only(pdu, &sec.k_rrc_int).is_some();
+                            let ok = b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some();
                             if ok {
-                                let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((int_alg(sec.integrity_alg), sec.k_rrc_int)), cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_rrc_enc)) });
+                                let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
                             }
                             ok
                         }
@@ -315,11 +315,11 @@ impl Stack {
                             match b.rb {
                                 RbId::Srb(1) => {}
                                 RbId::Srb(_) => {
-                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((int_alg(sec.integrity_alg), sec.k_rrc_int)), cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_rrc_enc)) });
+                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) });
                                 }
                                 RbId::Drb(_) => {
                                     let integ = b.pdcp.config().integrity_on_drb;
-                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: integ.then_some((int_alg(sec.integrity_alg), sec.k_up_int)), cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_up_enc)) });
+                                    let _ = b.pdcp.configure_security(SecurityConfig { integrity: integ.then_some((sec.integrity_alg, sec.k_up_int)), cipher: Some((sec.ciphering_alg, sec.k_up_enc)) });
                                 }
                             }
                         }
@@ -350,7 +350,7 @@ impl Stack {
                 RrcEvent::VerifySecurity(sec) => {
                     // §5.3.4.3: check the SMC MAC-I with K_RRCint, then activate.
                     let ok = match (self.pending_smc_pdu.as_ref(), self.bearers.by_lcid.values().find(|b| b.rb == RbId::Srb(1))) {
-                        (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, &sec.k_rrc_int).is_some(),
+                        (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
                         _ => false,
                     };
                     if ok {
@@ -358,14 +358,14 @@ impl Stack {
                         for b in self.bearers.by_lcid.values_mut() {
                             if matches!(b.rb, RbId::Srb(_)) {
                                 let _ = b.pdcp.configure_security(SecurityConfig {
-                                    integrity: Some((int_alg(sec.integrity_alg), sec.k_rrc_int)),
-                                    cipher: Some((cipher_alg(sec.ciphering_alg), sec.k_rrc_enc)),
+                                    integrity: Some((sec.integrity_alg, sec.k_rrc_int)),
+                                    cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)),
                                 });
                                 // The SecurityModeComplete itself is integrity protected but not ciphered.
                                 b.pdcp.set_tx_cipher_enabled(false);
                             }
                         }
-                        log::info!("AS security activated (NIA{} / NEA{})", sec.integrity_alg, sec.ciphering_alg);
+                        log::info!("AS security activated ({} / {})", sec.integrity_alg.name(), sec.ciphering_alg.name());
                     } else {
                         log::warn!("SecurityModeCommand MAC-I check failed");
                     }
@@ -720,27 +720,8 @@ fn rlc_sn(bits: u8) -> ferrite_rlc::SnLen {
     }
 }
 
-fn int_alg(a: u8) -> IntegrityAlg {
-    match a {
-        0 => IntegrityAlg::Nia0,
-        1 => IntegrityAlg::Nia1,
-        3 => IntegrityAlg::Nia3,
-        _ => IntegrityAlg::Nia2,
-    }
-}
-
-fn cipher_alg(a: u8) -> CipherAlg {
-    match a {
-        1 => CipherAlg::Nea1,
-        2 => CipherAlg::Nea2,
-        3 => CipherAlg::Nea3,
-        _ => CipherAlg::Nea0,
-    }
-}
-
-/// MAC configuration before SIB1 is known (nothing to do yet).
 fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, tx_lead: u16) -> MacConfig {
-    use ferrite_l1::config::{PrachConfig, TdraRow};
+    use ferrite_fapi::config::PrachConfig;
     MacConfig::initial(
         numerology,
         ferrite_mac::RachConfig {
@@ -752,7 +733,7 @@ fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, t
             nof_cb_preambles: 64,
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
-                phy: ferrite_phy::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
                 zero_correlation_zone: 0,
                 root_sequence_index: 0,
                 restricted_set: 0,
@@ -760,10 +741,6 @@ fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, t
                 target_power_dbm: -100,
                 power_ramping_step_db: 4,
             },
-            ul_bwp_rb: 24,
-            msg3_delta: if numerology.mu == 0 { 2 } else { 3 },
-            pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
-        msg3_transform_precoding: None,
         },
         tx_lead,
     )

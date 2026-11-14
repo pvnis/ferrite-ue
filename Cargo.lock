@@ -452,6 +452,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-fapi"
+version = "0.1.0"
+dependencies = [
+ "ferrite-common",
+ "ferrite-ran",
+]
+
+[[package]]
 name = "ferrite-l1"
 version = "0.1.0"
 dependencies = [
@@ -459,12 +467,11 @@ dependencies = [
  "env_logger",
  "ferrite-asn1",
  "ferrite-common",
+ "ferrite-fapi",
  "ferrite-phy",
  "ferrite-radio",
- "libc",
  "log",
  "num-complex",
- "rayon",
 ]
 
 [[package]]
@@ -472,8 +479,8 @@ name = "ferrite-mac"
 version = "0.1.0"
 dependencies = [
  "ferrite-common",
- "ferrite-l1",
- "ferrite-phy",
+ "ferrite-fapi",
+ "ferrite-ran",
  "log",
 ]
 
@@ -481,23 +488,17 @@ dependencies = [
 name = "ferrite-nas"
 version = "0.1.0"
 dependencies = [
- "aes",
- "cmac",
- "ctr",
  "ferrite-common",
- "hmac",
+ "ferrite-security",
  "log",
- "sha2",
 ]
 
 [[package]]
 name = "ferrite-pdcp"
 version = "0.1.0"
 dependencies = [
- "aes",
- "cmac",
- "ctr",
  "ferrite-common",
+ "ferrite-security",
  "log",
 ]
 
@@ -507,6 +508,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-common",
  "ferrite-radio",
+ "ferrite-ran",
  "num-complex",
  "rustfft",
 ]
@@ -519,6 +521,13 @@ dependencies = [
  "num-complex",
  "seify",
  "zmq",
+]
+
+[[package]]
+name = "ferrite-ran"
+version = "0.1.0"
+dependencies = [
+ "ferrite-common",
 ]
 
 [[package]]
@@ -535,13 +544,25 @@ version = "0.1.0"
 dependencies = [
  "ferrite-asn1",
  "ferrite-common",
- "ferrite-l1",
+ "ferrite-fapi",
  "ferrite-mac",
- "ferrite-pdcp",
  "ferrite-phy",
- "hmac",
+ "ferrite-ran",
+ "ferrite-security",
  "log",
+]
+
+[[package]]
+name = "ferrite-security"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cmac",
+ "ctr",
+ "ferrite-common",
+ "hmac",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -553,12 +574,14 @@ dependencies = [
  "env_logger",
  "ferrite-asn1",
  "ferrite-common",
+ "ferrite-fapi",
  "ferrite-l1",
  "ferrite-mac",
  "ferrite-nas",
  "ferrite-pdcp",
  "ferrite-phy",
  "ferrite-radio",
+ "ferrite-ran",
  "ferrite-rlc",
  "ferrite-rrc",
  "libc",

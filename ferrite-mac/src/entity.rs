@@ -17,7 +17,7 @@ use crate::pdu::*;
 use crate::phr::{PhrProcedure, PowerHeadroom};
 use crate::{harq::*, lcp::Lcp, ra::*, rar::parse_rar_pdu, sr::SrProcedure, ta::TimingAdvance, MacConfig};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
-use ferrite_l1::fapi::*;
+use ferrite_fapi::*;
 use std::collections::BTreeMap;
 
 /// Events MAC reports to RRC.
@@ -401,7 +401,7 @@ impl MacEntity {
     fn on_dci(&mut self, slot: SlotPoint, dci: Dci, phy: &mut dyn MacToPhySink, upper: &mut dyn UpperLayers) {
         match dci {
             Dci::Dl(g) => self.on_dl_grant(slot, g),
-            Dci::Ul(g) => self.on_ul_grant(slot, g, upper),
+            Dci::Ul(g) => self.on_ul_grant(slot, g, phy, upper),
             Dci::Other { .. } => {}
         }
         // C-RNTI based RA resolves on any C-RNTI PDCCH (§5.1.5).
@@ -425,7 +425,11 @@ impl MacEntity {
         }
     }
 
-    fn on_ul_grant(&mut self, slot: SlotPoint, g: UlGrant, upper: &mut dyn UpperLayers) {
+    fn on_ul_grant(&mut self, slot: SlotPoint, g: UlGrant, phy: &mut dyn MacToPhySink, upper: &mut dyn UpperLayers) {
+        if g.rnti_kind == RntiKind::Tc && self.ra.msg3_pending() {
+            self.send_msg3(g, phy);
+            return;
+        }
         if g.freq_hopping || !g.ul_sch {
             log::warn!("UL grant with unsupported features (hopping={} ul_sch={}) ignored", g.freq_hopping, g.ul_sch);
             return;
@@ -555,7 +559,10 @@ impl MacEntity {
                         self.apply_ra_actions(actions, phy);
                         self.ta.apply_rar(rar.ta, d.pdsch_slot);
                         phy.send(MacToPhy::TimingAdvance { n_ta_tc: self.ta.n_ta_tc });
-                        self.send_msg3(d.pdsch_slot, &rar, phy);
+                        // The PHY owns the PUSCH configuration: it resolves the RAR
+                        // UL grant (TS 38.213 §8.2 / §8.3) and answers with a
+                        // TC-RNTI UL grant that `on_ul_grant` turns into Msg3.
+                        phy.send(MacToPhy::RarGrant { rar_slot: d.pdsch_slot, tc_rnti: Rnti(rar.tc_rnti), grant: rar.grant });
                     }
                 }
             }
@@ -601,52 +608,10 @@ impl MacEntity {
         }
     }
 
-    /// Msg3 (§5.1.4 / §5.4.2.2): CCCH SDU (+ C-RNTI CE for a C-RNTI RA) on the
-    /// RAR grant, at `rar_slot + k2 + Δ`.
-    fn send_msg3(&mut self, rar_slot: SlotPoint, rar: &crate::rar::Rar, phy: &mut dyn MacToPhySink) {
-        let Some(tc) = self.tc_rnti else { return };
-        let r = &self.cfg.rach;
-        let row = r.pusch_tdra_common.get(rar.grant.time_resource as usize).copied().unwrap_or(ferrite_l1::config::TdraRow {
-            k: 1,
-            mapping_type_a: true,
-            start_symbol: 0,
-            n_symbols: 14,
-        });
-        let pusch_slot = rar_slot.add(row.k as u64 + r.msg3_delta as u64);
-        let (prb_start, n_prb) = riv_decode(rar.grant.fdra as usize & ((1 << riv_bits(r.ul_bwp_rb as usize)) - 1), r.ul_bwp_rb as usize);
-        let (qm, r1024) = ferrite_phy::mcs::mcs_params(ferrite_phy::mcs::McsTable::Qam64, rar.grant.mcs).unwrap_or((2, 120));
-        let dmrs = ferrite_phy::dmrs::pusch_dmrs_symbols(
-            if row.mapping_type_a { ferrite_phy::dmrs::MappingType::TypeA } else { ferrite_phy::dmrs::MappingType::TypeB },
-            2,
-            2,
-            row.start_symbol as usize,
-            row.n_symbols as usize,
-        )
-        .map(|v| v.len())
-        .unwrap_or(3);
-        let n_re = ferrite_phy::pdsch_params::n_re_per_prb(row.n_symbols as usize, ferrite_phy::pdsch_params::dmrs_re_per_prb(dmrs, 2), 0);
-        let tbs_bits = ferrite_phy::pdsch_params::tbs(n_re, n_prb, qm, r1024, 1) as u32;
-        let grant = UlGrant {
-            rnti: tc,
-            rnti_kind: RntiKind::Tc,
-            pusch_slot,
-            prb_start: prb_start as u16,
-            n_prb: n_prb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
-            mcs: Mcs { index: rar.grant.mcs, qm, r_x1024: Some(r1024) },
-            tbs_bits,
-            harq_id: 0,
-            ndi: 0,
-            rv: 0,
-            dai: None,
-            tpc: rar.grant.tpc,
-            csi_request: 0,
-            ul_sch: true,
-            cdm_groups_wo_data: 2,
-            dmrs_add_pos: 2,
-            freq_hopping: rar.grant.freq_hopping,
-            transform_precoding: r.msg3_transform_precoding,
-        };
+    /// Msg3 (§5.1.4 / §5.4.2.2): the CCCH SDU (or the C-RNTI CE for a C-RNTI
+    /// RA) on the Msg3 grant the PHY resolved from the RAR.
+    fn send_msg3(&mut self, grant: UlGrant, phy: &mut dyn MacToPhySink) {
+        let tbs_bits = grant.tbs_bits;
         let tbs = (tbs_bits / 8) as usize;
         let mut tb = Vec::with_capacity(tbs);
         if let Some(ccch) = self.ra.msg3_ccch {
@@ -660,9 +625,9 @@ impl MacEntity {
         // Msg3 uses HARQ process 0 with NDI 0; a DCI 0_0 with the TC-RNTI and
         // NDI 0 is then a retransmission request (§5.4.2.1).
         self.ul_harq.store(0, 0, tbs_bits, tb.clone());
-        self.ra.on_msg3_scheduled(pusch_slot);
+        self.ra.on_msg3_scheduled(grant.pusch_slot);
         self.stats.ul_tb += 1;
-        phy.send(MacToPhy::UlTti(UlTtiRequest { slot: pusch_slot, pdus: vec![UlTtiPdu::Pusch { grant, tb, uci: UciPayload::default() }] }));
+        phy.send(MacToPhy::UlTti(UlTtiRequest { slot: grant.pusch_slot, pdus: vec![UlTtiPdu::Pusch { grant, tb, uci: UciPayload::default() }] }));
     }
 }
 
@@ -672,20 +637,6 @@ fn cqi_bits(cqi: u8) -> Vec<u8> {
 }
 
 /// Resource allocation type 1 RIV decode (TS 38.214 §6.1.2.2.2).
-pub fn riv_decode(riv: usize, n_bwp: usize) -> (usize, usize) {
-    let l0 = riv / n_bwp + 1;
-    let s0 = riv % n_bwp;
-    if l0 <= n_bwp - s0 {
-        (s0, l0)
-    } else {
-        (n_bwp - 1 - s0, n_bwp - l0 + 2)
-    }
-}
-
-/// Number of RIV bits for a BWP of `n` RBs: ⌈log2(n(n+1)/2)⌉.
-pub fn riv_bits(n: usize) -> usize {
-    (0usize..).find(|&b| (1usize << b) >= n * (n + 1) / 2).unwrap()
-}
 
 impl MacHandler for MacEntity {
     fn handle(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink) {

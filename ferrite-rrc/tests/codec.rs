@@ -2,7 +2,7 @@
 //! SIB1 → common configuration, RRCSetup → dedicated configuration + bearers.
 
 use ferrite_common::DuplexMode;
-use ferrite_l1::config::{PucchFormat, SearchSpaceKind};
+use ferrite_fapi::config::{PucchFormat, SearchSpaceKind};
 use ferrite_rrc::derive::{cell_from_sib1, decode_dl_ccch, DlCcch, MibInfo, RadioInfo};
 use ferrite_rrc::{RbId, RlcSetup};
 
@@ -36,8 +36,6 @@ fn sib1_gives_common_config() {
     assert_eq!(cs0.start_crb as i32, p.ssb_crb as i32 - mib().coreset0_offset_rb);
     assert!(p.prach.phy.index > 0);
     assert!(!p.pusch_tdra_common.is_empty() || p.pdsch_tdra_common.is_empty());
-    assert_eq!(cell.mac.rach.ul_bwp_rb, 24);
-    assert_eq!(cell.mac.rach.msg3_delta, 3);
     assert_eq!(cell.mac.tx_lead_slots, 2);
     // An FDD radio must reject the TDD cell.
     let fdd = RadioInfo { duplex: DuplexMode::Fdd, ..radio() };

@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NR security algorithms (NIA/NEA), TS 33.501 key hierarchy and MILENAGE for the Ferrite UE"
+
+[dependencies]
+thiserror.workspace = true
+aes.workspace = true
+cmac.workspace = true
+ctr.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+ferrite-common.workspace = true

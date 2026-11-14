@@ -7,8 +7,4 @@ license.workspace = true
 [dependencies]
 ferrite-common.workspace = true
 log.workspace = true
-aes.workspace = true
-cmac.workspace = true
-ctr.workspace = true
-sha2.workspace = true
-hmac.workspace = true
+ferrite-security.workspace = true

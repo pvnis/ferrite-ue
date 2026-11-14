@@ -4,7 +4,7 @@
 //!
 //! This module holds the transport-agnostic building blocks — the typed messages that
 //! flow between stages, the bounded queues that connect them (backpressure included),
-//! the shared `rayon` pool for intra-stage data parallelism, and the [`InjectionTable`]
+//! and the [`InjectionTable`]
 //! the timeline thread uses to place ready uplink waveforms at their absolute sample
 //! positions. Wiring these into `run()` is done in later phases; here they are
 //! self-contained and unit-tested.
@@ -142,21 +142,6 @@ impl InjectionTable {
     }
 }
 
-/// Build a `rayon` thread pool for intra-stage data parallelism (the PDCCH candidate
-/// blind-decode, LDPC code blocks). `threads == 0` picks (available cores − 1), reserving
-/// one core for the timeline thread so it never gets preempted by a decode burst.
-pub fn rayon_pool(threads: usize) -> rayon::ThreadPool {
-    let n = if threads == 0 {
-        std::thread::available_parallelism().map(|c| c.get().saturating_sub(1)).unwrap_or(1).max(1)
-    } else {
-        threads
-    };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .thread_name(|i| format!("ferrite-worker-{i}"))
-        .build()
-        .expect("build rayon pool")
-}
 
 #[cfg(test)]
 mod tests {
@@ -214,11 +199,4 @@ mod tests {
         assert_eq!(b[2].re, 0.0);
     }
 
-    #[test]
-    fn rayon_pool_has_workers() {
-        let p = rayon_pool(2);
-        assert_eq!(p.current_num_threads(), 2);
-        let sum: i32 = p.install(|| (1..=100).sum());
-        assert_eq!(sum, 5050);
-    }
 }

@@ -171,8 +171,8 @@ pub enum SearchSpaceKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrachConfig {
     /// Index/duplex/numerology/FDM/frequency start — the occasion pattern
-    /// (TS 38.211 Table 6.3.3.2-2/-3) is enumerated by `ferrite_phy::prach_config`.
-    pub phy: ferrite_phy::prach_config::PrachConfig,
+    /// (TS 38.211 Table 6.3.3.2-2/-3) is enumerated by `ferrite_ran::prach_config`.
+    pub phy: ferrite_ran::prach_config::PrachConfig,
     pub zero_correlation_zone: u8,
     pub root_sequence_index: u16,
     pub restricted_set: u8,
@@ -184,11 +184,11 @@ pub struct PrachConfig {
 
 impl PrachConfig {
     /// All PRACH occasions whose transmission starts in data-numerology slot `slot`.
-    pub fn occasions_in_slot(&self, slot: ferrite_common::SlotPoint) -> Vec<crate::fapi::PrachOccasion> {
-        ferrite_phy::prach_config::prach_occasions_in_slot(&self.phy, slot)
+    pub fn occasions_in_slot(&self, slot: ferrite_common::SlotPoint) -> Vec<crate::PrachOccasion> {
+        ferrite_ran::prach_config::prach_occasions_in_slot(&self.phy, slot)
             .map(|v| {
                 v.into_iter()
-                    .map(|o| crate::fapi::PrachOccasion {
+                    .map(|o| crate::PrachOccasion {
                         slot,
                         start_symbol: o.start_symbol,
                         freq_index: o.freq_index,
@@ -369,7 +369,7 @@ pub struct PucchConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SrsResourceConfig {
     pub id: u8,
-    pub params: ferrite_phy::srs::SrsResourceParams,
+    pub params: ferrite_ran::srs::SrsResourceParams,
     pub period_slots: u16,
     pub offset_slots: u16,
 }

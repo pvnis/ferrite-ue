@@ -149,8 +149,8 @@ struct Reporting<'a> {
     meas_rx: crossbeam_channel::Receiver<(u16, ferrite_common::SlotPoint, f32, f32, f32)>,
 }
 
-impl ferrite_l1::fapi::MacHandler for Reporting<'_> {
-    fn handle(&mut self, msg: ferrite_l1::fapi::PhyToMac, phy: &mut dyn ferrite_l1::fapi::MacToPhySink) {
+impl ferrite_fapi::MacHandler for Reporting<'_> {
+    fn handle(&mut self, msg: ferrite_fapi::PhyToMac, phy: &mut dyn ferrite_fapi::MacToPhySink) {
         while let Ok(m) = self.mib_rx.try_recv() {
             self.stack.set_mib(m);
         }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ferrite-common.workspace = true
+ferrite-ran.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
 

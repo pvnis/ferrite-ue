@@ -22,7 +22,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod security;
 
 use ferrite_common::{Numerology, SlotPoint};
 use std::collections::{BTreeMap, VecDeque};
@@ -76,26 +75,7 @@ pub enum RbType {
     Drb,
 }
 
-/// NR integrity algorithm identifiers (TS 33.501 §5.11.1.2 / Annex D.3).
-/// Only `Nia0` and `Nia2` are implemented; configuring `Nia1`/`Nia3` fails
-/// with [`PdcpError::Unsupported`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IntegrityAlg {
-    Nia0,
-    Nia1,
-    Nia2,
-    Nia3,
-}
-
-/// NR ciphering algorithm identifiers (TS 33.501 §5.11.1.1 / Annex D.2).
-/// Only `Nea0` and `Nea2` are implemented.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CipherAlg {
-    Nea0,
-    Nea1,
-    Nea2,
-    Nea3,
-}
+pub use ferrite_security::{CipherAlg, IntegrityAlg};
 
 /// Algorithms and keys for one bearer. For SRBs these are `K_RRCint` /
 /// `K_RRCenc`, for DRBs `K_UPint` / `K_UPenc` (TS 33.501 §6.2.1). `None`
@@ -341,15 +321,11 @@ impl PdcpEntity {
     /// Fails with [`PdcpError::Unsupported`] for NIA1/NIA3/NEA1/NEA3, leaving
     /// the previous configuration in place.
     pub fn configure_security(&mut self, sec: SecurityConfig) -> Result<(), PdcpError> {
-        match sec.integrity {
-            Some((IntegrityAlg::Nia1, _)) => return Err(PdcpError::Unsupported("NIA1 (SNOW 3G)")),
-            Some((IntegrityAlg::Nia3, _)) => return Err(PdcpError::Unsupported("NIA3 (ZUC)")),
-            _ => {}
+        if let Some((alg, _)) = sec.integrity {
+            alg.check_supported().map_err(|_| PdcpError::Unsupported(alg.name()))?;
         }
-        match sec.cipher {
-            Some((CipherAlg::Nea1, _)) => return Err(PdcpError::Unsupported("NEA1 (SNOW 3G)")),
-            Some((CipherAlg::Nea3, _)) => return Err(PdcpError::Unsupported("NEA3 (ZUC)")),
-            _ => {}
+        if let Some((alg, _)) = sec.cipher {
+            alg.check_supported().map_err(|_| PdcpError::Unsupported(alg.name()))?;
         }
         self.integrity = sec.integrity;
         self.cipher = sec.cipher;
@@ -457,14 +433,9 @@ impl PdcpEntity {
             pdu.extend_from_slice(&mac);
         }
         if self.tx_cipher_enabled {
-            if let Some((CipherAlg::Nea2, key)) = self.cipher {
-                security::nea2_crypt(
-                    &key,
-                    count,
-                    self.cfg.bearer_id,
-                    self.tx_direction(),
-                    &mut pdu[hdr_len..],
-                );
+            if let Some((alg, key)) = self.cipher {
+                // Unsupported algorithms are rejected by `configure_security`.
+                let _ = ferrite_security::cipher_in_place(alg, &key, count, self.cfg.bearer_id, self.tx_direction(), &mut pdu[hdr_len..]);
             }
         }
 
@@ -565,12 +536,12 @@ impl PdcpEntity {
     }
 
     /// Verify a received SRB/DRB Data PDU's MAC-I with a candidate integrity
-    /// key (NIA2) without touching the entity state. The COUNT is inferred
+    /// algorithm and key without touching the entity state. The COUNT is inferred
     /// from the current `RX_DELIV` exactly as [`Self::rx_pdu`] would; the
     /// configured deciphering (if enabled) is applied first. Returns the COUNT
     /// on success. RRC uses this to check a freshly derived `K_RRCint` against
     /// the SecurityModeCommand before activating it.
-    pub fn verify_only(&self, pdu: &[u8], key: &[u8; 16]) -> Option<u32> {
+    pub fn verify_only(&self, pdu: &[u8], alg: IntegrityAlg, key: &[u8; 16]) -> Option<u32> {
         let hdr_len = self.header_len();
         if pdu.len() < hdr_len + 4 {
             return None;
@@ -582,21 +553,15 @@ impl PdcpEntity {
         let count = self.infer_count(sn);
         let mut body = pdu[hdr_len..].to_vec();
         if self.rx_cipher_enabled {
-            if let Some((CipherAlg::Nea2, k)) = self.cipher {
-                security::nea2_crypt(
-                    &k,
-                    count,
-                    self.cfg.bearer_id,
-                    self.rx_direction(),
-                    &mut body,
-                );
+            if let Some((alg, k)) = self.cipher {
+                let _ = ferrite_security::cipher_in_place(alg, &k, count, self.cfg.bearer_id, self.rx_direction(), &mut body);
             }
         }
         let split = body.len() - 4;
         let mut msg = Vec::with_capacity(hdr_len + split);
         msg.extend_from_slice(&pdu[..hdr_len]);
         msg.extend_from_slice(&body[..split]);
-        let mac = security::nia2_mac(key, count, self.cfg.bearer_id, self.rx_direction(), &msg);
+        let mac = ferrite_security::integrity_mac(alg, key, count, self.cfg.bearer_id, self.rx_direction(), &msg).ok()?;
         (mac[..] == body[split..]).then_some(count)
     }
 
@@ -729,10 +694,8 @@ impl PdcpEntity {
     /// NIA0 / not configured ⇒ all zeros (TS 33.501 D.3.1.1; §6.3.4 padding).
     fn compute_mac(&self, count: u32, direction: u8, msg: &[u8]) -> [u8; 4] {
         match self.integrity {
-            Some((IntegrityAlg::Nia2, key)) => {
-                security::nia2_mac(&key, count, self.cfg.bearer_id, direction, msg)
-            }
-            _ => [0u8; 4],
+            Some((alg, key)) => ferrite_security::integrity_mac(alg, &key, count, self.cfg.bearer_id, direction, msg).unwrap_or([0u8; 4]),
+            None => [0u8; 4],
         }
     }
 
@@ -756,25 +719,18 @@ impl PdcpEntity {
 
         let mut body = pdu[hdr_len..].to_vec();
         if self.rx_cipher_enabled {
-            if let Some((CipherAlg::Nea2, key)) = self.cipher {
-                security::nea2_crypt(
-                    &key,
-                    count,
-                    self.cfg.bearer_id,
-                    self.rx_direction(),
-                    &mut body,
-                );
+            if let Some((alg, key)) = self.cipher {
+                let _ = ferrite_security::cipher_in_place(alg, &key, count, self.cfg.bearer_id, self.rx_direction(), &mut body);
             }
         }
         if mac_len > 0 {
             let split = body.len() - 4;
             let rx_mac = body.split_off(split);
-            if let Some((IntegrityAlg::Nia2, key)) = self.integrity {
+            if let Some((alg, key)) = self.integrity.filter(|(a, _)| *a != IntegrityAlg::Nia0) {
                 let mut msg = Vec::with_capacity(hdr_len + body.len());
                 msg.extend_from_slice(&pdu[..hdr_len]);
                 msg.extend_from_slice(&body);
-                let mac =
-                    security::nia2_mac(&key, count, self.cfg.bearer_id, self.rx_direction(), &msg);
+                let mac = ferrite_security::integrity_mac(alg, &key, count, self.cfg.bearer_id, self.rx_direction(), &msg).unwrap_or([0u8; 4]);
                 if mac[..] != rx_mac[..] {
                     log::warn!(
                         "pdcp: {} integrity failure at COUNT {}",
@@ -1006,9 +962,9 @@ mod tests {
 
         let mut ue = PdcpEntity::new(PdcpConfig::srb(1), MU);
         // RRC validates the derived key first…
-        assert_eq!(ue.verify_only(&smc, &K_INT), Some(0));
-        assert_eq!(ue.verify_only(&smc, &[0x00; 16]), None);
-        assert_eq!(ue.verify_only(&smc[..3], &K_INT), None);
+        assert_eq!(ue.verify_only(&smc, IntegrityAlg::Nia2, &K_INT), Some(0));
+        assert_eq!(ue.verify_only(&smc, IntegrityAlg::Nia2, &[0x00; 16]), None);
+        assert_eq!(ue.verify_only(&smc[..3], IntegrityAlg::Nia2, &K_INT), None);
         // …then receives it with integrity not yet configured (MAC-I ignored).
         ue.rx_pdu(&smc, t(0)).unwrap();
         assert_eq!(ue.pop_rx_sdu().unwrap(), b"SecurityModeCommand");
@@ -1388,7 +1344,7 @@ mod tests {
         assert_eq!(d18.rx_pdu(&[0x80, 0x00, 0x00], t(0)), Ok(())); // empty SDU
         assert_eq!(d18.pop_rx_sdu(), Some(vec![]));
         assert_eq!(srb.stats().rx_malformed, 4);
-        assert!(srb.verify_only(&[], &K_INT).is_none());
+        assert!(srb.verify_only(&[], IntegrityAlg::Nia2, &K_INT).is_none());
     }
 
     #[test]

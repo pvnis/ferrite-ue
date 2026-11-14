@@ -7,18 +7,17 @@
 //! (`mu` 0/1 for FR1) and sample rate.
 
 pub mod coding;
+// Spec tables shared with the upper layers live in `ferrite_ran`; re-exported
+// so the PHY's own modules keep their `crate::` paths.
+pub use ferrite_ran::tbs as pdsch_params;
+pub use ferrite_ran::{dmrs, mcs, prach_config, prach_tables};
 pub mod coreset0;
 pub mod csi;
-pub mod dmrs;
-pub mod mcs;
 pub mod numerology;
 pub mod ofdm;
 pub mod pdcch;
 pub mod pdsch;
-pub mod pdsch_params;
 pub mod prach;
-pub mod prach_config;
-pub mod prach_tables;
 pub mod pucch;
 pub mod pusch;
 pub mod sequence;

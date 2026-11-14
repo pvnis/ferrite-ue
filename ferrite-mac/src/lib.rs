@@ -1,7 +1,7 @@
 //! Ferrite MAC (3GPP TS 38.321) — the UE MAC entity.
 //!
 //! Sits between the PHY (through the FAPI-style interface in
-//! `ferrite_l1::fapi`) and the RLC bearers (through [`UpperLayers`]). Pure
+//! `ferrite_fapi`) and the RLC bearers (through [`UpperLayers`]). Pure
 //! state machines driven by PHY indications; no threads, no I/O.
 //!
 //! Sub-entities:
@@ -28,7 +28,7 @@ pub mod sr;
 pub mod ta;
 
 pub use entity::{MacEntity, MacEvent, UpperLayers};
-pub use ferrite_l1::fapi;
+pub use ferrite_fapi as fapi;
 
 use ferrite_common::Numerology;
 
@@ -118,16 +118,8 @@ pub struct RachConfig {
     pub nof_cb_preambles: u8,
     /// `ssb-perRACH-OccasionAndCB-PreamblesPerSSB` (preambles per SSB per occasion).
     pub cb_preambles_per_ssb: u8,
-    /// The PRACH configuration (occasion pattern lives in `ferrite_phy::prach_config`).
-    pub prach: ferrite_l1::config::PrachConfig,
-    /// Initial UL BWP size in RBs (for the RAR grant's frequency allocation).
-    pub ul_bwp_rb: u16,
-    /// Msg3 Δ (TS 38.214 Table 6.1.2.1.1-5): 2/3/4/6 for µ = 0..3.
-    pub msg3_delta: u8,
-    /// Common PUSCH TDRA list for the RAR grant's time-resource field.
-    pub pusch_tdra_common: Vec<ferrite_l1::config::TdraRow>,
-    /// `msg3-transformPrecoder`: Msg3 (and its DM-RS parameters) uses DFT-s-OFDM.
-    pub msg3_transform_precoding: Option<ferrite_l1::fapi::TransformPrecoding>,
+    /// The PRACH configuration (occasion pattern lives in `ferrite_ran::prach_config`).
+    pub prach: ferrite_fapi::config::PrachConfig,
 }
 
 /// PUCCH facts MAC needs to pick a resource for UCI.

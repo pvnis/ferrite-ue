@@ -5,15 +5,13 @@
 //!   derived K_NASint / K_NASenc and the uplink / downlink NAS COUNTs.
 //! * [`protect`] / [`unprotect`]: security-protected NAS message framing
 //!   (TS 24.501 §9.1.1): `EPD | SHT | MAC(4) | SEQ | plain message`.
-//! * [`nea2`]: 128-NEA2 (AES-128 CTR, TS 33.501 D.3.1.3 = TS 33.401 B.1.3).
+//! * [`nea2`] / NIA2 come from `ferrite-security` (shared with PDCP / RRC).
 //! * [`run_5g_aka`]: USIM side of 5G-AKA with MILENAGE, SQN freshness and
 //!   AUTS generation.
 
 use crate::ie::NasError;
-use crate::milenage::{algo_key, k_amf, k_ausf, k_gnb, k_seaf, milenage, nia2_mac, res_star};
+use crate::milenage::{algo_key, k_amf, k_ausf, k_gnb, k_seaf, milenage, res_star};
 use crate::mm::{SecurityHeader, SecurityHeaderType, EPD_5GMM};
-use aes::cipher::{generic_array::GenericArray, KeyIvInit, StreamCipher};
-use aes::Aes128;
 
 /// NAS connection identifier / BEARER for 3GPP access (TS 33.501 §6.4.2.2).
 pub const BEARER_3GPP: u8 = 1;
@@ -22,62 +20,8 @@ pub const DIR_UL: u8 = 0;
 /// DIRECTION bit: downlink.
 pub const DIR_DL: u8 = 1;
 
-/// 5G NAS ciphering algorithm identifiers (TS 33.501 §5.11.1.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CipherAlg {
-    Nea0 = 0,
-    Nea1 = 1,
-    Nea2 = 2,
-    Nea3 = 3,
-}
-
-/// 5G NAS integrity algorithm identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum IntegrityAlg {
-    Nia0 = 0,
-    Nia1 = 1,
-    Nia2 = 2,
-    Nia3 = 3,
-}
-
-impl CipherAlg {
-    /// Only NEA0 and NEA2 are implemented.
-    pub fn from_id(id: u8) -> Option<Self> {
-        match id {
-            0 => Some(Self::Nea0),
-            2 => Some(Self::Nea2),
-            _ => None,
-        }
-    }
-}
-
-impl IntegrityAlg {
-    /// Only NIA0 and NIA2 are implemented.
-    pub fn from_id(id: u8) -> Option<Self> {
-        match id {
-            0 => Some(Self::Nia0),
-            2 => Some(Self::Nia2),
-            _ => None,
-        }
-    }
-}
-
-/// 128-NEA2: AES-128 in CTR mode. The initial counter block (TS 33.401 B.1.3)
-/// is `COUNT(32) | BEARER(5) | DIRECTION(1) | 0(26) | 0(64)` and is
-/// incremented as a 128-bit big-endian integer. Encryption and decryption are
-/// the same operation.
-pub fn nea2(key: &[u8; 16], count: u32, bearer: u8, direction: u8, data: &[u8]) -> Vec<u8> {
-    type Ctr = ctr::Ctr128BE<Aes128>;
-    let mut iv = [0u8; 16];
-    iv[0..4].copy_from_slice(&count.to_be_bytes());
-    iv[4] = ((bearer & 0x1f) << 3) | ((direction & 1) << 2);
-    let mut c = Ctr::new(GenericArray::from_slice(key), GenericArray::from_slice(&iv));
-    let mut out = data.to_vec();
-    c.apply_keystream(&mut out);
-    out
-}
+pub use ferrite_security::nea::nea2;
+pub use ferrite_security::{CipherAlg, IntegrityAlg};
 
 /// Apply the selected ciphering algorithm (both directions are symmetric).
 pub fn cipher(
@@ -88,12 +32,10 @@ pub fn cipher(
     direction: u8,
     data: &[u8],
 ) -> Vec<u8> {
-    match alg {
-        CipherAlg::Nea0 => data.to_vec(),
-        CipherAlg::Nea2 => nea2(key, count, bearer, direction, data),
-        // Not implemented; never selected because `from_id` rejects them.
-        CipherAlg::Nea1 | CipherAlg::Nea3 => data.to_vec(),
-    }
+    let mut out = data.to_vec();
+    // Unsupported algorithms are rejected when the security context is created.
+    let _ = ferrite_security::cipher_in_place(alg, key, count, bearer, direction, &mut out);
+    out
 }
 
 /// Compute the NAS-MAC with the selected integrity algorithm over
@@ -106,11 +48,7 @@ pub fn integrity_mac(
     direction: u8,
     msg: &[u8],
 ) -> [u8; 4] {
-    match alg {
-        IntegrityAlg::Nia0 => [0; 4],
-        IntegrityAlg::Nia2 => nia2_mac(key, count, bearer, direction, msg),
-        IntegrityAlg::Nia1 | IntegrityAlg::Nia3 => [0; 4],
-    }
+    ferrite_security::integrity_mac(alg, key, count, bearer, direction, msg).unwrap_or([0; 4])
 }
 
 /// The selected NAS algorithms with their keys (TS 33.501 A.8).
@@ -203,8 +141,8 @@ impl NasSecurityContext {
     /// Derive a context from K_AMF and the algorithms selected by the SMC
     /// (TS 33.501 A.8: K_NASenc = KDF(K_AMF, 0x69, 0x01, NEA), K_NASint = (.., 0x02, NIA)).
     pub fn new(k_amf: [u8; 32], ngksi: u8, ea: u8, ia: u8) -> Result<Self, NasError> {
-        let ea_alg = CipherAlg::from_id(ea).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
-        let ia_alg = IntegrityAlg::from_id(ia).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
+        let ea_alg = CipherAlg::try_from(ea).ok().filter(|a| a.is_supported()).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
+        let ia_alg = IntegrityAlg::try_from(ia).ok().filter(|a| a.is_supported()).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
         Ok(NasSecurityContext {
             k_amf,
             ngksi,

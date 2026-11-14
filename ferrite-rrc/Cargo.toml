@@ -7,10 +7,11 @@ license.workspace = true
 [dependencies]
 ferrite-common.workspace = true
 ferrite-asn1.workspace = true
-ferrite-phy.workspace = true
-ferrite-l1.workspace = true
+ferrite-fapi.workspace = true
+ferrite-ran.workspace = true
 ferrite-mac.workspace = true
 log.workspace = true
-ferrite-pdcp.workspace = true
-hmac.workspace = true
-sha2.workspace = true
+ferrite-security.workspace = true
+
+[dev-dependencies]
+ferrite-phy.workspace = true

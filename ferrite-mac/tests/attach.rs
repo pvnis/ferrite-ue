@@ -3,8 +3,8 @@
 //! HARQ-ACK goes out on a PUCCH at n + k1.
 
 use ferrite_common::{Numerology, Rnti, RntiKind, SlotPoint};
-use ferrite_l1::config::{PrachConfig, TdraRow};
-use ferrite_l1::fapi::*;
+use ferrite_fapi::config::PrachConfig;
+use ferrite_fapi::*;
 use ferrite_mac::*;
 
 struct FakeUpper {
@@ -41,7 +41,7 @@ fn config() -> MacConfig {
             nof_cb_preambles: 64,
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
-                phy: ferrite_phy::prach_config::PrachConfig { index: 159, duplex: ferrite_common::DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 5 },
+                phy: ferrite_ran::prach_config::PrachConfig { index: 159, duplex: ferrite_common::DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 5 },
                 zero_correlation_zone: 0,
                 root_sequence_index: 1,
                 restricted_set: 0,
@@ -49,10 +49,6 @@ fn config() -> MacConfig {
                 target_power_dbm: -100,
                 power_ramping_step_db: 4,
             },
-            ul_bwp_rb: 24,
-            msg3_delta: 3,
-            pusch_tdra_common: vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }],
-        msg3_transform_precoding: None,
         },
         3,
     );
@@ -109,6 +105,39 @@ fn attach_flow() {
     rar.extend_from_slice(&0x4601u16.to_be_bytes());
     let rar_slot = occ.slot.add(5);
     let out = step(&mut mac, &mut up, PhyToMac::RxData(RxDataIndication { rnti: occ.ra_rnti, rnti_kind: RntiKind::Ra, harq_id: 0, ndi: 0, pdsch_slot: rar_slot, tb: Some(rar), sinr_db: 30.0 }));
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::TimingAdvance { n_ta_tc } if *n_ta_tc == 5 * 512)));
+    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { tc_rnti: Some(Rnti(0x4601)), .. })));
+    // MAC parses the RAR grant fields and asks the PHY to resolve them.
+    let rar_grant = out
+        .iter()
+        .find_map(|m| if let MacToPhy::RarGrant { rar_slot: s, tc_rnti, grant } = m { Some((*s, *tc_rnti, *grant)) } else { None })
+        .expect("RAR grant handed to the PHY");
+    assert_eq!(rar_grant.0, rar_slot);
+    assert_eq!(rar_grant.1, Rnti(0x4601));
+    assert_eq!(rar_grant.2, RarUlGrant { freq_hopping: false, fdra: riv as u16, time_resource: 0, mcs: 0, tpc: 7, csi_request: false });
+    // The PHY's answer: the Msg3 grant (k2 = 4, Δ = 3 at 30 kHz), 3 RBs at RB 4.
+    let msg3_grant = UlGrant {
+        rnti: Rnti(0x4601),
+        rnti_kind: RntiKind::Tc,
+        pusch_slot: rar_slot.add(4 + 3),
+        prb_start: 4,
+        n_prb: 3,
+        time: TimeAlloc { mapping_type_a: true, start_symbol: 0, n_symbols: 14 },
+        mcs: Mcs { index: 0, qm: 2, r_x1024: Some(120) },
+        tbs_bits: 88,
+        harq_id: 0,
+        ndi: 0,
+        rv: 0,
+        dai: None,
+        tpc: 7,
+        csi_request: 0,
+        ul_sch: true,
+        cdm_groups_wo_data: 2,
+        dmrs_add_pos: 2,
+        freq_hopping: false,
+        transform_precoding: None,
+    };
+    let out = step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: rar_slot, dci: Dci::Ul(msg3_grant) }));
     let msg3 = out.iter().find_map(|m| match m {
         MacToPhy::UlTti(r) => r.pdus.iter().find_map(|p| if let UlTtiPdu::Pusch { grant, tb, .. } = p { Some((r.slot, grant.clone(), tb.clone())) } else { None }),
         _ => None,
@@ -117,10 +146,9 @@ fn attach_flow() {
     assert_eq!(msg3_slot, rar_slot.add(4 + 3));
     assert_eq!(grant.rnti, Rnti(0x4601));
     assert_eq!((grant.prb_start, grant.n_prb), (4, 3));
+    assert_eq!(tb.len(), 11);
     assert_eq!(tb[0], 52); // CCCH48 subheader
     assert_eq!(&tb[1..7], &ccch);
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::TimingAdvance { n_ta_tc } if *n_ta_tc == 5 * 512)));
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { tc_rnti: Some(Rnti(0x4601)), .. })));
     // Msg4: DCI 1_0 for the TC-RNTI then the PDSCH with the ConRes CE + CCCH SDU.
     let m4_slot = msg3_slot.add(6);
     let dl = DlGrant {

@@ -2,7 +2,7 @@
 //! PHY configuration (TDRA tables, k1 list, BWP sizes, DMRS/MCS config).
 
 use crate::config::{McsTableSel, PhyConfig, SearchSpaceKind, TdraRow};
-use crate::fapi::{TransformPrecoding, Dci, DlGrant, Mcs, TimeAlloc, UlGrant};
+use crate::fapi::{Dci, DlGrant, Mcs, RarUlGrant, TimeAlloc, TransformPrecoding, UlGrant};
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 use ferrite_phy::coding::dci::{self as dci, DciSizeConfig, DciSizes, HarqAckCodebook};
 use ferrite_phy::dmrs::{self, MappingType};
@@ -346,6 +346,51 @@ impl DciResolver {
             vrb_to_prb_interleaved: d.vrb_to_prb_interleaved.unwrap_or(false),
             r_pucch_common: r_pucch,
         }))
+    }
+
+    /// The Msg3 PUSCH grant for a RAR UL grant (TS 38.213 §8.2 / §8.3): the
+    /// PUSCH is `k2 + Δ` slots after the RAR (Δ from TS 38.214 Table
+    /// 6.1.2.1.1-5), on the common PUSCH TDRA row `time_resource`, with the
+    /// RIV in the ⌈log2(N(N+1)/2)⌉ LSBs of the 14-bit FDRA (N_BWP ≤ 180; for a
+    /// larger BWP the 14 bits are the RIV, the hopping bits being ignored), MCS
+    /// from Table 6.1.4.1-1 or 5.1.3.1-1 per `msg3-transformPrecoder`, HARQ
+    /// process 0, NDI 0.
+    pub fn resolve_rar_grant(&self, rar_slot: SlotPoint, tc_rnti: Rnti, g: &RarUlGrant) -> Option<UlGrant> {
+        let n = self.ul_bwp_rb;
+        let riv = if n <= 180 {
+            let m = n * (n + 1) / 2;
+            let bits = (usize::BITS - (m.max(2) - 1).leading_zeros()) as usize;
+            u32::from(g.fdra) & ((1u32 << bits.min(14)) - 1)
+        } else {
+            u32::from(g.fdra)
+        };
+        let (rb_start, n_rb) = dci::riv_decode(riv, n)?;
+        let row = self.pusch_tdra_row(g.time_resource as usize, false)?;
+        let table = if self.msg3_tp.is_some() { McsTable::Qam64TransformPrecoding } else { McsTable::Qam64 };
+        let mcs = self.pusch_mcs_of(table, g.mcs, false);
+        let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
+        let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, 2);
+        Some(UlGrant {
+            rnti: tc_rnti,
+            rnti_kind: RntiKind::Tc,
+            pusch_slot: rar_slot.add(row.k as u64 + self.msg3_delta as u64),
+            prb_start: rb_start as u16,
+            n_prb: n_rb as u16,
+            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            mcs,
+            tbs_bits: tbs,
+            harq_id: 0,
+            ndi: 0,
+            rv: 0,
+            dai: None,
+            tpc: g.tpc,
+            csi_request: u8::from(g.csi_request),
+            ul_sch: true,
+            cdm_groups_wo_data: cdm,
+            dmrs_add_pos: 2,
+            freq_hopping: g.freq_hopping,
+            transform_precoding: self.msg3_tp,
+        })
     }
 
     pub fn resolve_0_1(&self, bits: &[u8], rnti: Rnti, slot: SlotPoint) -> Option<Dci> {
