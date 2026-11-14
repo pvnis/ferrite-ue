@@ -9,7 +9,6 @@
 // symbol / subcarrier index; the iterator rewrite clippy suggests reads worse.
 #![allow(clippy::needless_range_loop)]
 
-
 pub mod coding;
 // Spec tables shared with the upper layers live in `ferrite_ran`; re-exported
 // so the PHY's own modules keep their `crate::` paths.

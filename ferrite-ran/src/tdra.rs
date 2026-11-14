@@ -3,7 +3,6 @@
 
 use crate::dmrs::MappingType;
 
-
 /// One row of a default time-domain allocation table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TdraRow {
@@ -93,4 +92,3 @@ pub fn default_pusch_tdra(row: u8, mu: u8) -> Option<TdraRow> {
     r.k += j;
     Some(r)
 }
-

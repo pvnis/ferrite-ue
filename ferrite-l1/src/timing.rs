@@ -92,7 +92,6 @@ impl SampleClock {
         self.numerology.samples_per_slot(self.fs) as i64
     }
 
-
     /// DL stream index of the start of `slot`.
     pub fn dl_index(&self, slot: SlotPoint) -> i64 {
         self.anchor_index + slot.diff(&self.anchor_slot) * self.samples_per_slot()
@@ -104,7 +103,11 @@ impl SampleClock {
         let sps = self.samples_per_slot();
         let n = d.div_euclid(sps);
         let off = d.rem_euclid(sps);
-        let slot = if n >= 0 { self.anchor_slot.add(n as u64) } else { self.anchor_slot.sub((-n) as u64) };
+        let slot = if n >= 0 {
+            self.anchor_slot.add(n as u64)
+        } else {
+            self.anchor_slot.sub((-n) as u64)
+        };
         (slot, off)
     }
 
@@ -124,7 +127,6 @@ impl SampleClock {
     pub fn ul_index(&self, slot: SlotPoint) -> i64 {
         self.dl_index(slot) - self.ta_samples() - self.tx_rx_offset + self.ul_guard
     }
-
 
     /// Re-anchor after a measured timing error: the SSB at `slot` was found
     /// `err` samples later than predicted → shift the anchor by `err`.
@@ -174,7 +176,11 @@ mod tests {
         // Symbol offsets: slot 0 of a subframe has the long CP on symbol 0.
         assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 0), 1), 44 + 512);
         assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 1), 1), 44 + 512); // symbol 14 = 7·2^µ also has the long CP
-        assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 1), 2) - c.symbol_offset(SlotPoint::new(n, 0, 1), 1), 36 + 512);
+        assert_eq!(
+            c.symbol_offset(SlotPoint::new(n, 0, 1), 2)
+                - c.symbol_offset(SlotPoint::new(n, 0, 1), 1),
+            36 + 512
+        );
         assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 0), 14), 7680);
     }
 
@@ -185,7 +191,11 @@ mod tests {
         assert_eq!(c.samples_per_slot(), 11520);
         // fft 768: CP 54 normal, 60 long (symbols 0 and 7).
         assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 0), 1), 60 + 768);
-        assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 0), 8) - c.symbol_offset(SlotPoint::new(n, 0, 0), 7), 60 + 768);
+        assert_eq!(
+            c.symbol_offset(SlotPoint::new(n, 0, 0), 8)
+                - c.symbol_offset(SlotPoint::new(n, 0, 0), 7),
+            60 + 768
+        );
         assert_eq!(c.symbol_offset(SlotPoint::new(n, 0, 0), 14), 11520);
         assert_eq!(c.ta_samples(), 150);
     }

@@ -23,7 +23,9 @@ pub struct RarPdu {
 }
 
 /// Backoff parameter values (TS 38.321 Table 7.2-1), ms.
-const BACKOFF_MS: [u16; 16] = [0, 10, 20, 30, 40, 60, 80, 120, 160, 240, 320, 480, 960, 1920, 1920, 1920];
+const BACKOFF_MS: [u16; 16] = [
+    0, 10, 20, 30, 40, 60, 80, 120, 160, 240, 320, 480, 960, 1920, 1920, 1920,
+];
 
 /// Parse a RAR MAC PDU (one or more E/T/RAPID or E/T/R/R/BI subheaders, then the
 /// 7-octet MAC RARs in order).
@@ -50,7 +52,10 @@ pub fn parse_rar_pdu(pdu: &[u8]) -> Option<RarPdu> {
         let p = pdu.get(i..i + 7)?;
         i += 7;
         let ta = (((p[0] & 0x7f) as u16) << 5) | (p[1] >> 3) as u16;
-        let g = (((p[1] & 0x07) as u32) << 24) | ((p[2] as u32) << 16) | ((p[3] as u32) << 8) | p[4] as u32;
+        let g = (((p[1] & 0x07) as u32) << 24)
+            | ((p[2] as u32) << 16)
+            | ((p[3] as u32) << 8)
+            | p[4] as u32;
         let grant = RarUlGrant {
             freq_hopping: (g >> 26) & 1 == 1,
             fdra: ((g >> 12) & 0x3fff) as u16,
@@ -60,7 +65,12 @@ pub fn parse_rar_pdu(pdu: &[u8]) -> Option<RarPdu> {
             csi_request: g & 1 == 1,
         };
         let tc_rnti = ((p[5] as u16) << 8) | p[6] as u16;
-        rars.push(Rar { rapid, ta, grant, tc_rnti });
+        rars.push(Rar {
+            rapid,
+            ta,
+            grant,
+            tc_rnti,
+        });
     }
     Some(RarPdu { backoff_ms, rars })
 }

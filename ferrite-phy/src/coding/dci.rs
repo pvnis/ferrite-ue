@@ -177,7 +177,10 @@ pub struct DmrsConfig {
 
 impl DmrsConfig {
     /// Type 1, single symbol — the configuration when both IEs are absent.
-    pub const TYPE1_LEN1: DmrsConfig = DmrsConfig { config_type: 1, max_length: 1 };
+    pub const TYPE1_LEN1: DmrsConfig = DmrsConfig {
+        config_type: 1,
+        max_length: 1,
+    };
 }
 
 /// `codebookSubset` (PUSCH-Config), for the precoding-information field width.
@@ -193,7 +196,11 @@ pub enum CodebookSubset {
 pub enum PuschTxScheme {
     /// Codebook-based: `nof_srs_ports` from the SRS resource(s) of the
     /// `usage = codebook` set, `max_rank` = `maxRank`.
-    Codebook { nof_srs_ports: u8, max_rank: u8, subset: CodebookSubset },
+    Codebook {
+        nof_srs_ports: u8,
+        max_rank: u8,
+        subset: CodebookSubset,
+    },
     /// Non-codebook-based: `l_max` = `maxMIMO-Layers` of PUSCH-ServingCellConfig.
     NonCodebook { l_max: u8 },
 }
@@ -473,7 +480,11 @@ fn bwp_indicator_bits(nof_bwp_rrc: usize) -> usize {
     if nof_bwp_rrc == 0 {
         return 0;
     }
-    log2_ceil(if nof_bwp_rrc <= 3 { nof_bwp_rrc + 1 } else { nof_bwp_rrc })
+    log2_ceil(if nof_bwp_rrc <= 3 {
+        nof_bwp_rrc + 1
+    } else {
+        nof_bwp_rrc
+    })
 }
 
 /// DCI 1_1 antenna-port field width (Tables 7.3.1.2.2-1 … -4): 4 bits for type 1
@@ -485,7 +496,11 @@ fn dl_antenna_ports_bits(a: Option<DmrsConfig>, b: Option<DmrsConfig>) -> usize 
 }
 
 /// DCI 0_1 antenna-port field width (Tables 7.3.1.1.2-6 … -23).
-fn ul_antenna_ports_bits(a: Option<DmrsConfig>, b: Option<DmrsConfig>, transform_precoding: bool) -> usize {
+fn ul_antenna_ports_bits(
+    a: Option<DmrsConfig>,
+    b: Option<DmrsConfig>,
+    transform_precoding: bool,
+) -> usize {
     let w = |d: DmrsConfig| match (transform_precoding, d.config_type, d.max_length) {
         (true, 1, 1) => 2,
         (true, 1, 2) => 4,
@@ -512,7 +527,9 @@ fn sri_bits(scheme: Option<PuschTxScheme>, nof_srs: usize) -> usize {
         None => 0,
         Some(PuschTxScheme::Codebook { .. }) => log2_ceil(nof_srs),
         Some(PuschTxScheme::NonCodebook { l_max }) => {
-            let sum: usize = (1..=usize::from(l_max).min(nof_srs)).map(|k| binomial(nof_srs, k)).sum();
+            let sum: usize = (1..=usize::from(l_max).min(nof_srs))
+                .map(|k| binomial(nof_srs, k))
+                .sum();
             log2_ceil(sum)
         }
     }
@@ -521,7 +538,14 @@ fn sri_bits(scheme: Option<PuschTxScheme>, nof_srs: usize) -> usize {
 /// Precoding information and number of layers (Tables 7.3.1.1.2-2 … -5): 0 bits
 /// for non-codebook or a single SRS port.
 fn precoding_bits(scheme: Option<PuschTxScheme>, transform_precoding: bool) -> usize {
-    let Some(PuschTxScheme::Codebook { nof_srs_ports, max_rank, subset }) = scheme else { return 0 };
+    let Some(PuschTxScheme::Codebook {
+        nof_srs_ports,
+        max_rank,
+        subset,
+    }) = scheme
+    else {
+        return 0;
+    };
     use CodebookSubset::*;
     match (nof_srs_ports, max_rank > 1 && !transform_precoding, subset) {
         (1, _, _) => 0,
@@ -542,13 +566,22 @@ fn precoding_bits(scheme: Option<PuschTxScheme>, transform_precoding: bool) -> u
 /// DCI 0_0 bits before padding: `20 + ⌈log2(N(N+1)/2)⌉`.
 fn dci_0_0_raw(n_rb_ul: usize) -> Dci0_0Size {
     let fdra = fdra_type1_bits(n_rb_ul);
-    Dci0_0Size { total: 20 + fdra, fdra, padding: 0, ul_sul_present: false }
+    Dci0_0Size {
+        total: 20 + fdra,
+        fdra,
+        padding: 0,
+        ul_sul_present: false,
+    }
 }
 
 /// DCI 1_0 bits before padding: `28 + ⌈log2(N(N+1)/2)⌉`.
 fn dci_1_0_raw(n_rb_dl: usize) -> Dci1_0Size {
     let fdra = fdra_type1_bits(n_rb_dl);
-    Dci1_0Size { total: 28 + fdra, fdra, padding: 0 }
+    Dci1_0Size {
+        total: 28 + fdra,
+        fdra,
+        padding: 0,
+    }
 }
 
 /// DCI 0_1 size before the §7.3.1.0 padding (§7.3.1.1.2).
@@ -559,7 +592,11 @@ pub fn dci_0_1_size(cfg: &DciSizeConfig) -> Dci0_1Size {
     let fdra = fdra_bits(cfg.pusch_resource_allocation, cfg.ul_bwp_active_rb);
     let tdra = log2_ceil(cfg.nof_pusch_tdra_rows);
     let frequency_hopping_flag = usize::from(
-        cfg.frequency_hopping && !matches!(cfg.pusch_resource_allocation, ResourceAllocation::Type0 { .. }),
+        cfg.frequency_hopping
+            && !matches!(
+                cfg.pusch_resource_allocation,
+                ResourceAllocation::Type0 { .. }
+            ),
     );
     let harq_id = usize::from(cfg.ul_harq_bits);
     let first_dai = match cfg.harq_ack_codebook {
@@ -567,10 +604,18 @@ pub fn dci_0_1_size(cfg: &DciSizeConfig) -> Dci0_1Size {
         HarqAckCodebook::SemiStatic => 1,
     };
     let second_dai =
-        if cfg.harq_ack_codebook == HarqAckCodebook::Dynamic && cfg.two_harq_ack_sub_codebooks { 2 } else { 0 };
+        if cfg.harq_ack_codebook == HarqAckCodebook::Dynamic && cfg.two_harq_ack_sub_codebooks {
+            2
+        } else {
+            0
+        };
     let srs_resource_indicator = sri_bits(cfg.pusch_tx_scheme, cfg.nof_srs_resources);
     let precoding_info = precoding_bits(cfg.pusch_tx_scheme, cfg.transform_precoding);
-    let antenna_ports = ul_antenna_ports_bits(cfg.pusch_dmrs_type_a, cfg.pusch_dmrs_type_b, cfg.transform_precoding);
+    let antenna_ports = ul_antenna_ports_bits(
+        cfg.pusch_dmrs_type_a,
+        cfg.pusch_dmrs_type_b,
+        cfg.transform_precoding,
+    );
     let srs_request = if cfg.sul_configured { 3 } else { 2 };
     let csi_request = usize::from(cfg.report_trigger_size);
     let cbgti = usize::from(cfg.pusch_cbg_bits);
@@ -579,7 +624,11 @@ pub fn dci_0_1_size(cfg: &DciSizeConfig) -> Dci0_1Size {
         Some(PuschTxScheme::NonCodebook { l_max }) => l_max,
         None => 1,
     };
-    let ptrs_dmrs_association = if cfg.ptrs_uplink && !cfg.transform_precoding && max_rank > 1 { 2 } else { 0 };
+    let ptrs_dmrs_association = if cfg.ptrs_uplink && !cfg.transform_precoding && max_rank > 1 {
+        2
+    } else {
+        0
+    };
     let beta_offset = if cfg.dynamic_beta_offsets { 2 } else { 0 };
     let dmrs_seq_init = usize::from(!cfg.transform_precoding);
     // identifier 1 + MCS 5 + NDI 1 + RV 2 + TPC 2 + UL-SCH indicator 1 = 12 fixed.
@@ -633,7 +682,11 @@ pub fn dci_1_1_size(cfg: &DciSizeConfig) -> Dci1_1Size {
     let fdra = fdra_bits(cfg.pdsch_resource_allocation, cfg.dl_bwp_active_rb);
     let tdra = log2_ceil(cfg.nof_pdsch_tdra_rows);
     let vrb_to_prb = usize::from(
-        cfg.vrb_to_prb_interleaver && !matches!(cfg.pdsch_resource_allocation, ResourceAllocation::Type0 { .. }),
+        cfg.vrb_to_prb_interleaver
+            && !matches!(
+                cfg.pdsch_resource_allocation,
+                ResourceAllocation::Type0 { .. }
+            ),
     );
     let prb_bundling = usize::from(cfg.dynamic_prb_bundling);
     let rate_matching = usize::from(cfg.rate_match_groups.min(2));
@@ -696,7 +749,12 @@ pub fn dci_1_1_size(cfg: &DciSizeConfig) -> Dci1_1Size {
 /// Align a 0_0 / 1_0 pair: pad the smaller 0_0 (padding precedes the UL/SUL bit,
 /// which only exists when 1_0 was larger before padding); truncate the 0_0 FDRA
 /// MSBs when 0_0 is larger (CSS, step 0) or pad 1_0 (USS, step 1).
-fn align_fallback(mut f0: Dci0_0Size, mut f1: Dci1_0Size, sul: bool, truncate_0_0: bool) -> (Dci0_0Size, Dci1_0Size) {
+fn align_fallback(
+    mut f0: Dci0_0Size,
+    mut f1: Dci1_0Size,
+    sul: bool,
+    truncate_0_0: bool,
+) -> (Dci0_0Size, Dci1_0Size) {
     if f0.total < f1.total {
         f0.padding = f1.total - f0.total;
         f0.ul_sul_present = sul;
@@ -816,7 +874,16 @@ pub fn dci_sizes(cfg: &DciSizeConfig) -> DciSizes {
         }
     }
 
-    DciSizes { f0_0_css, f1_0_css, f0_0_uss, f1_0_uss, f0_1, f1_1, nof_distinct_sizes, uss_fallback_aligned_to_css }
+    DciSizes {
+        f0_0_css,
+        f1_0_css,
+        f0_0_uss,
+        f1_0_uss,
+        f0_1,
+        f1_1,
+        nof_distinct_sizes,
+        uss_fallback_aligned_to_css,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +904,9 @@ pub enum DciParseError {
 impl std::fmt::Display for DciParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WrongLength { expected, got } => write!(f, "DCI payload is {got} bits, expected {expected}"),
+            Self::WrongLength { expected, got } => {
+                write!(f, "DCI payload is {got} bits, expected {expected}")
+            }
             Self::WrongIdentifier => write!(f, "DCI format identifier bit mismatch"),
             Self::NotABit => write!(f, "DCI payload contains a non-binary value"),
         }
@@ -855,7 +924,10 @@ struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     fn new(bits: &'a [u8], expected: usize) -> Result<Self, DciParseError> {
         if bits.len() != expected {
-            return Err(DciParseError::WrongLength { expected, got: bits.len() });
+            return Err(DciParseError::WrongLength {
+                expected,
+                got: bits.len(),
+            });
         }
         if bits.iter().any(|&b| b > 1) {
             return Err(DciParseError::NotABit);
@@ -947,7 +1019,11 @@ pub struct Dci1_0 {
 
 /// Parse a DCI 1_0 payload of `size` bits (from [`DciSizes::f1_0_css`] or
 /// `f1_0_uss`) for the given RNTI.
-pub fn parse_dci_1_0(bits: &[u8], rnti: RntiKind, size: &Dci1_0Size) -> Result<Dci1_0, DciParseError> {
+pub fn parse_dci_1_0(
+    bits: &[u8],
+    rnti: RntiKind,
+    size: &Dci1_0Size,
+) -> Result<Dci1_0, DciParseError> {
     let mut r = BitReader::new(bits, size.total)?;
     let f = size.fdra;
     let mut d = Dci1_0 {
@@ -1009,7 +1085,12 @@ pub fn parse_dci_1_0(bits: &[u8], rnti: RntiKind, size: &Dci1_0Size) -> Result<D
                 let ssb_index = r.read_u8(6);
                 let prach_mask_index = r.read_u8(4);
                 r.skip(10);
-                d.pdcch_order = Some(PdcchOrder { preamble_index, ul_sul, ssb_index, prach_mask_index });
+                d.pdcch_order = Some(PdcchOrder {
+                    preamble_index,
+                    ul_sul,
+                    ssb_index,
+                    prach_mask_index,
+                });
             } else {
                 d.tdra = r.read_u8(4);
                 d.vrb_to_prb_interleaved = r.flag();
@@ -1054,7 +1135,12 @@ pub struct Dci0_0 {
 
 /// Parse a DCI 0_0 payload. `n_bwp_ul` is the UL BWP size the RIV refers to
 /// (initial UL BWP in the CSS, active UL BWP in a USS) — it fixes `N_UL_hop`.
-pub fn parse_dci_0_0(bits: &[u8], rnti: RntiKind, size: &Dci0_0Size, n_bwp_ul: usize) -> Result<Dci0_0, DciParseError> {
+pub fn parse_dci_0_0(
+    bits: &[u8],
+    rnti: RntiKind,
+    size: &Dci0_0Size,
+    n_bwp_ul: usize,
+) -> Result<Dci0_0, DciParseError> {
     let mut r = BitReader::new(bits, size.total)?;
     if r.flag() {
         return Err(DciParseError::WrongIdentifier);
@@ -1066,7 +1152,10 @@ pub fn parse_dci_0_0(bits: &[u8], rnti: RntiKind, size: &Dci0_0Size, n_bwp_ul: u
     let n_ul_hop = if n_bwp_ul < 50 { 1 } else { 2 };
     let (fdra, hopping_offset) = if frequency_hopping && size.fdra > n_ul_hop {
         let riv_bits = size.fdra - n_ul_hop;
-        (raw & ((1u32 << riv_bits) - 1), Some((raw >> riv_bits) as u8))
+        (
+            raw & ((1u32 << riv_bits) - 1),
+            Some((raw >> riv_bits) as u8),
+        )
     } else {
         (raw, None)
     };
@@ -1288,9 +1377,9 @@ pub fn parse_dci_0_1(bits: &[u8], size: &Dci0_1Size) -> Result<Dci0_1, DciParseE
 
 // Resource allocation (RIV) and default TDRA tables live in `ferrite_ran`;
 // re-exported here so DCI users keep one import path.
-pub use ferrite_ran::riv::{riv_decode, riv_decode_css, riv_encode, sliv_decode};
 #[cfg(test)]
 use crate::dmrs::MappingType;
+pub use ferrite_ran::riv::{riv_decode, riv_decode_css, riv_encode, sliv_decode};
 pub use ferrite_ran::tdra::{default_pdsch_tdra, default_pusch_tdra, TdraRow};
 
 #[cfg(test)]
@@ -1314,7 +1403,10 @@ mod tests {
         for trial in 0..40 {
             let a: Vec<u8> = (0..41).map(|_| bit()).collect();
             let coded = dci_encode(&a, rnti, 576);
-            let llr_al4: Vec<f32> = coded.iter().map(|&b| if b == 1 { -8.0 } else { 8.0 }).collect();
+            let llr_al4: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 1 { -8.0 } else { 8.0 })
+                .collect();
             // AL8 candidate containing the AL4 one at its start (other CCEs empty).
             let mut llr_al8 = llr_al4.clone();
             llr_al8.resize(1152, 0.0);
@@ -1324,14 +1416,27 @@ mod tests {
             // AL2 candidates = halves of the AL4 one.
             let llr_al2a = llr_al4[..288].to_vec();
             let llr_al2b = llr_al4[288..].to_vec();
-            for (name, llr) in [("al4", &llr_al4), ("al8", &llr_al8), ("al8b", &llr_al8b), ("al2a", &llr_al2a), ("al2b", &llr_al2b)] {
+            for (name, llr) in [
+                ("al4", &llr_al4),
+                ("al8", &llr_al8),
+                ("al8b", &llr_al8b),
+                ("al2a", &llr_al2a),
+                ("al2b", &llr_al2b),
+            ] {
                 for size in [37usize, 41, 47] {
                     let got = dci_decode(llr, rnti, size);
                     let legit = size == 41 && (name == "al4" || name == "al8");
                     if legit {
-                        assert_eq!(got.as_deref(), Some(&a[..]), "trial {trial} {name} size {size}");
+                        assert_eq!(
+                            got.as_deref(),
+                            Some(&a[..]),
+                            "trial {trial} {name} size {size}"
+                        );
                     } else {
-                        assert!(got.is_none(), "trial {trial}: phantom decode at {name} size {size}: {got:?}");
+                        assert!(
+                            got.is_none(),
+                            "trial {trial}: phantom decode at {name} size {size}: {got:?}"
+                        );
                     }
                 }
             }
@@ -1398,7 +1503,10 @@ mod tests {
             let a: Vec<u8> = (0..a_len).map(|_| rng.bit()).collect();
             let coded = dci_encode(&a, rnti, e);
             assert_eq!(coded.len(), e);
-            let llrs: Vec<f32> = coded.iter().map(|&b| if b == 0 { 8.0 } else { -8.0 }).collect();
+            let llrs: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 0 { 8.0 } else { -8.0 })
+                .collect();
             let dec = dci_decode(&llrs, rnti, a_len).unwrap_or_else(|| panic!("AL{al} failed"));
             assert_eq!(dec, a, "AL{al}");
         }
@@ -1412,7 +1520,10 @@ mod tests {
         let mut rng = Rng(0xD0C1_0002);
         let a: Vec<u8> = (0..a_len).map(|_| rng.bit()).collect();
         let coded = dci_encode(&a, 0xFFFF, 4 * BITS_PER_CCE);
-        let llrs: Vec<f32> = coded.iter().map(|&b| if b == 0 { 8.0 } else { -8.0 }).collect();
+        let llrs: Vec<f32> = coded
+            .iter()
+            .map(|&b| if b == 0 { 8.0 } else { -8.0 })
+            .collect();
         assert!(dci_decode(&llrs, 0xFFFE, a_len).is_none(), "wrong RNTI");
         assert!(dci_decode(&llrs, 0xFFFF, a_len + 2).is_none(), "wrong size");
     }
@@ -1458,22 +1569,65 @@ mod tests {
     fn sizes_live_tdd_10mhz() {
         let s = dci_sizes(&live_tdd_10mhz());
         // 1_0 = 28 + 9; 0_0 = 20 + 9 padded by 8.
-        assert_eq!(s.f1_0_css, Dci1_0Size { total: 37, fdra: 9, padding: 0 });
-        assert_eq!(s.f0_0_css, Dci0_0Size { total: 37, fdra: 9, padding: 8, ul_sul_present: false });
+        assert_eq!(
+            s.f1_0_css,
+            Dci1_0Size {
+                total: 37,
+                fdra: 9,
+                padding: 0
+            }
+        );
+        assert_eq!(
+            s.f0_0_css,
+            Dci0_0Size {
+                total: 37,
+                fdra: 9,
+                padding: 8,
+                ul_sul_present: false
+            }
+        );
         assert_eq!(s.f1_0_uss.unwrap().total, 37);
         assert_eq!(s.f0_0_uss.unwrap().total, 37);
         // 0_1: id 1 + FDRA 9 + TDRA 3 + MCS 5 + NDI 1 + RV 2 + HARQ 4 + DAI 2 +
         // TPC 2 + antenna ports 3 + SRS request 2 + DM-RS init 1 + UL-SCH 1 = 36.
         let f0_1 = s.f0_1.unwrap();
         assert_eq!(f0_1.total, 36);
-        assert_eq!((f0_1.fdra, f0_1.tdra, f0_1.frequency_hopping_flag), (9, 3, 0));
-        assert_eq!((f0_1.first_dai, f0_1.srs_resource_indicator, f0_1.precoding_info), (2, 0, 0));
-        assert_eq!((f0_1.antenna_ports, f0_1.srs_request, f0_1.csi_request, f0_1.dmrs_seq_init), (3, 2, 0, 1));
+        assert_eq!(
+            (f0_1.fdra, f0_1.tdra, f0_1.frequency_hopping_flag),
+            (9, 3, 0)
+        );
+        assert_eq!(
+            (
+                f0_1.first_dai,
+                f0_1.srs_resource_indicator,
+                f0_1.precoding_info
+            ),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            (
+                f0_1.antenna_ports,
+                f0_1.srs_request,
+                f0_1.csi_request,
+                f0_1.dmrs_seq_init
+            ),
+            (3, 2, 0, 1)
+        );
         // 1_1: id 1 + FDRA 9 + TDRA 1 + MCS 5 + NDI 1 + RV 2 + HARQ 4 + DAI 2 +
         // TPC 2 + PRI 3 + K1 3 + antenna ports 4 + SRS request 2 + DM-RS init 1 = 40.
         let f1_1 = s.f1_1.unwrap();
         assert_eq!(f1_1.total, 40);
-        assert_eq!((f1_1.fdra, f1_1.tdra, f1_1.vrb_to_prb, f1_1.dai, f1_1.k1, f1_1.antenna_ports), (9, 1, 0, 2, 3, 4));
+        assert_eq!(
+            (
+                f1_1.fdra,
+                f1_1.tdra,
+                f1_1.vrb_to_prb,
+                f1_1.dai,
+                f1_1.k1,
+                f1_1.antenna_ports
+            ),
+            (9, 1, 0, 2, 3, 4)
+        );
         assert_eq!(s.nof_distinct_sizes, 3);
         assert!(!s.uss_fallback_aligned_to_css);
     }
@@ -1506,7 +1660,15 @@ mod tests {
         c.nof_pdsch_tdra_rows = 16;
         let s = dci_sizes(&c);
         assert_eq!(s.f1_0_css.total, 28 + 13);
-        assert_eq!(s.f0_0_css, Dci0_0Size { total: 41, fdra: 13, padding: 8, ul_sul_present: false });
+        assert_eq!(
+            s.f0_0_css,
+            Dci0_0Size {
+                total: 41,
+                fdra: 13,
+                padding: 8,
+                ul_sul_present: false
+            }
+        );
         assert_eq!(s.f1_0_uss.unwrap().total, 41);
         // 0_1: 33 + 0 TDRA (one row) + 13 − 9 = 37; 1_1: 36 + 4 TDRA + 3 K1 + 4 = 47.
         assert_eq!(s.f0_1.unwrap().tdra, 0);
@@ -1526,7 +1688,15 @@ mod tests {
         c.monitor_0_1_1_1 = false;
         let s = dci_sizes(&c);
         assert_eq!(s.f1_0_css.total, 35);
-        assert_eq!(s.f0_0_css, Dci0_0Size { total: 35, fdra: 15, padding: 0, ul_sul_present: false });
+        assert_eq!(
+            s.f0_0_css,
+            Dci0_0Size {
+                total: 35,
+                fdra: 15,
+                padding: 0,
+                ul_sul_present: false
+            }
+        );
         assert_eq!(s.nof_distinct_sizes, 1);
     }
 
@@ -1543,9 +1713,24 @@ mod tests {
         let u0 = s.f0_0_uss.unwrap();
         let u1 = s.f1_0_uss.unwrap();
         assert_eq!(u0.total, 36);
-        assert_eq!(u1, Dci1_0Size { total: 36, fdra: 7, padding: 1 });
+        assert_eq!(
+            u1,
+            Dci1_0Size {
+                total: 36,
+                fdra: 7,
+                padding: 1
+            }
+        );
         // CSS: 0_0 (20 + 9 = 29) padded to 37 with the UL/SUL bit last.
-        assert_eq!(s.f0_0_css, Dci0_0Size { total: 37, fdra: 9, padding: 8, ul_sul_present: true });
+        assert_eq!(
+            s.f0_0_css,
+            Dci0_0Size {
+                total: 37,
+                fdra: 9,
+                padding: 8,
+                ul_sul_present: true
+            }
+        );
     }
 
     /// Step 2: a 0_1 that lands on the USS fallback size gets one padding bit.
@@ -1573,7 +1758,14 @@ mod tests {
         c.ul_bwp_active_rb = 51;
         let s = dci_sizes(&c);
         assert!(s.uss_fallback_aligned_to_css);
-        assert_eq!(s.f1_0_uss.unwrap(), Dci1_0Size { total: 37, fdra: 9, padding: 0 });
+        assert_eq!(
+            s.f1_0_uss.unwrap(),
+            Dci1_0Size {
+                total: 37,
+                fdra: 9,
+                padding: 0
+            }
+        );
         let u0 = s.f0_0_uss.unwrap();
         // 0_0 USS: 20 + 11 = 31 bits before padding → padded (not truncated) to 37.
         assert_eq!((u0.total, u0.fdra, u0.padding), (37, 11, 6));
@@ -1594,7 +1786,10 @@ mod tests {
         c.rate_match_groups = 2;
         c.tci_present = true;
         c.two_codewords = true;
-        c.pdsch_dmrs_type_a = Some(DmrsConfig { config_type: 2, max_length: 2 });
+        c.pdsch_dmrs_type_a = Some(DmrsConfig {
+            config_type: 2,
+            max_length: 2,
+        });
         c.nof_dl_bwp_rrc = 1;
         c.nof_ul_bwp_rrc = 4;
         c.pusch_tx_scheme = Some(PuschTxScheme::Codebook {
@@ -1607,11 +1802,33 @@ mod tests {
         c.dynamic_beta_offsets = true;
         c.transform_precoding = false;
         let a = dci_0_1_size(&c);
-        assert_eq!((a.bwp_indicator, a.frequency_hopping_flag, a.first_dai), (2, 1, 1));
-        assert_eq!((a.srs_resource_indicator, a.precoding_info, a.antenna_ports), (1, 4, 3));
-        assert_eq!((a.csi_request, a.ptrs_dmrs_association, a.beta_offset, a.dmrs_seq_init), (2, 2, 2, 1));
+        assert_eq!(
+            (a.bwp_indicator, a.frequency_hopping_flag, a.first_dai),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (a.srs_resource_indicator, a.precoding_info, a.antenna_ports),
+            (1, 4, 3)
+        );
+        assert_eq!(
+            (
+                a.csi_request,
+                a.ptrs_dmrs_association,
+                a.beta_offset,
+                a.dmrs_seq_init
+            ),
+            (2, 2, 2, 1)
+        );
         let b = dci_1_1_size(&c);
-        assert_eq!((b.bwp_indicator, b.vrb_to_prb, b.rate_matching, b.zp_csi_rs_trigger), (1, 1, 2, 1));
+        assert_eq!(
+            (
+                b.bwp_indicator,
+                b.vrb_to_prb,
+                b.rate_matching,
+                b.zp_csi_rs_trigger
+            ),
+            (1, 1, 2, 1)
+        );
         assert_eq!((b.tb2, b.dai, b.antenna_ports, b.tci), (8, 0, 6, 3));
         // Non-codebook SRI: N_SRS = 4, L_max = 2 → C(4,1) + C(4,2) = 10 → 4 bits.
         c.pusch_tx_scheme = Some(PuschTxScheme::NonCodebook { l_max: 2 });
@@ -1641,18 +1858,50 @@ mod tests {
         // SI-RNTI: RIV 275 (= 24·11 + 11 → start 11, 12 RB), row 0, MCS 5, RV 0, SIB1.
         let si = bits_of(&[(275, 9), (0, 4), (1, 1), (5, 5), (0, 2), (0, 1), (0, 15)]);
         let d = parse_dci_1_0(&si, RntiKind::Si, &f).unwrap();
-        assert_eq!((d.fdra, d.tdra, d.vrb_to_prb_interleaved, d.mcs, d.rv, d.si_indicator), (275, 0, true, 5, Some(0), Some(0)));
+        assert_eq!(
+            (
+                d.fdra,
+                d.tdra,
+                d.vrb_to_prb_interleaved,
+                d.mcs,
+                d.rv,
+                d.si_indicator
+            ),
+            (275, 0, true, 5, Some(0), Some(0))
+        );
         assert_eq!(riv_decode(d.fdra, 24), Some((11, 12)));
         assert_eq!(riv_decode_css(d.fdra, 24, 0), Some((11, 12)));
         // RA-RNTI: TB scaling 1.
         let ra = bits_of(&[(3, 9), (2, 4), (0, 1), (9, 5), (1, 2), (0, 16)]);
         let d = parse_dci_1_0(&ra, RntiKind::Ra, &f).unwrap();
-        assert_eq!((d.fdra, d.tdra, d.mcs, d.tb_scaling, d.rv), (3, 2, 9, Some(1), None));
+        assert_eq!(
+            (d.fdra, d.tdra, d.mcs, d.tb_scaling, d.rv),
+            (3, 2, 9, Some(1), None)
+        );
         // C-RNTI: id 1, RIV 100, row 1, MCS 7, NDI 1, RV 2, HARQ 5, DAI 3, TPC 1, PRI 6, K1 idx 4.
-        let c = bits_of(&[(1, 1), (100, 9), (1, 4), (0, 1), (7, 5), (1, 1), (2, 2), (5, 4), (3, 2), (1, 2), (6, 3), (4, 3)]);
+        let c = bits_of(&[
+            (1, 1),
+            (100, 9),
+            (1, 4),
+            (0, 1),
+            (7, 5),
+            (1, 1),
+            (2, 2),
+            (5, 4),
+            (3, 2),
+            (1, 2),
+            (6, 3),
+            (4, 3),
+        ]);
         let d = parse_dci_1_0(&c, RntiKind::C, &f).unwrap();
-        assert_eq!((d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id), (100, 1, 7, Some(true), Some(2), Some(5)));
-        assert_eq!((d.dai, d.tpc, d.pri, d.k1_idx), (Some(3), Some(1), Some(6), Some(4)));
+        assert_eq!(
+            (d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id),
+            (100, 1, 7, Some(true), Some(2), Some(5))
+        );
+        assert_eq!(
+            (d.dai, d.tpc, d.pri, d.k1_idx),
+            (Some(3), Some(1), Some(6), Some(4))
+        );
         assert!(d.pdcch_order.is_none());
         // TC-RNTI: the DAI bits are reserved.
         let d = parse_dci_1_0(&c, RntiKind::Tc, &f).unwrap();
@@ -1661,33 +1910,87 @@ mod tests {
         // PDCCH order: FDRA all ones.
         let po = bits_of(&[(1, 1), (511, 9), (17, 6), (0, 1), (3, 6), (2, 4), (0, 10)]);
         let d = parse_dci_1_0(&po, RntiKind::C, &f).unwrap();
-        assert_eq!(d.pdcch_order, Some(PdcchOrder { preamble_index: 17, ul_sul: false, ssb_index: 3, prach_mask_index: 2 }));
+        assert_eq!(
+            d.pdcch_order,
+            Some(PdcchOrder {
+                preamble_index: 17,
+                ul_sul: false,
+                ssb_index: 3,
+                prach_mask_index: 2
+            })
+        );
         // P-RNTI.
-        let p = bits_of(&[(2, 2), (0b1000_0000, 8), (5, 9), (0, 4), (0, 1), (2, 5), (0, 2), (0, 6)]);
+        let p = bits_of(&[
+            (2, 2),
+            (0b1000_0000, 8),
+            (5, 9),
+            (0, 4),
+            (0, 1),
+            (2, 5),
+            (0, 2),
+            (0, 6),
+        ]);
         let d = parse_dci_1_0(&p, RntiKind::P, &f).unwrap();
-        assert_eq!((d.short_messages_indicator, d.short_messages, d.fdra, d.mcs), (Some(2), Some(128), 5, 2));
+        assert_eq!(
+            (d.short_messages_indicator, d.short_messages, d.fdra, d.mcs),
+            (Some(2), Some(128), 5, 2)
+        );
         // Wrong identifier / length.
         let mut bad = c.clone();
         bad[0] = 0;
-        assert_eq!(parse_dci_1_0(&bad, RntiKind::C, &f), Err(DciParseError::WrongIdentifier));
-        assert!(matches!(parse_dci_1_0(&c[..36], RntiKind::C, &f), Err(DciParseError::WrongLength { .. })));
+        assert_eq!(
+            parse_dci_1_0(&bad, RntiKind::C, &f),
+            Err(DciParseError::WrongIdentifier)
+        );
+        assert!(matches!(
+            parse_dci_1_0(&c[..36], RntiKind::C, &f),
+            Err(DciParseError::WrongLength { .. })
+        ));
     }
 
     #[test]
     fn parse_0_0_with_padding_and_hopping() {
         let s = dci_sizes(&live_tdd_10mhz());
         let f = s.f0_0_css; // 37 bits: 9 FDRA + 8 padding
-        // Hopping on: 1 MSB of the FDRA field is the offset (N_BWP = 24 < 50).
+                            // Hopping on: 1 MSB of the FDRA field is the offset (N_BWP = 24 < 50).
         let raw = (1 << 8) | 37; // offset 1, RIV 37
-        let b = bits_of(&[(0, 1), (raw, 9), (3, 4), (1, 1), (4, 5), (1, 1), (0, 2), (2, 4), (3, 2), (0, 8)]);
+        let b = bits_of(&[
+            (0, 1),
+            (raw, 9),
+            (3, 4),
+            (1, 1),
+            (4, 5),
+            (1, 1),
+            (0, 2),
+            (2, 4),
+            (3, 2),
+            (0, 8),
+        ]);
         let d = parse_dci_0_0(&b, RntiKind::C, &f, 24).unwrap();
-        assert_eq!((d.fdra, d.hopping_offset, d.tdra, d.frequency_hopping), (37, Some(1), 3, true));
-        assert_eq!((d.mcs, d.ndi, d.rv, d.harq_id, d.tpc, d.ul_sul), (4, Some(true), 0, Some(2), 3, None));
+        assert_eq!(
+            (d.fdra, d.hopping_offset, d.tdra, d.frequency_hopping),
+            (37, Some(1), 3, true)
+        );
+        assert_eq!(
+            (d.mcs, d.ndi, d.rv, d.harq_id, d.tpc, d.ul_sul),
+            (4, Some(true), 0, Some(2), 3, None)
+        );
         // Same payload for TC-RNTI: NDI / HARQ reserved.
         let d = parse_dci_0_0(&b, RntiKind::Tc, &f, 24).unwrap();
         assert_eq!((d.ndi, d.harq_id), (None, None));
         // Hopping off: the whole field is the RIV.
-        let b = bits_of(&[(0, 1), (raw, 9), (3, 4), (0, 1), (4, 5), (1, 1), (0, 2), (2, 4), (3, 2), (0, 8)]);
+        let b = bits_of(&[
+            (0, 1),
+            (raw, 9),
+            (3, 4),
+            (0, 1),
+            (4, 5),
+            (1, 1),
+            (0, 2),
+            (2, 4),
+            (3, 2),
+            (0, 8),
+        ]);
         let d = parse_dci_0_0(&b, RntiKind::C, &f, 24).unwrap();
         assert_eq!((d.fdra, d.hopping_offset), (raw, None));
         // UL/SUL bit in the last padding position.
@@ -1695,8 +1998,23 @@ mod tests {
         c.sul_configured = true;
         let f = dci_sizes(&c).f0_0_css;
         assert!(f.ul_sul_present);
-        let b = bits_of(&[(0, 1), (raw, 9), (3, 4), (0, 1), (4, 5), (1, 1), (0, 2), (2, 4), (3, 2), (0, 7), (1, 1)]);
-        assert_eq!(parse_dci_0_0(&b, RntiKind::C, &f, 24).unwrap().ul_sul, Some(true));
+        let b = bits_of(&[
+            (0, 1),
+            (raw, 9),
+            (3, 4),
+            (0, 1),
+            (4, 5),
+            (1, 1),
+            (0, 2),
+            (2, 4),
+            (3, 2),
+            (0, 7),
+            (1, 1),
+        ]);
+        assert_eq!(
+            parse_dci_0_0(&b, RntiKind::C, &f, 24).unwrap().ul_sul,
+            Some(true)
+        );
     }
 
     #[test]
@@ -1705,23 +2023,95 @@ mod tests {
         let f1 = s.f1_1.unwrap();
         // id 1, RIV 200, TDRA 1, MCS 20, NDI 0, RV 1, HARQ 9, DAI 2, TPC 1, PRI 5, K1 idx 3,
         // antenna ports 2, SRS request 0, DM-RS init 1.
-        let b = bits_of(&[(1, 1), (200, 9), (1, 1), (20, 5), (0, 1), (1, 2), (9, 4), (2, 2), (1, 2), (5, 3), (3, 3), (2, 4), (0, 2), (1, 1)]);
+        let b = bits_of(&[
+            (1, 1),
+            (200, 9),
+            (1, 1),
+            (20, 5),
+            (0, 1),
+            (1, 2),
+            (9, 4),
+            (2, 2),
+            (1, 2),
+            (5, 3),
+            (3, 3),
+            (2, 4),
+            (0, 2),
+            (1, 1),
+        ]);
         assert_eq!(b.len(), 40);
         let d = parse_dci_1_1(&b, &f1).unwrap();
-        assert_eq!((d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id), (200, 1, 20, false, 1, 9));
-        assert_eq!((d.dai, d.tpc, d.pri, d.k1_idx, d.antenna_ports, d.dmrs_seq_init), (Some(2), 1, 5, Some(3), 2, 1));
-        assert_eq!((d.vrb_to_prb_interleaved, d.tci, d.cbgti, d.tb2), (None, None, None, None));
-        assert_eq!(crate::dmrs::dci_1_1_antenna_ports_type1_len1(d.antenna_ports).unwrap().nof_cdm_groups_without_data, 1);
+        assert_eq!(
+            (d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id),
+            (200, 1, 20, false, 1, 9)
+        );
+        assert_eq!(
+            (
+                d.dai,
+                d.tpc,
+                d.pri,
+                d.k1_idx,
+                d.antenna_ports,
+                d.dmrs_seq_init
+            ),
+            (Some(2), 1, 5, Some(3), 2, 1)
+        );
+        assert_eq!(
+            (d.vrb_to_prb_interleaved, d.tci, d.cbgti, d.tb2),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            crate::dmrs::dci_1_1_antenna_ports_type1_len1(d.antenna_ports)
+                .unwrap()
+                .nof_cdm_groups_without_data,
+            1
+        );
         let f0 = s.f0_1.unwrap();
         // id 0, RIV 300, TDRA 5, MCS 10, NDI 1, RV 0, HARQ 3, DAI 1, TPC 2, antenna 2, SRS req 0,
         // DM-RS init 0, UL-SCH 1.
-        let b = bits_of(&[(0, 1), (300, 9), (5, 3), (10, 5), (1, 1), (0, 2), (3, 4), (1, 2), (2, 2), (2, 3), (0, 2), (0, 1), (1, 1)]);
+        let b = bits_of(&[
+            (0, 1),
+            (300, 9),
+            (5, 3),
+            (10, 5),
+            (1, 1),
+            (0, 2),
+            (3, 4),
+            (1, 2),
+            (2, 2),
+            (2, 3),
+            (0, 2),
+            (0, 1),
+            (1, 1),
+        ]);
         assert_eq!(b.len(), 36);
         let d = parse_dci_0_1(&b, &f0).unwrap();
-        assert_eq!((d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id), (300, 5, 10, true, 0, 3));
-        assert_eq!((d.first_dai, d.tpc, d.antenna_ports, d.srs_request, d.dmrs_seq_init, d.ul_sch), (1, 2, 2, 0, Some(0), true));
-        assert_eq!((d.frequency_hopping, d.srs_resource_indicator, d.csi_request), (None, None, None));
-        assert_eq!(parse_dci_0_1(&b[..35], &f0), Err(DciParseError::WrongLength { expected: 36, got: 35 }));
+        assert_eq!(
+            (d.fdra, d.tdra, d.mcs, d.ndi, d.rv, d.harq_id),
+            (300, 5, 10, true, 0, 3)
+        );
+        assert_eq!(
+            (
+                d.first_dai,
+                d.tpc,
+                d.antenna_ports,
+                d.srs_request,
+                d.dmrs_seq_init,
+                d.ul_sch
+            ),
+            (1, 2, 2, 0, Some(0), true)
+        );
+        assert_eq!(
+            (d.frequency_hopping, d.srs_resource_indicator, d.csi_request),
+            (None, None, None)
+        );
+        assert_eq!(
+            parse_dci_0_1(&b[..35], &f0),
+            Err(DciParseError::WrongLength {
+                expected: 36,
+                got: 35
+            })
+        );
     }
 
     #[test]
@@ -1752,7 +2142,15 @@ mod tests {
         assert_eq!(default_pdsch_tdra(5, 3).unwrap().s, 10);
         assert_eq!(default_pdsch_tdra(6, 3).unwrap().s, 6);
         assert_eq!(default_pdsch_tdra(11, 2).unwrap().l, 13);
-        assert_eq!(default_pdsch_tdra(15, 2).unwrap(), TdraRow { k: 0, mapping: MappingType::TypeB, s: 8, l: 4 });
+        assert_eq!(
+            default_pdsch_tdra(15, 2).unwrap(),
+            TdraRow {
+                k: 0,
+                mapping: MappingType::TypeB,
+                s: 8,
+                l: 4
+            }
+        );
         assert!(default_pdsch_tdra(16, 2).is_none());
         assert!(default_pdsch_tdra(0, 1).is_none());
         let r = default_pusch_tdra(0, 1).unwrap();
@@ -1760,7 +2158,15 @@ mod tests {
         assert_eq!(default_pusch_tdra(0, 2).unwrap().k, 2);
         assert_eq!(default_pusch_tdra(7, 0).unwrap().k, 2);
         assert_eq!(default_pusch_tdra(14, 3).unwrap().k, 6);
-        assert_eq!(default_pusch_tdra(13, 1).unwrap(), TdraRow { k: 1, mapping: MappingType::TypeB, s: 8, l: 6 });
+        assert_eq!(
+            default_pusch_tdra(13, 1).unwrap(),
+            TdraRow {
+                k: 1,
+                mapping: MappingType::TypeB,
+                s: 8,
+                l: 6
+            }
+        );
         assert!(default_pusch_tdra(0, 4).is_none());
     }
 }

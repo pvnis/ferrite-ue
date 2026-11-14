@@ -35,9 +35,9 @@ use crate::milenage::k_gnb;
 use crate::mm::{
     cause, configuration_update_complete, decode_mm, deregistration_accept, identity_type,
     mm_message_type, msg_type, notification_response, payload_container_type,
-    registration_complete, request_type,
-    security_mode_reject, split_security_header, AuthenticationFailure, AuthenticationRequest,
-    AuthenticationResponse, ConfigurationUpdateCommand, DeregistrationRequestUeOriginating,
+    registration_complete, request_type, security_mode_reject, split_security_header,
+    AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
+    ConfigurationUpdateCommand, DeregistrationRequestUeOriginating,
     DeregistrationRequestUeTerminated, DeregistrationType, DlNasTransport, Guti, IdentityRequest,
     IdentityResponse, MmMessage, MmStatus, MobileIdentity, NgKsi, Plmn, RegistrationAccept,
     RegistrationReject, RegistrationRequest, RegistrationType, SecurityHeader, SecurityHeaderType,
@@ -495,7 +495,14 @@ impl NasUe {
 
     fn set_cm(&mut self, cm: CmState) {
         if cm != self.cm {
-            log::info!("NAS: 5GMM-{}", if cm == CmState::Connected { "CONNECTED" } else { "IDLE" });
+            log::info!(
+                "NAS: 5GMM-{}",
+                if cm == CmState::Connected {
+                    "CONNECTED"
+                } else {
+                    "IDLE"
+                }
+            );
             self.cm = cm;
         }
     }
@@ -569,8 +576,14 @@ impl NasUe {
     pub fn set_current_tai(&mut self, tai: Tai) {
         let changed = self.last_tai != Some(tai);
         self.last_tai = Some(tai);
-        if changed && self.is_registered() && !self.tai_list.is_empty() && !self.tai_list.contains(&tai) {
-            log::info!("NAS: TAI {tai:?} outside the registration area: mobility registration update");
+        if changed
+            && self.is_registered()
+            && !self.tai_list.is_empty()
+            && !self.tai_list.contains(&tai)
+        {
+            log::info!(
+                "NAS: TAI {tai:?} outside the registration area: mobility registration update"
+            );
             self.initiate_registration(RegistrationType::MobilityUpdating);
         }
     }
@@ -676,7 +689,14 @@ impl NasUe {
             self.next_registration = reg_type;
             return None;
         }
-        if matches!(self.state, MmState::Deregistered(DeregisteredSub::NoSupi | DeregisteredSub::PlmnSearch | DeregisteredSub::LimitedService)) {
+        if matches!(
+            self.state,
+            MmState::Deregistered(
+                DeregisteredSub::NoSupi
+                    | DeregisteredSub::PlmnSearch
+                    | DeregisteredSub::LimitedService
+            )
+        ) {
             log::info!("NAS: no registration in {:?}", self.state);
             return None;
         }
@@ -692,7 +712,9 @@ impl NasUe {
             Some(pdu)
         } else {
             self.pending_initial = Some(pdu);
-            self.events.push(NasEvent::ConnectionNeeded { cause: ConnectionCause::MoSignalling });
+            self.events.push(NasEvent::ConnectionNeeded {
+                cause: ConnectionCause::MoSignalling,
+            });
             None
         }
     }
@@ -729,11 +751,19 @@ impl NasUe {
             MmState::Deregistered(DeregisteredSub::AttemptingRegistration)
         };
         if self.reg_attempts < timers::MAX_REGISTRATION_ATTEMPTS.min(self.cfg.max_attempts.max(1)) {
-            log::warn!("NAS: registration attempt {} failed: T3511 ({} s)", self.reg_attempts, timers::T3511_MS / 1000);
+            log::warn!(
+                "NAS: registration attempt {} failed: T3511 ({} s)",
+                self.reg_attempts,
+                timers::T3511_MS / 1000
+            );
             self.t3511 = Some(self.now + timers::T3511_MS);
         } else {
             let t = t3502_ms.unwrap_or(timers::T3502_MS);
-            log::warn!("NAS: registration attempt {} failed: T3502 ({} s)", self.reg_attempts, t / 1000);
+            log::warn!(
+                "NAS: registration attempt {} failed: T3502 ({} s)",
+                self.reg_attempts,
+                t / 1000
+            );
             self.t3502 = Some(self.now + t);
             self.reg_attempts = 0;
         }
@@ -878,7 +908,10 @@ impl NasUe {
             ngksi,
             mobile_identity: identity,
         };
-        log::info!("NAS: DEREGISTRATION REQUEST ({})", if switch_off { "switch off" } else { "normal" });
+        log::info!(
+            "NAS: DEREGISTRATION REQUEST ({})",
+            if switch_off { "switch off" } else { "normal" }
+        );
         let pdu = self.tx(req.encode());
         if switch_off {
             self.local_deregister(DeregisteredSub::NormalService);
@@ -1242,7 +1275,9 @@ impl NasUe {
         ) {
             self.state = MmState::SecurityMode;
         }
-        self.events.push(NasEvent::SecurityActivated { ul_nas_count_at_activation: count });
+        self.events.push(NasEvent::SecurityActivated {
+            ul_nas_count_at_activation: count,
+        });
         Ok(vec![out])
     }
 
@@ -1292,13 +1327,18 @@ impl NasUe {
         self.state = MmState::Registered(RegisteredSub::NormalService);
         log::info!(
             "NAS: REGISTRATION ACCEPT ({}, result {}, GUTI {:?})",
-            if was_update { "registration update complete" } else { "initial registration complete" },
+            if was_update {
+                "registration update complete"
+            } else {
+                "initial registration complete"
+            },
             ra.result,
             ra.guti.is_some()
         );
         let mut out = vec![self.tx(registration_complete())];
         if was_update {
-            self.events.push(NasEvent::RegistrationUpdated { guti: self.guti });
+            self.events
+                .push(NasEvent::RegistrationUpdated { guti: self.guti });
         } else {
             self.events
                 .push(NasEvent::RegistrationComplete { guti: self.guti });
@@ -1364,7 +1404,9 @@ impl NasUe {
                 self.ctx = None;
                 self.local_deregister(DeregisteredSub::NormalService);
                 self.reg_attempts = 0;
-                self.initiate_registration(RegistrationType::Initial).into_iter().collect()
+                self.initiate_registration(RegistrationType::Initial)
+                    .into_iter()
+                    .collect()
             }
             22 => {
                 if let Some(t) = r.t3346.and_then(|t| t.to_ms()).filter(|&t| t > 0) {
@@ -1398,7 +1440,9 @@ impl NasUe {
             d.dereg_type.reregistration_required
         );
         let mut out = vec![self.tx(deregistration_accept(true))];
-        let (sub, forget) = d.cause.map_or((DeregisteredSub::NormalService, false), Self::cause_outcome);
+        let (sub, forget) = d
+            .cause
+            .map_or((DeregisteredSub::NormalService, false), Self::cause_outcome);
         if forget {
             self.guti = None;
             self.ctx = None;
@@ -1408,7 +1452,14 @@ impl NasUe {
             self.t3346 = Some(self.now + t);
         }
         self.local_deregister(sub);
-        if d.dereg_type.reregistration_required && !matches!(sub, DeregisteredSub::NoSupi | DeregisteredSub::PlmnSearch | DeregisteredSub::LimitedService) {
+        if d.dereg_type.reregistration_required
+            && !matches!(
+                sub,
+                DeregisteredSub::NoSupi
+                    | DeregisteredSub::PlmnSearch
+                    | DeregisteredSub::LimitedService
+            )
+        {
             self.reg_attempts = 0;
             self.reregister = true;
             out.extend(self.initiate_registration(RegistrationType::Initial));
@@ -1458,7 +1509,8 @@ impl NasUe {
         // §5.4.4.3: "registration requested" → a registration once the
         // network releases the connection (see `on_connection_released`).
         self.registration_requested |= c.registration_requested;
-        self.events.push(NasEvent::ConfigurationUpdated { guti: self.guti });
+        self.events
+            .push(NasEvent::ConfigurationUpdated { guti: self.guti });
         if c.ack_requested {
             vec![self.tx(configuration_update_complete())]
         } else {
@@ -1602,7 +1654,10 @@ impl NasUe {
             SmMessage::ModificationCommand(h) => {
                 // §6.3.2.3: the modification is accepted as a whole (the QoS
                 // rules are not applied beyond the default rule).
-                log::info!("NAS: PDU SESSION MODIFICATION COMMAND psi {} → COMPLETE", h.psi);
+                log::info!(
+                    "NAS: PDU SESSION MODIFICATION COMMAND psi {} → COMPLETE",
+                    h.psi
+                );
                 vec![self.ul_transport_sm(h.psi, modification_complete(h.psi, h.pti))]
             }
             SmMessage::Unknown(h) => {
@@ -1639,7 +1694,10 @@ impl NasUe {
         }
         if self.t3511.is_some_and(|t| now_ms >= t) {
             self.t3511 = None;
-            log::info!("NAS: T3511 expired: registration attempt {}", self.reg_attempts + 1);
+            log::info!(
+                "NAS: T3511 expired: registration attempt {}",
+                self.reg_attempts + 1
+            );
             out.extend(self.initiate_registration(self.next_registration));
         }
         if self.t3502.is_some_and(|t| now_ms >= t) {
@@ -1650,7 +1708,9 @@ impl NasUe {
         if self.t3346.is_some_and(|t| now_ms >= t) {
             self.t3346 = None;
             log::info!("NAS: T3346 expired");
-            if self.is_deregistered() || self.state == MmState::Registered(RegisteredSub::AttemptingRegistrationUpdate) {
+            if self.is_deregistered()
+                || self.state == MmState::Registered(RegisteredSub::AttemptingRegistrationUpdate)
+            {
                 out.extend(self.initiate_registration(self.next_registration));
             }
         }
@@ -1682,7 +1742,10 @@ impl NasUe {
             self.state = MmState::Registered(RegisteredSub::NormalService);
         }
         // T3512 (§5.3.7): only in 5GMM-IDLE; expiry → periodic registration update.
-        if self.cm == CmState::Idle && self.t3512.is_some_and(|t| now_ms >= t) && self.is_registered() {
+        if self.cm == CmState::Idle
+            && self.t3512.is_some_and(|t| now_ms >= t)
+            && self.is_registered()
+        {
             self.t3512 = None;
             log::info!("NAS: T3512 expired, periodic registration update");
             self.reg_attempts = 0;
@@ -1696,7 +1759,14 @@ impl NasUe {
                 s.timer = None;
                 s.attempts += 1;
                 if s.attempts < self.cfg.max_attempts {
-                    s.timer = Some(now_ms + if s.state == SmState::InactivePending { timers::T3582_MS } else { timers::T3580_MS });
+                    s.timer = Some(
+                        now_ms
+                            + if s.state == SmState::InactivePending {
+                                timers::T3582_MS
+                            } else {
+                                timers::T3580_MS
+                            },
+                    );
                     retries.push((s.psi, s.pti, s.state));
                 } else {
                     let psi = s.psi;
@@ -1783,7 +1853,10 @@ mod tests {
         }
         // T3510 expiry → T3511 (10 s) → retry, four times; the fifth failure starts T3502.
         assert_eq!(sent, 4, "retries after each T3511");
-        assert_eq!(u.state(), MmState::Deregistered(DeregisteredSub::AttemptingRegistration));
+        assert_eq!(
+            u.state(),
+            MmState::Deregistered(DeregisteredSub::AttemptingRegistration)
+        );
     }
 
     #[test]

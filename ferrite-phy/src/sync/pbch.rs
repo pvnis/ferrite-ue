@@ -130,7 +130,11 @@ pub fn rank_ssb_index(rx_dmrs: &[Complex32], cell_id: u16, l_max: u8) -> Vec<Ssb
                 ref_pow += rd.norm_sqr();
             }
             let metric = acc.norm() * inv / ref_pow.sqrt().max(1e-12);
-            SsbIndexDetection { i_ssb_bar, l_max, metric }
+            SsbIndexDetection {
+                i_ssb_bar,
+                l_max,
+                metric,
+            }
         })
         .collect();
     out.sort_by(|a, b| b.metric.total_cmp(&a.metric));
@@ -334,11 +338,19 @@ mod tests {
         assert_eq!(pbch_dmrs_index(3, 1, 4), 7);
         assert_eq!(pbch_dmrs_index(2, 0, 4), 2);
         assert_eq!(pbch_scrambling_index(7, 4), 3);
-        let det = SsbIndexDetection { i_ssb_bar: 6, l_max: 4, metric: 1.0 };
+        let det = SsbIndexDetection {
+            i_ssb_bar: 6,
+            l_max: 4,
+            metric: 1.0,
+        };
         assert_eq!(det.candidate_index(), 2);
         assert_eq!(det.half_frame(), Some(1));
         assert_eq!(det.scrambling_index(), 2);
-        let det8 = SsbIndexDetection { i_ssb_bar: 6, l_max: 8, metric: 1.0 };
+        let det8 = SsbIndexDetection {
+            i_ssb_bar: 6,
+            l_max: 8,
+            metric: 1.0,
+        };
         assert_eq!(det8.candidate_index(), 6);
         assert_eq!(det8.half_frame(), None);
     }

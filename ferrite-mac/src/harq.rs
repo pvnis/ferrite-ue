@@ -25,7 +25,9 @@ pub struct DlHarqEntity {
 
 impl DlHarqEntity {
     pub fn new(n: u8) -> Self {
-        Self { processes: vec![DlHarqProcess::default(); n.max(1) as usize] }
+        Self {
+            processes: vec![DlHarqProcess::default(); n.max(1) as usize],
+        }
     }
 
     /// Classify a DL assignment: returns `(is_new_data, already_delivered)`.
@@ -37,12 +39,14 @@ impl DlHarqEntity {
         match p.ndi {
             Some(prev) if prev == ndi => (false, p.delivered),
             _ => {
-                *p = DlHarqProcess { ndi: Some(ndi), delivered: false };
+                *p = DlHarqProcess {
+                    ndi: Some(ndi),
+                    delivered: false,
+                };
                 (true, false)
             }
         }
     }
-
 
     pub fn is_delivered(&self, harq_id: u8) -> bool {
         self.processes[harq_id as usize % self.processes.len()].delivered
@@ -76,7 +80,9 @@ pub struct UlHarqEntity {
 
 impl UlHarqEntity {
     pub fn new(n: u8) -> Self {
-        Self { processes: vec![UlHarqProcess::default(); n.max(1) as usize] }
+        Self {
+            processes: vec![UlHarqProcess::default(); n.max(1) as usize],
+        }
     }
 
     /// Is a grant with this NDI/TBS a retransmission of the stored TB?
@@ -91,7 +97,11 @@ impl UlHarqEntity {
 
     pub fn store(&mut self, harq_id: u8, ndi: u8, tbs_bits: u32, tb: Vec<u8>) {
         let n = self.processes.len();
-        self.processes[harq_id as usize % n] = UlHarqProcess { ndi: Some(ndi), tbs_bits, tb };
+        self.processes[harq_id as usize % n] = UlHarqProcess {
+            ndi: Some(ndi),
+            tbs_bits,
+            tb,
+        };
     }
 
     pub fn reset(&mut self) {
@@ -125,7 +135,10 @@ impl AckBook {
     /// yields a correctly sized codebook).
     pub fn book(&mut self, ack_slot: SlotPoint, entry: AckEntry) {
         let v = self.slots.entry(ack_slot.index()).or_default();
-        if let Some(e) = v.iter_mut().find(|e| e.pdsch_slot == entry.pdsch_slot && e.harq_id == entry.harq_id) {
+        if let Some(e) = v
+            .iter_mut()
+            .find(|e| e.pdsch_slot == entry.pdsch_slot && e.harq_id == entry.harq_id)
+        {
             *e = entry;
         } else {
             v.push(entry);
@@ -135,7 +148,10 @@ impl AckBook {
     /// Record the decode result for a PDSCH (by its slot + HARQ id).
     pub fn set_result(&mut self, pdsch_slot: SlotPoint, harq_id: u8, ack: bool) -> bool {
         for v in self.slots.values_mut() {
-            if let Some(e) = v.iter_mut().find(|e| e.pdsch_slot == pdsch_slot && e.harq_id == harq_id) {
+            if let Some(e) = v
+                .iter_mut()
+                .find(|e| e.pdsch_slot == pdsch_slot && e.harq_id == harq_id)
+            {
                 e.ack = Some(ack);
                 return true;
             }
@@ -150,7 +166,11 @@ impl AckBook {
     /// The PRI of the last DCI targeting `ack_slot` (TS 38.213 §9.2.3: the
     /// PUCCH resource follows the last DCI).
     pub fn pri(&self, ack_slot: SlotPoint) -> Option<u8> {
-        self.slots.get(&ack_slot.index()).and_then(|v| v.iter().max_by_key(|e| (e.pdsch_slot.index(), e.dai)).map(|e| e.pri))
+        self.slots.get(&ack_slot.index()).and_then(|v| {
+            v.iter()
+                .max_by_key(|e| (e.pdsch_slot.index(), e.dai))
+                .map(|e| e.pri)
+        })
     }
 
     /// Take the codebook for `ack_slot`: bits ordered by DAI with gaps NACKed.
@@ -166,7 +186,11 @@ impl AckBook {
         let total = now.slots_per_frame() as u64 * 1024;
         self.slots.retain(|&k, _| {
             let d = (k as i64 - idx as i64).rem_euclid(total as i64);
-            let d = if d > total as i64 / 2 { d - total as i64 } else { d };
+            let d = if d > total as i64 / 2 {
+                d - total as i64
+            } else {
+                d
+            };
             d >= 0
         });
     }
@@ -234,7 +258,14 @@ mod tests {
     fn codebook_orders_and_fills_gaps() {
         let mut b = AckBook::default();
         let ack = sp(7);
-        let e = |dai: u8, s: u16, ack: Option<bool>| AckEntry { rnti: Rnti(1), pdsch_slot: sp(s), harq_id: dai, dai, ack, pri: 0 };
+        let e = |dai: u8, s: u16, ack: Option<bool>| AckEntry {
+            rnti: Rnti(1),
+            pdsch_slot: sp(s),
+            harq_id: dai,
+            dai,
+            ack,
+            pri: 0,
+        };
         b.book(ack, e(0, 1, Some(true)));
         b.book(ack, e(2, 3, Some(true))); // DAI 1 missed
         assert!(b.set_result(sp(1), 0, true));

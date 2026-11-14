@@ -22,7 +22,7 @@ pub fn gold_sequence(c_init: u32, len: usize) -> Vec<u8> {
     x1[0] = 1;
     for (i, x) in x2.iter_mut().take(31).enumerate() {
         *x = ((c_init >> i) & 1) as u8;
-        }
+    }
     for n in 0..total {
         x1[n + 31] = (x1[n + 3] + x1[n]) & 1;
         x2[n + 31] = (x2[n + 3] + x2[n + 2] + x2[n + 1] + x2[n]) & 1;

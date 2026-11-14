@@ -10,7 +10,6 @@
 // symbol / subcarrier index; the iterator rewrite clippy suggests reads worse.
 #![allow(clippy::needless_range_loop)]
 
-
 // The PHY↔MAC interface and the PHY configuration are `ferrite-fapi`;
 // re-exported under their historical paths.
 pub use ferrite_fapi as fapi;
@@ -19,9 +18,9 @@ pub use ferrite_fapi::config;
 pub(crate) mod cell;
 pub(crate) mod dl;
 pub mod engine;
-pub(crate) mod resolve;
-pub(crate) mod ul;
 pub mod radio;
+pub(crate) mod resolve;
 pub(crate) mod rt;
 pub mod stream;
 pub(crate) mod timing;
+pub(crate) mod ul;

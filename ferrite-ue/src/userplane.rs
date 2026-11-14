@@ -76,7 +76,9 @@ impl UserPlane {
     pub fn session_up(&mut self, ip: [u8; 4]) {
         self.ip = Some(ip);
         self.next_ping = Instant::now() + Duration::from_millis(500);
-        let Some(name) = self.tun_name.clone() else { return };
+        let Some(name) = self.tun_name.clone() else {
+            return;
+        };
         match crate::tun::open_tun(&name) {
             Ok(f) => {
                 if let Err(e) = crate::tun::configure_tun(&name, ip, 1400, self.netns.as_deref()) {
@@ -111,25 +113,48 @@ impl UserPlane {
             }
             return pkts;
         }
-        let (Some(ip), true) = (self.ip, self.ping_count > 0) else { return pkts };
+        let (Some(ip), true) = (self.ip, self.ping_count > 0) else {
+            return pkts;
+        };
         let total = self.ping_count * self.ping_rounds;
         if u32::from(self.ping_seq) < total && Instant::now() >= self.next_ping {
-            pkts.push(ip::ipv4_icmp_echo_request(ip, self.ping_target, self.ping_id, self.ping_seq, b"ferrite-ping"));
+            pkts.push(ip::ipv4_icmp_echo_request(
+                ip,
+                self.ping_target,
+                self.ping_id,
+                self.ping_seq,
+                b"ferrite-ping",
+            ));
             self.ping_sent.push(Instant::now());
             self.ping_seq += 1;
-            let round_done = u32::from(self.ping_seq) % self.ping_count == 0 && u32::from(self.ping_seq) < total;
+            let round_done =
+                u32::from(self.ping_seq) % self.ping_count == 0 && u32::from(self.ping_seq) < total;
             let wait = if round_done && !self.ping_round_gap.is_zero() {
-                log::info!("ping round {} of {} done; next round in {} s", u32::from(self.ping_seq) / self.ping_count, self.ping_rounds, self.ping_round_gap.as_secs());
+                log::info!(
+                    "ping round {} of {} done; next round in {} s",
+                    u32::from(self.ping_seq) / self.ping_count,
+                    self.ping_rounds,
+                    self.ping_round_gap.as_secs()
+                );
                 self.ping_round_gap
             } else {
                 self.ping_interval
             };
             self.next_ping = Instant::now() + wait;
         }
-        if !self.ping_done && u32::from(self.ping_seq) >= total && self.ping_sent.last().is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+        if !self.ping_done
+            && u32::from(self.ping_seq) >= total
+            && self
+                .ping_sent
+                .last()
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(2))
+        {
             self.ping_done = true;
             self.result = Some((u32::from(self.ping_seq), self.ping_recv));
-            self.events.push(UserPlaneEvent::PingDone { sent: u32::from(self.ping_seq), received: self.ping_recv });
+            self.events.push(UserPlaneEvent::PingDone {
+                sent: u32::from(self.ping_seq),
+                received: self.ping_recv,
+            });
         }
         pkts
     }
@@ -144,7 +169,13 @@ impl UserPlane {
             return None;
         }
         if let Some(reply) = ip::ipv4_icmp_echo_reply_for(pkt) {
-            log::info!("echo request from {}.{}.{}.{}: replying", pkt[12], pkt[13], pkt[14], pkt[15]);
+            log::info!(
+                "echo request from {}.{}.{}.{}: replying",
+                pkt[12],
+                pkt[13],
+                pkt[14],
+                pkt[15]
+            );
             return Some(reply);
         }
         if let Some(r) = ip::parse_ipv4_icmp_echo_reply(pkt) {
@@ -152,7 +183,10 @@ impl UserPlane {
                 let rtt = t0.elapsed().as_secs_f64() * 1e3;
                 self.ping_recv += 1;
                 log::info!("ping reply seq={} rtt={rtt:.1} ms", r.seq);
-                self.events.push(UserPlaneEvent::PingReply { seq: r.seq, rtt_ms: rtt });
+                self.events.push(UserPlaneEvent::PingReply {
+                    seq: r.seq,
+                    rtt_ms: rtt,
+                });
             }
         }
         None

@@ -78,20 +78,46 @@ pub struct CellInfo {
 /// Decoded DL-CCCH messages the state machine acts on.
 #[allow(clippy::large_enum_variant)] // one message at a time; boxing the configs buys nothing
 pub enum DlCcch {
-    Setup { tid: u8, phy: PhyConfig, mac: MacConfig, bearers: Vec<BearerSetup>, bwps: BwpConfigs },
+    Setup {
+        tid: u8,
+        phy: PhyConfig,
+        mac: MacConfig,
+        bearers: Vec<BearerSetup>,
+        bwps: BwpConfigs,
+    },
     Reject,
 }
 
 /// Decoded DL-DCCH messages the state machine acts on.
 #[allow(clippy::large_enum_variant)]
 pub enum DlDcch {
-    SecurityModeCommand { tid: u8, integrity_alg: u8, ciphering_alg: u8 },
-    UeCapabilityEnquiry { tid: u8 },
-    Reconfiguration { tid: u8, phy: Option<PhyConfig>, mac: Option<MacConfig>, bearers: Vec<BearerSetup>, released: Vec<u8>, nas: Vec<Vec<u8>>, meas: Option<ferrite_asn1::meas::MeasConfig>, bwps: Option<BwpConfigs> },
-    DlInformationTransfer { nas: Option<Vec<u8>> },
+    SecurityModeCommand {
+        tid: u8,
+        integrity_alg: u8,
+        ciphering_alg: u8,
+    },
+    UeCapabilityEnquiry {
+        tid: u8,
+    },
+    Reconfiguration {
+        tid: u8,
+        phy: Option<PhyConfig>,
+        mac: Option<MacConfig>,
+        bearers: Vec<BearerSetup>,
+        released: Vec<u8>,
+        nas: Vec<Vec<u8>>,
+        meas: Option<ferrite_asn1::meas::MeasConfig>,
+        bwps: Option<BwpConfigs>,
+    },
+    DlInformationTransfer {
+        nas: Option<Vec<u8>>,
+    },
     Release,
     /// `RRCReestablishment` (§5.3.7.5) with its `nextHopChainingCount`.
-    Reestablishment { tid: u8, ncc: u8 },
+    Reestablishment {
+        tid: u8,
+        ncc: u8,
+    },
     Other(&'static str),
 }
 

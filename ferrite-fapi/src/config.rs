@@ -46,7 +46,14 @@ impl TddConfig {
     /// pattern for a transmission in `dir`: DL symbols block an uplink, UL
     /// symbols block a downlink; flexible symbols block neither (TS 38.213
     /// §11.1: a DCI may schedule in flexible symbols).
-    pub fn conflicts(&self, slot_index: u64, mu: Numerology, start: u8, n: u8, dir: LinkDirection) -> bool {
+    pub fn conflicts(
+        &self,
+        slot_index: u64,
+        mu: Numerology,
+        start: u8,
+        n: u8,
+        dir: LinkDirection,
+    ) -> bool {
         let d = self.slot_direction(slot_index, mu);
         let end = start.saturating_add(n).min(14);
         let (lo, hi) = match dir {
@@ -61,19 +68,30 @@ impl TddConfig {
     /// Direction of `slot` (absolute slot index at the data numerology `mu`).
     pub fn slot_direction(&self, slot_index: u64, mu: Numerology) -> SlotDirection {
         // Scale the pattern (given at the reference SCS) to the data numerology.
-        let scale = mu.slots_per_subframe() as u64 / self.reference_scs.slots_per_subframe().max(1) as u64;
+        let scale =
+            mu.slots_per_subframe() as u64 / self.reference_scs.slots_per_subframe().max(1) as u64;
         let scale = scale.max(1);
         let p1 = self.pattern1.period_slots as u64 * scale;
         let total = p1 + self.pattern2.map_or(0, |p| p.period_slots as u64 * scale);
         let s = slot_index % total;
-        let (pat, s) = if s < p1 { (self.pattern1, s) } else { (self.pattern2.unwrap(), s - p1) };
+        let (pat, s) = if s < p1 {
+            (self.pattern1, s)
+        } else {
+            (self.pattern2.unwrap(), s - p1)
+        };
         let dl_full = pat.dl_slots as u64 * scale;
         let ul_full = pat.ul_slots as u64 * scale;
         let period = pat.period_slots as u64 * scale;
         if s < dl_full {
-            SlotDirection { dl_symbols: 14, ul_symbols: 0 }
+            SlotDirection {
+                dl_symbols: 14,
+                ul_symbols: 0,
+            }
         } else if s >= period - ul_full {
-            SlotDirection { dl_symbols: 0, ul_symbols: 14 }
+            SlotDirection {
+                dl_symbols: 0,
+                ul_symbols: 14,
+            }
         } else {
             // The flexible region, spread over (period − dl_full − ul_full) slots:
             // the first carries the leading DL symbols, the last the trailing UL
@@ -82,7 +100,10 @@ impl TddConfig {
             let i = s - dl_full;
             let dl = if i == 0 { pat.dl_symbols } else { 0 };
             let ul = if i == flex - 1 { pat.ul_symbols } else { 0 };
-            SlotDirection { dl_symbols: dl, ul_symbols: ul }
+            SlotDirection {
+                dl_symbols: dl,
+                ul_symbols: ul,
+            }
         }
     }
 }
@@ -230,7 +251,9 @@ impl PrachConfig {
     /// Duration of an occasion of `format` in data-numerology symbols
     /// (rounded up; long formats longer than a slot count as the whole slot).
     fn occasion_symbols(&self, format: ferrite_ran::prach_config::PreambleFormat, mu: u8) -> u8 {
-        let Ok(p) = ferrite_ran::prach_config::format_params(format, self.phy.msg1_scs_mu) else { return 14 };
+        let Ok(p) = ferrite_ran::prach_config::format_params(format, self.phy.msg1_scs_mu) else {
+            return 14;
+        };
         // Normal-CP symbol at mu: (2048 + 144) · 64 / 2^mu T_c.
         let symbol_tc = ((2048u64 + 144) * 64) >> mu;
         p.nominal_tc.div_ceil(symbol_tc).clamp(1, 14) as u8
@@ -241,7 +264,13 @@ impl PrachConfig {
     /// block of its slot and starts at least `N_gap` symbols after the last
     /// SSB symbol (`N_gap` = 0 for the long preamble formats, 2 otherwise).
     /// Always valid on FDD.
-    pub fn occasion_valid(&self, slot: ferrite_common::SlotPoint, start_symbol: u8, n_symbols: u8, format: ferrite_ran::prach_config::PreambleFormat) -> bool {
+    pub fn occasion_valid(
+        &self,
+        slot: ferrite_common::SlotPoint,
+        start_symbol: u8,
+        n_symbols: u8,
+        format: ferrite_ran::prach_config::PreambleFormat,
+    ) -> bool {
         let Some(tdd) = &self.tdd else { return true };
         let d = tdd.slot_direction(slot.index(), slot.numerology);
         let end = start_symbol.saturating_add(n_symbols).min(14);
@@ -259,9 +288,16 @@ impl PrachConfig {
             return true;
         }
         use ferrite_ran::prach_config::PreambleFormat as F;
-        let n_gap = if matches!(format, F::F0 | F::F1 | F::F2 | F::F3) { 0 } else { 2 };
+        let n_gap = if matches!(format, F::F0 | F::F1 | F::F2 | F::F3) {
+            0
+        } else {
+            2
+        };
         let _ = end;
-        self.ssb_symbols.iter().filter(|s| u16::from(s.slot_in_half_frame) == slot.slot).all(|s| start_symbol >= s.last_symbol + 1 + n_gap)
+        self.ssb_symbols
+            .iter()
+            .filter(|s| u16::from(s.slot_in_half_frame) == slot.slot)
+            .all(|s| start_symbol >= s.last_symbol + 1 + n_gap)
     }
 
     /// All valid PRACH occasions whose transmission starts in data-numerology slot `slot`.
@@ -270,7 +306,14 @@ impl PrachConfig {
         ferrite_ran::prach_config::prach_occasions_in_slot(&self.phy, slot)
             .map(|v| {
                 v.into_iter()
-                    .filter(|o| self.occasion_valid(slot, o.start_symbol, self.occasion_symbols(o.format, mu), o.format))
+                    .filter(|o| {
+                        self.occasion_valid(
+                            slot,
+                            o.start_symbol,
+                            self.occasion_symbols(o.format, mu),
+                            o.format,
+                        )
+                    })
                     .map(|o| crate::PrachOccasion {
                         slot,
                         start_symbol: o.start_symbol,
@@ -296,7 +339,10 @@ pub struct DmrsConfig {
 
 impl Default for DmrsConfig {
     fn default() -> Self {
-        Self { additional_position: 2, scrambling_id0: None }
+        Self {
+            additional_position: 2,
+            scrambling_id0: None,
+        }
     }
 }
 
@@ -393,11 +439,23 @@ pub struct PucchResource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PucchFormat {
-    F0 { initial_cyclic_shift: u8 },
-    F1 { initial_cyclic_shift: u8, time_domain_occ: u8 },
-    F2 { n_prb: u8 },
-    F3 { n_prb: u8 },
-    F4 { occ_length: u8, occ_index: u8 },
+    F0 {
+        initial_cyclic_shift: u8,
+    },
+    F1 {
+        initial_cyclic_shift: u8,
+        time_domain_occ: u8,
+    },
+    F2 {
+        n_prb: u8,
+    },
+    F3 {
+        n_prb: u8,
+    },
+    F4 {
+        occ_length: u8,
+        occ_index: u8,
+    },
 }
 
 /// `PUCCH-ResourceSet`.
@@ -492,8 +550,8 @@ pub struct CsiReportConfig {
     pub quantity: CsiReportQuantity,
     /// CSI-RS antenna ports of the PMI codebook (1 without a `codebookConfig`).
     pub nof_ports: u8,
-    /// `typeI-SinglePanel-ri-Restriction` (MSB first: bit 7 allows rank 1);
-    /// `0x80` without a codebook.
+    /// `typeI-SinglePanel-ri-Restriction` (TS 38.214 §5.2.2.2.1: bit `i`,
+    /// r0 = LSB, allows rank `i + 1`); `0x01` without a codebook.
     pub ri_restriction: u8,
 }
 
@@ -510,8 +568,15 @@ pub enum CsiReportQuantity {
 impl CsiReportConfig {
     /// Ranks the `ri-Restriction` allows, ascending (rank 1 when nothing is set).
     pub fn allowed_ranks(&self) -> Vec<u8> {
-        let v: Vec<u8> = (0..8u8).filter(|i| self.ri_restriction & (0x80 >> i) != 0).map(|i| i + 1).collect();
-        if v.is_empty() { vec![1] } else { v }
+        let v: Vec<u8> = (0..8u8)
+            .filter(|i| self.ri_restriction & (1 << i) != 0)
+            .map(|i| i + 1)
+            .collect();
+        if v.is_empty() {
+            vec![1]
+        } else {
+            v
+        }
     }
 }
 
@@ -529,13 +594,17 @@ impl PhyConfig {
     /// Whether a downlink reception in symbols `[start, start + n)` of `slot`
     /// is compatible with the TDD pattern (always on FDD).
     pub fn dl_allowed(&self, slot: ferrite_common::SlotPoint, start: u8, n: u8) -> bool {
-        self.tdd.as_ref().is_none_or(|t| !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Dl))
+        self.tdd.as_ref().is_none_or(|t| {
+            !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Dl)
+        })
     }
 
     /// Whether an uplink transmission in symbols `[start, start + n)` of `slot`
     /// is compatible with the TDD pattern (always on FDD).
     pub fn ul_allowed(&self, slot: ferrite_common::SlotPoint, start: u8, n: u8) -> bool {
-        self.tdd.as_ref().is_none_or(|t| !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Ul))
+        self.tdd.as_ref().is_none_or(|t| {
+            !t.conflicts(slot.index(), slot.numerology, start, n, LinkDirection::Ul)
+        })
     }
 }
 
@@ -593,17 +662,50 @@ impl PhyConfig {
     /// dedicated part is at its default. The engine starts from this and RRC
     /// replaces it once SIB1 and the dedicated configuration are decoded.
     #[allow(clippy::too_many_arguments)]
-    pub fn initial(duplex: DuplexMode, numerology: Numerology, ssb_scs: Numerology, pci: u16, coreset0_n_rb: usize, coreset0_n_symb: u8, dmrs_typea_pos: u8, k_ssb: u8, ss0_index: u8) -> Self {
+    pub fn initial(
+        duplex: DuplexMode,
+        numerology: Numerology,
+        ssb_scs: Numerology,
+        pci: u16,
+        coreset0_n_rb: usize,
+        coreset0_n_symb: u8,
+        dmrs_typea_pos: u8,
+        k_ssb: u8,
+        ss0_index: u8,
+    ) -> Self {
         PhyConfig {
             duplex,
             paging: None,
             numerology,
-            ssb: SsbConfig { pci, scs: ssb_scs, period_ms: 20, ssb_index: 0, k_ssb, dmrs_typea_pos },
-            dl_carrier: Carrier { offset_crb: 0, n_rb: 0 },
-            ul_carrier: Carrier { offset_crb: 0, n_rb: 0 },
+            ssb: SsbConfig {
+                pci,
+                scs: ssb_scs,
+                period_ms: 20,
+                ssb_index: 0,
+                k_ssb,
+                dmrs_typea_pos,
+            },
+            dl_carrier: Carrier {
+                offset_crb: 0,
+                n_rb: 0,
+            },
+            ul_carrier: Carrier {
+                offset_crb: 0,
+                n_rb: 0,
+            },
             ssb_crb: 0,
-            dl_bwp: Bwp { id: 0, start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
-            ul_bwp: Bwp { id: 0, start_crb: 0, n_rb: coreset0_n_rb as u16, scs: numerology },
+            dl_bwp: Bwp {
+                id: 0,
+                start_crb: 0,
+                n_rb: coreset0_n_rb as u16,
+                scs: numerology,
+            },
+            ul_bwp: Bwp {
+                id: 0,
+                start_crb: 0,
+                n_rb: coreset0_n_rb as u16,
+                scs: numerology,
+            },
             nof_dl_bwp_rrc: 0,
             nof_ul_bwp_rrc: 0,
             tdd: None,
@@ -621,7 +723,14 @@ impl PhyConfig {
             pdsch_tdra_common: Vec::new(),
             pusch_tdra_common: Vec::new(),
             prach: PrachConfig {
-                phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                phy: ferrite_ran::prach_config::PrachConfig {
+                    index: 0,
+                    duplex,
+                    mu: numerology.mu,
+                    msg1_scs_mu: numerology.mu,
+                    msg1_fdm: 1,
+                    msg1_frequency_start: 0,
+                },
                 tdd: None,
                 ssb_symbols: Vec::new(),
                 ssb_period_ms: 20,
@@ -653,7 +762,35 @@ mod tests {
 
     fn tdd() -> TddConfig {
         // 6 DL + special (8 DL symbols, 2 UL symbols) + 3 UL in 10 slots.
-        TddConfig { reference_scs: MU, pattern1: TddPattern { period_slots: 10, dl_slots: 6, dl_symbols: 8, ul_slots: 3, ul_symbols: 2 }, pattern2: None }
+        TddConfig {
+            reference_scs: MU,
+            pattern1: TddPattern {
+                period_slots: 10,
+                dl_slots: 6,
+                dl_symbols: 8,
+                ul_slots: 3,
+                ul_symbols: 2,
+            },
+            pattern2: None,
+        }
+    }
+
+    #[test]
+    fn allowed_ranks_follow_ts_38_214_bit_order() {
+        let c = |r: u8| CsiReportConfig {
+            report_id: 0,
+            period_slots: 20,
+            offset_slots: 0,
+            pucch_resource: 0,
+            cqi_table: 0,
+            quantity: CsiReportQuantity::RiPmiCqi,
+            nof_ports: 2,
+            ri_restriction: r,
+        };
+        assert_eq!(c(0b0000_0011).allowed_ranks(), vec![1, 2]);
+        assert_eq!(c(0b0000_0001).allowed_ranks(), vec![1]);
+        assert_eq!(c(0b0000_0010).allowed_ranks(), vec![2]);
+        assert_eq!(c(0).allowed_ranks(), vec![1]);
     }
 
     #[test]
@@ -677,7 +814,14 @@ mod tests {
 
     fn prach(tdd: Option<TddConfig>, ssb: Vec<SsbSlotSymbols>) -> PrachConfig {
         PrachConfig {
-            phy: ferrite_ran::prach_config::PrachConfig { index: 159, duplex: DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 0 },
+            phy: ferrite_ran::prach_config::PrachConfig {
+                index: 159,
+                duplex: DuplexMode::Tdd,
+                mu: 1,
+                msg1_scs_mu: 1,
+                msg1_fdm: 1,
+                msg1_frequency_start: 0,
+            },
             tdd,
             ssb_symbols: ssb,
             ssb_period_ms: 20,
@@ -694,7 +838,11 @@ mod tests {
     fn prach_occasion_validity() {
         use ferrite_ran::prach_config::PreambleFormat as F;
         let slot = |n: u64| SlotPoint::from_index(MU, n);
-        let ssb = vec![SsbSlotSymbols { slot_in_half_frame: 6, first_symbol: 2, last_symbol: 5 }];
+        let ssb = vec![SsbSlotSymbols {
+            slot_in_half_frame: 6,
+            first_symbol: 2,
+            last_symbol: 5,
+        }];
         let p = prach(Some(tdd()), ssb.clone());
         // UL slot: valid; DL slot: invalid; FDD: always valid.
         assert!(p.occasion_valid(slot(7), 0, 12, F::B4));
@@ -706,7 +854,11 @@ mod tests {
         assert!(p.occasion_valid(slot(6), 8, 2, F::A1));
         assert!(!p.occasion_valid(slot(6), 4, 2, F::A1));
         // An SSB later in the slot than the occasion makes it invalid (gap rule).
-        let late = vec![SsbSlotSymbols { slot_in_half_frame: 6, first_symbol: 8, last_symbol: 11 }];
+        let late = vec![SsbSlotSymbols {
+            slot_in_half_frame: 6,
+            first_symbol: 8,
+            last_symbol: 11,
+        }];
         let p2 = prach(Some(tdd()), late);
         assert!(!p2.occasion_valid(slot(6), 8, 2, F::A1));
         // Not an SSB frame (period 20 ms = every other frame): the SSB rule is off.
@@ -714,6 +866,11 @@ mod tests {
         // T1's configuration (index 159, B4, slot 19 is UL) keeps its occasions.
         let p = prach(Some(tdd()), ssb);
         assert!(!p.occasions_in_slot(slot(19)).is_empty());
-        assert!(p.occasions_in_slot(slot(18)).is_empty() || p.occasions_in_slot(slot(18)).iter().all(|o| o.start_symbol >= 12));
+        assert!(
+            p.occasions_in_slot(slot(18)).is_empty()
+                || p.occasions_in_slot(slot(18))
+                    .iter()
+                    .all(|o| o.start_symbol >= 12)
+        );
     }
 }

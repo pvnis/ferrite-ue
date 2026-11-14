@@ -26,7 +26,10 @@ pub enum DmrsError {
     InvalidAdditionalPosition(u8),
     /// The allocation (`start_symbol`, `n_symbols`) is not a valid row of the
     /// relevant table (e.g. type A ending before `l0`, type B of 14 symbols).
-    InvalidAllocation { start_symbol: usize, n_symbols: usize },
+    InvalidAllocation {
+        start_symbol: usize,
+        n_symbols: usize,
+    },
     /// Double-symbol DM-RS (`maxLength = 2`) is not supported.
     DoubleSymbolUnsupported,
 }
@@ -35,8 +38,13 @@ impl std::fmt::Display for DmrsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidTypeAPosition(p) => write!(f, "dmrs-TypeA-Position {p} not in {{2,3}}"),
-            Self::InvalidAdditionalPosition(p) => write!(f, "dmrs-AdditionalPosition {p} not in 0..=3"),
-            Self::InvalidAllocation { start_symbol, n_symbols } => {
+            Self::InvalidAdditionalPosition(p) => {
+                write!(f, "dmrs-AdditionalPosition {p} not in 0..=3")
+            }
+            Self::InvalidAllocation {
+                start_symbol,
+                n_symbols,
+            } => {
                 write!(f, "no DM-RS row for S={start_symbol}, L={n_symbols}")
             }
             Self::DoubleSymbolUnsupported => write!(f, "double-symbol DM-RS not supported"),
@@ -126,7 +134,10 @@ fn dmrs_symbols(
     if add_pos > 3 {
         return Err(DmrsError::InvalidAdditionalPosition(add_pos));
     }
-    let invalid = DmrsError::InvalidAllocation { start_symbol, n_symbols };
+    let invalid = DmrsError::InvalidAllocation {
+        start_symbol,
+        n_symbols,
+    };
     if n_symbols == 0 || start_symbol + n_symbols > 14 {
         return Err(invalid);
     }
@@ -174,7 +185,14 @@ pub fn pdsch_dmrs_symbols(
     start_symbol: usize,
     n_symbols: usize,
 ) -> Result<Vec<usize>, DmrsError> {
-    dmrs_symbols(Channel::Pdsch, mapping, typea_pos, add_pos, start_symbol, n_symbols)
+    dmrs_symbols(
+        Channel::Pdsch,
+        mapping,
+        typea_pos,
+        add_pos,
+        start_symbol,
+        n_symbols,
+    )
 }
 
 /// PDSCH DM-RS positions for double-symbol DM-RS (Table 7.4.1.1.2-4).
@@ -199,7 +217,14 @@ pub fn pusch_dmrs_symbols(
     start_symbol: usize,
     n_symbols: usize,
 ) -> Result<Vec<usize>, DmrsError> {
-    dmrs_symbols(Channel::Pusch, mapping, typea_pos, add_pos, start_symbol, n_symbols)
+    dmrs_symbols(
+        Channel::Pusch,
+        mapping,
+        typea_pos,
+        add_pos,
+        start_symbol,
+        n_symbols,
+    )
 }
 
 /// DM-RS configuration type 1 (38.211 §7.4.1.1.2): CDM group λ occupies
@@ -238,18 +263,54 @@ pub struct AntennaPorts {
 /// Values 12..15 are reserved.
 pub fn dci_1_1_antenna_ports_type1_len1(value: u8) -> Option<AntennaPorts> {
     const T: [AntennaPorts; 12] = [
-        AntennaPorts { nof_cdm_groups_without_data: 1, ports: &[0] },
-        AntennaPorts { nof_cdm_groups_without_data: 1, ports: &[1] },
-        AntennaPorts { nof_cdm_groups_without_data: 1, ports: &[0, 1] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[1] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[2] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[3] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0, 1] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[2, 3] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0, 1, 2] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0, 1, 2, 3] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0, 2] },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 1,
+            ports: &[0],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 1,
+            ports: &[1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 1,
+            ports: &[0, 1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[2],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[3],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0, 1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[2, 3],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0, 1, 2],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0, 1, 2, 3],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0, 2],
+        },
     ];
     T.get(usize::from(value)).copied()
 }
@@ -259,12 +320,30 @@ pub fn dci_1_1_antenna_ports_type1_len1(value: u8) -> Option<AntennaPorts> {
 /// Values 6, 7 are reserved.
 pub fn dci_0_1_antenna_ports_type1_len1_rank1(value: u8) -> Option<AntennaPorts> {
     const T: [AntennaPorts; 6] = [
-        AntennaPorts { nof_cdm_groups_without_data: 1, ports: &[0] },
-        AntennaPorts { nof_cdm_groups_without_data: 1, ports: &[1] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[0] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[1] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[2] },
-        AntennaPorts { nof_cdm_groups_without_data: 2, ports: &[3] },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 1,
+            ports: &[0],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 1,
+            ports: &[1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[0],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[1],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[2],
+        },
+        AntennaPorts {
+            nof_cdm_groups_without_data: 2,
+            ports: &[3],
+        },
     ];
     T.get(usize::from(value)).copied()
 }
@@ -341,12 +420,20 @@ mod tests {
         assert_eq!(dmrs_type1_re_per_rb_symbol(2), 12);
         assert_eq!(dmrs_type1_re_per_rb_symbol(1), 6);
         let v2 = dci_1_1_antenna_ports_type1_len1(2).unwrap();
-        assert_eq!((v2.nof_cdm_groups_without_data, v2.ports), (1, &[0u8, 1][..]));
+        assert_eq!(
+            (v2.nof_cdm_groups_without_data, v2.ports),
+            (1, &[0u8, 1][..])
+        );
         let v3 = dci_1_1_antenna_ports_type1_len1(3).unwrap();
         assert_eq!((v3.nof_cdm_groups_without_data, v3.ports), (2, &[0u8][..]));
         assert_eq!(dci_1_1_antenna_ports_type1_len1(11).unwrap().ports, &[0, 2]);
         assert!(dci_1_1_antenna_ports_type1_len1(12).is_none());
-        assert_eq!(dci_0_1_antenna_ports_type1_len1_rank1(2).unwrap().nof_cdm_groups_without_data, 2);
+        assert_eq!(
+            dci_0_1_antenna_ports_type1_len1_rank1(2)
+                .unwrap()
+                .nof_cdm_groups_without_data,
+            2
+        );
         assert!(dci_0_1_antenna_ports_type1_len1_rank1(6).is_none());
     }
 }

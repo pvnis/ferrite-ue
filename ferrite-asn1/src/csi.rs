@@ -309,8 +309,9 @@ pub struct ReportFreqConfiguration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodebookConfig {
     pub ports: CodebookPorts,
-    /// `typeI-SinglePanel-ri-Restriction`: bit `i` (MSB first, so bit 7 is
-    /// rank 1) allows rank `i + 1`.
+    /// `typeI-SinglePanel-ri-Restriction` as the bit sequence r7…r0 of
+    /// TS 38.214 §5.2.2.2.1: bit `i` (value `1 << i`, r0 = LSB) allows rank
+    /// `i + 1`.
     pub ri_restriction: u8,
     /// `codebookMode` 1 or 2.
     pub codebook_mode: u8,
@@ -323,7 +324,12 @@ pub enum CodebookPorts {
     Two { subset_restriction: u8 },
     /// `(N1, N2)` panel and the restriction bit string (MSB first), plus the
     /// optional `codebookSubsetRestriction-i2`.
-    MoreThanTwo { n1: u8, n2: u8, restriction: Vec<u8>, i2_restriction: Option<u16> },
+    MoreThanTwo {
+        n1: u8,
+        n2: u8,
+        restriction: Vec<u8>,
+        i2_restriction: Option<u16>,
+    },
 }
 
 impl CodebookConfig {
@@ -337,7 +343,10 @@ impl CodebookConfig {
 
     /// Highest rank the `ri-Restriction` allows (0 when none).
     pub fn max_rank(&self) -> u8 {
-        (0..8u8).rev().find(|i| self.ri_restriction & (0x80 >> i) != 0).map_or(0, |i| i + 1)
+        (0..8u8)
+            .rev()
+            .find(|i| self.ri_restriction & (1 << i) != 0)
+            .map_or(0, |i| i + 1)
     }
 
     fn decode(r: &mut BitReader) -> DecodeResult<Self> {
@@ -348,22 +357,44 @@ impl CodebookConfig {
             return r.unsupported("codebookConfig typeI-MultiPanel");
         }
         let ports = if !r.bit()? {
-            CodebookPorts::Two { subset_restriction: r.bitstring(6)? as u8 }
+            CodebookPorts::Two {
+                subset_restriction: r.bitstring(6)? as u8,
+            }
         } else {
             let [has_i2] = r.opt_bits::<1>()?;
             // n1-n2 CHOICE: (N1, N2, restriction bits) per alternative.
             const ALTS: [(u8, u8, u16); 13] = [
-                (2, 1, 8), (2, 2, 64), (4, 1, 16), (3, 2, 96), (6, 1, 24), (4, 2, 128), (8, 1, 32),
-                (4, 3, 192), (6, 2, 192), (12, 1, 48), (4, 4, 256), (8, 2, 256), (16, 1, 64),
+                (2, 1, 8),
+                (2, 2, 64),
+                (4, 1, 16),
+                (3, 2, 96),
+                (6, 1, 24),
+                (4, 2, 128),
+                (8, 1, 32),
+                (4, 3, 192),
+                (6, 2, 192),
+                (12, 1, 48),
+                (4, 4, 256),
+                (8, 2, 256),
+                (16, 1, 64),
             ];
             let (n1, n2, bits) = ALTS[r.uint(0, 12)? as usize];
             let restriction = r.bitstring_bytes(bits as usize)?;
             let i2_restriction = r.opt(has_i2, |r| Ok(r.bitstring(16)? as u16))?;
-            CodebookPorts::MoreThanTwo { n1, n2, restriction, i2_restriction }
+            CodebookPorts::MoreThanTwo {
+                n1,
+                n2,
+                restriction,
+                i2_restriction,
+            }
         };
         let ri_restriction = r.bitstring(8)? as u8;
         let codebook_mode = r.uint(1, 2)? as u8;
-        Ok(CodebookConfig { ports, ri_restriction, codebook_mode })
+        Ok(CodebookConfig {
+            ports,
+            ri_restriction,
+            codebook_mode,
+        })
     }
 }
 

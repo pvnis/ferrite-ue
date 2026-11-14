@@ -1101,7 +1101,11 @@ mod tests {
         ));
         assert!(matches!(
             decode_sm(&[0x2e, 1, 2, 0xcb]),
-            Ok(SmMessage::ModificationCommand(SmHeader { psi: 1, pti: 2, .. }))
+            Ok(SmMessage::ModificationCommand(SmHeader {
+                psi: 1,
+                pti: 2,
+                ..
+            }))
         ));
         assert_eq!(modification_complete(1, 2), vec![0x2e, 1, 2, 0xcc]);
         assert!(matches!(

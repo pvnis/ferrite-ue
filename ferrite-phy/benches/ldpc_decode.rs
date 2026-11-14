@@ -39,7 +39,10 @@ impl Rng {
 
 /// Every distinct NR lifting size, ascending.
 fn all_lifting_sizes() -> Vec<u16> {
-    let mut v: Vec<u16> = LIFTING_SETS.iter().flat_map(|s| s.iter().copied()).collect();
+    let mut v: Vec<u16> = LIFTING_SETS
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .collect();
     v.sort_unstable();
     v.dedup();
     v
@@ -73,7 +76,9 @@ fn main() {
 
     for bg in [BaseGraph::Bg2, BaseGraph::Bg1] {
         for &zc in &lifting {
-            let Some(g) = LdpcGraph::new(bg, zc) else { continue };
+            let Some(g) = LdpcGraph::new(bg, zc) else {
+                continue;
+            };
             let k = g.k();
             let n = g.n();
             let n_tx = n - 2 * g.zc(); // transmitted length excl. 2·Zc puncture (OCUDU convention)

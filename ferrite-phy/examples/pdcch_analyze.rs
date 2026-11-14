@@ -8,9 +8,17 @@ use ferrite_phy::coding::dci::dci_decode;
 use ferrite_phy::sequence::gold_sequence;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: pdcch_analyze <file.rec> [n_rb] [n_cell]");
-    let n_rb: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24);
-    let n_cell: u32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: pdcch_analyze <file.rec> [n_rb] [n_cell]");
+    let n_rb: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let n_cell: u32 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let bytes = std::fs::read(&path).unwrap();
 
     // Parse records: 1 + 2 + 4 + 4 = 11 bytes each.
@@ -28,8 +36,14 @@ fn main() {
     type Record = (u8, u16, f32, f32);
     type Sorter = Box<dyn Fn(&mut Vec<Record>)>;
     let orderings: Vec<(&str, Sorter)> = vec![
-        ("k,l", Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (k, l)))),
-        ("l,k", Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (l, k)))),
+        (
+            "k,l",
+            Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (k, l))),
+        ),
+        (
+            "l,k",
+            Box::new(|v: &mut Vec<_>| v.sort_by_key(|&(l, k, ..)| (l, k))),
+        ),
     ];
     let c_inits: Vec<(String, Option<u32>)> = vec![
         ("none".into(), None),
@@ -76,7 +90,10 @@ fn main() {
                             println!(
                                 "  DECODED order={oname} ser={sname} c_init={cname} conj={conj} a_len={a_len}:"
                             );
-                            println!("    {}", bits.iter().map(|x| x.to_string()).collect::<String>());
+                            println!(
+                                "    {}",
+                                bits.iter().map(|x| x.to_string()).collect::<String>()
+                            );
                         }
                     }
                 }

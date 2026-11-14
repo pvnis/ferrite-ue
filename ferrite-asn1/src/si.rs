@@ -8,7 +8,10 @@
 //! a length prefix, so a message carrying one of them decodes as
 //! [`crate::DecodeErrorKind::Unsupported`] until a decoder exists.
 
-use crate::meas::{q_offset, ss_rssi_measurement, ssb_mtc, ssb_to_measure, threshold_nr, SsRssiMeasurement, SsbMtc, SsbToMeasure, ThresholdNr};
+use crate::meas::{
+    q_offset, ss_rssi_measurement, ssb_mtc, ssb_to_measure, threshold_nr, SsRssiMeasurement,
+    SsbMtc, SsbToMeasure, ThresholdNr,
+};
 use crate::sib1::{decode_multi_band_list, NrMultiBandInfo};
 use crate::uper::{BitReader, Ctx, DecodeResult};
 
@@ -105,10 +108,15 @@ pub enum Sib {
     Sib3(Sib3),
     /// A SIB carried as an extension alternative: the SIB number (10..) and
     /// its UPER octets.
-    Raw { sib_type: u8, octets: Vec<u8> },
+    Raw {
+        sib_type: u8,
+        octets: Vec<u8>,
+    },
     /// A SIB type without a decoder (SIB4–SIB9) ended the decoding of the
     /// message; the SIBs before it are valid.
-    Unsupported { sib_type: u8 },
+    Unsupported {
+        sib_type: u8,
+    },
 }
 
 impl Sib {
@@ -171,7 +179,9 @@ impl SystemInformation {
                 0 => sibs.push(Sib::Sib2(Sib2::decode(r).ctx("sib2")?)),
                 1 => sibs.push(Sib::Sib3(Sib3::decode(r).ctx("sib3")?)),
                 n => {
-                    sibs.push(Sib::Unsupported { sib_type: n as u8 + 2 });
+                    sibs.push(Sib::Unsupported {
+                        sib_type: n as u8 + 2,
+                    });
                     break;
                 }
             }
@@ -200,12 +210,27 @@ impl Sib2 {
             const SF: [i8; 4] = [-6, -4, -2, 0];
             let q_hyst_sf_medium_db = SF[r.enu(4)? as usize];
             let q_hyst_sf_high_db = SF[r.enu(4)? as usize];
-            Ok(SpeedStateReselectionPars { mobility_state_parameters: MobilityStateParameters { t_evaluation_s, t_hyst_normal_s, n_cell_change_medium, n_cell_change_high }, q_hyst_sf_medium_db, q_hyst_sf_high_db })
+            Ok(SpeedStateReselectionPars {
+                mobility_state_parameters: MobilityStateParameters {
+                    t_evaluation_s,
+                    t_hyst_normal_s,
+                    n_cell_change_medium,
+                    n_cell_change_high,
+                },
+                q_hyst_sf_medium_db,
+                q_hyst_sf_high_db,
+            })
         })?;
         if cext {
             r.skip_ext_additions()?;
         }
-        let cell_reselection_info_common = CellReselectionInfoCommon { nrof_ss_blocks_to_average, abs_thresh_ss_blocks_consolidation, range_to_best_cell_db, q_hyst_db, speed_state_reselection_pars };
+        let cell_reselection_info_common = CellReselectionInfoCommon {
+            nrof_ss_blocks_to_average,
+            abs_thresh_ss_blocks_consolidation,
+            range_to_best_cell_db,
+            q_hyst_db,
+            speed_state_reselection_pars,
+        };
         // cellReselectionServingFreqInfo
         let sext = r.bit()?;
         let o = r.opt_bits::<4>()?;
@@ -218,7 +243,14 @@ impl Sib2 {
         if sext {
             r.skip_ext_additions()?;
         }
-        let cell_reselection_serving_freq_info = CellReselectionServingFreqInfo { s_non_intra_search_p, s_non_intra_search_q, thresh_serving_low_p, thresh_serving_low_q, cell_reselection_priority, cell_reselection_sub_priority };
+        let cell_reselection_serving_freq_info = CellReselectionServingFreqInfo {
+            s_non_intra_search_p,
+            s_non_intra_search_q,
+            thresh_serving_low_p,
+            thresh_serving_low_q,
+            cell_reselection_priority,
+            cell_reselection_sub_priority,
+        };
         // intraFreqCellReselectionInfo
         let iext = r.bit()?;
         let o = r.opt_bits::<9>()?;
@@ -228,8 +260,16 @@ impl Sib2 {
         let s_intra_search_p = r.u8(0, 31)?;
         let s_intra_search_q = r.opt(o[2], |r| r.u8(0, 31))?;
         let t_reselection_nr_s = r.u8(0, 7)?;
-        let frequency_band_list = if o[3] { decode_multi_band_list(r).ctx("frequencyBandList")? } else { Vec::new() };
-        let frequency_band_list_sul = if o[4] { decode_multi_band_list(r).ctx("frequencyBandListSUL")? } else { Vec::new() };
+        let frequency_band_list = if o[3] {
+            decode_multi_band_list(r).ctx("frequencyBandList")?
+        } else {
+            Vec::new()
+        };
+        let frequency_band_list_sul = if o[4] {
+            decode_multi_band_list(r).ctx("frequencyBandListSUL")?
+        } else {
+            Vec::new()
+        };
         let p_max = r.opt(o[5], |r| Ok(r.int(-30, 33)? as i8))?;
         let smtc = r.opt(o[6], ssb_mtc)?;
         let ss_rssi_measurement = r.opt(o[7], ss_rssi_measurement)?;
@@ -256,7 +296,11 @@ impl Sib2 {
         if ext {
             r.skip_ext_additions()?;
         }
-        Ok(Self { cell_reselection_info_common, cell_reselection_serving_freq_info, intra_freq_cell_reselection_info })
+        Ok(Self {
+            cell_reselection_info_common,
+            cell_reselection_serving_freq_info,
+            intra_freq_cell_reselection_info,
+        })
     }
 }
 
@@ -276,17 +320,27 @@ impl Sib3 {
                 if cext {
                     r.skip_ext_additions()?;
                 }
-                Ok(IntraFreqNeighCellInfo { pci, q_offset_cell_db, q_rx_lev_min_offset_cell, q_rx_lev_min_offset_cell_sul, q_qual_min_offset_cell })
+                Ok(IntraFreqNeighCellInfo {
+                    pci,
+                    q_offset_cell_db,
+                    q_rx_lev_min_offset_cell,
+                    q_rx_lev_min_offset_cell_sul,
+                    q_qual_min_offset_cell,
+                })
             })?
         } else {
             Vec::new()
         };
         let intra_freq_excluded_cell_list = if has_excluded {
-            const RANGE: [u16; 15] = [4, 8, 12, 16, 24, 32, 48, 64, 84, 96, 128, 168, 252, 504, 1008];
+            const RANGE: [u16; 15] = [
+                4, 8, 12, 16, 24, 32, 48, 64, 84, 96, 128, 168, 252, 504, 1008,
+            ];
             r.seq_of(1, 16, |r| {
                 let [has_range] = r.opt_bits::<1>()?;
                 let start = r.u16(0, 1007)?;
-                let range = r.opt(has_range, |r| Ok(RANGE.get(r.enu(16)? as usize).copied().unwrap_or(1)))?;
+                let range = r.opt(has_range, |r| {
+                    Ok(RANGE.get(r.enu(16)? as usize).copied().unwrap_or(1))
+                })?;
                 Ok((start, range.unwrap_or(1)))
             })?
         } else {
@@ -295,7 +349,10 @@ impl Sib3 {
         if ext {
             r.skip_ext_additions()?;
         }
-        Ok(Self { intra_freq_neigh_cell_list, intra_freq_excluded_cell_list })
+        Ok(Self {
+            intra_freq_neigh_cell_list,
+            intra_freq_excluded_cell_list,
+        })
     }
 }
 
@@ -318,7 +375,7 @@ mod tests {
         w.bit(false); // not extended
         w.enu(0, 8);
         w.bit(false); // SIB2 ext
-        // cellReselectionInfoCommon: no optionals, q-Hyst dB3
+                      // cellReselectionInfoCommon: no optionals, q-Hyst dB3
         w.bit(false);
         w.opt_bits(&[false, false, false, false]);
         w.enu(3, 16);
@@ -344,20 +401,45 @@ mod tests {
         let bytes = w.finish();
         let si = SystemInformation::decode(&bytes).expect("decode");
         assert_eq!(si.sibs.len(), 2);
-        let Sib::Sib2(s2) = &si.sibs[0] else { panic!("sib2") };
+        let Sib::Sib2(s2) = &si.sibs[0] else {
+            panic!("sib2")
+        };
         assert_eq!(s2.cell_reselection_info_common.q_hyst_db, 3);
-        assert_eq!(s2.cell_reselection_serving_freq_info.cell_reselection_priority, 6);
+        assert_eq!(
+            s2.cell_reselection_serving_freq_info
+                .cell_reselection_priority,
+            6
+        );
         assert_eq!(s2.intra_freq_cell_reselection_info.q_rx_lev_min, -70);
         assert_eq!(s2.intra_freq_cell_reselection_info.s_intra_search_p, 31);
-        assert_eq!(s2.intra_freq_cell_reselection_info.smtc, Some(SsbMtc { periodicity_sf: 20, offset_sf: 0, duration_sf: 5 }));
-        assert!(s2.intra_freq_cell_reselection_info.derive_ssb_index_from_cell);
-        assert_eq!(si.sibs[1], Sib::Raw { sib_type: 19, octets: vec![1, 2, 3] });
+        assert_eq!(
+            s2.intra_freq_cell_reselection_info.smtc,
+            Some(SsbMtc {
+                periodicity_sf: 20,
+                offset_sf: 0,
+                duration_sf: 5
+            })
+        );
+        assert!(
+            s2.intra_freq_cell_reselection_info
+                .derive_ssb_index_from_cell
+        );
+        assert_eq!(
+            si.sibs[1],
+            Sib::Raw {
+                sib_type: 19,
+                octets: vec![1, 2, 3]
+            }
+        );
     }
 
     #[test]
     fn sib1_block_is_not_system_information() {
         // c1 = systemInformationBlockType1 (bit 1 after the class bit).
         let e = SystemInformation::decode(&[0x40]).unwrap_err();
-        assert!(format!("{e}").contains("systemInformationBlockType1"), "{e}");
+        assert!(
+            format!("{e}").contains("systemInformationBlockType1"),
+            "{e}"
+        );
     }
 }

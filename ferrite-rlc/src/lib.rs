@@ -74,7 +74,10 @@ pub struct UmConfig {
 impl Default for UmConfig {
     /// 12-bit SN, t-Reassembly 35 ms.
     fn default() -> Self {
-        Self { sn_len: SnLen::Bits12, t_reassembly_ms: 35 }
+        Self {
+            sn_len: SnLen::Bits12,
+            t_reassembly_ms: 35,
+        }
     }
 }
 

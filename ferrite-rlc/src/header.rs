@@ -332,7 +332,11 @@ impl StatusPdu {
                     let n1 = *pdu.get(i + 1)?;
                     i += 2;
                     e1 = n1 & 0x08 != 0;
-                    (((n0 as u32) << 4) | ((n1 >> 4) as u32), n1 & 0x04 != 0, n1 & 0x02 != 0)
+                    (
+                        ((n0 as u32) << 4) | ((n1 >> 4) as u32),
+                        n1 & 0x04 != 0,
+                        n1 & 0x02 != 0,
+                    )
                 }
             };
             let so = if e2 {
@@ -364,7 +368,12 @@ mod tests {
     fn umd_full_sdu_is_one_zero_octet() {
         for sn_len in [SnLen::Bits6, SnLen::Bits12] {
             let mut out = Vec::new();
-            UmdHeader { si: Si::Full, sn: 17, so: 0 }.encode(sn_len, &mut out);
+            UmdHeader {
+                si: Si::Full,
+                sn: 17,
+                so: 0,
+            }
+            .encode(sn_len, &mut out);
             assert_eq!(out, [0x00]);
             let (h, len) = UmdHeader::decode(sn_len, &[0x00, 0xAA]).unwrap();
             assert_eq!((h.si, len), (Si::Full, 1));
@@ -374,15 +383,40 @@ mod tests {
     #[test]
     fn umd_6bit_layouts() {
         let mut out = Vec::new();
-        UmdHeader { si: Si::First, sn: 0x2A, so: 0 }.encode(SnLen::Bits6, &mut out);
+        UmdHeader {
+            si: Si::First,
+            sn: 0x2A,
+            so: 0,
+        }
+        .encode(SnLen::Bits6, &mut out);
         assert_eq!(out, [0x40 | 0x2A]);
         out.clear();
-        UmdHeader { si: Si::Middle, sn: 0x3F, so: 0x1234 }.encode(SnLen::Bits6, &mut out);
+        UmdHeader {
+            si: Si::Middle,
+            sn: 0x3F,
+            so: 0x1234,
+        }
+        .encode(SnLen::Bits6, &mut out);
         assert_eq!(out, [0xC0 | 0x3F, 0x12, 0x34]);
         let (h, len) = UmdHeader::decode(SnLen::Bits6, &out).unwrap();
-        assert_eq!((h, len), (UmdHeader { si: Si::Middle, sn: 0x3F, so: 0x1234 }, 3));
+        assert_eq!(
+            (h, len),
+            (
+                UmdHeader {
+                    si: Si::Middle,
+                    sn: 0x3F,
+                    so: 0x1234
+                },
+                3
+            )
+        );
         out.clear();
-        UmdHeader { si: Si::Last, sn: 1, so: 7 }.encode(SnLen::Bits6, &mut out);
+        UmdHeader {
+            si: Si::Last,
+            sn: 1,
+            so: 7,
+        }
+        .encode(SnLen::Bits6, &mut out);
         assert_eq!(out, [0x81, 0x00, 0x07]);
         assert_eq!(UmdHeader::size(Si::Last, SnLen::Bits6), 3);
         assert_eq!(UmdHeader::size(Si::First, SnLen::Bits6), 1);
@@ -391,13 +425,33 @@ mod tests {
     #[test]
     fn umd_12bit_layouts() {
         let mut out = Vec::new();
-        UmdHeader { si: Si::First, sn: 0xABC, so: 0 }.encode(SnLen::Bits12, &mut out);
+        UmdHeader {
+            si: Si::First,
+            sn: 0xABC,
+            so: 0,
+        }
+        .encode(SnLen::Bits12, &mut out);
         assert_eq!(out, [0x40 | 0x0A, 0xBC]);
         out.clear();
-        UmdHeader { si: Si::Last, sn: 0xFFF, so: 0xBEEF }.encode(SnLen::Bits12, &mut out);
+        UmdHeader {
+            si: Si::Last,
+            sn: 0xFFF,
+            so: 0xBEEF,
+        }
+        .encode(SnLen::Bits12, &mut out);
         assert_eq!(out, [0x80 | 0x0F, 0xFF, 0xBE, 0xEF]);
         let (h, len) = UmdHeader::decode(SnLen::Bits12, &out).unwrap();
-        assert_eq!((h, len), (UmdHeader { si: Si::Last, sn: 0xFFF, so: 0xBEEF }, 4));
+        assert_eq!(
+            (h, len),
+            (
+                UmdHeader {
+                    si: Si::Last,
+                    sn: 0xFFF,
+                    so: 0xBEEF
+                },
+                4
+            )
+        );
         // Truncated SO field.
         assert!(UmdHeader::decode(SnLen::Bits12, &[0x8F, 0xFF, 0xBE]).is_none());
         assert!(UmdHeader::decode(SnLen::Bits12, &[]).is_none());
@@ -409,27 +463,79 @@ mod tests {
     fn amd_12bit_layouts() {
         // D/C=1, P=1, SI=00, SN=0x123 → 0xC1 0x23 (matches the Msg5 framing proven on a live gNB).
         let mut out = Vec::new();
-        AmdHeader { poll: true, si: Si::Full, sn: 0x123, so: 0 }.encode(SnLen::Bits12, &mut out);
+        AmdHeader {
+            poll: true,
+            si: Si::Full,
+            sn: 0x123,
+            so: 0,
+        }
+        .encode(SnLen::Bits12, &mut out);
         assert_eq!(out, [0xC1, 0x23]);
         out.clear();
-        AmdHeader { poll: false, si: Si::Middle, sn: 0xFFF, so: 0x0102 }.encode(SnLen::Bits12, &mut out);
+        AmdHeader {
+            poll: false,
+            si: Si::Middle,
+            sn: 0xFFF,
+            so: 0x0102,
+        }
+        .encode(SnLen::Bits12, &mut out);
         assert_eq!(out, [0x80 | 0x30 | 0x0F, 0xFF, 0x01, 0x02]);
         let (h, len) = AmdHeader::decode(SnLen::Bits12, &out).unwrap();
-        assert_eq!((h, len), (AmdHeader { poll: false, si: Si::Middle, sn: 0xFFF, so: 0x0102 }, 4));
-        assert!(AmdHeader::decode(SnLen::Bits12, &[0x00, 0x00]).is_none(), "status pdu");
-        assert!(AmdHeader::decode(SnLen::Bits12, &[0xB0, 0x01, 0x00]).is_none(), "truncated SO");
+        assert_eq!(
+            (h, len),
+            (
+                AmdHeader {
+                    poll: false,
+                    si: Si::Middle,
+                    sn: 0xFFF,
+                    so: 0x0102
+                },
+                4
+            )
+        );
+        assert!(
+            AmdHeader::decode(SnLen::Bits12, &[0x00, 0x00]).is_none(),
+            "status pdu"
+        );
+        assert!(
+            AmdHeader::decode(SnLen::Bits12, &[0xB0, 0x01, 0x00]).is_none(),
+            "truncated SO"
+        );
     }
 
     #[test]
     fn amd_18bit_layouts() {
         let mut out = Vec::new();
-        AmdHeader { poll: true, si: Si::Last, sn: 0x3FFFF, so: 0xFFFF }.encode(SnLen::Bits18, &mut out);
+        AmdHeader {
+            poll: true,
+            si: Si::Last,
+            sn: 0x3FFFF,
+            so: 0xFFFF,
+        }
+        .encode(SnLen::Bits18, &mut out);
         assert_eq!(out, [0x80 | 0x40 | 0x20 | 0x03, 0xFF, 0xFF, 0xFF, 0xFF]);
         out.clear();
-        AmdHeader { poll: false, si: Si::First, sn: 0x12345, so: 0 }.encode(SnLen::Bits18, &mut out);
+        AmdHeader {
+            poll: false,
+            si: Si::First,
+            sn: 0x12345,
+            so: 0,
+        }
+        .encode(SnLen::Bits18, &mut out);
         assert_eq!(out, [0x80 | 0x10 | 0x01, 0x23, 0x45]);
         let (h, len) = AmdHeader::decode(SnLen::Bits18, &out).unwrap();
-        assert_eq!((h, len), (AmdHeader { poll: false, si: Si::First, sn: 0x12345, so: 0 }, 3));
+        assert_eq!(
+            (h, len),
+            (
+                AmdHeader {
+                    poll: false,
+                    si: Si::First,
+                    sn: 0x12345,
+                    so: 0
+                },
+                3
+            )
+        );
         assert_eq!(AmdHeader::size(Si::Full, SnLen::Bits18), 3);
         assert_eq!(AmdHeader::size(Si::Last, SnLen::Bits18), 5);
     }
@@ -437,9 +543,15 @@ mod tests {
     #[test]
     fn status_12bit_ack_only_matches_legacy_vector() {
         // The legacy (gNB-proven) builder: [ACK_SN>>8 & 0xF, ACK_SN & 0xFF, 0x00].
-        let s = StatusPdu { ack_sn: 0x5A7, nacks: vec![] };
+        let s = StatusPdu {
+            ack_sn: 0x5A7,
+            nacks: vec![],
+        };
         assert_eq!(s.encode(SnLen::Bits12), [0x05, 0xA7, 0x00]);
-        assert_eq!(StatusPdu::decode(SnLen::Bits12, &[0x05, 0xA7, 0x00]).unwrap(), s);
+        assert_eq!(
+            StatusPdu::decode(SnLen::Bits12, &[0x05, 0xA7, 0x00]).unwrap(),
+            s
+        );
         assert!(is_status_pdu(&[0x05]));
         assert!(!is_status_pdu(&[0x85]));
         // Reserved CPT.
@@ -452,19 +564,51 @@ mod tests {
         let s = StatusPdu {
             ack_sn: 10,
             nacks: vec![
-                Nack { sn: 3, so: None, range: None },
-                Nack { sn: 5, so: Some((0x0010, SO_END_ALL)), range: None },
-                Nack { sn: 7, so: None, range: Some(2) },
-                Nack { sn: 0xABC, so: Some((1, 2)), range: Some(3) },
+                Nack {
+                    sn: 3,
+                    so: None,
+                    range: None,
+                },
+                Nack {
+                    sn: 5,
+                    so: Some((0x0010, SO_END_ALL)),
+                    range: None,
+                },
+                Nack {
+                    sn: 7,
+                    so: None,
+                    range: Some(2),
+                },
+                Nack {
+                    sn: 0xABC,
+                    so: Some((1, 2)),
+                    range: Some(3),
+                },
             ],
         };
         let b = s.encode(SnLen::Bits12);
         let expect = [
-            0x00, 0x0A, 0x80, // ACK_SN=10, E1=1
-            0x00, 0x30 | 0x08, // NACK_SN=3, E1=1
-            0x00, 0x50 | 0x08 | 0x04, 0x00, 0x10, 0xFF, 0xFF, // NACK_SN=5 E1 E2 SOstart SOend
-            0x00, 0x70 | 0x08 | 0x02, 0x02, // NACK_SN=7 E1 E3 range=2
-            0xAB, 0xC0 | 0x04 | 0x02, 0x00, 0x01, 0x00, 0x02, 0x03, // last: E1=0 E2 E3
+            0x00,
+            0x0A,
+            0x80, // ACK_SN=10, E1=1
+            0x00,
+            0x30 | 0x08, // NACK_SN=3, E1=1
+            0x00,
+            0x50 | 0x08 | 0x04,
+            0x00,
+            0x10,
+            0xFF,
+            0xFF, // NACK_SN=5 E1 E2 SOstart SOend
+            0x00,
+            0x70 | 0x08 | 0x02,
+            0x02, // NACK_SN=7 E1 E3 range=2
+            0xAB,
+            0xC0 | 0x04 | 0x02,
+            0x00,
+            0x01,
+            0x00,
+            0x02,
+            0x03, // last: E1=0 E2 E3
         ];
         assert_eq!(b, expect);
         assert_eq!(s.size(SnLen::Bits12), expect.len());
@@ -478,20 +622,42 @@ mod tests {
         let s = StatusPdu {
             ack_sn: 0x3FFFF,
             nacks: vec![
-                Nack { sn: 0x2AAAA, so: Some((5, 9)), range: None },
-                Nack { sn: 0x00001, so: None, range: Some(200) },
+                Nack {
+                    sn: 0x2AAAA,
+                    so: Some((5, 9)),
+                    range: None,
+                },
+                Nack {
+                    sn: 0x00001,
+                    so: None,
+                    range: Some(200),
+                },
             ],
         };
         let b = s.encode(SnLen::Bits18);
         let expect = [
-            0x0F, 0xFF, 0xFC | 0x02, // ACK_SN all ones, E1=1
-            0xAA, 0xAA, 0x80 | 0x20 | 0x10, 0x00, 0x05, 0x00, 0x09, // sn=0x2AAAA → 10101010 10101010 10|E1|E2
-            0x00, 0x00, 0x40 | 0x08, 200, // sn=1 → 00000000 00000000 01, E1=0, E3=1
+            0x0F,
+            0xFF,
+            0xFC | 0x02, // ACK_SN all ones, E1=1
+            0xAA,
+            0xAA,
+            0x80 | 0x20 | 0x10,
+            0x00,
+            0x05,
+            0x00,
+            0x09, // sn=0x2AAAA → 10101010 10101010 10|E1|E2
+            0x00,
+            0x00,
+            0x40 | 0x08,
+            200, // sn=1 → 00000000 00000000 01, E1=0, E3=1
         ];
         assert_eq!(b, expect);
         assert_eq!(s.size(SnLen::Bits18), expect.len());
         assert_eq!(StatusPdu::decode(SnLen::Bits18, &b).unwrap(), s);
-        let ack_only = StatusPdu { ack_sn: 0x12345, nacks: vec![] };
+        let ack_only = StatusPdu {
+            ack_sn: 0x12345,
+            nacks: vec![],
+        };
         let b = ack_only.encode(SnLen::Bits18);
         assert_eq!(b, [0x04, 0x8D, 0x14]);
         assert_eq!(StatusPdu::decode(SnLen::Bits18, &b).unwrap(), ack_only);

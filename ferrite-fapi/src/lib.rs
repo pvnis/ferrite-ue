@@ -80,6 +80,10 @@ pub struct DlGrant {
     pub tpc: u8,
     /// Number of DMRS CDM groups without data (1 or 2).
     pub cdm_groups_wo_data: u8,
+    /// Spatial layers (1 or 2) and their DM-RS ports (`1000 + p`, type 1:
+    /// ports 0/1 in CDM group 0, 2/3 in group 1).
+    pub n_layers: u8,
+    pub dmrs_ports: Vec<u8>,
     /// `dmrs-AdditionalPosition` to use (2 for fallback DCI, else configured).
     pub dmrs_add_pos: u8,
     /// VRB-to-PRB mapping bit of the DCI (true = interleaved).
@@ -158,11 +162,16 @@ pub enum Dci {
     Ul(UlGrant),
     /// A DCI the PHY recognised but MAC does not act on (paging short
     /// messages, SI scheduling for a SIB the UE has not requested, …).
-    Other { format: &'static str },
+    Other {
+        format: &'static str,
+    },
     /// A DCI 1_1 / 0_1 whose bandwidth-part indicator names a BWP other than
     /// the active one (TS 38.213 §12): MAC switches the active BWP; the
     /// grant itself, which would apply on the new BWP, is not resolved.
-    BwpSwitch { dl_bwp: Option<u8>, ul_bwp: Option<u8> },
+    BwpSwitch {
+        dl_bwp: Option<u8>,
+        ul_bwp: Option<u8>,
+    },
 }
 
 /// SLOT.indication.
@@ -293,12 +302,23 @@ pub struct PrachOccasion {
 #[derive(Clone, Debug)]
 pub enum UlTtiPdu {
     /// Transmit a preamble on an occasion (MAC chose preamble + occasion).
-    Prach { occasion: PrachOccasion, preamble: u8, power_offset_db: f32 },
+    Prach {
+        occasion: PrachOccasion,
+        preamble: u8,
+        power_offset_db: f32,
+    },
     /// Transmit a PUSCH for a grant with the given MAC PDU (TX_Data.request
     /// payload) and the UCI multiplexed onto it, if any.
-    Pusch { grant: UlGrant, tb: Vec<u8>, uci: UciPayload },
+    Pusch {
+        grant: UlGrant,
+        tb: Vec<u8>,
+        uci: UciPayload,
+    },
     /// Transmit a PUCCH on `resource` with `uci`.
-    Pucch { resource: PucchResourceRef, uci: UciPayload },
+    Pucch {
+        resource: PucchResourceRef,
+        uci: UciPayload,
+    },
     /// Transmit the SRS resource `resource_id` (its periodic occasion).
     Srs { resource_id: u8 },
 }
@@ -322,7 +342,11 @@ pub enum MacToPhy {
     /// UL_TTI.request (+ TX_Data) for one future slot.
     UlTti(UlTtiRequest),
     /// Set the RNTIs the PHY monitors (C-RNTI / TC-RNTI / RA-RNTI). `None` clears.
-    SetRntis { c_rnti: Option<Rnti>, tc_rnti: Option<Rnti>, ra_rnti: Option<Rnti> },
+    SetRntis {
+        c_rnti: Option<Rnti>,
+        tc_rnti: Option<Rnti>,
+        ra_rnti: Option<Rnti>,
+    },
     /// Absolute N_TA in T_c units (MAC maintains it from the RAR + TA MAC CEs).
     TimingAdvance { n_ta_tc: i64 },
     /// Monitor paging for this UE_ID (5G-S-TMSI mod 1024); `None` stops.
@@ -335,7 +359,11 @@ pub enum MacToPhy {
     /// grant. The PHY answers with a [`PhyToMac::Dci`] carrying
     /// `Dci::Ul(UlGrant { rnti_kind: Tc, harq_id: 0, ndi: 0, .. })` for the
     /// slot `rar_slot + k2 + Δ`; MAC then builds Msg3 like any other PUSCH.
-    RarGrant { rar_slot: SlotPoint, tc_rnti: Rnti, grant: RarUlGrant },
+    RarGrant {
+        rar_slot: SlotPoint,
+        tc_rnti: Rnti,
+        grant: RarUlGrant,
+    },
 }
 
 /// What MAC implements: the PHY calls this on its timeline thread.

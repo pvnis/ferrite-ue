@@ -14,7 +14,10 @@ use ferrite_ue::stack::{Stack, StackEvent};
 const SIB1_HEX: &str = "748101701040040200000e000a680018056109a008200042e02050900c316a61b3704020000080800041a2352412130426931860000042ee18b53224f8050664abff0124e9106e28dc61b8e372c6fbf56c70ea008580d003058b6822800000000000000000";
 
 fn hex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn slot(n: u64) -> SlotPoint {
@@ -23,12 +26,28 @@ fn slot(n: u64) -> SlotPoint {
 
 fn mib() -> MibInfo {
     let cs0 = ferrite_phy::coreset0::coreset0_config(30, 30, 10, 2).unwrap();
-    MibInfo { pci: 1, mu: 1, dmrs_typea_pos: 2, k_ssb: 0, coreset0_index: 2, ss0_index: 0, ssb_index: 0, ssb_scs_khz: 30, ssb_arfcn: 626000, coreset0_n_rb: cs0.n_rb as u16, coreset0_n_symb: cs0.n_symb as u8, coreset0_offset_rb: cs0.offset_rb }
+    MibInfo {
+        pci: 1,
+        mu: 1,
+        dmrs_typea_pos: 2,
+        k_ssb: 0,
+        coreset0_index: 2,
+        ss0_index: 0,
+        ssb_index: 0,
+        ssb_scs_khz: 30,
+        ssb_arfcn: 626000,
+        coreset0_n_rb: cs0.n_rb as u16,
+        coreset0_n_symb: cs0.n_symb as u8,
+        coreset0_offset_rb: cs0.offset_rb,
+    }
 }
 
 fn config() -> UeConfig {
     UeConfig {
-        radio: RadioConfig::Zmq { tx: vec![String::new()], rx: String::new() },
+        radio: RadioConfig::Zmq {
+            tx: vec![String::new()],
+            rx: String::new(),
+        },
         fs: 15.36e6,
         dl_center_hz: 3.5e9,
         ul_center_hz: 3.5e9,
@@ -61,7 +80,15 @@ fn config() -> UeConfig {
 }
 
 fn sib1(at: u64) -> PhyToMac {
-    PhyToMac::RxData(RxDataIndication { rnti: Rnti(0xffff), rnti_kind: RntiKind::Si, harq_id: 0, ndi: 0, pdsch_slot: slot(at), tb: Some(hex(SIB1_HEX)), sinr_db: 30.0 })
+    PhyToMac::RxData(RxDataIndication {
+        rnti: Rnti(0xffff),
+        rnti_kind: RntiKind::Si,
+        harq_id: 0,
+        ndi: 0,
+        pdsch_slot: slot(at),
+        tb: Some(hex(SIB1_HEX)),
+        sinr_db: 30.0,
+    })
 }
 
 fn events(stack: &mut Stack) -> Vec<StackEvent> {
@@ -82,7 +109,16 @@ fn sib1_configures_the_phy_and_starts_registration() {
     let mut phy: Vec<MacToPhy> = Vec::new();
     stack.handle(sib1(4), &mut phy);
     // CONFIG.request with the SIB1-derived cell configuration.
-    let cfg = phy.iter().find_map(|m| if let MacToPhy::Config(c) = m { Some(c) } else { None }).expect("CONFIG.request");
+    let cfg = phy
+        .iter()
+        .find_map(|m| {
+            if let MacToPhy::Config(c) = m {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .expect("CONFIG.request");
     assert_eq!(cfg.dl_bwp.n_rb, 24);
     assert!(cfg.tdd.is_some());
     assert_eq!(cfg.ssb.pci, 1);
@@ -116,7 +152,10 @@ fn failed_attempt_is_retried_after_a_backoff() {
         phy.clear();
         stack.handle(PhyToMac::Slot(SlotIndication { slot: slot(n) }), &mut phy);
         if failed_at.is_none() {
-            if events(&mut stack).iter().any(|e| matches!(e, StackEvent::Failed(_))) {
+            if events(&mut stack)
+                .iter()
+                .any(|e| matches!(e, StackEvent::Failed(_)))
+            {
                 failed_at = Some(n);
                 assert_eq!(stack.rrc_state(), RrcState::Idle);
             }
@@ -128,6 +167,9 @@ fn failed_attempt_is_retried_after_a_backoff() {
         }
     }
     let failed_at = failed_at.expect("the attempt must fail without a RAR");
-    assert!(prach_after_failure > 0, "no new random access after the failure at slot {failed_at}");
+    assert!(
+        prach_after_failure > 0,
+        "no new random access after the failure at slot {failed_at}"
+    );
     assert_eq!(stack.rrc_state(), RrcState::Connecting);
 }

@@ -7,15 +7,24 @@ use crate::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DlSubPdu {
     /// A logical-channel SDU (CCCH = LCID 0, DCCH/DTCH 1..32).
-    Sdu { lcid: u8, sdu: Vec<u8> },
+    Sdu {
+        lcid: u8,
+        sdu: Vec<u8>,
+    },
     /// Timing Advance Command: (TAG id, T_A 0..63).
-    TaCommand { tag: u8, ta: u8 },
+    TaCommand {
+        tag: u8,
+        ta: u8,
+    },
     /// UE Contention Resolution Identity (the first 48 bits of the Msg3 CCCH SDU).
     ContentionResolution([u8; 6]),
     DrxCommand,
     LongDrxCommand,
     /// Any other CE, kept for diagnostics.
-    Other { lcid: u8, payload: Vec<u8> },
+    Other {
+        lcid: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// Parse a DL-SCH MAC PDU (§6.1.2) into subPDUs. Stops at padding; tolerates a
@@ -32,7 +41,10 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
             LCID_PADDING => break,
             LCID_TA_COMMAND => {
                 let Some(&v) = pdu.get(i) else { break };
-                out.push(DlSubPdu::TaCommand { tag: v >> 6, ta: v & 0x3f });
+                out.push(DlSubPdu::TaCommand {
+                    tag: v >> 6,
+                    ta: v & 0x3f,
+                });
                 i += 1;
             }
             LCID_DL_CON_RES => {
@@ -44,17 +56,26 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
             LCID_LONG_DRX => out.push(DlSubPdu::LongDrxCommand),
             LCID_SCELL_ACT_1 => {
                 let Some(&v) = pdu.get(i) else { break };
-                out.push(DlSubPdu::Other { lcid, payload: vec![v] });
+                out.push(DlSubPdu::Other {
+                    lcid,
+                    payload: vec![v],
+                });
                 i += 1;
             }
             LCID_SCELL_ACT_4 => {
                 let Some(p) = pdu.get(i..i + 4) else { break };
-                out.push(DlSubPdu::Other { lcid, payload: p.to_vec() });
+                out.push(DlSubPdu::Other {
+                    lcid,
+                    payload: p.to_vec(),
+                });
                 i += 4;
             }
             LCID_DUP_ACT => {
                 let Some(&v) = pdu.get(i) else { break };
-                out.push(DlSubPdu::Other { lcid, payload: vec![v] });
+                out.push(DlSubPdu::Other {
+                    lcid,
+                    payload: vec![v],
+                });
                 i += 1;
             }
             // Fixed-size CEs without an L field (TS 38.321 Table 6.2.1-1):
@@ -65,7 +86,10 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
             47 | 48 | 51 | 52 | 49 => {
                 let n = if lcid == 49 { 3 } else { 2 };
                 let Some(p) = pdu.get(i..i + n) else { break };
-                out.push(DlSubPdu::Other { lcid, payload: p.to_vec() });
+                out.push(DlSubPdu::Other {
+                    lcid,
+                    payload: p.to_vec(),
+                });
                 i += n;
             }
             // eLCID subheaders (33: 1-octet eLCID, 34: 2-octet eLCID) and the
@@ -77,7 +101,9 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
             _ => {
                 // Variable-length: an L field (8 or 16 bits) follows.
                 let len = if f == 1 {
-                    let (Some(&h), Some(&l)) = (pdu.get(i), pdu.get(i + 1)) else { break };
+                    let (Some(&h), Some(&l)) = (pdu.get(i), pdu.get(i + 1)) else {
+                        break;
+                    };
                     i += 2;
                     ((h as usize) << 8) | l as usize
                 } else {
@@ -87,9 +113,15 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
                 };
                 let Some(p) = pdu.get(i..i + len) else { break };
                 if lcid <= LCID_MAX_LCH {
-                    out.push(DlSubPdu::Sdu { lcid, sdu: p.to_vec() });
+                    out.push(DlSubPdu::Sdu {
+                        lcid,
+                        sdu: p.to_vec(),
+                    });
                 } else {
-                    out.push(DlSubPdu::Other { lcid, payload: p.to_vec() });
+                    out.push(DlSubPdu::Other {
+                        lcid,
+                        payload: p.to_vec(),
+                    });
                 }
                 i += len;
             }
@@ -137,7 +169,10 @@ pub fn bsr_index_5bit(bytes: usize) -> u8 {
 /// (index k ⇔ bytes ≤ B_k; 254 ⇔ > 81338368; 255 reserved). Normative
 /// constant table (cross-checked against the OCUDU reference implementation).
 pub fn bsr_index_8bit(bytes: usize) -> u8 {
-    LONG_BSR_LEVELS.iter().position(|&l| l as usize >= bytes).map_or(254, |p| p as u8)
+    LONG_BSR_LEVELS
+        .iter()
+        .position(|&l| l as usize >= bytes)
+        .map_or(254, |p| p as u8)
 }
 
 #[rustfmt::skip]
@@ -176,7 +211,11 @@ pub fn push_single_phr(out: &mut Vec<u8>, ph_db: f32, pcmax_dbm: f32) {
 
 /// Build a Short BSR MAC CE subPDU (LCG id + 5-bit index) into `out`.
 pub fn push_short_bsr(out: &mut Vec<u8>, lcg: u8, bytes: usize, truncated: bool) {
-    out.push(if truncated { LCID_SHORT_TRUNC_BSR } else { LCID_SHORT_BSR });
+    out.push(if truncated {
+        LCID_SHORT_TRUNC_BSR
+    } else {
+        LCID_SHORT_BSR
+    });
     out.push(((lcg & 7) << 5) | bsr_index_5bit(bytes));
 }
 
@@ -189,7 +228,11 @@ pub fn push_long_bsr(out: &mut Vec<u8>, lcg_bytes: &[(u8, usize)], truncated: bo
         bitmap |= 1 << (lcg & 7);
     }
     let payload_len = 1 + entries.len();
-    out.push(if truncated { LCID_LONG_TRUNC_BSR } else { LCID_LONG_BSR });
+    out.push(if truncated {
+        LCID_LONG_TRUNC_BSR
+    } else {
+        LCID_LONG_BSR
+    });
     out.push(payload_len as u8);
     out.push(bitmap);
     for &(_, b) in &entries {
@@ -225,11 +268,19 @@ mod tests {
 
     #[test]
     fn parse_con_res_ccch_ta_padding() {
-        let pdu = [62, 9, 8, 7, 6, 5, 4, 0, 3, 0xaa, 0xbb, 0xcc, 61, 0x1a, 63, 0, 0];
+        let pdu = [
+            62, 9, 8, 7, 6, 5, 4, 0, 3, 0xaa, 0xbb, 0xcc, 61, 0x1a, 63, 0, 0,
+        ];
         let subs = parse_dl_pdu(&pdu);
         assert_eq!(subs.len(), 3);
         assert_eq!(subs[0], DlSubPdu::ContentionResolution([9, 8, 7, 6, 5, 4]));
-        assert_eq!(subs[1], DlSubPdu::Sdu { lcid: 0, sdu: vec![0xaa, 0xbb, 0xcc] });
+        assert_eq!(
+            subs[1],
+            DlSubPdu::Sdu {
+                lcid: 0,
+                sdu: vec![0xaa, 0xbb, 0xcc]
+            }
+        );
         assert_eq!(subs[2], DlSubPdu::TaCommand { tag: 0, ta: 26 });
     }
 
@@ -263,6 +314,15 @@ mod tests {
     fn long_bsr_layout() {
         let mut v = Vec::new();
         push_long_bsr(&mut v, &[(2, 100), (0, 10)], false);
-        assert_eq!(v, vec![LCID_LONG_BSR, 3, 0b101, bsr_index_8bit(10), bsr_index_8bit(100)]);
+        assert_eq!(
+            v,
+            vec![
+                LCID_LONG_BSR,
+                3,
+                0b101,
+                bsr_index_8bit(10),
+                bsr_index_8bit(100)
+            ]
+        );
     }
 }

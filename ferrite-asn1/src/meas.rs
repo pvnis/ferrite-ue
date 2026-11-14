@@ -78,7 +78,10 @@ pub struct QOffsetRangeList {
 }
 
 /// `Q-OffsetRange` values in dB, by enumeration index.
-const Q_OFFSET_DB: [i8; 31] = [-24, -22, -20, -18, -16, -14, -12, -10, -8, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
+const Q_OFFSET_DB: [i8; 31] = [
+    -24, -22, -20, -18, -16, -14, -12, -10, -8, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 8, 10,
+    12, 14, 16, 18, 20, 22, 24,
+];
 
 /// `CellsToAddMod`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,12 +168,29 @@ pub enum MeasTriggerQuantityOffset {
 /// `EventTriggerConfig.eventId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventId {
-    A1 { threshold: MeasTriggerQuantity },
-    A2 { threshold: MeasTriggerQuantity },
-    A3 { offset: MeasTriggerQuantityOffset, use_allowed_cell_list: bool },
-    A4 { threshold: MeasTriggerQuantity, use_allowed_cell_list: bool },
-    A5 { threshold1: MeasTriggerQuantity, threshold2: MeasTriggerQuantity, use_allowed_cell_list: bool },
-    A6 { offset: MeasTriggerQuantityOffset, use_allowed_cell_list: bool },
+    A1 {
+        threshold: MeasTriggerQuantity,
+    },
+    A2 {
+        threshold: MeasTriggerQuantity,
+    },
+    A3 {
+        offset: MeasTriggerQuantityOffset,
+        use_allowed_cell_list: bool,
+    },
+    A4 {
+        threshold: MeasTriggerQuantity,
+        use_allowed_cell_list: bool,
+    },
+    A5 {
+        threshold1: MeasTriggerQuantity,
+        threshold2: MeasTriggerQuantity,
+        use_allowed_cell_list: bool,
+    },
+    A6 {
+        offset: MeasTriggerQuantityOffset,
+        use_allowed_cell_list: bool,
+    },
 }
 
 /// The event part of an `EventTriggerConfig`.
@@ -184,9 +204,13 @@ pub struct EventTrigger {
 }
 
 /// `TimeToTrigger` values (ms) by enumeration index.
-const TIME_TO_TRIGGER_MS: [u16; 16] = [0, 40, 64, 80, 100, 128, 160, 256, 320, 480, 512, 640, 1024, 1280, 2560, 5120];
+const TIME_TO_TRIGGER_MS: [u16; 16] = [
+    0, 40, 64, 80, 100, 128, 160, 256, 320, 480, 512, 640, 1024, 1280, 2560, 5120,
+];
 /// `ReportInterval` values (ms) by enumeration index.
-const REPORT_INTERVAL_MS: [u32; 14] = [120, 240, 480, 640, 1024, 2048, 5120, 10240, 20480, 40960, 60_000, 360_000, 720_000, 1_800_000];
+const REPORT_INTERVAL_MS: [u32; 14] = [
+    120, 240, 480, 640, 1024, 2048, 5120, 10240, 20480, 40960, 60_000, 360_000, 720_000, 1_800_000,
+];
 
 /// `ReportConfigNR` (periodical or event-triggered).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,7 +259,11 @@ pub struct FilterConfig {
 
 impl Default for FilterConfig {
     fn default() -> Self {
-        Self { rsrp: 4, rsrq: 4, rs_sinr: 4 }
+        Self {
+            rsrp: 4,
+            rsrq: 4,
+            rs_sinr: 4,
+        }
     }
 }
 
@@ -319,7 +347,11 @@ fn q_offset_range_list(r: &mut BitReader) -> DecodeResult<QOffsetRangeList> {
 
 pub(crate) fn threshold_nr(r: &mut BitReader) -> DecodeResult<ThresholdNr> {
     let [p, q, s] = r.opt_bits::<3>()?;
-    Ok(ThresholdNr { rsrp: r.opt(p, |r| r.u8(0, 127))?, rsrq: r.opt(q, |r| r.u8(0, 127))?, sinr: r.opt(s, |r| r.u8(0, 127))? })
+    Ok(ThresholdNr {
+        rsrp: r.opt(p, |r| r.u8(0, 127))?,
+        rsrq: r.opt(q, |r| r.u8(0, 127))?,
+        sinr: r.opt(s, |r| r.u8(0, 127))?,
+    })
 }
 
 pub(crate) fn ssb_mtc(r: &mut BitReader) -> DecodeResult<SsbMtc> {
@@ -328,15 +360,26 @@ pub(crate) fn ssb_mtc(r: &mut BitReader) -> DecodeResult<SsbMtc> {
     let periodicity_sf = PERIOD[idx];
     let offset_sf = r.u16(0, periodicity_sf - 1)?;
     let duration_sf = r.enu(5)? as u8 + 1;
-    Ok(SsbMtc { periodicity_sf, offset_sf, duration_sf })
+    Ok(SsbMtc {
+        periodicity_sf,
+        offset_sf,
+        duration_sf,
+    })
 }
 
 fn ssb_mtc2(r: &mut BitReader) -> DecodeResult<SsbMtc2> {
     let [has_pci] = r.opt_bits::<1>()?;
-    let pci_list = if has_pci { r.seq_of(1, 64, |r| r.u16(0, 1007))? } else { Vec::new() };
+    let pci_list = if has_pci {
+        r.seq_of(1, 64, |r| r.u16(0, 1007))?
+    } else {
+        Vec::new()
+    };
     let p = r.enu(8)?;
     let periodicity_sf = [5u16, 10, 20, 40, 80].get(p as usize).copied();
-    Ok(SsbMtc2 { pci_list, periodicity_sf })
+    Ok(SsbMtc2 {
+        pci_list,
+        periodicity_sf,
+    })
 }
 
 pub(crate) fn ssb_to_measure(r: &mut BitReader) -> DecodeResult<SsbToMeasure> {
@@ -353,7 +396,10 @@ pub(crate) fn ss_rssi_measurement(r: &mut BitReader) -> DecodeResult<SsRssiMeasu
     for _ in 0..n {
         measurement_slots.push(r.bit()?);
     }
-    Ok(SsRssiMeasurement { measurement_slots, end_symbol: r.u8(0, 3)? })
+    Ok(SsRssiMeasurement {
+        measurement_slots,
+        end_symbol: r.u8(0, 3)?,
+    })
 }
 
 fn ssb_config_mobility(r: &mut BitReader) -> DecodeResult<SsbConfigMobility> {
@@ -365,17 +411,29 @@ fn ssb_config_mobility(r: &mut BitReader) -> DecodeResult<SsbConfigMobility> {
     if ext {
         r.skip_ext_additions()?;
     }
-    Ok(SsbConfigMobility { ssb_to_measure, derive_ssb_index_from_cell, ss_rssi_measurement })
+    Ok(SsbConfigMobility {
+        ssb_to_measure,
+        derive_ssb_index_from_cell,
+        ss_rssi_measurement,
+    })
 }
 
 fn pci_range_elements(r: &mut BitReader) -> DecodeResult<Vec<PciRangeElement>> {
-    const RANGE: [u16; 15] = [4, 8, 12, 16, 24, 32, 48, 64, 84, 96, 128, 168, 252, 504, 1008];
+    const RANGE: [u16; 15] = [
+        4, 8, 12, 16, 24, 32, 48, 64, 84, 96, 128, 168, 252, 504, 1008,
+    ];
     r.seq_of(1, 8, |r| {
         let index = r.u8(1, 8)?;
         let [has_range] = r.opt_bits::<1>()?;
         let start = r.u16(0, 1007)?;
-        let range = r.opt(has_range, |r| Ok(RANGE.get(r.enu(16)? as usize).copied().unwrap_or(1)))?;
-        Ok(PciRangeElement { index, start, range })
+        let range = r.opt(has_range, |r| {
+            Ok(RANGE.get(r.enu(16)? as usize).copied().unwrap_or(1))
+        })?;
+        Ok(PciRangeElement {
+            index,
+            start,
+            range,
+        })
     })
 }
 
@@ -384,13 +442,20 @@ impl MeasObjectNr {
         let ext = r.bit()?;
         let o = r.opt_bits::<15>()?;
         let ssb_frequency = r.opt(o[0], |r| r.uint(0, 3_279_165))?;
-        let ssb_scs_khz = r.opt(o[1], |r| Ok([15u16, 30, 60, 120, 240].get(r.enu(8)? as usize).copied().unwrap_or(15)))?;
+        let ssb_scs_khz = r.opt(o[1], |r| {
+            Ok([15u16, 30, 60, 120, 240]
+                .get(r.enu(8)? as usize)
+                .copied()
+                .unwrap_or(15))
+        })?;
         let smtc1 = r.opt(o[2], ssb_mtc).ctx("smtc1")?;
         let smtc2 = r.opt(o[3], ssb_mtc2).ctx("smtc2")?;
         let ref_freq_csi_rs = r.opt(o[4], |r| r.uint(0, 3_279_165))?;
         // referenceSignalConfig (no extension marker).
         let [has_ssb_mob, has_csi_mob] = r.opt_bits::<2>()?;
-        let ssb_config_mobility = r.opt(has_ssb_mob, ssb_config_mobility).ctx("ssb-ConfigMobility")?;
+        let ssb_config_mobility = r
+            .opt(has_ssb_mob, ssb_config_mobility)
+            .ctx("ssb-ConfigMobility")?;
         if has_csi_mob {
             return r.unsupported("csi-rs-ResourceConfigMobility");
         }
@@ -400,16 +465,41 @@ impl MeasObjectNr {
         let nrof_csi_rs_resources_to_average = r.opt(o[8], |r| r.u8(2, 16))?;
         let quantity_config_index = r.u8(1, 2)?;
         let offset_mo = q_offset_range_list(r)?;
-        let cells_to_remove_list = if o[9] { r.seq_of(1, 32, |r| r.u16(0, 1007))? } else { Vec::new() };
-        let cells_to_add_mod_list = if o[10] {
-            r.seq_of(1, 32, |r| Ok(CellsToAddMod { pci: r.u16(0, 1007)?, cell_individual_offset: q_offset_range_list(r)? }))?
+        let cells_to_remove_list = if o[9] {
+            r.seq_of(1, 32, |r| r.u16(0, 1007))?
         } else {
             Vec::new()
         };
-        let excluded_cells_to_remove_list = if o[11] { r.seq_of(1, 8, |r| r.u8(1, 8))? } else { Vec::new() };
-        let excluded_cells_to_add_mod_list = if o[12] { pci_range_elements(r)? } else { Vec::new() };
-        let allowed_cells_to_remove_list = if o[13] { r.seq_of(1, 8, |r| r.u8(1, 8))? } else { Vec::new() };
-        let allowed_cells_to_add_mod_list = if o[14] { pci_range_elements(r)? } else { Vec::new() };
+        let cells_to_add_mod_list = if o[10] {
+            r.seq_of(1, 32, |r| {
+                Ok(CellsToAddMod {
+                    pci: r.u16(0, 1007)?,
+                    cell_individual_offset: q_offset_range_list(r)?,
+                })
+            })?
+        } else {
+            Vec::new()
+        };
+        let excluded_cells_to_remove_list = if o[11] {
+            r.seq_of(1, 8, |r| r.u8(1, 8))?
+        } else {
+            Vec::new()
+        };
+        let excluded_cells_to_add_mod_list = if o[12] {
+            pci_range_elements(r)?
+        } else {
+            Vec::new()
+        };
+        let allowed_cells_to_remove_list = if o[13] {
+            r.seq_of(1, 8, |r| r.u8(1, 8))?
+        } else {
+            Vec::new()
+        };
+        let allowed_cells_to_add_mod_list = if o[14] {
+            pci_range_elements(r)?
+        } else {
+            Vec::new()
+        };
         if ext {
             r.skip_ext_additions()?;
         }
@@ -437,7 +527,11 @@ impl MeasObjectNr {
 }
 
 fn meas_report_quantity(r: &mut BitReader) -> DecodeResult<MeasReportQuantity> {
-    Ok(MeasReportQuantity { rsrp: r.boolean()?, rsrq: r.boolean()?, sinr: r.boolean()? })
+    Ok(MeasReportQuantity {
+        rsrp: r.boolean()?,
+        rsrq: r.boolean()?,
+        sinr: r.boolean()?,
+    })
 }
 
 fn trigger_quantity(r: &mut BitReader) -> DecodeResult<MeasTriggerQuantity> {
@@ -490,26 +584,56 @@ impl ReportConfigNr {
                 2 => {
                     let offset = trigger_quantity_offset(r)?;
                     let tail = event_tail(r)?;
-                    (EventId::A3 { offset, use_allowed_cell_list: r.boolean()? }, tail)
+                    (
+                        EventId::A3 {
+                            offset,
+                            use_allowed_cell_list: r.boolean()?,
+                        },
+                        tail,
+                    )
                 }
                 3 => {
                     let threshold = trigger_quantity(r)?;
                     let tail = event_tail(r)?;
-                    (EventId::A4 { threshold, use_allowed_cell_list: r.boolean()? }, tail)
+                    (
+                        EventId::A4 {
+                            threshold,
+                            use_allowed_cell_list: r.boolean()?,
+                        },
+                        tail,
+                    )
                 }
                 4 => {
                     let threshold1 = trigger_quantity(r)?;
                     let threshold2 = trigger_quantity(r)?;
                     let tail = event_tail(r)?;
-                    (EventId::A5 { threshold1, threshold2, use_allowed_cell_list: r.boolean()? }, tail)
+                    (
+                        EventId::A5 {
+                            threshold1,
+                            threshold2,
+                            use_allowed_cell_list: r.boolean()?,
+                        },
+                        tail,
+                    )
                 }
                 _ => {
                     let offset = trigger_quantity_offset(r)?;
                     let tail = event_tail(r)?;
-                    (EventId::A6 { offset, use_allowed_cell_list: r.boolean()? }, tail)
+                    (
+                        EventId::A6 {
+                            offset,
+                            use_allowed_cell_list: r.boolean()?,
+                        },
+                        tail,
+                    )
                 }
             };
-            event = Some(EventTrigger { event: id, report_on_leave: tail.0, hysteresis: tail.1, time_to_trigger_ms: tail.2 });
+            event = Some(EventTrigger {
+                event: id,
+                report_on_leave: tail.0,
+                hysteresis: tail.1,
+                time_to_trigger_ms: tail.2,
+            });
             (o[0], o[1], o[2])
         } else {
             let o = r.opt_bits::<2>()?;
@@ -528,7 +652,11 @@ impl ReportConfigNr {
         let max_nrof_rs_indexes_to_report = r.opt(has_max_idx, |r| r.u8(1, 32))?;
         let include_beam_measurements = r.boolean()?;
         // Periodical: useWhiteCellList BOOLEAN; event: reportAddNeighMeas ENUMERATED {setup} OPTIONAL (0 bits).
-        let use_allowed_cell_list = if event_triggered { has_extra } else { r.boolean()? };
+        let use_allowed_cell_list = if event_triggered {
+            has_extra
+        } else {
+            r.boolean()?
+        };
         if ext {
             r.skip_ext_additions()?;
         }
@@ -558,11 +686,18 @@ fn filter_config(r: &mut BitReader) -> DecodeResult<FilterConfig> {
             };
         }
     }
-    Ok(FilterConfig { rsrp: v[0], rsrq: v[1], rs_sinr: v[2] })
+    Ok(FilterConfig {
+        rsrp: v[0],
+        rsrq: v[1],
+        rs_sinr: v[2],
+    })
 }
 
 fn quantity_config_rs(r: &mut BitReader) -> DecodeResult<QuantityConfigRs> {
-    Ok(QuantityConfigRs { ssb: filter_config(r)?, csi_rs: filter_config(r)? })
+    Ok(QuantityConfigRs {
+        ssb: filter_config(r)?,
+        csi_rs: filter_config(r)?,
+    })
 }
 
 fn gap_config(r: &mut BitReader) -> DecodeResult<GapConfig> {
@@ -574,7 +709,12 @@ fn gap_config(r: &mut BitReader) -> DecodeResult<GapConfig> {
     if ext {
         r.skip_ext_additions()?;
     }
-    Ok(GapConfig { gap_offset, mgl_half_ms, mgrp_ms, mgta_quarter_ms })
+    Ok(GapConfig {
+        gap_offset,
+        mgl_half_ms,
+        mgrp_ms,
+        mgta_quarter_ms,
+    })
 }
 
 impl MeasConfig {
@@ -582,7 +722,11 @@ impl MeasConfig {
     pub fn decode(r: &mut BitReader) -> DecodeResult<Self> {
         let ext = r.bit()?;
         let o = r.opt_bits::<10>()?;
-        let meas_object_to_remove_list = if o[0] { r.seq_of(1, 64, |r| r.u8(1, 64))? } else { Vec::new() };
+        let meas_object_to_remove_list = if o[0] {
+            r.seq_of(1, 64, |r| r.u8(1, 64))?
+        } else {
+            Vec::new()
+        };
         let meas_object_to_add_mod_list = if o[1] {
             r.seq_of(1, 64, |r| {
                 let meas_object_id = r.u8(1, 64)?;
@@ -590,12 +734,19 @@ impl MeasConfig {
                     return r.unsupported("measObject extension alternative (non-NR)");
                 }
                 let meas_object = MeasObjectNr::decode(r).ctx("measObjectNR")?;
-                Ok(MeasObjectToAddMod { meas_object_id, meas_object })
+                Ok(MeasObjectToAddMod {
+                    meas_object_id,
+                    meas_object,
+                })
             })?
         } else {
             Vec::new()
         };
-        let report_config_to_remove_list = if o[2] { r.seq_of(1, 64, |r| r.u8(1, 64))? } else { Vec::new() };
+        let report_config_to_remove_list = if o[2] {
+            r.seq_of(1, 64, |r| r.u8(1, 64))?
+        } else {
+            Vec::new()
+        };
         let report_config_to_add_mod_list = if o[3] {
             r.seq_of(1, 64, |r| {
                 let report_config_id = r.u8(1, 64)?;
@@ -603,18 +754,37 @@ impl MeasConfig {
                     return r.unsupported("reportConfig extension alternative (non-NR)");
                 }
                 let report_config = ReportConfigNr::decode(r).ctx("reportConfigNR")?;
-                Ok(ReportConfigToAddMod { report_config_id, report_config })
+                Ok(ReportConfigToAddMod {
+                    report_config_id,
+                    report_config,
+                })
             })?
         } else {
             Vec::new()
         };
-        let meas_id_to_remove_list = if o[4] { r.seq_of(1, 64, |r| r.u8(1, 64))? } else { Vec::new() };
-        let meas_id_to_add_mod_list = if o[5] {
-            r.seq_of(1, 64, |r| Ok(MeasIdToAddMod { meas_id: r.u8(1, 64)?, meas_object_id: r.u8(1, 64)?, report_config_id: r.u8(1, 64)? }))?
+        let meas_id_to_remove_list = if o[4] {
+            r.seq_of(1, 64, |r| r.u8(1, 64))?
         } else {
             Vec::new()
         };
-        let s_measure_config = r.opt(o[6], |r| Ok(if r.bit()? { SMeasureConfig::CsiRsrp(r.u8(0, 127)?) } else { SMeasureConfig::SsbRsrp(r.u8(0, 127)?) }))?;
+        let meas_id_to_add_mod_list = if o[5] {
+            r.seq_of(1, 64, |r| {
+                Ok(MeasIdToAddMod {
+                    meas_id: r.u8(1, 64)?,
+                    meas_object_id: r.u8(1, 64)?,
+                    report_config_id: r.u8(1, 64)?,
+                })
+            })?
+        } else {
+            Vec::new()
+        };
+        let s_measure_config = r.opt(o[6], |r| {
+            Ok(if r.bit()? {
+                SMeasureConfig::CsiRsrp(r.u8(0, 127)?)
+            } else {
+                SMeasureConfig::SsbRsrp(r.u8(0, 127)?)
+            })
+        })?;
         let quantity_config = r
             .opt(o[7], |r| {
                 let qext = r.bit()?;
@@ -622,7 +792,10 @@ impl MeasConfig {
                 let list = if has_nr {
                     r.seq_of(1, 2, |r| {
                         let [has_idx] = r.opt_bits::<1>()?;
-                        Ok(QuantityConfigNr { cell: quantity_config_rs(r)?, rs_index: r.opt(has_idx, quantity_config_rs)? })
+                        Ok(QuantityConfigNr {
+                            cell: quantity_config_rs(r)?,
+                            rs_index: r.opt(has_idx, quantity_config_rs)?,
+                        })
                     })?
                 } else {
                     Vec::new()
@@ -726,7 +899,10 @@ fn encode_result_nr(w: &mut BitWriter, m: &MeasResultNr) {
     }
     // measResult SEQUENCE { cellResults, rsIndexResults OPTIONAL }
     w.opt_bits(&[false]);
-    w.opt_bits(&[m.results_ssb_cell.is_some(), m.results_csi_rs_cell.is_some()]);
+    w.opt_bits(&[
+        m.results_ssb_cell.is_some(),
+        m.results_csi_rs_cell.is_some(),
+    ]);
     if let Some(q) = &m.results_ssb_cell {
         encode_quantity_results(w, q);
     }
@@ -771,7 +947,11 @@ impl MeasResults {
             if sext {
                 r.skip_ext_additions()?;
             }
-            Ok(MeasResultServMo { serv_cell_id, serving_cell, best_neigh_cell })
+            Ok(MeasResultServMo {
+                serv_cell_id,
+                serving_cell,
+                best_neigh_cell,
+            })
         })?;
         let neigh_cells_nr = if has_neigh {
             if r.bit()? {
@@ -787,13 +967,21 @@ impl MeasResults {
         if ext {
             r.skip_ext_additions()?;
         }
-        Ok(Self { meas_id, serving, neigh_cells_nr })
+        Ok(Self {
+            meas_id,
+            serving,
+            neigh_cells_nr,
+        })
     }
 }
 
 fn decode_quantity_results(r: &mut BitReader) -> DecodeResult<MeasQuantityResults> {
     let [p, q, s] = r.opt_bits::<3>()?;
-    Ok(MeasQuantityResults { rsrp: r.opt(p, |r| r.u8(0, 127))?, rsrq: r.opt(q, |r| r.u8(0, 127))?, sinr: r.opt(s, |r| r.u8(0, 127))? })
+    Ok(MeasQuantityResults {
+        rsrp: r.opt(p, |r| r.u8(0, 127))?,
+        rsrq: r.opt(q, |r| r.u8(0, 127))?,
+        sinr: r.opt(s, |r| r.u8(0, 127))?,
+    })
 }
 
 fn decode_result_nr(r: &mut BitReader) -> DecodeResult<MeasResultNr> {
@@ -810,7 +998,11 @@ fn decode_result_nr(r: &mut BitReader) -> DecodeResult<MeasResultNr> {
     if ext {
         r.skip_ext_additions()?;
     }
-    Ok(MeasResultNr { pci, results_ssb_cell, results_csi_rs_cell })
+    Ok(MeasResultNr {
+        pci,
+        results_ssb_cell,
+        results_csi_rs_cell,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -859,20 +1051,25 @@ mod tests {
     fn meas_config_round_trip() {
         let mut w = BitWriter::new();
         w.bit(false); // ext
-        w.opt_bits(&[false, true, false, true, false, true, true, true, false, false]);
+        w.opt_bits(&[
+            false, true, false, true, false, true, true, true, false, false,
+        ]);
         // measObjectToAddModList: one entry.
         w.len_constrained(1, 1, 64);
         w.uint(1, 1, 64); // measObjectId
         w.bit(false); // measObjectNR
         w.bit(false); // ext
-        // optionals: ssbFrequency, ssbSCS, smtc1, (no smtc2), (no refFreqCSI), absThreshSS, (no csi thresh), nrofSS, (no csi avg), cellsToRemove(no), cellsToAddMod(yes), rest no
-        w.opt_bits(&[true, true, true, false, false, true, false, true, false, false, true, false, false, false, false]);
+                      // optionals: ssbFrequency, ssbSCS, smtc1, (no smtc2), (no refFreqCSI), absThreshSS, (no csi thresh), nrofSS, (no csi avg), cellsToRemove(no), cellsToAddMod(yes), rest no
+        w.opt_bits(&[
+            true, true, true, false, false, true, false, true, false, false, true, false, false,
+            false, false,
+        ]);
         w.uint(626000, 0, 3_279_165);
         w.enu(1, 8); // kHz30
         w.enu(2, 6); // sf20
         w.uint(3, 0, 19);
         w.enu(4, 5); // sf5
-        // referenceSignalConfig: ssb-ConfigMobility present
+                     // referenceSignalConfig: ssb-ConfigMobility present
         w.opt_bits(&[true, false]);
         w.bit(false); // ext
         w.opt_bits(&[true, false]);
@@ -880,19 +1077,19 @@ mod tests {
         w.enu(1, 3); // mediumBitmap
         w.bitstring(0b1010_0000, 8);
         w.boolean(true); // deriveSSB-IndexFromCell
-        // absThreshSS-BlocksConsolidation: rsrp only
+                         // absThreshSS-BlocksConsolidation: rsrp only
         w.opt_bits(&[true, false, false]);
         w.uint(40, 0, 127);
         w.uint(4, 2, 16); // nrofSS-BlocksToAverage
         w.uint(1, 1, 2); // quantityConfigIndex
-        // offsetMO: all defaults
+                         // offsetMO: all defaults
         w.opt_bits(&[false; 6]);
         // cellsToAddModList: one cell with rsrpOffsetSSB = +2 dB
         w.len_constrained(1, 1, 32);
         w.uint(7, 0, 1007);
         w.opt_bits(&[true, false, false, false, false, false]);
         w.enu(17, 31); // dB2
-        // reportConfigToAddModList: periodical (id 1) and A3 (id 2).
+                       // reportConfigToAddModList: periodical (id 1) and A3 (id 2).
         w.len_constrained(2, 1, 64);
         w.uint(1, 1, 64);
         w.bit(false); // reportConfigNR
@@ -957,22 +1154,60 @@ mod tests {
         let o = &m.meas_object_to_add_mod_list[0].meas_object;
         assert_eq!(o.ssb_frequency, Some(626000));
         assert_eq!(o.ssb_scs_khz, Some(30));
-        assert_eq!(o.smtc1, Some(SsbMtc { periodicity_sf: 20, offset_sf: 3, duration_sf: 5 }));
-        assert_eq!(o.ssb_config_mobility.as_ref().unwrap().ssb_to_measure, Some(SetupRelease::Setup(SsbToMeasure::Medium(0b1010_0000))));
+        assert_eq!(
+            o.smtc1,
+            Some(SsbMtc {
+                periodicity_sf: 20,
+                offset_sf: 3,
+                duration_sf: 5
+            })
+        );
+        assert_eq!(
+            o.ssb_config_mobility.as_ref().unwrap().ssb_to_measure,
+            Some(SetupRelease::Setup(SsbToMeasure::Medium(0b1010_0000)))
+        );
         assert_eq!(o.abs_thresh_ss_blocks_consolidation.unwrap().rsrp, Some(40));
         assert_eq!(o.nrof_ss_blocks_to_average, Some(4));
         assert_eq!(o.cells_to_add_mod_list[0].pci, 7);
-        assert_eq!(o.cells_to_add_mod_list[0].cell_individual_offset.rsrp_offset_ssb_db, 2);
+        assert_eq!(
+            o.cells_to_add_mod_list[0]
+                .cell_individual_offset
+                .rsrp_offset_ssb_db,
+            2
+        );
         assert_eq!(m.report_config_to_add_mod_list.len(), 2);
         let p = m.report_config_to_add_mod_list[0].report_config;
         assert_eq!(p.event, None);
         assert_eq!(p.report_interval_ms, 1024);
         assert_eq!(p.report_amount, None);
-        assert_eq!(p.report_quantity_cell, MeasReportQuantity { rsrp: true, rsrq: true, sinr: false });
-        let e = m.report_config_to_add_mod_list[1].report_config.event.unwrap();
-        assert_eq!(e.event, EventId::A3 { offset: MeasTriggerQuantityOffset::Rsrp(6), use_allowed_cell_list: false });
+        assert_eq!(
+            p.report_quantity_cell,
+            MeasReportQuantity {
+                rsrp: true,
+                rsrq: true,
+                sinr: false
+            }
+        );
+        let e = m.report_config_to_add_mod_list[1]
+            .report_config
+            .event
+            .unwrap();
+        assert_eq!(
+            e.event,
+            EventId::A3 {
+                offset: MeasTriggerQuantityOffset::Rsrp(6),
+                use_allowed_cell_list: false
+            }
+        );
         assert_eq!(e.time_to_trigger_ms, 100);
-        assert_eq!(m.meas_id_to_add_mod_list[1], MeasIdToAddMod { meas_id: 2, meas_object_id: 1, report_config_id: 2 });
+        assert_eq!(
+            m.meas_id_to_add_mod_list[1],
+            MeasIdToAddMod {
+                meas_id: 2,
+                meas_object_id: 1,
+                report_config_id: 2
+            }
+        );
         assert_eq!(m.s_measure_config, Some(SMeasureConfig::SsbRsrp(50)));
         assert_eq!(m.quantity_config.as_ref().unwrap()[0].cell.ssb.rsrp, 8);
         assert_eq!(m.quantity_config.as_ref().unwrap()[0].cell.ssb.rsrq, 4);
@@ -985,10 +1220,26 @@ mod tests {
             meas_id: 1,
             serving: vec![MeasResultServMo {
                 serv_cell_id: 0,
-                serving_cell: MeasResultNr { pci: Some(1), results_ssb_cell: Some(MeasQuantityResults { rsrp: Some(77), rsrq: Some(60), sinr: Some(100) }), results_csi_rs_cell: None },
+                serving_cell: MeasResultNr {
+                    pci: Some(1),
+                    results_ssb_cell: Some(MeasQuantityResults {
+                        rsrp: Some(77),
+                        rsrq: Some(60),
+                        sinr: Some(100),
+                    }),
+                    results_csi_rs_cell: None,
+                },
                 best_neigh_cell: None,
             }],
-            neigh_cells_nr: vec![MeasResultNr { pci: Some(2), results_ssb_cell: Some(MeasQuantityResults { rsrp: Some(70), rsrq: None, sinr: None }), results_csi_rs_cell: None }],
+            neigh_cells_nr: vec![MeasResultNr {
+                pci: Some(2),
+                results_ssb_cell: Some(MeasQuantityResults {
+                    rsrp: Some(70),
+                    rsrq: None,
+                    sinr: None,
+                }),
+                results_csi_rs_cell: None,
+            }],
         };
         let mut w = BitWriter::new();
         res.encode(&mut w);

@@ -79,20 +79,31 @@ impl SeifyRadio {
         }
         .map_err(radio_err)?;
 
-        let bw = if cfg.bandwidth > 0.0 { cfg.bandwidth } else { cfg.sample_rate };
+        let bw = if cfg.bandwidth > 0.0 {
+            cfg.bandwidth
+        } else {
+            cfg.sample_rate
+        };
         for (dir, gain, ant) in [
             (Direction::Rx, cfg.rx_gain, cfg.rx_antenna.as_deref()),
             (Direction::Tx, cfg.tx_gain, cfg.tx_antenna.as_deref()),
         ] {
-            device.set_sample_rate(dir, 0, cfg.sample_rate).map_err(radio_err)?;
-            device.set_frequency(dir, 0, cfg.frequency, Args::new()).map_err(radio_err)?;
+            device
+                .set_sample_rate(dir, 0, cfg.sample_rate)
+                .map_err(radio_err)?;
+            device
+                .set_frequency(dir, 0, cfg.frequency, Args::new())
+                .map_err(radio_err)?;
             device.set_gain(dir, 0, gain).map_err(radio_err)?;
             device.set_bandwidth(dir, 0, bw).map_err(radio_err)?;
             if let Some(a) = ant {
                 device.set_antenna(dir, 0, a).map_err(radio_err)?;
             }
         }
-        Ok(Self { device, sample_rate: cfg.sample_rate })
+        Ok(Self {
+            device,
+            sample_rate: cfg.sample_rate,
+        })
     }
 
     /// Configured sample rate (Hz).
@@ -110,7 +121,10 @@ impl SeifyRadio {
     pub fn rx(&self) -> Result<SeifyRx> {
         let mut streamer = self.device.rx_streamer(&[0]).map_err(radio_err)?;
         streamer.activate().map_err(radio_err)?;
-        Ok(SeifyRx { streamer, sample_rate: self.sample_rate })
+        Ok(SeifyRx {
+            streamer,
+            sample_rate: self.sample_rate,
+        })
     }
 
     /// Activate and return the TX stream (channel 0) as a [`SampleSink`]. Unlike the ZMQ
@@ -121,7 +135,10 @@ impl SeifyRadio {
     pub fn tx(&self) -> Result<SeifyTx> {
         let mut streamer = self.device.tx_streamer(&[0]).map_err(radio_err)?;
         streamer.activate().map_err(radio_err)?;
-        Ok(SeifyTx { streamer, sample_rate: self.sample_rate })
+        Ok(SeifyTx {
+            streamer,
+            sample_rate: self.sample_rate,
+        })
     }
 }
 
@@ -156,7 +173,9 @@ impl SeifyTx {
     /// calibrated; the continuous-stream path uses [`SampleSink::write`].
     pub fn write_at(&mut self, buf: &[Iq], at_ns: i64, end_burst: bool) -> Result<usize> {
         let chans = [buf];
-        self.streamer.write(&chans, Some(at_ns), end_burst, 1_000_000).map_err(radio_err)
+        self.streamer
+            .write(&chans, Some(at_ns), end_burst, 1_000_000)
+            .map_err(radio_err)
     }
 }
 
@@ -168,6 +187,8 @@ impl SampleSink for SeifyTx {
     fn write(&mut self, buf: &[Iq]) -> Result<usize> {
         // Continuous stream: no explicit timestamp, not a burst end. FIFO backpressure paces.
         let chans = [buf];
-        self.streamer.write(&chans, None, false, 1_000_000).map_err(radio_err)
+        self.streamer
+            .write(&chans, None, false, 1_000_000)
+            .map_err(radio_err)
     }
 }

@@ -132,7 +132,10 @@ mod tests {
         let rrc_int = algo_key(&k, algo_type::RRC_INT, 2);
         assert_ne!(rrc_int, algo_key(&k, algo_type::UP_INT, 2));
         assert_ne!(rrc_int, algo_key(&k, algo_type::RRC_INT, 1));
-        assert_ne!(algo_key(&k, algo_type::NAS_ENC, 2), algo_key(&k, algo_type::UP_ENC, 2));
+        assert_ne!(
+            algo_key(&k, algo_type::NAS_ENC, 2),
+            algo_key(&k, algo_type::UP_ENC, 2)
+        );
     }
 
     #[test]

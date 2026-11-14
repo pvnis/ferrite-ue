@@ -22,7 +22,6 @@
 
 #![forbid(unsafe_code)]
 
-
 use ferrite_common::{Numerology, SlotPoint};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -322,10 +321,12 @@ impl PdcpEntity {
     /// the previous configuration in place.
     pub fn configure_security(&mut self, sec: SecurityConfig) -> Result<(), PdcpError> {
         if let Some((alg, _)) = sec.integrity {
-            alg.check_supported().map_err(|_| PdcpError::Unsupported(alg.name()))?;
+            alg.check_supported()
+                .map_err(|_| PdcpError::Unsupported(alg.name()))?;
         }
         if let Some((alg, _)) = sec.cipher {
-            alg.check_supported().map_err(|_| PdcpError::Unsupported(alg.name()))?;
+            alg.check_supported()
+                .map_err(|_| PdcpError::Unsupported(alg.name()))?;
         }
         self.integrity = sec.integrity;
         self.cipher = sec.cipher;
@@ -435,7 +436,14 @@ impl PdcpEntity {
         if self.tx_cipher_enabled {
             if let Some((alg, key)) = self.cipher {
                 // Unsupported algorithms are rejected by `configure_security`.
-                let _ = ferrite_security::cipher_in_place(alg, &key, count, self.cfg.bearer_id, self.tx_direction(), &mut pdu[hdr_len..]);
+                let _ = ferrite_security::cipher_in_place(
+                    alg,
+                    &key,
+                    count,
+                    self.cfg.bearer_id,
+                    self.tx_direction(),
+                    &mut pdu[hdr_len..],
+                );
             }
         }
 
@@ -554,14 +562,29 @@ impl PdcpEntity {
         let mut body = pdu[hdr_len..].to_vec();
         if self.rx_cipher_enabled {
             if let Some((alg, k)) = self.cipher {
-                let _ = ferrite_security::cipher_in_place(alg, &k, count, self.cfg.bearer_id, self.rx_direction(), &mut body);
+                let _ = ferrite_security::cipher_in_place(
+                    alg,
+                    &k,
+                    count,
+                    self.cfg.bearer_id,
+                    self.rx_direction(),
+                    &mut body,
+                );
             }
         }
         let split = body.len() - 4;
         let mut msg = Vec::with_capacity(hdr_len + split);
         msg.extend_from_slice(&pdu[..hdr_len]);
         msg.extend_from_slice(&body[..split]);
-        let mac = ferrite_security::integrity_mac(alg, key, count, self.cfg.bearer_id, self.rx_direction(), &msg).ok()?;
+        let mac = ferrite_security::integrity_mac(
+            alg,
+            key,
+            count,
+            self.cfg.bearer_id,
+            self.rx_direction(),
+            &msg,
+        )
+        .ok()?;
         (mac[..] == body[split..]).then_some(count)
     }
 
@@ -694,7 +717,15 @@ impl PdcpEntity {
     /// NIA0 / not configured ⇒ all zeros (TS 33.501 D.3.1.1; §6.3.4 padding).
     fn compute_mac(&self, count: u32, direction: u8, msg: &[u8]) -> [u8; 4] {
         match self.integrity {
-            Some((alg, key)) => ferrite_security::integrity_mac(alg, &key, count, self.cfg.bearer_id, direction, msg).unwrap_or([0u8; 4]),
+            Some((alg, key)) => ferrite_security::integrity_mac(
+                alg,
+                &key,
+                count,
+                self.cfg.bearer_id,
+                direction,
+                msg,
+            )
+            .unwrap_or([0u8; 4]),
             None => [0u8; 4],
         }
     }
@@ -720,7 +751,14 @@ impl PdcpEntity {
         let mut body = pdu[hdr_len..].to_vec();
         if self.rx_cipher_enabled {
             if let Some((alg, key)) = self.cipher {
-                let _ = ferrite_security::cipher_in_place(alg, &key, count, self.cfg.bearer_id, self.rx_direction(), &mut body);
+                let _ = ferrite_security::cipher_in_place(
+                    alg,
+                    &key,
+                    count,
+                    self.cfg.bearer_id,
+                    self.rx_direction(),
+                    &mut body,
+                );
             }
         }
         if mac_len > 0 {
@@ -730,7 +768,15 @@ impl PdcpEntity {
                 let mut msg = Vec::with_capacity(hdr_len + body.len());
                 msg.extend_from_slice(&pdu[..hdr_len]);
                 msg.extend_from_slice(&body);
-                let mac = ferrite_security::integrity_mac(alg, &key, count, self.cfg.bearer_id, self.rx_direction(), &msg).unwrap_or([0u8; 4]);
+                let mac = ferrite_security::integrity_mac(
+                    alg,
+                    &key,
+                    count,
+                    self.cfg.bearer_id,
+                    self.rx_direction(),
+                    &msg,
+                )
+                .unwrap_or([0u8; 4]);
                 if mac[..] != rx_mac[..] {
                     log::warn!(
                         "pdcp: {} integrity failure at COUNT {}",

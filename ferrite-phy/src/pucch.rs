@@ -165,7 +165,9 @@ pub(crate) fn modulate_slot_grids(
     let n = ofdm.fft_size();
     let slot_in_subframe = (slot_in_frame % (1u32 << mu)) as usize;
     let mut out = Vec::with_capacity(14 * (n + 40));
-    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, mu) + n).sum();
+    let mut sub_off: usize = (0..slot_in_subframe * 14)
+        .map(|k| ofdm.cp_len(k, mu) + n)
+        .sum();
     for (l, grid) in grids.iter().enumerate() {
         let cp = ofdm.cp_len(slot_in_subframe * 14 + l, mu);
         let sym = ofdm.modulate_symbol(grid, cp);
@@ -210,14 +212,25 @@ pub fn pucch_f0_modulate_slot(
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
     for s in 0..cfg.nof_symbols {
         let l = cfg.start_symbol + s;
-        let prb = if s == 1 { cfg.second_hop_prb.unwrap_or(cfg.prb) } else { cfg.prb };
+        let prb = if s == 1 {
+            cfg.second_hop_prb.unwrap_or(cfg.prb)
+        } else {
+            cfg.prb
+        };
         let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift, m_cs);
         let seq = base_seq_shifted(u, alpha);
         for (k, &v) in seq.iter().enumerate() {
             grids[l][bin(12 * prb + k)] = v;
         }
     }
-    Some(modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs))
+    Some(modulate_slot_grids(
+        ofdm,
+        &grids,
+        slot_in_frame,
+        mu,
+        center_freq_hz,
+        fs,
+    ))
 }
 
 /// BPSK/QPSK modulation of the HARQ-ACK bits (TS 38.211 §5.1). 1 bit → BPSK.
@@ -232,7 +245,10 @@ fn modulate_ack(bits: &[u8]) -> Complex32 {
         }
         _ => {
             let (b0, b1) = (bits[0], bits[1]);
-            Complex32::new((1 - 2 * b0 as i32) as f32 * FRAC_1_SQRT_2, (1 - 2 * b1 as i32) as f32 * FRAC_1_SQRT_2)
+            Complex32::new(
+                (1 - 2 * b0 as i32) as f32 * FRAC_1_SQRT_2,
+                (1 - 2 * b1 as i32) as f32 * FRAC_1_SQRT_2,
+            )
         }
     }
 }
@@ -260,37 +276,42 @@ pub fn pucch_f1_modulate_slot(
     // Split the symbols into two hops (first ⌊N/2⌋ / rest). Within a hop, even
     // relative symbols are DM-RS, odd are data. OCC spreads over like symbols.
     let hopping = cfg.prb1 != cfg.prb2;
-    let n1 = if hopping { cfg.nof_symbols / 2 } else { cfg.nof_symbols };
+    let n1 = if hopping {
+        cfg.nof_symbols / 2
+    } else {
+        cfg.nof_symbols
+    };
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
 
-    let place_hop = |grids: &mut Vec<Vec<Complex32>>, hop_start: usize, hop_len: usize, prb: usize| {
-        // Count DM-RS (even rel) and data (odd rel) symbols in the hop.
-        let n_dmrs = hop_len.div_ceil(2);
-        let n_data = hop_len / 2;
-        let (mut i_dmrs, mut i_data) = (0usize, 0usize);
-        for rel in 0..hop_len {
-            let l = cfg.start_symbol + hop_start + rel;
-            let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift, 0);
-            let seq = base_seq_shifted(u, alpha);
-            let is_dmrs = rel % 2 == 0;
-            let (n_sf, m, sym_val) = if is_dmrs {
-                let m = i_dmrs;
-                i_dmrs += 1;
-                (n_dmrs, m, Complex32::new(1.0, 0.0))
-            } else {
-                let m = i_data;
-                i_data += 1;
-                (n_data, m, d)
-            };
-            // OCC w_i(m) = exp(j·2π·φ/N_SF).
-            let occ_phi = OCC_PHI[n_sf - 1][cfg.occ_index][m] as f32;
-            let wphase = 2.0 * PI * occ_phi / n_sf as f32;
-            let w = Complex32::new(wphase.cos(), wphase.sin());
-            for (k, &s) in seq.iter().enumerate() {
-                grids[l][bin(12 * prb + k)] = w * sym_val * s;
+    let place_hop =
+        |grids: &mut Vec<Vec<Complex32>>, hop_start: usize, hop_len: usize, prb: usize| {
+            // Count DM-RS (even rel) and data (odd rel) symbols in the hop.
+            let n_dmrs = hop_len.div_ceil(2);
+            let n_data = hop_len / 2;
+            let (mut i_dmrs, mut i_data) = (0usize, 0usize);
+            for rel in 0..hop_len {
+                let l = cfg.start_symbol + hop_start + rel;
+                let alpha = alpha_index(cfg.n_id, slot_in_frame, l, cfg.init_cyclic_shift, 0);
+                let seq = base_seq_shifted(u, alpha);
+                let is_dmrs = rel % 2 == 0;
+                let (n_sf, m, sym_val) = if is_dmrs {
+                    let m = i_dmrs;
+                    i_dmrs += 1;
+                    (n_dmrs, m, Complex32::new(1.0, 0.0))
+                } else {
+                    let m = i_data;
+                    i_data += 1;
+                    (n_data, m, d)
+                };
+                // OCC w_i(m) = exp(j·2π·φ/N_SF).
+                let occ_phi = OCC_PHI[n_sf - 1][cfg.occ_index][m] as f32;
+                let wphase = 2.0 * PI * occ_phi / n_sf as f32;
+                let w = Complex32::new(wphase.cos(), wphase.sin());
+                for (k, &s) in seq.iter().enumerate() {
+                    grids[l][bin(12 * prb + k)] = w * sym_val * s;
+                }
             }
-        }
-    };
+        };
     place_hop(&mut grids, 0, n1, cfg.prb1);
     if hopping {
         place_hop(&mut grids, n1, cfg.nof_symbols - n1, cfg.prb2);
@@ -441,13 +462,20 @@ pub fn pucch_f3_modulate_slot(
 ) -> Option<Vec<Complex32>> {
     let n = ofdm.fft_size();
     let m_sc = 12 * cfg.nof_prb;
-    if cfg.nof_symbols < 4 || cfg.nof_symbols > 14 || cfg.start_symbol + cfg.nof_symbols > 14 || cfg.nof_prb == 0 {
+    if cfg.nof_symbols < 4
+        || cfg.nof_symbols > 14
+        || cfg.start_symbol + cfg.nof_symbols > 14
+        || cfg.nof_prb == 0
+    {
         return None;
     }
     let center = cfg.carrier_rb * 6;
     let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
     let dmrs_rel = pucch_f3_dmrs_symbols(cfg.nof_symbols, cfg.additional_dmrs);
-    let data_syms: Vec<usize> = (0..cfg.nof_symbols).filter(|l| !dmrs_rel.contains(l)).map(|l| cfg.start_symbol + l).collect();
+    let data_syms: Vec<usize> = (0..cfg.nof_symbols)
+        .filter(|l| !dmrs_rel.contains(l))
+        .map(|l| cfg.start_symbol + l)
+        .collect();
     let qm = if cfg.pi2_bpsk { 1 } else { 2 };
     let e = data_syms.len() * m_sc * qm;
     let coded = crate::pusch::rm_encode(uci_bits, e);
@@ -458,11 +486,19 @@ pub fn pucch_f3_modulate_slot(
     if cfg.pi2_bpsk {
         for (i, &b) in scrambled.iter().enumerate() {
             let rot = Complex32::from_polar(1.0, PI / 2.0 * (i % 2) as f32);
-            d.push(rot * Complex32::new((1 - 2 * b as i32) as f32, (1 - 2 * b as i32) as f32) * FRAC_1_SQRT_2);
+            d.push(
+                rot * Complex32::new((1 - 2 * b as i32) as f32, (1 - 2 * b as i32) as f32)
+                    * FRAC_1_SQRT_2,
+            );
         }
     } else {
         for pair in scrambled.chunks(2) {
-            d.push(Complex32::new((1 - 2 * pair[0] as i32) as f32, (1 - 2 * pair[1] as i32) as f32) * FRAC_1_SQRT_2);
+            d.push(
+                Complex32::new(
+                    (1 - 2 * pair[0] as i32) as f32,
+                    (1 - 2 * pair[1] as i32) as f32,
+                ) * FRAC_1_SQRT_2,
+            );
         }
     }
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
@@ -484,10 +520,18 @@ pub fn pucch_f3_modulate_slot(
         let a = alpha_index(cfg.hopping_id, slot_in_frame, l, 0, 0);
         let alpha = 2.0 * PI * a as f32 / 12.0;
         for (k, r) in base.iter().enumerate() {
-            grids[l][bin(12 * cfg.prb_start + k)] = r * Complex32::from_polar(1.0, alpha * k as f32);
+            grids[l][bin(12 * cfg.prb_start + k)] =
+                r * Complex32::from_polar(1.0, alpha * k as f32);
         }
     }
-    Some(modulate_slot_grids(ofdm, &grids, slot_in_frame, mu, center_freq_hz, fs))
+    Some(modulate_slot_grids(
+        ofdm,
+        &grids,
+        slot_in_frame,
+        mu,
+        center_freq_hz,
+        fs,
+    ))
 }
 
 #[cfg(test)]
@@ -497,8 +541,20 @@ mod tests {
     #[test]
     fn f3_re_occupancy() {
         let ofdm = Ofdm::new(512);
-        let cfg = PucchF3 { prb_start: 3, nof_prb: 2, start_symbol: 0, nof_symbols: 14, rnti: 0x4601, n_id: 1, hopping_id: 1, additional_dmrs: false, pi2_bpsk: false, carrier_rb: 24 };
-        let slot = pucch_f3_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1, 0], 7, 1, 0.0, 15.36e6).unwrap();
+        let cfg = PucchF3 {
+            prb_start: 3,
+            nof_prb: 2,
+            start_symbol: 0,
+            nof_symbols: 14,
+            rnti: 0x4601,
+            n_id: 1,
+            hopping_id: 1,
+            additional_dmrs: false,
+            pi2_bpsk: false,
+            carrier_rb: 24,
+        };
+        let slot =
+            pucch_f3_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1, 0], 7, 1, 0.0, 15.36e6).unwrap();
         let n = 512;
         let center = 24 * 6;
         let bin = |sc: usize| (sc as i32 - center).rem_euclid(n as i32) as usize;
@@ -514,7 +570,19 @@ mod tests {
         }
         assert_eq!(pucch_f3_dmrs_symbols(14, false), vec![3, 10]);
         assert_eq!(pucch_f3_dmrs_symbols(10, true), vec![1, 3, 6, 8]);
-        assert!(pucch_f3_modulate_slot(&ofdm, &PucchF3 { nof_symbols: 3, ..cfg.clone() }, &[1, 0, 1], 7, 1, 0.0, 15.36e6).is_none());
+        assert!(pucch_f3_modulate_slot(
+            &ofdm,
+            &PucchF3 {
+                nof_symbols: 3,
+                ..cfg.clone()
+            },
+            &[1, 0, 1],
+            7,
+            1,
+            0.0,
+            15.36e6
+        )
+        .is_none());
     }
 
     use super::*;
@@ -525,8 +593,14 @@ mod tests {
     fn f2_re_occupancy() {
         let ofdm = Ofdm::new(512);
         let cfg = PucchF2 {
-            prb_start: 23, nof_prb: 1, start_symbol: 0, nof_symbols: 2,
-            rnti: 0x4626, n_id: 1, n_id0: 1, carrier_rb: 24,
+            prb_start: 23,
+            nof_prb: 1,
+            start_symbol: 0,
+            nof_symbols: 2,
+            rnti: 0x4626,
+            n_id: 1,
+            n_id0: 1,
+            carrier_rb: 24,
         };
         let wave = pucch_f2_modulate_slot(&ofdm, &cfg, &[1, 0, 1, 1], 8, 1, 0.0, 15.36e6);
         // 14 symbols × (512 + CP). Just assert it is a full slot (> 14·512).
@@ -553,8 +627,14 @@ mod tests {
     fn slot_length_and_hop_placement() {
         let ofdm = Ofdm::new(512);
         let cfg = PucchF1 {
-            prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
-            init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
+            prb1: 0,
+            prb2: 23,
+            start_symbol: 0,
+            nof_symbols: 14,
+            init_cyclic_shift: 0,
+            occ_index: 0,
+            n_id: 1,
+            carrier_rb: 24,
         };
         let wave = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 1, 0.0, 15.36e6);
         assert_eq!(wave.len(), 7680); // one slot at μ=1, 15.36 Msps
@@ -564,8 +644,14 @@ mod tests {
     fn ack_nack_differ() {
         let ofdm = Ofdm::new(512);
         let cfg = PucchF1 {
-            prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
-            init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
+            prb1: 0,
+            prb2: 23,
+            start_symbol: 0,
+            nof_symbols: 14,
+            init_cyclic_shift: 0,
+            occ_index: 0,
+            n_id: 1,
+            carrier_rb: 24,
         };
         let a = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 17, 1, 0.0, 15.36e6);
         let b = pucch_f1_modulate_slot(&ofdm, &cfg, &[0], 17, 1, 0.0, 15.36e6);
@@ -599,8 +685,13 @@ mod tests {
     fn f0_occupancy_and_shift() {
         let ofdm = Ofdm::new(512);
         let cfg = PucchF0 {
-            prb: 0, second_hop_prb: Some(23), start_symbol: 12, nof_symbols: 2,
-            init_cyclic_shift: 0, n_id: 1, carrier_rb: 24,
+            prb: 0,
+            second_hop_prb: Some(23),
+            start_symbol: 12,
+            nof_symbols: 2,
+            init_cyclic_shift: 0,
+            n_id: 1,
+            carrier_rb: 24,
         };
         let ack = pucch_f0_modulate_slot(&ofdm, &cfg, &[1], false, 3, 1, 0.0, 15.36e6).unwrap();
         let nack = pucch_f0_modulate_slot(&ofdm, &cfg, &[0], false, 3, 1, 0.0, 15.36e6).unwrap();
@@ -631,8 +722,14 @@ mod tests {
     fn f1_mu0_slot_length() {
         let ofdm = Ofdm::new(512);
         let cfg = PucchF1 {
-            prb1: 0, prb2: 23, start_symbol: 0, nof_symbols: 14,
-            init_cyclic_shift: 0, occ_index: 0, n_id: 1, carrier_rb: 24,
+            prb1: 0,
+            prb2: 23,
+            start_symbol: 0,
+            nof_symbols: 14,
+            init_cyclic_shift: 0,
+            occ_index: 0,
+            n_id: 1,
+            carrier_rb: 24,
         };
         let wave = pucch_f1_modulate_slot(&ofdm, &cfg, &[1], 5, 0, 0.0, 7.68e6);
         assert_eq!(wave.len(), 7680);

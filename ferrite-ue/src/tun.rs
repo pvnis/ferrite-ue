@@ -24,11 +24,21 @@ struct IfReq {
 /// Create a TUN device named `name` (layer 3, no packet-info header) and return an
 /// open, non-blocking File handle to its character device. Needs CAP_NET_ADMIN.
 pub fn open_tun(name: &str) -> io::Result<File> {
-    let file = OpenOptions::new().read(true).write(true).open("/dev/net/tun")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")?;
     if name.len() >= 16 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "tun name too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tun name too long",
+        ));
     }
-    let mut req = IfReq { name: [0; 16], flags: IFF_TUN | IFF_NO_PI, _pad: [0; 22] };
+    let mut req = IfReq {
+        name: [0; 16],
+        flags: IFF_TUN | IFF_NO_PI,
+        _pad: [0; 22],
+    };
     for (i, &b) in name.as_bytes().iter().enumerate() {
         req.name[i] = b as libc::c_char;
     }
@@ -52,18 +62,16 @@ pub fn configure_tun(name: &str, ip: [u8; 4], mtu: u32, netns: Option<&str>) -> 
     let mtu = mtu.to_string();
     // Run `ip <args>`; log (don't fail) on a non-zero exit so re-runs are tolerant
     // of "File exists" from a leftover interface/address.
-    let run = |args: &[&str]| {
-        match Command::new("ip").args(args).output() {
-            Ok(o) if !o.status.success() => {
-                let e = String::from_utf8_lossy(&o.stderr);
-                let e = e.trim();
-                if !e.contains("File exists") {
-                    eprintln!("   [tun] `ip {}` -> {e}", args.join(" "));
-                }
+    let run = |args: &[&str]| match Command::new("ip").args(args).output() {
+        Ok(o) if !o.status.success() => {
+            let e = String::from_utf8_lossy(&o.stderr);
+            let e = e.trim();
+            if !e.contains("File exists") {
+                eprintln!("   [tun] `ip {}` -> {e}", args.join(" "));
             }
-            Err(e) => eprintln!("   [tun] failed to run `ip {}`: {e}", args.join(" ")),
-            _ => {}
         }
+        Err(e) => eprintln!("   [tun] failed to run `ip {}`: {e}", args.join(" ")),
+        _ => {}
     };
     if let Some(ns) = netns {
         run(&["netns", "add", ns]);

@@ -38,7 +38,9 @@ impl SsbMeasurement {
         10.0 * self.rsrp.max(1e-30).log10()
     }
     pub fn rsrq_db(&self) -> f32 {
-        10.0 * (SSB_N_RB as f32 * self.rsrp / self.rssi.max(1e-30)).max(1e-30).log10()
+        10.0 * (SSB_N_RB as f32 * self.rsrp / self.rssi.max(1e-30))
+            .max(1e-30)
+            .log10()
     }
     pub fn sinr_db(&self) -> f32 {
         10.0 * self.sinr.max(1e-30).log10()
@@ -48,7 +50,14 @@ impl SsbMeasurement {
 /// Measure the SSB whose PSS useful part starts at `pss_useful_start` in
 /// `samples` (the SSS is two symbols later), for cell `n_id_1`/`n_id_2`.
 /// `None` when the samples do not cover the SSS symbol.
-pub fn ssb_measure(ofdm: &Ofdm, samples: &[Complex32], pss_useful_start: usize, mu: u8, n_id_1: u16, n_id_2: u8) -> Option<SsbMeasurement> {
+pub fn ssb_measure(
+    ofdm: &Ofdm,
+    samples: &[Complex32],
+    pss_useful_start: usize,
+    mu: u8,
+    n_id_1: u16,
+    n_id_2: u8,
+) -> Option<SsbMeasurement> {
     let n = ofdm.fft_size();
     let cp = ofdm.cp_len(1, mu);
     let start = pss_useful_start + 2 * (n + cp);
@@ -69,7 +78,9 @@ pub fn ssb_measure(ofdm: &Ofdm, samples: &[Complex32], pss_useful_start: usize, 
     let noise: f32 = ys.iter().map(|y| (y - h).norm_sqr()).sum::<f32>() / SSS_LEN as f32;
     let sinr = rsrp / noise.max(1e-30);
     // RSSI over the whole SSB bandwidth of the SSS symbol.
-    let rssi: f32 = (0..12 * SSB_N_RB).map(|k| grid[ssb_subcarrier_bin(k, n)].norm_sqr()).sum();
+    let rssi: f32 = (0..12 * SSB_N_RB)
+        .map(|k| grid[ssb_subcarrier_bin(k, n)].norm_sqr())
+        .sum();
     Some(SsbMeasurement { rsrp, rssi, sinr })
 }
 
@@ -86,7 +97,10 @@ mod tests {
         let cp = ofdm.cp_len(1, 1);
         let (n_id_1, n_id_2) = (123u16, 1u8);
         let amp = 0.5f32;
-        let grid: Vec<Complex32> = sss_grid(n_id_1, n_id_2, n).iter().map(|v| v * amp).collect();
+        let grid: Vec<Complex32> = sss_grid(n_id_1, n_id_2, n)
+            .iter()
+            .map(|v| v * amp)
+            .collect();
         let sym = ofdm.modulate_symbol(&grid, cp);
         // Lay out PSS(0) PBCH(1) SSS(2) with zeros around the SSS.
         let mut samples = vec![Complex32::new(0.0, 0.0); 4 * (n + cp)];
@@ -94,7 +108,11 @@ mod tests {
         let m = ssb_measure(&ofdm, &samples, cp, 1, n_id_1, n_id_2).unwrap();
         // The demodulator scales so that a unit-amplitude RE comes back as itself.
         let expect = amp * amp;
-        assert!((m.rsrp / expect - 1.0).abs() < 1e-3, "rsrp {} expect {expect}", m.rsrp);
+        assert!(
+            (m.rsrp / expect - 1.0).abs() < 1e-3,
+            "rsrp {} expect {expect}",
+            m.rsrp
+        );
         assert!(m.sinr_db() > 60.0, "clean sinr {}", m.sinr_db());
         // Only the SSS carries power: RSSI = 127·RSRP.
         assert!((m.rssi / (expect * 127.0) - 1.0).abs() < 1e-3);
@@ -119,7 +137,15 @@ mod tests {
             *s += Complex32::new(gauss() * sigma, gauss() * sigma);
         }
         let m = ssb_measure(&ofdm, &noisy, cp, 1, n_id_1, n_id_2).unwrap();
-        assert!((m.rsrp / expect - 1.0).abs() < 0.2, "noisy rsrp {} expect {expect}", m.rsrp);
-        assert!((m.sinr_db() - 10.0).abs() < 2.0, "noisy sinr {} dB", m.sinr_db());
+        assert!(
+            (m.rsrp / expect - 1.0).abs() < 0.2,
+            "noisy rsrp {} expect {expect}",
+            m.rsrp
+        );
+        assert!(
+            (m.sinr_db() - 10.0).abs() < 2.0,
+            "noisy sinr {} dB",
+            m.sinr_db()
+        );
     }
 }

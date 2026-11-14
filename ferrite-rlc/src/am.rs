@@ -107,7 +107,10 @@ impl AmEntity {
 
     pub fn tx_sdu(&mut self, sdu: Vec<u8>) {
         if sdu.len() > u16::MAX as usize {
-            log::warn!("rlc am: discarding {}-byte SDU (exceeds SO range)", sdu.len());
+            log::warn!(
+                "rlc am: discarding {}-byte SDU (exceeds SO range)",
+                sdu.len()
+            );
             return;
         }
         self.tx_queue.push_back(sdu);
@@ -131,7 +134,9 @@ impl AmEntity {
 
     /// The SDU at TX_Next exists and has not been fully submitted.
     fn partial_at_tx_next(&self) -> bool {
-        self.tx_sdus.get(&self.tx_next).is_some_and(|s| s.sent < s.data.len())
+        self.tx_sdus
+            .get(&self.tx_next)
+            .is_some_and(|s| s.sent < s.data.len())
     }
 
     /// No new data available for transmission (transmission buffer empty).
@@ -185,10 +190,24 @@ impl AmEntity {
         poll
     }
 
-    fn encode_amd(&self, sn: u32, start: usize, end: usize, len: usize, poll: bool, data: &[u8]) -> Vec<u8> {
+    fn encode_amd(
+        &self,
+        sn: u32,
+        start: usize,
+        end: usize,
+        len: usize,
+        poll: bool,
+        data: &[u8],
+    ) -> Vec<u8> {
         let si = Si::of_range(start, end, len);
         let mut pdu = Vec::with_capacity(AmdHeader::size(si, self.sn_len) + data.len());
-        AmdHeader { poll, si, sn, so: start as u16 }.encode(self.sn_len, &mut pdu);
+        AmdHeader {
+            poll,
+            si,
+            sn,
+            so: start as u16,
+        }
+        .encode(self.sn_len, &mut pdu);
         pdu.extend_from_slice(data);
         pdu
     }
@@ -233,7 +252,11 @@ impl AmEntity {
             let data = sdu.data[start..new_end].to_vec();
             self.retx.pop_front();
             if new_end < end {
-                self.retx.push_front(RetxSeg { sn: seg.sn, start: new_end, end });
+                self.retx.push_front(RetxSeg {
+                    sn: seg.sn,
+                    start: new_end,
+                    end,
+                });
             }
             let poll = self.poll_decision(None, now);
             return Some(self.encode_amd(seg.sn, start, new_end, len, poll, &data));
@@ -247,7 +270,15 @@ impl AmEntity {
                 return None;
             }
             let data = self.tx_queue.pop_front()?;
-            self.tx_sdus.insert(sn, TxSdu { data, sent: 0, retx_count: None, max_reported: false });
+            self.tx_sdus.insert(
+                sn,
+                TxSdu {
+                    data,
+                    sent: 0,
+                    retx_count: None,
+                    max_reported: false,
+                },
+            );
         }
         let sdu = self.tx_sdus.get(&sn)?;
         let (len, start) = (sdu.data.len(), sdu.sent);
@@ -276,13 +307,19 @@ impl AmEntity {
             .tx_sdus
             .get(&self.tx_next)
             .filter(|s| s.sent < s.data.len())
-            .map_or(0, |s| s.data.len() - s.sent + base + if s.sent > 0 { 2 } else { 0 });
+            .map_or(0, |s| {
+                s.data.len() - s.sent + base + if s.sent > 0 { 2 } else { 0 }
+            });
         let retx: usize = self
             .retx
             .iter()
             .map(|r| r.end.saturating_sub(r.start) + base + if r.start > 0 { 2 } else { 0 })
             .sum();
-        let status = if self.status_triggered && !self.last_now.is_some_and(|n| self.t_status_prohibit.running_at(n)) {
+        let status = if self.status_triggered
+            && !self
+                .last_now
+                .is_some_and(|n| self.t_status_prohibit.running_at(n))
+        {
             self.build_status(usize::MAX).size(self.sn_len)
         } else {
             0
@@ -293,14 +330,25 @@ impl AmEntity {
     /// §5.3.2: consider `[start, end)` of SDU `sn` for retransmission.
     /// `incremented` collects SNs whose RETX_COUNT was already incremented by
     /// the same STATUS PDU.
-    fn consider_retx(&mut self, sn: u32, start: usize, end: usize, incremented: &mut BTreeSet<u32>) {
-        let Some(sdu) = self.tx_sdus.get_mut(&sn) else { return };
+    fn consider_retx(
+        &mut self,
+        sn: u32,
+        start: usize,
+        end: usize,
+        incremented: &mut BTreeSet<u32>,
+    ) {
+        let Some(sdu) = self.tx_sdus.get_mut(&sn) else {
+            return;
+        };
         // Only transmitted bytes can be retransmitted.
         let end = end.min(sdu.sent);
         if start >= end {
             return;
         }
-        let already_pending = self.retx.iter().any(|r| r.sn == sn && r.start <= start && end <= r.end);
+        let already_pending = self
+            .retx
+            .iter()
+            .any(|r| r.sn == sn && r.start <= start && end <= r.end);
         match sdu.retx_count {
             None => sdu.retx_count = Some(0),
             Some(c) if !already_pending && !incremented.contains(&sn) => {
@@ -326,7 +374,12 @@ impl AmEntity {
         let span = sn_mod(self.tx_next, base, m);
         let ack_rel = sn_mod(st.ack_sn, base, m);
         if ack_rel > span {
-            log::warn!("rlc am: STATUS ACK_SN {} outside [TX_Next_Ack {}, TX_Next {}]", st.ack_sn, base, self.tx_next);
+            log::warn!(
+                "rlc am: STATUS ACK_SN {} outside [TX_Next_Ack {}, TX_Next {}]",
+                st.ack_sn,
+                base,
+                self.tx_next
+            );
             return;
         }
         // Expand the NACKs into (sn, start, end) ranges; collect NACKed SNs.
@@ -343,7 +396,11 @@ impl AmEntity {
                     None => (0, None),
                     Some((s, e)) => {
                         let s = if i == 0 { s as usize } else { 0 };
-                        let e = if i + 1 == count && e != SO_END_ALL { Some(e as usize + 1) } else { None };
+                        let e = if i + 1 == count && e != SO_END_ALL {
+                            Some(e as usize + 1)
+                        } else {
+                            None
+                        };
                         (s, e)
                     }
                 };
@@ -365,7 +422,9 @@ impl AmEntity {
         // Negative acknowledgements.
         let mut incremented = BTreeSet::new();
         for (sn, start, end) in nacked {
-            let Some(len) = self.tx_sdus.get(&sn).map(|s| s.data.len()) else { continue };
+            let Some(len) = self.tx_sdus.get(&sn).map(|s| s.data.len()) else {
+                continue;
+            };
             self.consider_retx(sn, start, end.unwrap_or(len).min(len), &mut incremented);
         }
         // Advance TX_Next_Ack to the lowest unacknowledged SN.
@@ -384,7 +443,12 @@ impl AmEntity {
             let candidate = self
                 .highest_submitted_sn()
                 .filter(|sn| self.tx_sdus.contains_key(sn))
-                .or_else(|| self.tx_sdus.keys().copied().max_by_key(|&sn| sn_mod(sn, base, m)));
+                .or_else(|| {
+                    self.tx_sdus
+                        .keys()
+                        .copied()
+                        .max_by_key(|&sn| sn_mod(sn, base, m))
+                });
             if let Some(sn) = candidate {
                 let sent = self.tx_sdus.get(&sn).map_or(0, |s| s.sent);
                 let mut incremented = BTreeSet::new();
@@ -553,21 +617,33 @@ impl AmEntity {
                         count += 1;
                         sn = (sn + 1) % m;
                     }
-                    entries.push(Nack { sn: first, so: None, range: (count > 1).then_some(count as u8) });
+                    entries.push(Nack {
+                        sn: first,
+                        so: None,
+                        range: (count > 1).then_some(count as u8),
+                    });
                 }
                 Some(r) => {
                     if !r.is_complete() {
                         for (start, end) in r.gaps() {
                             let so_start = start.min(SO_END_ALL as usize) as u16;
-                            let so_end = end.map_or(SO_END_ALL, |e| (e - 1).min(SO_END_ALL as usize) as u16);
-                            entries.push(Nack { sn, so: Some((so_start, so_end)), range: None });
+                            let so_end =
+                                end.map_or(SO_END_ALL, |e| (e - 1).min(SO_END_ALL as usize) as u16);
+                            entries.push(Nack {
+                                sn,
+                                so: Some((so_start, so_end)),
+                                range: None,
+                            });
                         }
                     }
                     sn = (sn + 1) % m;
                 }
             }
         }
-        let mut status = StatusPdu { ack_sn: self.rx_highest_status, nacks: Vec::new() };
+        let mut status = StatusPdu {
+            ack_sn: self.rx_highest_status,
+            nacks: Vec::new(),
+        };
         let mut size = StatusPdu::HEADER_SIZE;
         for e in entries {
             let s = e.size(self.sn_len);

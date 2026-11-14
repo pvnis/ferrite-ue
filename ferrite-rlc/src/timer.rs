@@ -13,7 +13,10 @@ pub(crate) struct Timer {
 
 impl Timer {
     pub fn new(ms: u32, numerology: Numerology) -> Self {
-        Self { dur: ms as i64 * numerology.slots_per_subframe() as i64, start: None }
+        Self {
+            dur: ms as i64 * numerology.slots_per_subframe() as i64,
+            start: None,
+        }
     }
 
     /// (Re)start the timer at `now`.

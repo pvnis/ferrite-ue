@@ -5,8 +5,8 @@
 //! round-trip tests); uplink messages encode and decode.
 
 use crate::cellgroup::CellGroupConfig;
-use crate::meas::{MeasConfig, MeasResults};
 use crate::common::{PlmnIdentity, SubcarrierSpacing};
+use crate::meas::{MeasConfig, MeasResults};
 use crate::uper::{BitReader, BitWriter, Ctx, DecodeError, DecodeResult, SetupRelease};
 
 /// Why an encode was refused (only for downlink messages built for tests).
@@ -2433,16 +2433,27 @@ mod tests {
     fn ue_nr_capability_matches_ocudu_vector() {
         let cap = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel15,
-            supported_band_list_nr: vec![78], pdsch_256qam_fr1: false, pusch_256qam: false, drx: false };
+            supported_band_list_nr: vec![78],
+            pdsch_256qam_fr1: false,
+            pusch_256qam: false,
+            drx: false,
+        };
         let bytes = cap.encode();
         assert_eq!(bytes, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9a]);
         assert_eq!(UeNrCapability::decode(&bytes).unwrap(), cap);
         let multi = UeNrCapability {
             access_stratum_release: AccessStratumRelease::Rel16,
-            supported_band_list_nr: vec![1, 3, 78], pdsch_256qam_fr1: false, pusch_256qam: false, drx: false };
+            supported_band_list_nr: vec![1, 3, 78],
+            pdsch_256qam_fr1: false,
+            pusch_256qam: false,
+            drx: false,
+        };
         assert_eq!(UeNrCapability::decode(&multi.encode()).unwrap(), multi);
         // mac-Parameters with long + short DRX: 2 + 1 + 6 extra bits after PDCP-Parameters.
-        let drx = UeNrCapability { drx: true, ..multi.clone() };
+        let drx = UeNrCapability {
+            drx: true,
+            ..multi.clone()
+        };
         let b = drx.encode();
         assert_eq!(b[0] & 0x40, 0x40, "mac-Parameters present");
         assert_eq!(b.len() * 8, multi.encode().len() * 8 + 8);
@@ -2723,7 +2734,11 @@ impl PagingMessage {
                 if r.bit()? {
                     return r.unsupported("PagingUE-Identity extension alternative");
                 }
-                let id = if r.bit()? { PagingUeIdentity::FullIRnti(r.bitstring(40)?) } else { PagingUeIdentity::Ng5gSTmsi(r.bitstring(48)?) };
+                let id = if r.bit()? {
+                    PagingUeIdentity::FullIRnti(r.bitstring(40)?)
+                } else {
+                    PagingUeIdentity::Ng5gSTmsi(r.bitstring(48)?)
+                };
                 if has_access_type {
                     r.enu(1)?;
                 }
@@ -2771,7 +2786,12 @@ mod pcch_tests {
 
     #[test]
     fn paging_round_trip() {
-        let m = PagingMessage { records: vec![PagingUeIdentity::Ng5gSTmsi(0x1234_5678_9abc), PagingUeIdentity::FullIRnti(0xab_cdef_0123)] };
+        let m = PagingMessage {
+            records: vec![
+                PagingUeIdentity::Ng5gSTmsi(0x1234_5678_9abc),
+                PagingUeIdentity::FullIRnti(0xab_cdef_0123),
+            ],
+        };
         let bytes = m.encode();
         assert_eq!(PagingMessage::decode(&bytes).unwrap(), m);
         // An empty Paging (no records) is 1 byte: 0 0 000 + padding.

@@ -22,19 +22,36 @@ use ferrite_fapi::PrachOccasion;
 pub enum RaState {
     Idle,
     /// Waiting for the next suitable PRACH occasion (after `not_before`).
-    SelectResource { not_before: SlotPoint },
+    SelectResource {
+        not_before: SlotPoint,
+    },
     /// UL_TTI.request issued for `occasion`; waiting for RACH.indication.
-    PreambleRequested { occasion: PrachOccasion, preamble: u8 },
+    PreambleRequested {
+        occasion: PrachOccasion,
+        preamble: u8,
+    },
     /// Preamble transmitted; RAR window open until `window_end` (exclusive).
-    RarWindow { ra_rnti: Rnti, preamble: u8, window_end: SlotPoint },
+    RarWindow {
+        ra_rnti: Rnti,
+        preamble: u8,
+        window_end: SlotPoint,
+    },
     /// RAR matched; the PHY is resolving its UL grant into the Msg3 PUSCH
     /// grant (a TC-RNTI UL grant). Treated as a RAR-window failure if nothing
     /// arrives by `deadline`.
-    Msg3Pending { tc_rnti: Rnti, deadline: SlotPoint },
+    Msg3Pending {
+        tc_rnti: Rnti,
+        deadline: SlotPoint,
+    },
     /// Msg3 handed to the PHY; contention resolution timer runs from the Msg3
     /// slot (`timer_end`).
-    ContentionResolution { tc_rnti: Rnti, timer_end: SlotPoint },
-    Succeeded { c_rnti: Rnti },
+    ContentionResolution {
+        tc_rnti: Rnti,
+        timer_end: SlotPoint,
+    },
+    Succeeded {
+        c_rnti: Rnti,
+    },
     Failed,
 }
 
@@ -43,7 +60,11 @@ pub enum RaState {
 pub enum RaAction {
     /// Send this preamble on this occasion with this power offset (dB above
     /// `preambleReceivedTargetPower`).
-    SendPreamble { occasion: PrachOccasion, preamble: u8, power_offset_db: f32 },
+    SendPreamble {
+        occasion: PrachOccasion,
+        preamble: u8,
+        power_offset_db: f32,
+    },
     /// Start monitoring RA-RNTI (`Some`) / stop (`None`).
     MonitorRaRnti(Option<Rnti>),
     /// Start monitoring TC-RNTI for Msg4.
@@ -84,7 +105,9 @@ impl RaProcedure {
             preamble_trans_max: cfg.preamble_trans_max,
             power_ramping_step_db: cfg.power_ramping_step_db,
             ra_response_window_slots: cfg.ra_response_window_slots,
-            contention_resolution_slots: (cfg.contention_resolution_ms * numerology.slots_per_subframe()).max(1),
+            contention_resolution_slots: (cfg.contention_resolution_ms
+                * numerology.slots_per_subframe())
+            .max(1),
             nof_cb_preambles: cfg.nof_cb_preambles.max(1),
             msg3_ccch: None,
             crnti_ra: None,
@@ -104,7 +127,10 @@ impl RaProcedure {
     }
 
     pub fn is_running(&self) -> bool {
-        !matches!(self.state, RaState::Idle | RaState::Succeeded { .. } | RaState::Failed)
+        !matches!(
+            self.state,
+            RaState::Idle | RaState::Succeeded { .. } | RaState::Failed
+        )
     }
 
     /// §5.1.1 initialisation: start a new procedure at `now`. `ccch` is the
@@ -121,7 +147,8 @@ impl RaProcedure {
 
     /// Current power offset above the target (§5.1.3): (counter − 1) · step.
     pub fn power_offset_db(&self) -> f32 {
-        (self.preamble_power_ramping_counter.saturating_sub(1) * self.power_ramping_step_db as u32) as f32
+        (self.preamble_power_ramping_counter.saturating_sub(1) * self.power_ramping_step_db as u32)
+            as f32
     }
 
     /// Per-slot step. `occasions_from` yields the PRACH occasions in a slot;
@@ -136,7 +163,11 @@ impl RaProcedure {
         match self.state.clone() {
             RaState::SelectResource { not_before } => {
                 // §5.1.2: pick the next occasion at least `lead` slots ahead.
-                let from = if now.diff(&not_before) >= 0 { now } else { not_before };
+                let from = if now.diff(&not_before) >= 0 {
+                    now
+                } else {
+                    not_before
+                };
                 let from = from.add(lead as u64 + 1);
                 for d in 0..(2 * 10 * now.slots_per_frame() as u64) {
                     let s = from.add(d);
@@ -144,9 +175,16 @@ impl RaProcedure {
                     if let Some(o) = occ.first() {
                         let o = *o;
                         let preamble = (self.next_random() % self.nof_cb_preambles as u64) as u8;
-                        self.state = RaState::PreambleRequested { occasion: o, preamble };
+                        self.state = RaState::PreambleRequested {
+                            occasion: o,
+                            preamble,
+                        };
                         log::debug!("RA: attempt {} preamble {preamble} on slot {} (symbol {}, f {}, t {}, RA-RNTI {}) requested at slot {now}", self.preamble_tx_counter, o.slot, o.start_symbol, o.freq_index, o.time_index, o.ra_rnti.0);
-                        actions.push(RaAction::SendPreamble { occasion: o, preamble, power_offset_db: self.power_offset_db() });
+                        actions.push(RaAction::SendPreamble {
+                            occasion: o,
+                            preamble,
+                            power_offset_db: self.power_offset_db(),
+                        });
                         break;
                     }
                 }
@@ -192,17 +230,25 @@ impl RaProcedure {
         } else {
             0
         };
-        self.state = RaState::SelectResource { not_before: now.add(backoff_slots) };
+        self.state = RaState::SelectResource {
+            not_before: now.add(backoff_slots),
+        };
     }
 
     /// RACH.indication: the preamble went out in `slot`. Opens the RAR window
     /// (§5.1.4: starts at the first PDCCH occasion after the PRACH occasion end;
     /// approximated as the next slot).
     pub fn on_prach_sent(&mut self, slot: SlotPoint) -> Vec<RaAction> {
-        let RaState::PreambleRequested { occasion, preamble } = self.state.clone() else { return Vec::new() };
+        let RaState::PreambleRequested { occasion, preamble } = self.state.clone() else {
+            return Vec::new();
+        };
         let window_end = slot.add(1 + self.ra_response_window_slots as u64);
         log::debug!("RA: preamble sent in slot {slot}, RAR window until {window_end}");
-        self.state = RaState::RarWindow { ra_rnti: occasion.ra_rnti, preamble, window_end };
+        self.state = RaState::RarWindow {
+            ra_rnti: occasion.ra_rnti,
+            preamble,
+            window_end,
+        };
         vec![RaAction::MonitorRaRnti(Some(occasion.ra_rnti))]
     }
 
@@ -210,13 +256,26 @@ impl RaProcedure {
     /// RAR (the caller hands its UL grant to the PHY for resolution) if the
     /// RAPID matches; the procedure then waits for the Msg3 grant.
     pub fn on_rar(&mut self, pdu: &crate::rar::RarPdu) -> Option<(crate::rar::Rar, Vec<RaAction>)> {
-        let RaState::RarWindow { preamble, window_end, .. } = self.state else { return None };
+        let RaState::RarWindow {
+            preamble,
+            window_end,
+            ..
+        } = self.state
+        else {
+            return None;
+        };
         if let Some(bi) = pdu.backoff_ms {
             self.backoff_ms = bi;
         }
         let rar = pdu.rars.iter().find(|r| r.rapid == preamble)?;
-        let actions = vec![RaAction::MonitorRaRnti(None), RaAction::MonitorTcRnti(Rnti(rar.tc_rnti))];
-        self.state = RaState::Msg3Pending { tc_rnti: Rnti(rar.tc_rnti), deadline: window_end.add(self.ra_response_window_slots as u64) };
+        let actions = vec![
+            RaAction::MonitorRaRnti(None),
+            RaAction::MonitorTcRnti(Rnti(rar.tc_rnti)),
+        ];
+        self.state = RaState::Msg3Pending {
+            tc_rnti: Rnti(rar.tc_rnti),
+            deadline: window_end.add(self.ra_response_window_slots as u64),
+        };
         Some((*rar, actions))
     }
 
@@ -229,14 +288,19 @@ impl RaProcedure {
     /// resolution timer (§5.1.5, from the Msg3 transmission).
     pub fn on_msg3_scheduled(&mut self, msg3_slot: SlotPoint) {
         if let RaState::Msg3Pending { tc_rnti, .. } = self.state {
-            self.state = RaState::ContentionResolution { tc_rnti, timer_end: msg3_slot.add(1 + self.contention_resolution_slots as u64) };
+            self.state = RaState::ContentionResolution {
+                tc_rnti,
+                timer_end: msg3_slot.add(1 + self.contention_resolution_slots as u64),
+            };
         }
     }
 
     /// A DL-SCH PDU addressed to the TC-RNTI carried a Contention Resolution
     /// Identity CE: §5.1.5 — success if it matches our CCCH SDU.
     pub fn on_contention_resolution_id(&mut self, id: &[u8; 6]) -> Vec<RaAction> {
-        let RaState::ContentionResolution { tc_rnti, .. } = self.state else { return Vec::new() };
+        let RaState::ContentionResolution { tc_rnti, .. } = self.state else {
+            return Vec::new();
+        };
         if self.msg3_ccch.as_ref() == Some(id) {
             self.state = RaState::Succeeded { c_rnti: tc_rnti };
             vec![RaAction::Done(Ok(tc_rnti))]
@@ -309,7 +373,12 @@ mod tests {
         ra.start(now, Some([1, 2, 3, 4, 5, 6]), None);
         let occ = |s: SlotPoint| c.prach.occasions_in_slot(s);
         let a = ra.on_slot(now, 3, &occ);
-        let RaAction::SendPreamble { occasion, preamble, .. } = a[0].clone() else { panic!("{a:?}") };
+        let RaAction::SendPreamble {
+            occasion, preamble, ..
+        } = a[0].clone()
+        else {
+            panic!("{a:?}")
+        };
         assert_eq!(occasion.slot.slot, 19); // subframe 9, slot 1
         assert!(preamble < 64);
         let a = ra.on_prach_sent(occasion.slot);
@@ -319,7 +388,14 @@ mod tests {
             rars: vec![crate::rar::Rar {
                 rapid: preamble,
                 ta: 3,
-                grant: crate::rar::RarUlGrant { freq_hopping: false, fdra: 0, time_resource: 0, mcs: 0, tpc: 7, csi_request: false },
+                grant: crate::rar::RarUlGrant {
+                    freq_hopping: false,
+                    fdra: 0,
+                    time_resource: 0,
+                    mcs: 0,
+                    tpc: 7,
+                    csi_request: false,
+                },
                 tc_rnti: 0x4601,
             }],
         };
@@ -345,7 +421,11 @@ mod tests {
             let acts = ra.on_slot(now, 3, &occ);
             for a in acts {
                 match a {
-                    RaAction::SendPreamble { occasion, power_offset_db, .. } => {
+                    RaAction::SendPreamble {
+                        occasion,
+                        power_offset_db,
+                        ..
+                    } => {
                         assert_eq!(power_offset_db, (attempts * 4) as f32);
                         attempts += 1;
                         // Pretend the PHY sends it at the occasion slot.

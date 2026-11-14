@@ -10,7 +10,10 @@ pub enum SrState {
     /// No SR pending.
     Idle,
     /// An SR is pending: `counter` = SR_COUNTER, `prohibit_until` = sr-ProhibitTimer expiry.
-    Pending { counter: u32, prohibit_until: Option<SlotPoint> },
+    Pending {
+        counter: u32,
+        prohibit_until: Option<SlotPoint>,
+    },
     /// SR_COUNTER reached sr-TransMax: MAC must release PUCCH/SRS, clear the
     /// configured grants and start a random access (`take_failed`).
     Failed,
@@ -45,7 +48,10 @@ impl SrProcedure {
     /// (its counter continues); a failed one stays failed until `take_failed`.
     pub fn trigger(&mut self) {
         if self.state == SrState::Idle {
-            self.state = SrState::Pending { counter: 0, prohibit_until: None };
+            self.state = SrState::Pending {
+                counter: 0,
+                prohibit_until: None,
+            };
         }
     }
 
@@ -53,7 +59,6 @@ impl SrProcedure {
     pub fn cancel(&mut self) {
         self.state = SrState::Idle;
     }
-
 
     /// `true` once (and resets to `Idle`) when sr-TransMax was reached.
     pub fn take_failed(&mut self) -> bool {
@@ -67,14 +72,23 @@ impl SrProcedure {
 
     /// Is `slot` an SR occasion? Returns the PUCCH resource id.
     pub fn occasion(&self, slot: SlotPoint) -> Option<u8> {
-        self.resources.iter().find(|(p, o, _)| slot.is_occasion(*p as u32, *o as u32)).map(|r| r.2)
+        self.resources
+            .iter()
+            .find(|(p, o, _)| slot.is_occasion(*p as u32, *o as u32))
+            .map(|r| r.2)
     }
 
     /// Decide whether to transmit an SR at `slot` (an occasion). Returns the
     /// PUCCH resource id when a positive SR must be sent. Implements the
     /// prohibit timer and SR_COUNTER / sr-TransMax (§5.4.4).
     pub fn should_send(&mut self, slot: SlotPoint) -> Option<u8> {
-        let SrState::Pending { counter, prohibit_until } = self.state else { return None };
+        let SrState::Pending {
+            counter,
+            prohibit_until,
+        } = self.state
+        else {
+            return None;
+        };
         let res = self.occasion(slot)?;
         if let Some(t) = prohibit_until {
             if slot.diff(&t) < 0 {
@@ -86,7 +100,10 @@ impl SrProcedure {
             return None;
         }
         let prohibit = (self.prohibit_slots > 0).then(|| slot.add(self.prohibit_slots as u64));
-        self.state = SrState::Pending { counter: counter + 1, prohibit_until: prohibit };
+        self.state = SrState::Pending {
+            counter: counter + 1,
+            prohibit_until: prohibit,
+        };
         Some(res)
     }
 }
@@ -98,7 +115,12 @@ mod tests {
 
     #[test]
     fn sr_occasions_and_transmax() {
-        let cfg = crate::SrConfig { sr_id: 0, prohibit_ms: 0, trans_max: 2, resources: vec![(10, 7, 3)] };
+        let cfg = crate::SrConfig {
+            sr_id: 0,
+            prohibit_ms: 0,
+            trans_max: 2,
+            resources: vec![(10, 7, 3)],
+        };
         let mut sr = SrProcedure::new(&cfg, 2);
         sr.trigger();
         let s = |n: u16| SlotPoint::new(Numerology::KHZ30, 0, n);

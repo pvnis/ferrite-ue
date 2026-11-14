@@ -169,7 +169,9 @@ impl Coreset {
     pub fn reg_bundle_size(&self) -> usize {
         match self.mapping {
             CceToRegMapping::NonInterleaved => 6,
-            CceToRegMapping::Interleaved { reg_bundle_size, .. } => reg_bundle_size,
+            CceToRegMapping::Interleaved {
+                reg_bundle_size, ..
+            } => reg_bundle_size,
         }
     }
 
@@ -191,7 +193,10 @@ impl Coreset {
                 shift_index,
             } => {
                 let n_bundles = self.n_reg() / l;
-                debug_assert!(n_bundles.is_multiple_of(r), "N_REG must be a multiple of L·R");
+                debug_assert!(
+                    n_bundles.is_multiple_of(r),
+                    "N_REG must be a multiple of L·R"
+                );
                 let c_cols = n_bundles / r;
                 let (c, rr) = (x / r, x % r);
                 (rr * c_cols + c + usize::from(shift_index)) % n_bundles
@@ -212,7 +217,8 @@ impl Coreset {
     /// All REGs of a candidate, sorted by `(symbol, rb_index)` — the RE mapping
     /// order of its data (symbol-outer, subcarrier-inner).
     pub fn candidate_regs(&self, cand: &Candidate) -> Vec<(usize, usize)> {
-        let mut regs: Vec<(usize, usize)> = cand.cces.iter().flat_map(|&c| self.cce_regs(c)).collect();
+        let mut regs: Vec<(usize, usize)> =
+            cand.cces.iter().flat_map(|&c| self.cce_regs(c)).collect();
         regs.sort_unstable();
         regs
     }
@@ -224,7 +230,9 @@ impl Coreset {
 
     /// DMRS sequence length needed to cover the CORESET.
     fn dmrs_seq_len(&self) -> usize {
-        self.rbs.last().map_or(0, |&last| DMRS_PER_REG * (last - self.dmrs_ref_crb + 1))
+        self.rbs
+            .last()
+            .map_or(0, |&last| DMRS_PER_REG * (last - self.dmrs_ref_crb + 1))
     }
 }
 
@@ -386,8 +394,10 @@ impl SearchSpace {
         }
         let idx = slot.index();
         (0..self.duration_slots.max(1)).any(|d| {
-            (idx + u64::from(self.period_slots) * 1024 - u64::from(self.offset_slots) - u64::from(d))
-                .is_multiple_of(u64::from(self.period_slots))
+            (idx + u64::from(self.period_slots) * 1024
+                - u64::from(self.offset_slots)
+                - u64::from(d))
+            .is_multiple_of(u64::from(self.period_slots))
         })
     }
 
@@ -418,7 +428,8 @@ impl SearchSpace {
 /// `c_init = (2^17·(14·n_slot + l + 1)·(2·N_ID + 1) + 2·N_ID) mod 2^31`.
 pub fn pdcch_dmrs_sequence(n_id: u16, slot: u32, symbol: u32, len: usize) -> Vec<Complex32> {
     let n_id = u64::from(n_id);
-    let c_init = (((1u64 << 17) * (14 * u64::from(slot) + u64::from(symbol) + 1) * (2 * n_id + 1) + 2 * n_id)
+    let c_init = (((1u64 << 17) * (14 * u64::from(slot) + u64::from(symbol) + 1) * (2 * n_id + 1)
+        + 2 * n_id)
         % (1 << 31)) as u32;
     let c = gold_sequence(c_init, 2 * len);
     (0..len)
@@ -572,7 +583,9 @@ pub fn candidate_coherence(est: &CoresetEstimate, coreset: &Coreset, cand: &Cand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::dci::{dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE};
+    use crate::coding::dci::{
+        dci_1_0_si_size, dci_decode, dci_encode, pdcch_descramble_llr, BITS_PER_CCE,
+    };
     use crate::coreset0::coreset0_config;
     use crate::sequence::gold_sequence as gold;
     use ferrite_common::Numerology;
@@ -589,7 +602,10 @@ mod tests {
     /// Fill CORESET grids with DMRS + arbitrary data through a flat channel.
     fn synthetic_grids(coreset: &Coreset, slot: u32, h: Complex32) -> Vec<Vec<Complex32>> {
         let len = 3 * (coreset.rbs.last().unwrap() + 1);
-        let mut grids = vec![vec![Complex32::new(0.0, 0.0); 12 * (coreset.rbs.last().unwrap() + 1)]; coreset.n_symb];
+        let mut grids = vec![
+            vec![Complex32::new(0.0, 0.0); 12 * (coreset.rbs.last().unwrap() + 1)];
+            coreset.n_symb
+        ];
         for (l, grid) in grids.iter_mut().enumerate() {
             let dmrs = pdcch_dmrs_sequence(coreset.dmrs_scrambling_id, slot, l as u32, len);
             for &crb in &coreset.rbs {
@@ -646,14 +662,28 @@ mod tests {
             ((seed >> 40) as f32) / (1u64 << 24) as f32 - 0.5
         };
         let n_rb = coreset.n_rb();
-        let coherent = CoresetEstimate { n_rb, h: vec![h; coreset.n_reg()] };
+        let coherent = CoresetEstimate {
+            n_rb,
+            h: vec![h; coreset.n_reg()],
+        };
         let noise = CoresetEstimate {
             n_rb,
-            h: (0..coreset.n_reg()).map(|_| Complex32::new(rng(), rng())).collect(),
+            h: (0..coreset.n_reg())
+                .map(|_| Complex32::new(rng(), rng()))
+                .collect(),
         };
-        let cand = Candidate { agg_level: 4, cces: (0..4).collect() };
-        assert!(candidate_coherence(&coherent, &coreset, &cand) > 0.95, "coherent ≈ 1");
-        assert!(candidate_coherence(&noise, &coreset, &cand) < 0.5, "noise low");
+        let cand = Candidate {
+            agg_level: 4,
+            cces: (0..4).collect(),
+        };
+        assert!(
+            candidate_coherence(&coherent, &coreset, &cand) > 0.95,
+            "coherent ≈ 1"
+        );
+        assert!(
+            candidate_coherence(&noise, &coreset, &cand) < 0.5,
+            "noise low"
+        );
     }
 
     /// Exhaustive candidates cover every CCE-aligned position, in particular AL1
@@ -661,14 +691,33 @@ mod tests {
     #[test]
     fn all_candidates_cover_al1() {
         let c = all_candidates(8, &[1, 2, 4, 8]);
-        let al1: Vec<usize> = c.iter().filter(|x| x.agg_level == 1).map(|x| x.cces[0]).collect();
+        let al1: Vec<usize> = c
+            .iter()
+            .filter(|x| x.agg_level == 1)
+            .map(|x| x.cces[0])
+            .collect();
         assert_eq!(al1, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
-            c.iter().filter(|x| x.agg_level == 2).map(|x| x.cces[0]).collect::<Vec<_>>(),
+            c.iter()
+                .filter(|x| x.agg_level == 2)
+                .map(|x| x.cces[0])
+                .collect::<Vec<_>>(),
             vec![0, 2, 4, 6]
         );
-        assert_eq!(c.iter().filter(|x| x.agg_level == 4).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0, 4]);
-        assert_eq!(c.iter().filter(|x| x.agg_level == 8).map(|x| x.cces[0]).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            c.iter()
+                .filter(|x| x.agg_level == 4)
+                .map(|x| x.cces[0])
+                .collect::<Vec<_>>(),
+            vec![0, 4]
+        );
+        assert_eq!(
+            c.iter()
+                .filter(|x| x.agg_level == 8)
+                .map(|x| x.cces[0])
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
         for cand in &c {
             assert_eq!(cand.cces.len(), cand.agg_level);
             assert_eq!(cand.cces[0] % cand.agg_level, 0);
@@ -702,7 +751,11 @@ mod tests {
                 assert_eq!(c.cces[0] % c.agg_level, 0);
                 assert!(c.cces.windows(2).all(|w| w[1] == w[0] + 1));
                 if c.agg_level == 4 {
-                    assert!(c.cces[0] == 0 || c.cces[0] == 4, "AL4 base {} not in {{0,4}}", c.cces[0]);
+                    assert!(
+                        c.cces[0] == 0 || c.cces[0] == 4,
+                        "AL4 base {} not in {{0,4}}",
+                        c.cces[0]
+                    );
                 }
             }
         }
@@ -733,8 +786,14 @@ mod tests {
         assert!(!ss.is_monitored(SlotPoint::new(n, 0, 2)));
         // Common search space uses Y = 0: identical to the Type0 candidate set.
         let coreset = coreset0_live();
-        assert_eq!(ss.candidates(&coreset, 0xFFFF, 5), type0_candidates(coreset.n_cce()));
-        assert_eq!(SearchSpace::type0(0).candidates(&coreset, 0xFFFF, 0), type0_candidates(8));
+        assert_eq!(
+            ss.candidates(&coreset, 0xFFFF, 5),
+            type0_candidates(coreset.n_cce())
+        );
+        assert_eq!(
+            SearchSpace::type0(0).candidates(&coreset, 0xFFFF, 0),
+            type0_candidates(8)
+        );
     }
 
     #[test]
@@ -746,7 +805,11 @@ mod tests {
         assert_eq!(c.dmrs_ref_crb, 0);
         assert_eq!(
             c.mapping,
-            CceToRegMapping::Interleaved { reg_bundle_size: 6, interleaver_size: 2, shift_index: 1 }
+            CceToRegMapping::Interleaved {
+                reg_bundle_size: 6,
+                interleaver_size: 2,
+                shift_index: 1
+            }
         );
     }
 
@@ -781,9 +844,27 @@ mod tests {
         let cands = type0_candidates(8);
         // AL4: {0..4}, {4..8}; AL8: {0..8}; AL16 impossible → 3 distinct.
         assert_eq!(cands.len(), 3);
-        assert_eq!(cands[0], Candidate { agg_level: 4, cces: vec![0, 1, 2, 3] });
-        assert_eq!(cands[1], Candidate { agg_level: 4, cces: vec![4, 5, 6, 7] });
-        assert_eq!(cands[2], Candidate { agg_level: 8, cces: (0..8).collect() });
+        assert_eq!(
+            cands[0],
+            Candidate {
+                agg_level: 4,
+                cces: vec![0, 1, 2, 3]
+            }
+        );
+        assert_eq!(
+            cands[1],
+            Candidate {
+                agg_level: 4,
+                cces: vec![4, 5, 6, 7]
+            }
+        );
+        assert_eq!(
+            cands[2],
+            Candidate {
+                agg_level: 8,
+                cces: (0..8).collect()
+            }
+        );
     }
 
     #[test]
@@ -808,7 +889,11 @@ mod tests {
             0,
             48,
             1,
-            CceToRegMapping::Interleaved { reg_bundle_size: 2, interleaver_size: 6, shift_index: 3 },
+            CceToRegMapping::Interleaved {
+                reg_bundle_size: 2,
+                interleaver_size: 6,
+                shift_index: 3,
+            },
             1,
         );
         assert_eq!(c.bundle_interleaver(0), 3);
@@ -827,7 +912,10 @@ mod tests {
     #[test]
     fn candidate_layout_counts_and_order() {
         let coreset = coreset0_live();
-        let cand = Candidate { agg_level: 4, cces: vec![0, 1, 2, 3] };
+        let cand = Candidate {
+            agg_level: 4,
+            cces: vec![0, 1, 2, 3],
+        };
         let regs = coreset.candidate_regs(&cand);
         assert_eq!(regs.len(), 4 * 6);
         // Mapping order: strictly increasing (l, rb) — symbol first.
@@ -876,7 +964,10 @@ mod tests {
         let payload: Vec<u8> = (0..a_len).map(|_| rng.bit()).collect();
 
         // Transmit on the second AL4 candidate (CCEs 4..8).
-        let tx_cand = Candidate { agg_level: 4, cces: vec![4, 5, 6, 7] };
+        let tx_cand = Candidate {
+            agg_level: 4,
+            cces: vec![4, 5, 6, 7],
+        };
         let e = tx_cand.agg_level * BITS_PER_CCE;
         let mut bits = dci_encode(&payload, rnti, e);
         // 38.211 §7.3.2.3 scrambling with c_init = N_cell_ID.
@@ -889,8 +980,9 @@ mod tests {
         // (l, k) order.
         let mut grids = vec![vec![Complex32::new(0.0, 0.0); fft]; coreset.n_symb];
         let len = 3 * coreset.n_rb();
-        let dmrs: Vec<Vec<Complex32>> =
-            (0..coreset.n_symb).map(|l| pdcch_dmrs_sequence(cell_id, slot, l as u32, len)).collect();
+        let dmrs: Vec<Vec<Complex32>> = (0..coreset.n_symb)
+            .map(|l| pdcch_dmrs_sequence(cell_id, slot, l as u32, len))
+            .collect();
         let mut i = 0;
         for (l, rb) in coreset.candidate_regs(&tx_cand) {
             let crb = coreset.rbs[rb];
@@ -914,7 +1006,9 @@ mod tests {
         let sigma = 10f32.powf(-15.0 / 20.0);
         for g in &mut grids {
             for s in g.iter_mut() {
-                *s = *s * h + Complex32::new(rng.normal(), rng.normal()) * (sigma / std::f32::consts::SQRT_2);
+                *s = *s * h
+                    + Complex32::new(rng.normal(), rng.normal())
+                        * (sigma / std::f32::consts::SQRT_2);
             }
         }
 

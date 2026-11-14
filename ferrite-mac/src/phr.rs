@@ -40,7 +40,11 @@ impl Default for PowerHeadroom {
     /// lossless transport, and conservative over the air until power control
     /// feeds real numbers.
     fn default() -> Self {
-        Self { ph_db: 38.0, pcmax_dbm: 23.0, pathloss_db: 0.0 }
+        Self {
+            ph_db: 38.0,
+            pcmax_dbm: 23.0,
+            pathloss_db: 0.0,
+        }
     }
 }
 
@@ -58,7 +62,14 @@ pub struct PhrProcedure {
 
 impl PhrProcedure {
     pub fn new(cfg: Option<PhrMacConfig>, slots_per_ms: u32) -> Self {
-        let mut p = Self { cfg: None, slots_per_ms, periodic_expiry: None, prohibit_expiry: None, reported_pathloss_db: None, pending: false };
+        let mut p = Self {
+            cfg: None,
+            slots_per_ms,
+            periodic_expiry: None,
+            prohibit_expiry: None,
+            reported_pathloss_db: None,
+            pending: false,
+        };
         p.configure(cfg);
         p
     }
@@ -92,7 +103,9 @@ impl PhrProcedure {
             self.prohibit_expiry = None;
         }
         if self.prohibit_expiry.is_none() {
-            if let (Some(th), Some(last)) = (cfg.tx_power_factor_change_db, self.reported_pathloss_db) {
+            if let (Some(th), Some(last)) =
+                (cfg.tx_power_factor_change_db, self.reported_pathloss_db)
+            {
                 if (pathloss_db - last).abs() > f32::from(th) {
                     self.pending = true;
                 }
@@ -105,8 +118,11 @@ impl PhrProcedure {
         let Some(cfg) = self.cfg else { return };
         self.pending = false;
         self.reported_pathloss_db = Some(pathloss_db);
-        self.periodic_expiry = cfg.periodic_ms.map(|ms| now.add(u64::from((ms * self.slots_per_ms).max(1))));
-        self.prohibit_expiry = (cfg.prohibit_ms > 0).then(|| now.add(u64::from(cfg.prohibit_ms * self.slots_per_ms)));
+        self.periodic_expiry = cfg
+            .periodic_ms
+            .map(|ms| now.add(u64::from((ms * self.slots_per_ms).max(1))));
+        self.prohibit_expiry =
+            (cfg.prohibit_ms > 0).then(|| now.add(u64::from(cfg.prohibit_ms * self.slots_per_ms)));
     }
 
     /// MAC reset (§5.12): timers stopped, nothing pending until reconfigured.
@@ -172,7 +188,11 @@ mod tests {
 
     #[test]
     fn triggers() {
-        let cfg = PhrMacConfig { periodic_ms: Some(10), prohibit_ms: 20, tx_power_factor_change_db: Some(3) };
+        let cfg = PhrMacConfig {
+            periodic_ms: Some(10),
+            prohibit_ms: 20,
+            tx_power_factor_change_db: Some(3),
+        };
         let mut p = PhrProcedure::new(Some(cfg), 2);
         assert!(p.pending, "configuration triggers a report");
         p.on_sent(slot(0), 100.0);
@@ -193,7 +213,14 @@ mod tests {
         p.tick(slot(81), 104.0);
         assert!(p.pending, "periodic timer again");
         // Infinite timers never fire.
-        let mut q = PhrProcedure::new(Some(PhrMacConfig { periodic_ms: None, prohibit_ms: 0, tx_power_factor_change_db: None }), 2);
+        let mut q = PhrProcedure::new(
+            Some(PhrMacConfig {
+                periodic_ms: None,
+                prohibit_ms: 0,
+                tx_power_factor_change_db: None,
+            }),
+            2,
+        );
         q.on_sent(slot(0), 1.0);
         q.tick(slot(100_000), 50.0);
         assert!(!q.pending);

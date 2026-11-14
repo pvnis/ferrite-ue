@@ -44,7 +44,11 @@ pub struct Bearers {
 
 impl Bearers {
     pub fn new(numerology: Numerology) -> Self {
-        Self { by_lcid: BTreeMap::new(), numerology, reestablishing: false }
+        Self {
+            by_lcid: BTreeMap::new(),
+            numerology,
+            reestablishing: false,
+        }
     }
 
     /// The data numerology (from SIB1) the entity timers run on.
@@ -72,7 +76,10 @@ impl Bearers {
     /// LCID of the (lowest) DRB, the default data bearer; `None` while idle
     /// or before the first reconfiguration.
     pub fn drb_lcid(&self) -> Option<u8> {
-        self.by_lcid.iter().find(|(_, b)| matches!(b.rb, RbId::Drb(_))).map(|(l, _)| *l)
+        self.by_lcid
+            .iter()
+            .find(|(_, b)| matches!(b.rb, RbId::Drb(_)))
+            .map(|(l, _)| *l)
     }
 
     pub fn reestablishing(&self) -> bool {
@@ -88,8 +95,25 @@ impl Bearers {
         let n = self.numerology;
         let rlc = match &b.rlc {
             RlcSetup::Tm => RlcEntity::new(RlcMode::Tm, n),
-            RlcSetup::Um { sn_len, t_reassembly_ms } => RlcEntity::new(RlcMode::Um(UmConfig { sn_len: rlc_sn(*sn_len), t_reassembly_ms: *t_reassembly_ms }), n),
-            RlcSetup::Am { sn_len, t_poll_retransmit_ms, poll_pdu, poll_byte, max_retx, t_reassembly_ms, t_status_prohibit_ms } => RlcEntity::new(
+            RlcSetup::Um {
+                sn_len,
+                t_reassembly_ms,
+            } => RlcEntity::new(
+                RlcMode::Um(UmConfig {
+                    sn_len: rlc_sn(*sn_len),
+                    t_reassembly_ms: *t_reassembly_ms,
+                }),
+                n,
+            ),
+            RlcSetup::Am {
+                sn_len,
+                t_poll_retransmit_ms,
+                poll_pdu,
+                poll_byte,
+                max_retx,
+                t_reassembly_ms,
+                t_status_prohibit_ms,
+            } => RlcEntity::new(
                 RlcMode::Am(AmConfig {
                     sn_len: rlc_sn(*sn_len),
                     t_poll_retransmit_ms: *t_poll_retransmit_ms,
@@ -104,7 +128,14 @@ impl Bearers {
         };
         let mut pcfg = match b.rb {
             RbId::Srb(id) => PdcpConfig::srb(id),
-            RbId::Drb(id) => PdcpConfig::drb(id, if b.pdcp_sn_len == 18 { SnLen::Len18 } else { SnLen::Len12 }),
+            RbId::Drb(id) => PdcpConfig::drb(
+                id,
+                if b.pdcp_sn_len == 18 {
+                    SnLen::Len18
+                } else {
+                    SnLen::Len12
+                },
+            ),
         };
         pcfg.integrity_on_drb = b.pdcp_integrity;
         pcfg.sdap_header_ul = b.sdap_header_ul;
@@ -112,7 +143,11 @@ impl Bearers {
         pcfg.qfi = b.qfi;
         pcfg.t_reordering_ms = b.t_reordering_ms.or(pcfg.t_reordering_ms);
         pcfg.discard_timer_ms = b.discard_timer_ms;
-        let existing = self.by_lcid.iter().find(|(_, x)| x.rb == b.rb).map(|(l, _)| *l);
+        let existing = self
+            .by_lcid
+            .iter()
+            .find(|(_, x)| x.rb == b.rb)
+            .map(|(l, _)| *l);
         let mut pdcp = match existing.and_then(|l| self.by_lcid.remove(&l)) {
             Some(old) => {
                 let mut p = old.pdcp;
@@ -121,8 +156,21 @@ impl Bearers {
                 }
                 if !b.reestablish_rlc && !self.reestablishing {
                     // Keep the RLC entity too: only the configuration is refreshed.
-                    log::info!("bearer {:?} on LCID {} reconfigured ({:?})", b.rb, b.lcid, b.rlc);
-                    self.by_lcid.insert(b.lcid, Bearer { rb: b.rb, rlc: old.rlc, pdcp: p, pdu_session: b.pdu_session.or(old.pdu_session) });
+                    log::info!(
+                        "bearer {:?} on LCID {} reconfigured ({:?})",
+                        b.rb,
+                        b.lcid,
+                        b.rlc
+                    );
+                    self.by_lcid.insert(
+                        b.lcid,
+                        Bearer {
+                            rb: b.rb,
+                            rlc: old.rlc,
+                            pdcp: p,
+                            pdu_session: b.pdu_session.or(old.pdu_session),
+                        },
+                    );
                     return;
                 }
                 p
@@ -133,7 +181,15 @@ impl Bearers {
             configure(&mut pdcp, b.rb, sec, b.pdcp_integrity);
         }
         log::info!("bearer {:?} on LCID {} ({:?})", b.rb, b.lcid, b.rlc);
-        self.by_lcid.insert(b.lcid, Bearer { rb: b.rb, rlc, pdcp, pdu_session: b.pdu_session });
+        self.by_lcid.insert(
+            b.lcid,
+            Bearer {
+                rb: b.rb,
+                rlc,
+                pdcp,
+                pdu_session: b.pdu_session,
+            },
+        );
     }
 
     /// Install `sec` on every bearer `select` accepts: RRC keys on SRBs, UP
@@ -148,7 +204,11 @@ impl Bearers {
     /// Ciphering of the SRBs' transmit side (the SecurityModeComplete goes out
     /// integrity protected but not ciphered, TS 38.331 §5.3.4.3).
     pub fn set_srb_tx_cipher(&mut self, enabled: bool) {
-        for b in self.by_lcid.values_mut().filter(|b| matches!(b.rb, RbId::Srb(_))) {
+        for b in self
+            .by_lcid
+            .values_mut()
+            .filter(|b| matches!(b.rb, RbId::Srb(_)))
+        {
             b.pdcp.set_tx_cipher_enabled(enabled);
         }
     }
@@ -240,7 +300,9 @@ impl UpperLayers for Bearers {
         }
     }
     fn ul_pull(&mut self, lcid: u8, max_bytes: usize, now: SlotPoint) -> Option<Vec<u8>> {
-        self.by_lcid.get_mut(&lcid).and_then(|b| b.rlc.pull_pdu(max_bytes, now))
+        self.by_lcid
+            .get_mut(&lcid)
+            .and_then(|b| b.rlc.pull_pdu(max_bytes, now))
     }
     fn ul_buffer_status(&mut self, lcid: u8) -> usize {
         self.by_lcid.get(&lcid).map_or(0, |b| b.rlc.buffer_status())
@@ -251,8 +313,14 @@ impl UpperLayers for Bearers {
 /// §5.9): RRC keys on SRBs, UP keys on DRBs.
 fn security_for(sec: &AsSecurity, rb: RbId, integrity_on_drb: bool) -> SecurityConfig {
     match rb {
-        RbId::Srb(_) => SecurityConfig { integrity: Some((sec.integrity_alg, sec.k_rrc_int)), cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)) },
-        RbId::Drb(_) => SecurityConfig { integrity: integrity_on_drb.then_some((sec.integrity_alg, sec.k_up_int)), cipher: Some((sec.ciphering_alg, sec.k_up_enc)) },
+        RbId::Srb(_) => SecurityConfig {
+            integrity: Some((sec.integrity_alg, sec.k_rrc_int)),
+            cipher: Some((sec.ciphering_alg, sec.k_rrc_enc)),
+        },
+        RbId::Drb(_) => SecurityConfig {
+            integrity: integrity_on_drb.then_some((sec.integrity_alg, sec.k_up_int)),
+            cipher: Some((sec.ciphering_alg, sec.k_up_enc)),
+        },
     }
 }
 

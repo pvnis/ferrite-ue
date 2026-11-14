@@ -29,7 +29,17 @@ impl Rng {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_case(mu: u8, l_max: u8, cell_id: u16, i_ssb: u8, half_frame: u8, sfn: u16, cfo: f32, snr_db: f32, seed: u64) {
+fn run_case(
+    mu: u8,
+    l_max: u8,
+    cell_id: u16,
+    i_ssb: u8,
+    half_frame: u8,
+    sfn: u16,
+    cfo: f32,
+    snr_db: f32,
+    seed: u64,
+) {
     const FFT: usize = 256;
     let fs = FFT as f64 * f64::from(15_000u32 << mu);
     let ofdm = Ofdm::new(FFT);
@@ -48,7 +58,14 @@ fn run_case(mu: u8, l_max: u8, cell_id: u16, i_ssb: u8, half_frame: u8, sfn: u16
         k_ssb_msb: 0,
     };
 
-    let ssb = build_ssb_waveform(&mib, cell_id, pbch_dmrs_index(i_ssb, half_frame, l_max), l_max, &ofdm, mu);
+    let ssb = build_ssb_waveform(
+        &mib,
+        cell_id,
+        pbch_dmrs_index(i_ssb, half_frame, l_max),
+        l_max,
+        &ofdm,
+        mu,
+    );
     let prepad = 333usize;
     let mut sig = vec![Complex32::new(0.0, 0.0); prepad];
     sig.extend_from_slice(&ssb);
@@ -80,12 +97,32 @@ fn run_case(mu: u8, l_max: u8, cell_id: u16, i_ssb: u8, half_frame: u8, sfn: u16
 
 #[test]
 fn recovers_mib_clean() {
-    run_case(1, L_MAX_FR1_ABOVE_3GHZ, 623, 3, 0, 0x155, 0.0, 40.0, 0xA0_0001);
+    run_case(
+        1,
+        L_MAX_FR1_ABOVE_3GHZ,
+        623,
+        3,
+        0,
+        0x155,
+        0.0,
+        40.0,
+        0xA0_0001,
+    );
 }
 
 #[test]
 fn recovers_mib_with_cfo_and_noise() {
-    run_case(1, L_MAX_FR1_ABOVE_3GHZ, 101, 6, 1, 0x2BC, 1_700.0, 12.0, 0xA0_0002);
+    run_case(
+        1,
+        L_MAX_FR1_ABOVE_3GHZ,
+        101,
+        6,
+        1,
+        0x2BC,
+        1_700.0,
+        12.0,
+        0xA0_0002,
+    );
 }
 
 #[test]
@@ -94,7 +131,17 @@ fn recovers_mib_various_cells() {
         .iter()
         .enumerate()
     {
-        run_case(1, L_MAX_FR1_ABOVE_3GHZ, pci, issb, 0, sfn, 600.0, 20.0, 0xB000 + i as u64);
+        run_case(
+            1,
+            L_MAX_FR1_ABOVE_3GHZ,
+            pci,
+            issb,
+            0,
+            sfn,
+            600.0,
+            20.0,
+            0xB000 + i as u64,
+        );
     }
 }
 
@@ -102,10 +149,24 @@ fn recovers_mib_various_cells() {
 /// half-frame bit and only two candidate-index bits.
 #[test]
 fn recovers_mib_mu0_l_max_4() {
-    for (i, &(pci, issb, hf, sfn)) in [(623u16, 0u8, 0u8, 0x155u16), (101, 3, 1, 0x2BC), (500, 2, 1, 8)]
-        .iter()
-        .enumerate()
+    for (i, &(pci, issb, hf, sfn)) in [
+        (623u16, 0u8, 0u8, 0x155u16),
+        (101, 3, 1, 0x2BC),
+        (500, 2, 1, 8),
+    ]
+    .iter()
+    .enumerate()
     {
-        run_case(0, L_MAX_FR1_BELOW_3GHZ, pci, issb, hf, sfn, 300.0, 15.0, 0xC000 + i as u64);
+        run_case(
+            0,
+            L_MAX_FR1_BELOW_3GHZ,
+            pci,
+            issb,
+            hf,
+            sfn,
+            300.0,
+            15.0,
+            0xC000 + i as u64,
+        );
     }
 }

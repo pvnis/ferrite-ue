@@ -39,7 +39,10 @@ impl DlStream {
     /// `chans` must hold at least one stream.
     pub fn new(chans: Vec<BufferedStream>) -> Self {
         assert!(!chans.is_empty(), "at least one receive antenna");
-        Self { chans, scratch: Vec::new() }
+        Self {
+            chans,
+            scratch: Vec::new(),
+        }
     }
 
     pub fn single(chan: BufferedStream) -> Self {
@@ -114,7 +117,12 @@ pub trait UlSink {
     /// Serve one block: `fill(counter, block)` places samples for absolute UL
     /// index `counter`; advance `counter` by the samples accepted. Returns
     /// `Ok(false)` if nothing was served (no request yet / would block).
-    fn serve_block(&mut self, counter: &mut u64, block: &mut [Iq], fill: &mut dyn FnMut(u64, &mut [Iq])) -> Result<bool>;
+    fn serve_block(
+        &mut self,
+        counter: &mut u64,
+        block: &mut [Iq],
+        fill: &mut dyn FnMut(u64, &mut [Iq]),
+    ) -> Result<bool>;
 }
 
 /// ZMQ: the gNB pulls; we answer each request with the next block.
@@ -123,7 +131,12 @@ pub struct ZmqUlSink(pub ferrite_radio::zmq::ZmqSink);
 
 #[cfg(feature = "zmq")]
 impl UlSink for ZmqUlSink {
-    fn serve_block(&mut self, counter: &mut u64, _block: &mut [Iq], fill: &mut dyn FnMut(u64, &mut [Iq])) -> Result<bool> {
+    fn serve_block(
+        &mut self,
+        counter: &mut u64,
+        _block: &mut [Iq],
+        fill: &mut dyn FnMut(u64, &mut [Iq]),
+    ) -> Result<bool> {
         self.0.serve_with(counter, |c, b| fill(c, b))
     }
 }
@@ -132,7 +145,12 @@ impl UlSink for ZmqUlSink {
 pub struct PushUlSink<S: SampleSink>(pub S);
 
 impl<S: SampleSink> UlSink for PushUlSink<S> {
-    fn serve_block(&mut self, counter: &mut u64, block: &mut [Iq], fill: &mut dyn FnMut(u64, &mut [Iq])) -> Result<bool> {
+    fn serve_block(
+        &mut self,
+        counter: &mut u64,
+        block: &mut [Iq],
+        fill: &mut dyn FnMut(u64, &mut [Iq]),
+    ) -> Result<bool> {
         let n = ferrite_radio::serve_push(&mut self.0, counter, block, |c, b| fill(c, b))?;
         Ok(n > 0)
     }
@@ -177,7 +195,10 @@ pub fn serve_uplink(mut server: UlServer, shared: Arc<UlShared>, samples_per_slo
             // so its end is what must stay within the mark).
             let block_end = counter as i64 + server.block_len as i64;
             let mut waited = 0u32;
-            while shared.gate.load(Relaxed) && block_end > shared.committed.load(Relaxed) && !shared.stop.load(Relaxed) {
+            while shared.gate.load(Relaxed)
+                && block_end > shared.committed.load(Relaxed)
+                && !shared.stop.load(Relaxed)
+            {
                 std::thread::sleep(std::time::Duration::from_micros(20));
                 waited += 1;
                 if waited > 500_000 {
@@ -186,7 +207,9 @@ pub fn serve_uplink(mut server: UlServer, shared: Arc<UlShared>, samples_per_slo
             }
             // Pace to wall-clock.
             let served = (counter as i64 - server.start_index).max(0) as f64;
-            let target = std::time::Duration::from_secs_f64(served / samples_per_slot as f64 * pace_us * 1e-6);
+            let target = std::time::Duration::from_secs_f64(
+                served / samples_per_slot as f64 * pace_us * 1e-6,
+            );
             let el = start.elapsed();
             if el < target {
                 std::thread::sleep(target - el);
@@ -195,10 +218,12 @@ pub fn serve_uplink(mut server: UlServer, shared: Arc<UlShared>, samples_per_slo
         let before = counter;
         let ok = {
             let table = &shared.table;
-            server.sink.serve_block(&mut counter, &mut block, &mut |c, b| {
-                b.iter_mut().for_each(|s| *s = Iq::default());
-                table.lock().unwrap().fill(c as i64, b);
-            })
+            server
+                .sink
+                .serve_block(&mut counter, &mut block, &mut |c, b| {
+                    b.iter_mut().for_each(|s| *s = Iq::default());
+                    table.lock().unwrap().fill(c as i64, b);
+                })
         };
         match ok {
             Ok(true) => shared.served.store(counter as i64, Relaxed),

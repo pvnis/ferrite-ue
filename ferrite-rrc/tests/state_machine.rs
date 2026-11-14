@@ -7,7 +7,9 @@ mod common;
 
 use common::{hex, mib, radio, Bits, RRC_SETUP_HEX, SIB1_HEX};
 use ferrite_common::{Numerology, SlotPoint};
-use ferrite_rrc::{CipherAlg, IntegrityAlg, MacNotification, RbId, RrcConfig, RrcEvent, RrcState, RrcUe};
+use ferrite_rrc::{
+    CipherAlg, IntegrityAlg, MacNotification, RbId, RrcConfig, RrcEvent, RrcState, RrcUe,
+};
 
 fn slot(n: u64) -> SlotPoint {
     SlotPoint::from_index(Numerology::KHZ30, n)
@@ -19,7 +21,11 @@ fn ms(ms: u32) -> u64 {
 }
 
 fn new_ue() -> RrcUe {
-    RrcUe::new(RrcConfig { ue_random_id: Some(0x1234_5678), tx_lead_slots: 2, ..RrcConfig::default() })
+    RrcUe::new(RrcConfig {
+        ue_random_id: Some(0x1234_5678),
+        tx_lead_slots: 2,
+        ..RrcConfig::default()
+    })
 }
 
 /// A UE that has decoded SIB1 (RRC_IDLE with a cell).
@@ -97,7 +103,13 @@ fn sib1_configures_the_cell_and_stays_idle() {
     assert!(ue.cell().is_none());
     ue.on_bcch(&hex(SIB1_HEX), &mib(), &radio());
     let ev = ue.take_events();
-    assert!(has(&ev, |e| matches!(e, RrcEvent::CellConfigured { plmn, tac, .. } if plmn == "00101" && *tac == 7)), "{ev:?}");
+    assert!(
+        has(
+            &ev,
+            |e| matches!(e, RrcEvent::CellConfigured { plmn, tac, .. } if plmn == "00101" && *tac == 7)
+        ),
+        "{ev:?}"
+    );
     assert_eq!(ue.state(), RrcState::Idle);
     assert!(ue.cell().is_some());
     // The repeated SIB1 changes nothing.
@@ -119,7 +131,10 @@ fn connection_establishment() {
     ue.connect(vec![0x7e, 0x00, 0x41], slot(0));
     let ev = ue.take_events();
     assert_eq!(ue.state(), RrcState::Connecting);
-    assert!(has(&ev, |e| matches!(e, RrcEvent::StartRa { .. })), "RRCSetupRequest handed to MAC: {ev:?}");
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::StartRa { .. })),
+        "RRCSetupRequest handed to MAC: {ev:?}"
+    );
     // A second request while one is pending is ignored.
     ue.connect(vec![0x7e], slot(1));
     assert!(ue.take_events().is_empty());
@@ -127,13 +142,31 @@ fn connection_establishment() {
     ue.on_dl_ccch(&hex(RRC_SETUP_HEX));
     let ev = ue.take_events();
     assert_eq!(ue.state(), RrcState::Connected);
-    assert!(has(&ev, |e| matches!(e, RrcEvent::SetupBearer(b) if b.rb == RbId::Srb(1) && b.lcid == 1)), "SRB1: {ev:?}");
-    assert!(has(&ev, |e| matches!(e, RrcEvent::Reconfigure { .. })), "dedicated PHY/MAC configuration");
-    assert!(has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })), "RRCSetupComplete on SRB1");
+    assert!(
+        has(
+            &ev,
+            |e| matches!(e, RrcEvent::SetupBearer(b) if b.rb == RbId::Srb(1) && b.lcid == 1)
+        ),
+        "SRB1: {ev:?}"
+    );
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::Reconfigure { .. })),
+        "dedicated PHY/MAC configuration"
+    );
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })),
+        "RRCSetupComplete on SRB1"
+    );
     assert!(has(&ev, |e| matches!(e, RrcEvent::Connected)));
     // Order: configuration before the complete message.
-    let i_cfg = ev.iter().position(|e| matches!(e, RrcEvent::Reconfigure { .. })).unwrap();
-    let i_tx = ev.iter().position(|e| matches!(e, RrcEvent::TxSrb { .. })).unwrap();
+    let i_cfg = ev
+        .iter()
+        .position(|e| matches!(e, RrcEvent::Reconfigure { .. }))
+        .unwrap();
+    let i_tx = ev
+        .iter()
+        .position(|e| matches!(e, RrcEvent::TxSrb { .. }))
+        .unwrap();
     assert!(i_cfg < i_tx);
 }
 
@@ -148,7 +181,10 @@ fn t300_expiry_returns_to_idle() {
     assert!(ue.take_events().is_empty());
     ue.tick(slot(ms(t300)));
     assert_eq!(ue.state(), RrcState::Idle);
-    assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::Failed(why) if why.contains("T300"))));
+    assert!(has(
+        &ue.take_events(),
+        |e| matches!(e, RrcEvent::Failed(why) if why.contains("T300"))
+    ));
 }
 
 #[test]
@@ -170,7 +206,10 @@ fn rrc_setup_outside_connecting_is_ignored() {
     let mut ue = connected();
     ue.on_dl_ccch(&hex(RRC_SETUP_HEX));
     assert_eq!(ue.state(), RrcState::Connected);
-    assert!(ue.take_events().is_empty(), "a stray RRCSetup must not re-run the setup");
+    assert!(
+        ue.take_events().is_empty(),
+        "a stray RRCSetup must not re-run the setup"
+    );
 }
 
 #[test]
@@ -181,15 +220,36 @@ fn security_mode_command_derives_keys_and_waits_for_the_mac_i_check() {
     let ev = ue.take_events();
     let sec = ev
         .iter()
-        .find_map(|e| if let RrcEvent::VerifySecurity(s) = e { Some(*s) } else { None })
+        .find_map(|e| {
+            if let RrcEvent::VerifySecurity(s) = e {
+                Some(*s)
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| panic!("VerifySecurity expected: {ev:?}"));
-    assert_eq!((sec.integrity_alg, sec.ciphering_alg), (IntegrityAlg::Nia2, CipherAlg::Nea2));
-    assert_ne!(sec.k_rrc_int, sec.k_up_int, "RRC and UP keys use different distinguishers");
-    assert!(ue.security().is_none() || ue.security().is_some(), "security pending verification");
+    assert_eq!(
+        (sec.integrity_alg, sec.ciphering_alg),
+        (IntegrityAlg::Nia2, CipherAlg::Nea2)
+    );
+    assert_ne!(
+        sec.k_rrc_int, sec.k_up_int,
+        "RRC and UP keys use different distinguishers"
+    );
+    assert!(
+        ue.security().is_none() || ue.security().is_some(),
+        "security pending verification"
+    );
     ue.security_verified(true);
     let ev = ue.take_events();
-    assert!(has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })), "SecurityModeComplete: {ev:?}");
-    assert_eq!(ue.security().map(|s| s.integrity_alg), Some(IntegrityAlg::Nia2));
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })),
+        "SecurityModeComplete: {ev:?}"
+    );
+    assert_eq!(
+        ue.security().map(|s| s.integrity_alg),
+        Some(IntegrityAlg::Nia2)
+    );
 }
 
 #[test]
@@ -199,7 +259,10 @@ fn failed_mac_i_check_sends_security_mode_failure() {
     ue.on_dl_dcch(1, &smc(2, 2, 2));
     ue.take_events();
     ue.security_verified(false);
-    assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })));
+    assert!(has(&ue.take_events(), |e| matches!(
+        e,
+        RrcEvent::TxSrb { srb: 1, .. }
+    )));
     assert!(ue.security().is_none());
 }
 
@@ -210,8 +273,14 @@ fn unsupported_algorithm_or_missing_key_is_a_security_mode_failure() {
     ue.set_k_gnb([7u8; 32]);
     ue.on_dl_dcch(1, &smc(1, 2, 1));
     let ev = ue.take_events();
-    assert!(!has(&ev, |e| matches!(e, RrcEvent::VerifySecurity(_))), "{ev:?}");
-    assert!(has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })), "SecurityModeFailure: {ev:?}");
+    assert!(
+        !has(&ev, |e| matches!(e, RrcEvent::VerifySecurity(_))),
+        "{ev:?}"
+    );
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })),
+        "SecurityModeFailure: {ev:?}"
+    );
     assert!(ue.security().is_none());
     // No K_gNB (NAS security not yet activated).
     let mut ue = connected();
@@ -238,9 +307,18 @@ fn radio_link_failure_with_security_starts_reestablishment() {
     let ev = ue.take_events();
     assert_eq!(ue.state(), RrcState::Reestablishing);
     assert_eq!(ue.stats.reestablishments, 1);
-    let i_re = ev.iter().position(|e| matches!(e, RrcEvent::Reestablishing)).unwrap_or_else(|| panic!("{ev:?}"));
-    let i_cfg = ev.iter().position(|e| matches!(e, RrcEvent::Reconfigure { .. })).expect("back to the common configuration");
-    let i_ra = ev.iter().position(|e| matches!(e, RrcEvent::StartRa { .. })).expect("RRCReestablishmentRequest");
+    let i_re = ev
+        .iter()
+        .position(|e| matches!(e, RrcEvent::Reestablishing))
+        .unwrap_or_else(|| panic!("{ev:?}"));
+    let i_cfg = ev
+        .iter()
+        .position(|e| matches!(e, RrcEvent::Reconfigure { .. }))
+        .expect("back to the common configuration");
+    let i_ra = ev
+        .iter()
+        .position(|e| matches!(e, RrcEvent::StartRa { .. }))
+        .expect("RRCReestablishmentRequest");
     assert!(i_re < i_cfg && i_cfg < i_ra, "{ev:?}");
     // T301 runs from the request.
     let t301 = ue.cell().unwrap().t301_ms;
@@ -248,7 +326,10 @@ fn radio_link_failure_with_security_starts_reestablishment() {
     assert_eq!(ue.state(), RrcState::Reestablishing);
     ue.tick(slot(100 + ms(t301)));
     assert_eq!(ue.state(), RrcState::Idle);
-    assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::Failed(why) if why.contains("T301"))));
+    assert!(has(
+        &ue.take_events(),
+        |e| matches!(e, RrcEvent::Failed(why) if why.contains("T301"))
+    ));
     assert!(ue.security().is_none());
 }
 
@@ -275,7 +356,11 @@ fn radio_link_failure_without_security_goes_to_idle() {
     ue.tick(slot(0));
     ue.on_mac(MacNotification::RadioLinkFailure);
     let ev = ue.take_events();
-    assert_eq!(ue.state(), RrcState::Idle, "§5.3.7.2: no re-establishment without AS security");
+    assert_eq!(
+        ue.state(),
+        RrcState::Idle,
+        "§5.3.7.2: no re-establishment without AS security"
+    );
     assert!(has(&ev, |e| matches!(e, RrcEvent::Failed(_))), "{ev:?}");
     assert!(!has(&ev, |e| matches!(e, RrcEvent::Reestablishing)));
 }
@@ -311,12 +396,18 @@ fn nas_transport_only_while_connected() {
     assert!(ue.take_events().is_empty(), "dropped while idle");
     let mut ue = connected();
     ue.send_nas(&[0x7e, 0x00, 0x4c]);
-    assert!(has(&ue.take_events(), |e| matches!(e, RrcEvent::TxSrb { srb: 1, .. })));
+    assert!(has(&ue.take_events(), |e| matches!(
+        e,
+        RrcEvent::TxSrb { srb: 1, .. }
+    )));
     assert_eq!(ue.stats.ul_dcch, 1);
     let nas = [0x7e, 0x00, 0x56, 0x01, 0x02];
     ue.on_dl_dcch(1, &dl_info_transfer(0, &nas));
     let ev = ue.take_events();
-    assert!(has(&ev, |e| matches!(e, RrcEvent::DlNas(n) if n == &nas)), "{ev:?}");
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::DlNas(n) if n == &nas)),
+        "{ev:?}"
+    );
 }
 
 #[test]
@@ -355,15 +446,26 @@ fn n310_out_of_sync_indications_start_t310_and_its_expiry_is_a_radio_link_failur
     assert!(!ue.t310_running(), "N310 counts consecutive indications");
     ue.on_mac(MacNotification::SyncIndication { in_sync: false });
     assert!(ue.t310_running());
-    assert_eq!(ue.state(), RrcState::Connected, "T310 running is not yet a failure");
+    assert_eq!(
+        ue.state(),
+        RrcState::Connected,
+        "T310 running is not yet a failure"
+    );
     assert!(ue.take_events().is_empty());
     ue.tick(slot(ms(t310) - 1));
     assert_eq!(ue.state(), RrcState::Connected);
     ue.tick(slot(ms(t310)));
-    assert_eq!(ue.state(), RrcState::Reestablishing, "T310 expiry → RLF → re-establishment (security active)");
+    assert_eq!(
+        ue.state(),
+        RrcState::Reestablishing,
+        "T310 expiry → RLF → re-establishment (security active)"
+    );
     assert!(!ue.t310_running());
     let ev = ue.take_events();
-    assert!(has(&ev, |e| matches!(e, RrcEvent::Reestablishing)), "{ev:?}");
+    assert!(
+        has(&ev, |e| matches!(e, RrcEvent::Reestablishing)),
+        "{ev:?}"
+    );
     assert!(has(&ev, |e| matches!(e, RrcEvent::StartRa { .. })));
 }
 
@@ -371,7 +473,11 @@ fn n310_out_of_sync_indications_start_t310_and_its_expiry_is_a_radio_link_failur
 fn n311_in_sync_indications_stop_t310() {
     let mut ue = secured();
     ue.tick(slot(0));
-    let (t310, n310, n311) = (ue.cell().unwrap().t310_ms, ue.cell().unwrap().n310.max(1), ue.cell().unwrap().n311.max(1));
+    let (t310, n310, n311) = (
+        ue.cell().unwrap().t310_ms,
+        ue.cell().unwrap().n310.max(1),
+        ue.cell().unwrap().n311.max(1),
+    );
     for _ in 0..n310 {
         ue.on_mac(MacNotification::SyncIndication { in_sync: false });
     }
@@ -430,10 +536,16 @@ fn t310_without_security_goes_to_idle() {
 fn bwp_switch_to_an_unknown_bwp_is_ignored() {
     let mut ue = connected();
     assert_eq!(ue.active_bwp(), Some(0));
-    ue.on_mac(MacNotification::BwpSwitch { dl_bwp: Some(1), ul_bwp: None });
+    ue.on_mac(MacNotification::BwpSwitch {
+        dl_bwp: Some(1),
+        ul_bwp: None,
+    });
     assert!(ue.take_events().is_empty());
     assert_eq!(ue.active_bwp(), Some(0));
     // Switching to the active BWP is a no-op too.
-    ue.on_mac(MacNotification::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) });
+    ue.on_mac(MacNotification::BwpSwitch {
+        dl_bwp: Some(0),
+        ul_bwp: Some(0),
+    });
     assert!(ue.take_events().is_empty());
 }

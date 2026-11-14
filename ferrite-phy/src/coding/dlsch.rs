@@ -130,10 +130,12 @@ fn interleave(e: &[u8], qm: usize) -> Vec<u8> {
 /// `k0` for one code block (Table 5.4.2.1-2), given RV, base graph, and `Ncb`.
 fn k0_of(rv: u8, bg: BaseGraph, ncb: usize, zc: usize) -> usize {
     let nrows = ncb / zc; // = N_base - 2 columns worth
-    let f = |num: usize| (num * nrows).div_euclid(match bg {
-        BaseGraph::Bg1 => 66,
-        BaseGraph::Bg2 => 50,
-    }) * zc;
+    let f = |num: usize| {
+        (num * nrows).div_euclid(match bg {
+            BaseGraph::Bg1 => 66,
+            BaseGraph::Bg2 => 50,
+        }) * zc
+    };
     match (bg, rv) {
         (_, 0) => 0,
         (BaseGraph::Bg1, 1) => f(17),
@@ -196,7 +198,7 @@ fn encode_cb(cb_bits: &[u8], p: &SegParams, e_r: usize, rv: u8, qm: usize) -> Ve
     cb[..cb_bits.len()].copy_from_slice(cb_bits);
     let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
     let code = g.encode(&cb); // full 52·Zc (or 68·Zc) codeword
-    // d = codeword minus first 2·Zc punctured systematic bits.
+                              // d = codeword minus first 2·Zc punctured systematic bits.
     let d = &code[2 * p.zc..];
     let ncb = d.len();
     // filler mask over the circular buffer (d-index): systematic filler bits at
@@ -205,7 +207,7 @@ fn encode_cb(cb_bits: &[u8], p: &SegParams, e_r: usize, rv: u8, qm: usize) -> Ve
     let fstart = cb_bits.len().saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     rate_match_cb(d, &filler, e_r, k0, qm)
 }
@@ -241,7 +243,11 @@ pub fn dlsch_encode(tb: &[u8], e_len: usize, r: f64, qm: usize, rv: u8) -> Vec<u
     let rem = g_by % p.c;
     let mut out = Vec::with_capacity(e_len);
     for j in 0..p.c {
-        let e_r = if j < p.c - rem { base * qm } else { (base + 1) * qm };
+        let e_r = if j < p.c - rem {
+            base * qm
+        } else {
+            (base + 1) * qm
+        };
         let info = &b[j * p.k_info..(j + 1) * p.k_info];
         let cb_bits = CRC24B.attach(info); // k_info info + 24 CB-CRC = K'
         out.extend(encode_cb(&cb_bits, &p, e_r, rv, qm));
@@ -273,7 +279,7 @@ pub fn dlsch_decode_single(
     let fstart = b_len.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
 
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
@@ -313,14 +319,18 @@ pub fn dlsch_decode_single_dbg(
     let fstart = b_len.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];
     full[2 * p.zc..].copy_from_slice(&cb_llr);
     let (info, converged) = g.decode(&full, max_iter, 0.75);
     let b = &info[..b_len];
-    let tb = if tb_crc(tbs).check(b) { Some(b[..tbs].to_vec()) } else { None };
+    let tb = if tb_crc(tbs).check(b) {
+        Some(b[..tbs].to_vec())
+    } else {
+        None
+    };
     (tb, converged)
 }
 
@@ -345,7 +355,7 @@ pub fn dlsch_decode_single_bits(
     let fstart = b_len.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb_llr = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];
@@ -379,13 +389,17 @@ fn dlsch_decode_multi(
     let fstart = k_prime.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let mut b = Vec::with_capacity(p.c * p.k_info);
     let mut all_conv = true;
     let mut off = 0;
     for j in 0..p.c {
-        let e_r = if j < p.c - rem { base * qm } else { (base + 1) * qm };
+        let e_r = if j < p.c - rem {
+            base * qm
+        } else {
+            (base + 1) * qm
+        };
         if off + e_r > f.len() {
             return (vec![0u8; tbs], false, false); // malformed E length → NACK, don't panic
         }
@@ -426,7 +440,7 @@ pub fn dlsch_cb_llr(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> Vec<f32
     let fstart = b_len.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     // Scatter E soft bits into the buffer, skipping (untransmitted) filler positions;
     // do NOT pin filler to 1e6 (that happens once, at decode, after summing).
@@ -464,12 +478,16 @@ pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<
     let fstart = b_len.saturating_sub(2 * p.zc);
     for v in cbf.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *v = 1e6; // filler = known 0
-        }
+    }
     let mut full = vec![0f32; g.n()];
     full[2 * p.zc..].copy_from_slice(&cbf);
     let (info, converged) = g.decode(&full, max_iter, 0.75);
     let b = &info[..b_len];
-    (b[..tbs.min(b.len())].to_vec(), converged, tb_crc(tbs).check(b))
+    (
+        b[..tbs.min(b.len())].to_vec(),
+        converged,
+        tb_crc(tbs).check(b),
+    )
 }
 
 /// De-rate-match `E` soft bits to the full LDPC codeword LLRs (length
@@ -485,7 +503,7 @@ pub fn de_rate_match_full(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> (
     let fstart = b_len.saturating_sub(2 * p.zc);
     for f in filler.iter_mut().take(p.k - 2 * p.zc).skip(fstart) {
         *f = true;
-        }
+    }
     let k0 = k0_of(rv, p.bg, ncb, p.zc);
     let cb = de_rate_match_cb(f, &filler, ncb, k0, qm);
     let mut full = vec![0f32; g.n()];
@@ -537,7 +555,10 @@ mod tests {
     fn interleave_roundtrip() {
         let e: Vec<u8> = (0..24).map(|i| (i % 2) as u8).collect();
         let de: Vec<f32> = deinterleave(
-            &interleave(&e, 2).iter().map(|&b| b as f32).collect::<Vec<_>>(),
+            &interleave(&e, 2)
+                .iter()
+                .map(|&b| b as f32)
+                .collect::<Vec<_>>(),
             2,
         );
         assert_eq!(de.iter().map(|&x| x as u8).collect::<Vec<_>>(), e);
@@ -550,7 +571,7 @@ mod tests {
         let mut rng = Rng(0xD15C_0001);
         let tbs = 776usize;
         let qm = 2usize; // QPSK
-        // E must be a multiple of Qm; pick a rate ~0.2.
+                         // E must be a multiple of Qm; pick a rate ~0.2.
         let e_len = ((tbs + 24) as f64 / 0.2) as usize / qm * qm;
         let r = 0.2;
         let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
@@ -697,7 +718,10 @@ mod tests {
         let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
         // rv0 self-decodes on a clean channel (LLR sign: positive ⇒ 0).
         let f_bits = dlsch_encode(&tb, e_len, r, qm, 0);
-        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 12.0 } else { -12.0 }).collect();
+        let llr: Vec<f32> = f_bits
+            .iter()
+            .map(|&b| if b == 0 { 12.0 } else { -12.0 })
+            .collect();
         let (bits, _conv, crc) = dlsch_decode_single_bits(&llr, tbs, r, qm, 0, 40);
         assert!(crc, "multi-CB CRC failed");
         assert_eq!(bits, tb, "multi-CB bits mismatch");
@@ -713,7 +737,10 @@ mod tests {
         let (tbs, qm, e_len, r) = (808usize, 2usize, 2160usize, 0.370);
         let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
         let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
-        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 10.0 } else { -10.0 }).collect();
+        let llr: Vec<f32> = f_bits
+            .iter()
+            .map(|&b| if b == 0 { 10.0 } else { -10.0 })
+            .collect();
         let dec = dlsch_decode_single(&llr, tbs, r, qm, 0, 80).expect("CRC failed (uniform)");
         assert_eq!(dec, tb);
     }
@@ -734,8 +761,14 @@ mod tests {
         let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
         let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
         assert_eq!(f_bits.len(), e_len);
-        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 20.0 } else { -20.0 }).collect();
-        assert_eq!(dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(), Some(&tb[..]));
+        let llr: Vec<f32> = f_bits
+            .iter()
+            .map(|&b| if b == 0 { 20.0 } else { -20.0 })
+            .collect();
+        assert_eq!(
+            dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(),
+            Some(&tb[..])
+        );
     }
 
     /// The LDPC decoder is scale-invariant: clean LLRs decode regardless of magnitude. The
@@ -750,8 +783,15 @@ mod tests {
             for _ in 0..200 {
                 let tb: Vec<u8> = (0..tbs).map(|_| rng.bit()).collect();
                 let f_bits = dlsch_encode_single(&tb, e_len, r, qm, 0);
-                let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { mag } else { -mag }).collect();
-                assert_eq!(dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(), Some(&tb[..]), "mag ±{mag}");
+                let llr: Vec<f32> = f_bits
+                    .iter()
+                    .map(|&b| if b == 0 { mag } else { -mag })
+                    .collect();
+                assert_eq!(
+                    dlsch_decode_single(&llr, tbs, r, qm, 0, 40).as_deref(),
+                    Some(&tb[..]),
+                    "mag ±{mag}"
+                );
             }
         }
     }
@@ -761,7 +801,10 @@ mod tests {
         let mut rng = Rng(0xD15C_0002);
         let tb: Vec<u8> = (0..776).map(|_| rng.bit()).collect();
         let f_bits = dlsch_encode_single(&tb, 4000, 0.2, 2, 0);
-        let llr: Vec<f32> = f_bits.iter().map(|&b| if b == 0 { 6.0 } else { -6.0 }).collect();
+        let llr: Vec<f32> = f_bits
+            .iter()
+            .map(|&b| if b == 0 { 6.0 } else { -6.0 })
+            .collect();
         // Decoding as a different size must not spuriously pass.
         assert!(dlsch_decode_single(&llr, 700, 0.2, 2, 0, 20).is_none());
     }

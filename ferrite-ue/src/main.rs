@@ -16,7 +16,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(cfg.log.clone())).format_timestamp_micros().init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(cfg.log.clone()))
+        .format_timestamp_micros()
+        .init();
     log::info!(
         "ferrite-ue: band n{} {:?} DL {:.3} MHz UL {:.3} MHz fs {:.2} MHz SSB SCS {} kHz",
         cfg.band,
@@ -33,7 +35,13 @@ fn main() {
         RadioConfig::Zmq { tx, rx } => {
             let chans: Vec<BufferedStream> = tx
                 .iter()
-                .map(|ep| BufferedStream::spawn(ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000).unwrap_or_else(|e| panic!("connect DL {ep}: {e}")), block_len))
+                .map(|ep| {
+                    BufferedStream::spawn(
+                        ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000)
+                            .unwrap_or_else(|e| panic!("connect DL {ep}: {e}")),
+                        block_len,
+                    )
+                })
                 .collect();
             log::info!("DL: {} receive antenna(s) {:?}", chans.len(), tx);
             let sink = ferrite_radio::zmq::ZmqSink::bind(rx, cfg.fs, block_len).expect("bind UL");
@@ -89,14 +97,23 @@ fn main() {
     let mut stack = Stack::new(cfg.clone(), None);
     // MIB facts reach the stack through this channel (polled on the timeline thread).
     let (mib_tx, mib_rx) = crossbeam_channel::bounded::<MibInfo>(2);
-    let (meas_tx, meas_rx) = crossbeam_channel::bounded::<(u16, ferrite_common::SlotPoint, f32, f32, f32)>(8);
+    let (meas_tx, meas_rx) =
+        crossbeam_channel::bounded::<(u16, ferrite_common::SlotPoint, f32, f32, f32)>(8);
     let reporter = {
         let ssb_scs_khz = cfg.ssb_scs_khz;
         let dl_center_hz = cfg.dl_center_hz;
         std::thread::spawn(move || {
             while let Ok(ev) = ev_rx.recv() {
                 match ev {
-                    EngineEvent::CellFound { pci, sfn, cfo_hz, ssb_df_hz, mib, coreset0, ssb_index } => {
+                    EngineEvent::CellFound {
+                        pci,
+                        sfn,
+                        cfo_hz,
+                        ssb_df_hz,
+                        mib,
+                        coreset0,
+                        ssb_index,
+                    } => {
                         log::info!("cell found: PCI {pci} SFN {sfn} CFO {cfo_hz:.0} Hz SSB offset {:.3} MHz", ssb_df_hz / 1e6);
                         let _ = mib_tx.try_send(MibInfo {
                             pci,
@@ -113,7 +130,13 @@ fn main() {
                             ssb_arfcn: ferrite_common::band::hz_to_arfcn(dl_center_hz + ssb_df_hz),
                         });
                     }
-                    EngineEvent::Measurement { pci, slot, rsrp_dbfs, rsrq_db, sinr_db } => {
+                    EngineEvent::Measurement {
+                        pci,
+                        slot,
+                        rsrp_dbfs,
+                        rsrq_db,
+                        sinr_db,
+                    } => {
                         log::debug!("ssb measurement PCI {pci} @{slot}: rsrp {rsrp_dbfs:.1} dBFS rsrq {rsrq_db:.1} dB sinr {sinr_db:.1} dB");
                         let _ = meas_tx.try_send((pci, slot, rsrp_dbfs, rsrq_db, sinr_db));
                     }
@@ -136,7 +159,16 @@ fn main() {
         });
     }
     let result = {
-        let mut handler = Reporting { stack: &mut stack, cmd_tx: cmd_tx.clone(), exit_after_ping: cfg.exit_after_ping, done: false, mib_rx, meas_rx, shutdown, stop_at: None };
+        let mut handler = Reporting {
+            stack: &mut stack,
+            cmd_tx: cmd_tx.clone(),
+            exit_after_ping: cfg.exit_after_ping,
+            done: false,
+            mib_rx,
+            meas_rx,
+            shutdown,
+            stop_at: None,
+        };
         engine::run(params, dl, ul, &mut handler, cmd_rx, ev_tx)
     };
     let _ = reporter.join();
@@ -153,7 +185,9 @@ fn main() {
 }
 
 fn ping_succeeded(stack: &Stack) -> bool {
-    stack.ping_result().is_some_and(|(_, received)| received > 0)
+    stack
+        .ping_result()
+        .is_some_and(|(_, received)| received > 0)
 }
 
 /// Wraps the stack to print application events and stop the engine when done.
@@ -200,15 +234,22 @@ impl ferrite_fapi::MacHandler for Reporting<'_> {
         self.stack.handle(msg, phy);
         while let Some(ev) = self.stack.take_event() {
             match &ev {
-                StackEvent::CellConfigured { plmn, tac } => log::info!("★ cell configured: PLMN {plmn} TAC {tac}"),
+                StackEvent::CellConfigured { plmn, tac } => {
+                    log::info!("★ cell configured: PLMN {plmn} TAC {tac}")
+                }
                 StackEvent::RrcConnected => log::info!("★ RRC connected"),
                 StackEvent::Registered => log::info!("★ registered"),
-                StackEvent::PduSessionUp { ip } => log::info!("★ PDU session up: {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
-                StackEvent::PingReply { seq, rtt_ms } => log::info!("🏓 seq={seq} time={rtt_ms:.1} ms"),
+                StackEvent::PduSessionUp { ip } => {
+                    log::info!("★ PDU session up: {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+                }
+                StackEvent::PingReply { seq, rtt_ms } => {
+                    log::info!("🏓 seq={seq} time={rtt_ms:.1} ms")
+                }
                 StackEvent::PingDone { sent, received } => {
                     log::info!("★ ping done: {received}/{sent} replies");
                     if self.exit_after_ping {
-                        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.shutdown
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 StackEvent::RegistrationUpdated => log::info!("★ registration update complete"),
@@ -235,7 +276,13 @@ fn ctrlc_handler(f: impl Fn() + Send + Sync + 'static) {
         }
     }
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
 }

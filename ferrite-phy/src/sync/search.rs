@@ -16,7 +16,7 @@ use crate::coding::bch::{bch_decode, Mib};
 use crate::ofdm::Ofdm;
 use crate::sync::cfo::estimate_cfo_hz_multi;
 use crate::sync::detect::PssDetector;
-use crate::sync::pbch::{rank_ssb_index, equalize_pbch, extract_pbch};
+use crate::sync::pbch::{equalize_pbch, extract_pbch, rank_ssb_index};
 use crate::sync::ssb::{extract_sync_subcarriers, SSB_SYMBOLS};
 use crate::sync::sss::sss;
 use crate::sync::{physical_cell_id, N_ID_1_COUNT};
@@ -109,7 +109,12 @@ impl CellSearcher {
         assert!(l_max == 4 || l_max == 8, "FR1 L_max is 4 or 8");
         let ofdm = Ofdm::new(fft_size);
         let pss = PssDetector::new(&ofdm);
-        Self { ofdm, pss, mu, l_max }
+        Self {
+            ofdm,
+            pss,
+            mu,
+            l_max,
+        }
     }
 
     /// The OFDM (de)modulator (SSB FFT size).
@@ -163,7 +168,11 @@ impl CellSearcher {
         self.complete(samples, pss)
     }
 
-    fn complete(&self, samples: &[Complex32], pss: crate::sync::PssDetection) -> Option<CellSearchResult> {
+    fn complete(
+        &self,
+        samples: &[Complex32],
+        pss: crate::sync::PssDetection,
+    ) -> Option<CellSearchResult> {
         let n = self.ofdm.fft_size();
         let cp = self.ssb_cp();
         // SSS useful part = two full OFDM symbols after the PSS useful part.
@@ -181,7 +190,13 @@ impl CellSearcher {
         // (all share one offset), starting at the PSS symbol's cyclic prefix.
         let scs_hz = f64::from(15_000u32 << self.mu);
         let cfo_hz = if pss.sample_index >= cp {
-            estimate_cfo_hz_multi(&samples[pss.sample_index - cp..], cp, n, SSB_SYMBOLS, scs_hz)
+            estimate_cfo_hz_multi(
+                &samples[pss.sample_index - cp..],
+                cp,
+                n,
+                SSB_SYMBOLS,
+                scs_hz,
+            )
         } else {
             0.0
         };
@@ -209,9 +224,18 @@ impl CellSearcher {
     /// taken from the CRC-protected payload (the DMRS carries it too, but the
     /// scrambling does not distinguish the two half-frame hypotheses, so the
     /// payload bit is the reliable one).
-    pub fn decode_mib(&self, samples: &[Complex32], found: &CellSearchResult) -> Option<PbchDecode> {
-        let (rx_dmrs, rx_data, layout) =
-            extract_pbch(&self.ofdm, samples, found.timing_index, self.mu, found.cell_id)?;
+    pub fn decode_mib(
+        &self,
+        samples: &[Complex32],
+        found: &CellSearchResult,
+    ) -> Option<PbchDecode> {
+        let (rx_dmrs, rx_data, layout) = extract_pbch(
+            &self.ofdm,
+            samples,
+            found.timing_index,
+            self.mu,
+            found.cell_id,
+        )?;
         // The DMRS metric separates the hypotheses only at good SNR; the BCH
         // CRC (24 bits, no false passes measured on noise) is the final
         // arbiter, so walk the hypotheses best-first until one decodes.
@@ -286,8 +310,7 @@ mod tests {
             let h = Complex32::from_polar(0.7, 1.2);
             let cfo = 0.027 * (15_000u32 << mu) as f32;
             let snr_db = 20.0f32;
-            let sig_rms =
-                (ssb.iter().map(|s| s.norm_sqr()).sum::<f32>() / ssb.len() as f32).sqrt();
+            let sig_rms = (ssb.iter().map(|s| s.norm_sqr()).sum::<f32>() / ssb.len() as f32).sqrt();
             let sigma = sig_rms / 10f32.powf(snr_db / 20.0);
             for (m, s) in sig.iter_mut().enumerate() {
                 *s = *s * h * Complex32::from_polar(1.0, TAU * cfo * m as f32 / fs as f32);

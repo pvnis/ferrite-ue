@@ -37,7 +37,10 @@ pub struct InjectionTable {
 
 impl InjectionTable {
     pub fn new() -> Self {
-        Self { audit: std::env::var_os("FERRITE_DRIFT").is_some(), ..Self::default() }
+        Self {
+            audit: std::env::var_os("FERRITE_DRIFT").is_some(),
+            ..Self::default()
+        }
     }
 
     /// Queue a waveform for injection. `now` is the current uplink counter; if the
@@ -52,7 +55,13 @@ impl InjectionTable {
             if wf.pos < now {
                 // Already partially behind the serve: the head of this waveform can never
                 // be placed — the exact signature of a "partial waveform" at the receiver.
-                eprintln!("[inj] LATE push pos={} len={} now={} behind={} samples", wf.pos, wf.samples.len(), now, now - wf.pos);
+                eprintln!(
+                    "[inj] LATE push pos={} len={} now={} behind={} samples",
+                    wf.pos,
+                    wf.samples.len(),
+                    now,
+                    now - wf.pos
+                );
             }
             // Overlap check against everything still pending and recently retired: two
             // waveforms sharing samples garble each other at the receiver (last write wins
@@ -61,7 +70,10 @@ impl InjectionTable {
             for (other, _) in &self.pending {
                 let (os, oe) = (other.pos, other.pos + other.samples.len() as i64);
                 if s < oe && os < e {
-                    eprintln!("[inj] OVERLAP push {} [{s},{e}) vs pending {} [{os},{oe})", wf.tag, other.tag);
+                    eprintln!(
+                        "[inj] OVERLAP push {} [{s},{e}) vs pending {} [{os},{oe})",
+                        wf.tag, other.tag
+                    );
                 }
             }
             for &(os, ol, otag) in &self.retired {
@@ -105,7 +117,13 @@ impl InjectionTable {
                 if *placed < wf.samples.len() {
                     // Retiring a waveform that was only partially served: the receiver saw a
                     // truncated burst (low SINR / CRC KO). Says how many samples made it.
-                    eprintln!("[inj] PARTIAL serve {} pos={} len={} placed={}", wf.tag, wf.pos, wf.samples.len(), placed);
+                    eprintln!(
+                        "[inj] PARTIAL serve {} pos={} len={} placed={}",
+                        wf.tag,
+                        wf.pos,
+                        wf.samples.len(),
+                        placed
+                    );
                 }
                 retired.push((wf.pos, wf.samples.len(), wf.tag));
                 if retired.len() > 16 {
@@ -127,13 +145,16 @@ impl InjectionTable {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn wf(pos: i64, vals: &[f32]) -> ReadyWaveform {
-        ReadyWaveform { pos, samples: vals.iter().map(|&v| Complex32::new(v, 0.0)).collect(), tag: "test" }
+        ReadyWaveform {
+            pos,
+            samples: vals.iter().map(|&v| Complex32::new(v, 0.0)).collect(),
+            tag: "test",
+        }
     }
 
     /// A waveform lands exactly at its absolute position, split across two blocks if it
@@ -142,18 +163,18 @@ mod tests {
     fn injection_places_across_blocks() {
         let mut t = InjectionTable::new();
         t.push(wf(6, &[1.0, 2.0, 3.0, 4.0]), 0); // positions 6..10
-        // Block [0,4): nothing overlaps.
+                                                 // Block [0,4): nothing overlaps.
         let mut b0 = vec![Complex32::new(0.0, 0.0); 4];
         t.fill(0, &mut b0);
         assert!(b0.iter().all(|c| c.re == 0.0));
         assert_eq!(t.pending_len(), 1); // still waiting
-        // Block [4,8): positions 6,7 → block[2],block[3].
+                                        // Block [4,8): positions 6,7 → block[2],block[3].
         let mut b1 = vec![Complex32::new(0.0, 0.0); 4];
         t.fill(4, &mut b1);
         assert_eq!(b1[2].re, 1.0);
         assert_eq!(b1[3].re, 2.0);
         assert_eq!(t.pending_len(), 1); // 8,9 still pending
-        // Block [8,12): positions 8,9 → block[0],block[1]; then spent.
+                                        // Block [8,12): positions 8,9 → block[0],block[1]; then spent.
         let mut b2 = vec![Complex32::new(0.0, 0.0); 4];
         t.fill(8, &mut b2);
         assert_eq!(b2[0].re, 3.0);
@@ -183,5 +204,4 @@ mod tests {
         assert_eq!(b[0].re, 0.0);
         assert_eq!(b[2].re, 0.0);
     }
-
 }

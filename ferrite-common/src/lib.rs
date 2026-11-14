@@ -10,7 +10,9 @@ use num_complex::Complex32;
 pub mod band;
 pub mod slot;
 
-pub use band::{arfcn_to_hz, hz_to_arfcn, gscn_to_hz, hz_to_gscn, BandInfo, DuplexMode, NtaOffsetClass};
+pub use band::{
+    arfcn_to_hz, gscn_to_hz, hz_to_arfcn, hz_to_gscn, BandInfo, DuplexMode, NtaOffsetClass,
+};
 pub use slot::{Numerology, SlotPoint};
 
 /// A baseband IQ sample (single-precision complex).
@@ -103,5 +105,7 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     if !clean.len().is_multiple_of(2) {
         return None;
     }
-    (0..clean.len() / 2).map(|i| u8::from_str_radix(&clean[2 * i..2 * i + 2], 16).ok()).collect()
+    (0..clean.len() / 2)
+        .map(|i| u8::from_str_radix(&clean[2 * i..2 * i + 2], 16).ok())
+        .collect()
 }

@@ -72,7 +72,9 @@ impl Ofdm {
     /// symbol `symbol_in_subframe` (`0..14·2^mu`): the sum of `CP + N` over all
     /// preceding symbols of the subframe (§5.3.1).
     pub fn symbol_offset_in_subframe(&self, symbol_in_subframe: usize, mu: u8) -> usize {
-        (0..symbol_in_subframe).map(|l| self.cp_len(l, mu) + self.fft_size).sum()
+        (0..symbol_in_subframe)
+            .map(|l| self.cp_len(l, mu) + self.fft_size)
+            .sum()
     }
 
     /// Sample offset, from the start of the slot, of each of the 14 symbols'
@@ -80,7 +82,10 @@ impl Ofdm {
     /// subframe (the first slot of a subframe and the slot at the half-subframe
     /// boundary start with the long CP).
     pub fn slot_symbol_offsets(&self, mu: u8, slot_in_subframe: usize) -> [usize; 14] {
-        assert!(slot_in_subframe < (1usize << mu), "slot_in_subframe out of range for mu={mu}");
+        assert!(
+            slot_in_subframe < (1usize << mu),
+            "slot_in_subframe out of range for mu={mu}"
+        );
         let mut out = [0usize; 14];
         let mut off = 0usize;
         for (l, o) in out.iter_mut().enumerate() {
@@ -153,7 +158,9 @@ impl PhaseCompensation {
 
     /// Identity table (no compensation, `f₀ = 0`).
     pub fn none(mu: u8) -> Self {
-        Self { coeffs: vec![Complex32::new(1.0, 0.0); 14 << mu] }
+        Self {
+            coeffs: vec![Complex32::new(1.0, 0.0); 14 << mu],
+        }
     }
 
     #[inline]
@@ -192,8 +199,7 @@ mod tests {
         // Slot arithmetic must close exactly: at N=512, mu=1 (fs = 15.36 MHz)
         // a 0.5 ms half-subframe of 14 symbols is 7680 samples.
         let n512 = Ofdm::new(512);
-        let half_subframe: usize =
-            (0..14).map(|l| n512.cp_len(l, 1) + 512).sum();
+        let half_subframe: usize = (0..14).map(|l| n512.cp_len(l, 1) + 512).sum();
         assert_eq!(half_subframe, 7680);
         assert_eq!(n512.cp_len(0, 1), 44);
         assert_eq!(n512.cp_len(1, 1), 36);
@@ -217,7 +223,10 @@ mod tests {
         }
         // Symbol 14 at mu=1 is the second slot's first symbol (long CP).
         assert_eq!(n.symbol_offset_in_subframe(14, 1), n.samples_per_slot(1));
-        assert_eq!(n.symbol_offset_in_subframe(28, 1), n.samples_per_subframe(1));
+        assert_eq!(
+            n.symbol_offset_in_subframe(28, 1),
+            n.samples_per_subframe(1)
+        );
     }
 
     #[test]
@@ -251,7 +260,15 @@ mod tests {
         let t7 = (60 + 768 + 6 * (54 + 768) + 60) as f64 / fs;
         let want = (std::f64::consts::TAU * (1842.5e6 * t7).rem_euclid(1.0)) as f32;
         let got = rx.coefficient(7).arg();
-        assert!(((got - want + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs() < 1e-3);
-        assert_eq!(PhaseCompensation::none(1).coefficient(27), Complex32::new(1.0, 0.0));
+        assert!(
+            ((got - want + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI)
+                .abs()
+                < 1e-3
+        );
+        assert_eq!(
+            PhaseCompensation::none(1).coefficient(27),
+            Complex32::new(1.0, 0.0)
+        );
     }
 }

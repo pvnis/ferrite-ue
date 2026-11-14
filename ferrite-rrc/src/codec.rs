@@ -15,7 +15,9 @@ use ferrite_asn1::rrc;
 use ferrite_asn1::sib1;
 use ferrite_common::{DuplexMode, Numerology};
 use ferrite_fapi::config::*;
-use ferrite_mac::{CsiReportMacConfig, LogicalChannelConfig, MacConfig, PucchMacConfig, RachConfig, SrConfig};
+use ferrite_mac::{
+    CsiReportMacConfig, LogicalChannelConfig, MacConfig, PucchMacConfig, RachConfig, SrConfig,
+};
 
 // ---------------------------------------------------------------------------
 // SIB1 → common configuration
@@ -37,19 +39,31 @@ fn carrier_at(list: &[cm::ScsSpecificCarrier], n: Numerology) -> Option<Carrier>
     list.iter()
         .find(|c| c.subcarrier_spacing.mu() == n.mu)
         .or_else(|| list.first())
-        .map(|c| Carrier { offset_crb: c.offset_to_carrier, n_rb: c.carrier_bandwidth })
+        .map(|c| Carrier {
+            offset_crb: c.offset_to_carrier,
+            n_rb: c.carrier_bandwidth,
+        })
 }
 
 /// `BWP.locationAndBandwidth` → CRBs (`N_BWP^start = O_carrier + RB_start`, TS 38.214 §5.1.2.2.2 / TS 38.213 §12).
 fn bwp_of(b: &cm::Bwp, carrier: Carrier, id: u8) -> Result<Bwp, String> {
     let (start, len) = b.start_and_len();
-    Ok(Bwp { id, start_crb: carrier.offset_crb + start, n_rb: len, scs: numerology_of(b.subcarrier_spacing)? })
+    Ok(Bwp {
+        id,
+        start_crb: carrier.offset_crb + start,
+        n_rb: len,
+        scs: numerology_of(b.subcarrier_spacing)?,
+    })
 }
 
 /// `PDCCH-ConfigCommon` of a BWP: its common CORESET and common search spaces
 /// (add/mod by id; the Type0 CSS stays on `ss0_index`).
 fn apply_pdcch_common(phy: &mut PhyConfig, pc: &sib1::PdcchConfigCommon) {
-    if let Some(c) = pc.common_control_resource_set.as_ref().and_then(|c| coreset_of(c, phy.dl_bwp.start_crb)) {
+    if let Some(c) = pc
+        .common_control_resource_set
+        .as_ref()
+        .and_then(|c| coreset_of(c, phy.dl_bwp.start_crb))
+    {
         phy.coresets.retain(|x| x.id != c.id);
         phy.coresets.push(c);
     }
@@ -70,7 +84,12 @@ fn tdra_rows_pdsch(rows: &[cm::TdraRow]) -> Vec<TdraRow> {
     rows.iter()
         .map(|r| {
             let (s, l) = r.start_len();
-            TdraRow { k: r.k0(), mapping_type_a: r.mapping_type_a, start_symbol: s as u8, n_symbols: l as u8 }
+            TdraRow {
+                k: r.k0(),
+                mapping_type_a: r.mapping_type_a,
+                start_symbol: s as u8,
+                n_symbols: l as u8,
+            }
         })
         .collect()
 }
@@ -79,7 +98,12 @@ fn tdra_rows_pusch(rows: &[cm::TdraRow], mu: u8) -> Vec<TdraRow> {
     rows.iter()
         .map(|r| {
             let (s, l) = r.start_len();
-            TdraRow { k: r.k2(mu), mapping_type_a: r.mapping_type_a, start_symbol: s as u8, n_symbols: l as u8 }
+            TdraRow {
+                k: r.k2(mu),
+                mapping_type_a: r.mapping_type_a,
+                start_symbol: s as u8,
+                n_symbols: l as u8,
+            }
         })
         .collect()
 }
@@ -91,9 +115,19 @@ fn coreset_of(c: &cm::ControlResourceSet, bwp_start_crb: u16) -> Option<CoresetC
     let (&first, &last) = (groups.first()?, groups.last()?);
     let base = 6 * bwp_start_crb.div_ceil(6);
     let start_crb = base + 6 * first as u16;
-    let rb_mask: Vec<bool> = (first..=last).flat_map(|g| std::iter::repeat_n(c.has_rb_group(g), 6)).collect();
+    let rb_mask: Vec<bool> = (first..=last)
+        .flat_map(|g| std::iter::repeat_n(c.has_rb_group(g), 6))
+        .collect();
     let interleaved = match c.cce_reg_mapping_type {
-        cm::CceRegMapping::Interleaved { reg_bundle_size, interleaver_size, shift_index } => Some((reg_bundle_size, interleaver_size, shift_index.unwrap_or(u16::MAX))),
+        cm::CceRegMapping::Interleaved {
+            reg_bundle_size,
+            interleaver_size,
+            shift_index,
+        } => Some((
+            reg_bundle_size,
+            interleaver_size,
+            shift_index.unwrap_or(u16::MAX),
+        )),
         cm::CceRegMapping::NonInterleaved => None,
     };
     Some(CoresetConfig {
@@ -109,13 +143,17 @@ fn coreset_of(c: &cm::ControlResourceSet, bwp_start_crb: u16) -> Option<CoresetC
 
 fn search_space_of(s: &cm::SearchSpace) -> Option<SearchSpaceConfig> {
     let coreset_id = s.control_resource_set_id?;
-    let (period_slots, offset_slots) = s.monitoring_slot_periodicity_and_offset.map_or((1, 0), |p| (p.period_slots, p.offset));
+    let (period_slots, offset_slots) = s
+        .monitoring_slot_periodicity_and_offset
+        .map_or((1, 0), |p| (p.period_slots, p.offset));
     let mut symbols = [false; 14];
     for l in s.monitoring_symbols() {
         symbols[l as usize] = true;
     }
     let kind = match &s.search_space_type {
-        Some(cm::SearchSpaceType::UeSpecific { dci_formats_0_1_and_1_1: true }) => SearchSpaceKind::UeSpecificNonFallback,
+        Some(cm::SearchSpaceType::UeSpecific {
+            dci_formats_0_1_and_1_1: true,
+        }) => SearchSpaceKind::UeSpecificNonFallback,
         Some(cm::SearchSpaceType::UeSpecific { .. }) => SearchSpaceKind::UeSpecificFallback,
         _ => SearchSpaceKind::Common,
     };
@@ -139,23 +177,38 @@ fn tdd_of(t: &sib1::TddUlDlConfigCommon) -> Result<TddConfig, String> {
         ul_slots: p.ul_slots as u16,
         ul_symbols: p.ul_symbols as u8,
     };
-    Ok(TddConfig { reference_scs: numerology_of(t.reference_subcarrier_spacing)?, pattern1: pat(&t.pattern1), pattern2: t.pattern2.as_ref().map(pat) })
+    Ok(TddConfig {
+        reference_scs: numerology_of(t.reference_subcarrier_spacing)?,
+        pattern1: pat(&t.pattern1),
+        pattern2: t.pattern2.as_ref().map(pat),
+    })
 }
 
 /// TS 38.214 Table 6.1.2.1.1-5: Msg3 slot delay Δ per µ.
 /// Build the PHY and MAC configuration of a cell from its SIB1 (TS 38.331
 /// `ServingCellConfigCommonSIB`) and the MIB-derived CORESET#0 facts.
-pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16) -> Result<CellInfo, String> {
+pub fn cell_from_sib1(
+    tb: &[u8],
+    mib: &MibInfo,
+    radio: &RadioInfo,
+    tx_lead: u16,
+) -> Result<CellInfo, String> {
     let s = sib1::Sib1::decode(tb).map_err(err("SIB1"))?;
-    let sc = s.serving_cell().ok_or("SIB1 without servingCellConfigCommon")?;
+    let sc = s
+        .serving_cell()
+        .ok_or("SIB1 without servingCellConfigCommon")?;
     let dl = &sc.downlink_config_common;
     let dl_bwp_gen = &dl.initial_downlink_bwp.generic_parameters;
     let numerology = numerology_of(dl_bwp_gen.subcarrier_spacing)?;
     let mu = numerology.mu;
     if mu != mib.mu {
-        return Err(format!("initial DL BWP µ={mu} but MIB common SCS µ={}", mib.mu));
+        return Err(format!(
+            "initial DL BWP µ={mu} but MIB common SCS µ={}",
+            mib.mu
+        ));
     }
-    let dl_carrier = carrier_at(&dl.frequency_info_dl.scs_specific_carrier_list, numerology).ok_or("no DL SCS-SpecificCarrier")?;
+    let dl_carrier = carrier_at(&dl.frequency_info_dl.scs_specific_carrier_list, numerology)
+        .ok_or("no DL SCS-SpecificCarrier")?;
     let dl_bwp = bwp_of(dl_bwp_gen, dl_carrier, 0)?;
 
     // SSB placement on the CRB grid: offsetToPointA is in 15 kHz RBs (FR1);
@@ -166,9 +219,13 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let ssb_scs = Numerology::from_scs_khz(mib.ssb_scs_khz).ok_or("bad SSB SCS")?;
 
     // Uplink.
-    let ul = sc.uplink_config_common.as_ref().ok_or("SIB1 without uplinkConfigCommon")?;
+    let ul = sc
+        .uplink_config_common
+        .as_ref()
+        .ok_or("SIB1 without uplinkConfigCommon")?;
     let ul_bwp_gen = &ul.initial_uplink_bwp.generic_parameters;
-    let ul_carrier = carrier_at(&ul.frequency_info_ul.scs_specific_carrier_list, numerology).ok_or("no UL SCS-SpecificCarrier")?;
+    let ul_carrier = carrier_at(&ul.frequency_info_ul.scs_specific_carrier_list, numerology)
+        .ok_or("no UL SCS-SpecificCarrier")?;
     let ul_bwp = bwp_of(ul_bwp_gen, ul_carrier, 0)?;
     if ul_bwp.scs != numerology {
         return Err("initial UL BWP numerology differs from DL".into());
@@ -178,8 +235,12 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let tdd = match (radio.duplex, sc.tdd_ul_dl_configuration_common.as_ref()) {
         (DuplexMode::Tdd, Some(t)) => Some(tdd_of(t)?),
         (DuplexMode::Fdd, None) => None,
-        (DuplexMode::Tdd, None) => return Err("radio is TDD but SIB1 has no tdd-UL-DL-ConfigurationCommon".into()),
-        (DuplexMode::Fdd, Some(_)) => return Err("radio is FDD but SIB1 carries a TDD configuration".into()),
+        (DuplexMode::Tdd, None) => {
+            return Err("radio is TDD but SIB1 has no tdd-UL-DL-ConfigurationCommon".into())
+        }
+        (DuplexMode::Fdd, Some(_)) => {
+            return Err("radio is FDD but SIB1 carries a TDD configuration".into())
+        }
     };
 
     // CORESET#0 (TS 38.213 §13): lowest CRB = SSB CRB − table offset.
@@ -196,7 +257,11 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     let mut search_spaces = Vec::new();
     let mut ss0_index = mib.ss0_index;
     if let Some(pc) = s.pdcch_config_common() {
-        if let Some(c) = pc.common_control_resource_set.as_ref().and_then(|c| coreset_of(c, dl_bwp.start_crb)) {
+        if let Some(c) = pc
+            .common_control_resource_set
+            .as_ref()
+            .and_then(|c| coreset_of(c, dl_bwp.start_crb))
+        {
             coresets.retain(|x| x.id != c.id);
             coresets.push(c);
         }
@@ -215,35 +280,42 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
     }
 
     // RACH.
-    let rach = s.rach_config_common().ok_or("SIB1 without rach-ConfigCommon")?;
+    let rach = s
+        .rach_config_common()
+        .ok_or("SIB1 without rach-ConfigCommon")?;
     let g = &rach.rach_config_generic;
     let msg1_scs_mu = rach.msg1_subcarrier_spacing.map_or(mu, |s| s.mu());
     // Transmitted SS/PBCH blocks (symbols at the data numerology) for the
     // PRACH occasion validity rule (TS 38.211 §6.3.3.2).
-    let ssb_symbols: Vec<SsbSlotSymbols> = ferrite_ran::ssb::SsbCase::from_scs(mib.ssb_scs_khz, radio.duplex)
-        .map(|case| {
-            let carrier_hz = ferrite_common::arfcn_to_hz(mib.ssb_arfcn);
-            let cands = case.candidate_symbols(carrier_hz);
-            let l_max = cands.len() as u8;
-            let (ssb_mu, data_mu) = (u32::from(case.mu()), u32::from(mu));
-            cands
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| sc.ssb_positions_in_burst.is_transmitted(*i as u8, l_max))
-                .map(|(_, &first)| {
-                    let last = first + ferrite_ran::ssb::SSB_SYMBOLS - 1;
-                    let (f, l) = if data_mu >= ssb_mu {
-                        let sh = data_mu - ssb_mu;
-                        (first << sh, ((last + 1) << sh) - 1)
-                    } else {
-                        let sh = ssb_mu - data_mu;
-                        (first >> sh, last >> sh)
-                    };
-                    SsbSlotSymbols { slot_in_half_frame: (f / 14) as u8, first_symbol: (f % 14) as u8, last_symbol: (l % 14) as u8 }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let ssb_symbols: Vec<SsbSlotSymbols> =
+        ferrite_ran::ssb::SsbCase::from_scs(mib.ssb_scs_khz, radio.duplex)
+            .map(|case| {
+                let carrier_hz = ferrite_common::arfcn_to_hz(mib.ssb_arfcn);
+                let cands = case.candidate_symbols(carrier_hz);
+                let l_max = cands.len() as u8;
+                let (ssb_mu, data_mu) = (u32::from(case.mu()), u32::from(mu));
+                cands
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| sc.ssb_positions_in_burst.is_transmitted(*i as u8, l_max))
+                    .map(|(_, &first)| {
+                        let last = first + ferrite_ran::ssb::SSB_SYMBOLS - 1;
+                        let (f, l) = if data_mu >= ssb_mu {
+                            let sh = data_mu - ssb_mu;
+                            (first << sh, ((last + 1) << sh) - 1)
+                        } else {
+                            let sh = ssb_mu - data_mu;
+                            (first >> sh, last >> sh)
+                        };
+                        SsbSlotSymbols {
+                            slot_in_half_frame: (f / 14) as u8,
+                            first_symbol: (f % 14) as u8,
+                            last_symbol: (l % 14) as u8,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     let prach = PrachConfig {
         phy: ferrite_ran::prach_config::PrachConfig {
             index: g.prach_configuration_index as u16,
@@ -286,13 +358,28 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
             sib1::PagingFrameOffset::OneEighthT(o) => (8, o),
             sib1::PagingFrameOffset::OneSixteenthT(o) => (16, o),
         };
-        s.pdcch_config_common().and_then(|p| p.paging_search_space).map(|ss| PagingConfig { t_rf: pc.default_paging_cycle_rf, n_div, offset, ns: pc.ns, search_space_id: ss })
+        s.pdcch_config_common()
+            .and_then(|p| p.paging_search_space)
+            .map(|ss| PagingConfig {
+                t_rf: pc.default_paging_cycle_rf,
+                n_div,
+                offset,
+                ns: pc.ns,
+                search_space_id: ss,
+            })
     };
     let phy = PhyConfig {
         duplex: radio.duplex,
         paging,
         numerology,
-        ssb: SsbConfig { pci: mib.pci, scs: ssb_scs, period_ms: sc.ssb_periodicity_ms as u16, ssb_index: mib.ssb_index, k_ssb, dmrs_typea_pos: mib.dmrs_typea_pos },
+        ssb: SsbConfig {
+            pci: mib.pci,
+            scs: ssb_scs,
+            period_ms: sc.ssb_periodicity_ms as u16,
+            ssb_index: mib.ssb_index,
+            k_ssb,
+            dmrs_typea_pos: mib.dmrs_typea_pos,
+        },
         dl_carrier,
         ul_carrier,
         ssb_crb,
@@ -308,7 +395,10 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         pusch_tdra_common: pusch_tdra_common.clone(),
         prach: prach.clone(),
         n_ta_offset_tc: sc.n_timing_advance_offset.unwrap_or(25600),
-        pdsch: PdschConfig { nof_harq_processes: 8, ..PdschConfig::default() },
+        pdsch: PdschConfig {
+            nof_harq_processes: 8,
+            ..PdschConfig::default()
+        },
         pusch: PuschConfig {
             transform_precoder: rach.msg3_transform_precoder,
             msg3_transform_precoder: rach.msg3_transform_precoder,
@@ -339,8 +429,13 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
             target_power_dbm: g.preamble_received_target_power,
             ra_response_window_slots: g.ra_response_window_slots as u16,
             contention_resolution_ms: rach.ra_contention_resolution_timer_sf as u32,
-            nof_cb_preambles: rach.group_b_configured.as_ref().map_or(prach.total_preambles, |b| b.number_of_ra_preambles_group_a),
-            cb_preambles_per_ssb: rach.ssb_per_rach_occasion_and_cb_preambles_per_ssb.map_or(64, |(_, n)| n),
+            nof_cb_preambles: rach
+                .group_b_configured
+                .as_ref()
+                .map_or(prach.total_preambles, |b| b.number_of_ra_preambles_group_a),
+            cb_preambles_per_ssb: rach
+                .ssb_per_rach_occasion_and_cb_preambles_per_ssb
+                .map_or(64, |(_, n)| n),
             prach,
         },
         tx_lead,
@@ -364,20 +459,41 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
         rlc_bearers: Default::default(),
         phy,
         mac,
-        t300_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t300_ms as u32),
+        t300_ms: s
+            .ue_timers_and_constants
+            .as_ref()
+            .map_or(1000, |t| t.t300_ms as u32),
         numerology,
         si_scheduled: s
             .si_scheduling_info
             .as_ref()
-            .map(|si| si.scheduling_info_list.iter().filter(|e| e.si_broadcasting).flat_map(|e| e.sib_mapping_info.iter().filter_map(|m| m.sib_type)).collect())
+            .map(|si| {
+                si.scheduling_info_list
+                    .iter()
+                    .filter(|e| e.si_broadcasting)
+                    .flat_map(|e| e.sib_mapping_info.iter().filter_map(|m| m.sib_type))
+                    .collect()
+            })
             .unwrap_or_default(),
-        si_window_slots: s.si_scheduling_info.as_ref().map_or(0, |si| si.si_window_length_slots),
+        si_window_slots: s
+            .si_scheduling_info
+            .as_ref()
+            .map_or(0, |si| si.si_window_length_slots),
         ssb_arfcn: mib.ssb_arfcn,
-        t301_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t301_ms as u32),
-        t310_ms: s.ue_timers_and_constants.as_ref().map_or(1000, |t| t.t310_ms as u32),
+        t301_ms: s
+            .ue_timers_and_constants
+            .as_ref()
+            .map_or(1000, |t| t.t301_ms as u32),
+        t310_ms: s
+            .ue_timers_and_constants
+            .as_ref()
+            .map_or(1000, |t| t.t310_ms as u32),
         n310: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n310),
         n311: s.ue_timers_and_constants.as_ref().map_or(1, |t| t.n311),
-        t311_ms: s.ue_timers_and_constants.as_ref().map_or(30000, |t| t.t311_ms as u32),
+        t311_ms: s
+            .ue_timers_and_constants
+            .as_ref()
+            .map_or(30000, |t| t.t311_ms as u32),
         bwps: std::collections::BTreeMap::new(),
     })
 }
@@ -386,16 +502,28 @@ pub fn cell_from_sib1(tb: &[u8], mib: &MibInfo, radio: &RadioInfo, tx_lead: u16)
 // CellGroupConfig → dedicated configuration (delta on top of a baseline)
 // ---------------------------------------------------------------------------
 
-fn dmrs_dl(d: Option<&ferrite_asn1::SetupRelease<cg::DmrsDownlinkConfig>>, base: DmrsConfig) -> DmrsConfig {
+fn dmrs_dl(
+    d: Option<&ferrite_asn1::SetupRelease<cg::DmrsDownlinkConfig>>,
+    base: DmrsConfig,
+) -> DmrsConfig {
     match d.and_then(|s| s.setup()) {
-        Some(c) => DmrsConfig { additional_position: c.additional_position(), scrambling_id0: c.scrambling_id0 },
+        Some(c) => DmrsConfig {
+            additional_position: c.additional_position(),
+            scrambling_id0: c.scrambling_id0,
+        },
         None => base,
     }
 }
 
-fn dmrs_ul(d: Option<&ferrite_asn1::SetupRelease<cg::DmrsUplinkConfig>>, base: DmrsConfig) -> DmrsConfig {
+fn dmrs_ul(
+    d: Option<&ferrite_asn1::SetupRelease<cg::DmrsUplinkConfig>>,
+    base: DmrsConfig,
+) -> DmrsConfig {
     match d.and_then(|s| s.setup()) {
-        Some(c) => DmrsConfig { additional_position: c.additional_position(), scrambling_id0: c.transform_precoding_disabled.and_then(|(id0, _)| id0) },
+        Some(c) => DmrsConfig {
+            additional_position: c.additional_position(),
+            scrambling_id0: c.transform_precoding_disabled.and_then(|(id0, _)| id0),
+        },
         None => base,
     }
 }
@@ -411,16 +539,44 @@ fn mcs_table_of(t: Option<cg::McsTable>) -> McsTableSel {
 fn pucch_resource_of(r: &cg::PucchResource) -> PucchResource {
     let (start_symbol, n_symbols) = r.format.symbols();
     let format = match r.format {
-        cg::PucchFormat::Format0 { initial_cyclic_shift, .. } => PucchFormat::F0 { initial_cyclic_shift },
-        cg::PucchFormat::Format1 { initial_cyclic_shift, time_domain_occ, .. } => PucchFormat::F1 { initial_cyclic_shift, time_domain_occ },
+        cg::PucchFormat::Format0 {
+            initial_cyclic_shift,
+            ..
+        } => PucchFormat::F0 {
+            initial_cyclic_shift,
+        },
+        cg::PucchFormat::Format1 {
+            initial_cyclic_shift,
+            time_domain_occ,
+            ..
+        } => PucchFormat::F1 {
+            initial_cyclic_shift,
+            time_domain_occ,
+        },
         cg::PucchFormat::Format2 { nrof_prbs, .. } => PucchFormat::F2 { n_prb: nrof_prbs },
         cg::PucchFormat::Format3 { nrof_prbs, .. } => PucchFormat::F3 { n_prb: nrof_prbs },
-        cg::PucchFormat::Format4 { occ_length, occ_index, .. } => PucchFormat::F4 { occ_length, occ_index },
+        cg::PucchFormat::Format4 {
+            occ_length,
+            occ_index,
+            ..
+        } => PucchFormat::F4 {
+            occ_length,
+            occ_index,
+        },
     };
-    PucchResource { id: r.pucch_resource_id, starting_prb: r.starting_prb, second_hop_prb: r.second_hop_prb, format, start_symbol, n_symbols }
+    PucchResource {
+        id: r.pucch_resource_id,
+        starting_prb: r.starting_prb,
+        second_hop_prb: r.second_hop_prb,
+        format,
+        start_symbol,
+        n_symbols,
+    }
 }
 
-fn format_config_of(f: Option<&ferrite_asn1::SetupRelease<cg::PucchFormatConfig>>) -> PucchFormatConfig {
+fn format_config_of(
+    f: Option<&ferrite_asn1::SetupRelease<cg::PucchFormatConfig>>,
+) -> PucchFormatConfig {
     match f.and_then(|s| s.setup()) {
         Some(c) => PucchFormatConfig {
             additional_dmrs: c.additional_dmrs,
@@ -442,11 +598,24 @@ fn pucch_max_bits(r: &PucchResource, f2: &PucchFormatConfig, f3: &PucchFormatCon
         PucchFormat::F3 { n_prb } => (n_prb, 12, f3.max_code_rate_x100.unwrap_or(35)),
     };
     let coded = n_prb as u32 * re_per_prb * r.n_symbols as u32 * 2 * rate as u32 / 100;
-    let crc = if coded > 30 { 11 } else if coded > 17 { 6 } else { 0 };
+    let crc = if coded > 30 {
+        11
+    } else if coded > 17 {
+        6
+    } else {
+        0
+    };
     coded.saturating_sub(crc).max(1) as u16
 }
 
-fn csi_rs_resource_of(id: u8, m: &cm::CsiRsResourceMapping, po: Option<cm::PeriodicityAndOffset>, zero_power: bool, scrambling_id: u16, trs: bool) -> CsiRsResource {
+fn csi_rs_resource_of(
+    id: u8,
+    m: &cm::CsiRsResourceMapping,
+    po: Option<cm::PeriodicityAndOffset>,
+    zero_power: bool,
+    scrambling_id: u16,
+    trs: bool,
+) -> CsiRsResource {
     CsiRsResource {
         zero_power,
         id,
@@ -470,15 +639,31 @@ fn csi_rs_resource_of(id: u8, m: &cm::CsiRsResourceMapping, po: Option<cm::Perio
 
 /// Apply a `CellGroupConfig` (RRCSetup / RRCReconfiguration) on top of the
 /// current configuration. Absent IEs keep their current values.
-pub fn apply_cell_group(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::CellGroupConfig) -> (PhyConfig, MacConfig) {
-    apply_cell_group_bwp(base_phy, base_mac, c, base_phy.dl_bwp.id, base_phy.ul_bwp.id)
+pub fn apply_cell_group(
+    base_phy: &PhyConfig,
+    base_mac: &MacConfig,
+    c: &cg::CellGroupConfig,
+) -> (PhyConfig, MacConfig) {
+    apply_cell_group_bwp(
+        base_phy,
+        base_mac,
+        c,
+        base_phy.dl_bwp.id,
+        base_phy.ul_bwp.id,
+    )
 }
 
 /// Apply a `CellGroupConfig` delta for the configuration of DL BWP `dl_id` /
 /// UL BWP `ul_id` (0 = initial): the BWP's own common part (generic
 /// parameters, PDCCH/PDSCH/PUSCH/PUCCH-ConfigCommon) when the message carries
 /// it, its dedicated part, and the cell-level items (CSI, HARQ, MAC).
-pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::CellGroupConfig, dl_id: u8, ul_id: u8) -> (PhyConfig, MacConfig) {
+pub fn apply_cell_group_bwp(
+    base_phy: &PhyConfig,
+    base_mac: &MacConfig,
+    c: &cg::CellGroupConfig,
+    dl_id: u8,
+    ul_id: u8,
+) -> (PhyConfig, MacConfig) {
     let mut phy = base_phy.clone();
     let mut mac = base_mac.clone();
     let mu = phy.numerology.mu;
@@ -515,9 +700,24 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
     phy.dl_bwp.id = dl_id;
     phy.ul_bwp.id = ul_id;
     if let Some(scc) = c.serving_cell() {
-        phy.nof_dl_bwp_rrc = phy.nof_dl_bwp_rrc.max(scc.downlink_bwp_to_add_mod_list.iter().filter(|b| b.bwp_id != 0).count() as u8);
-        phy.nof_ul_bwp_rrc = phy.nof_ul_bwp_rrc.max(scc.uplink_config.as_ref().map_or(0, |u| u.uplink_bwp_to_add_mod_list.iter().filter(|b| b.bwp_id != 0).count() as u8));
-        mac.bwp_inactivity_timer_ms = scc.bwp_inactivity_timer_ms.map(u32::from).or(mac.bwp_inactivity_timer_ms);
+        phy.nof_dl_bwp_rrc = phy.nof_dl_bwp_rrc.max(
+            scc.downlink_bwp_to_add_mod_list
+                .iter()
+                .filter(|b| b.bwp_id != 0)
+                .count() as u8,
+        );
+        phy.nof_ul_bwp_rrc = phy
+            .nof_ul_bwp_rrc
+            .max(scc.uplink_config.as_ref().map_or(0, |u| {
+                u.uplink_bwp_to_add_mod_list
+                    .iter()
+                    .filter(|b| b.bwp_id != 0)
+                    .count() as u8
+            }));
+        mac.bwp_inactivity_timer_ms = scc
+            .bwp_inactivity_timer_ms
+            .map(u32::from)
+            .or(mac.bwp_inactivity_timer_ms);
         mac.default_dl_bwp_id = scc.default_downlink_bwp_id.unwrap_or(mac.default_dl_bwp_id);
     }
     mac.dl_bwp_id = dl_id;
@@ -546,8 +746,14 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
 
     // --- PDSCH.
     if let Some(p) = dl_ded.and_then(|d| d.pdsch_config.as_ref()?.setup()) {
-        phy.pdsch.dmrs_type_a = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_a.as_ref(), phy.pdsch.dmrs_type_a);
-        phy.pdsch.dmrs_type_b = dmrs_dl(p.dmrs_downlink_for_pdsch_mapping_type_b.as_ref(), phy.pdsch.dmrs_type_b);
+        phy.pdsch.dmrs_type_a = dmrs_dl(
+            p.dmrs_downlink_for_pdsch_mapping_type_a.as_ref(),
+            phy.pdsch.dmrs_type_a,
+        );
+        phy.pdsch.dmrs_type_b = dmrs_dl(
+            p.dmrs_downlink_for_pdsch_mapping_type_b.as_ref(),
+            phy.pdsch.dmrs_type_b,
+        );
         phy.pdsch.mcs_table = mcs_table_of(p.mcs_table);
         if let Some(rows) = p.tdra_list() {
             phy.pdsch.tdra = tdra_rows_pdsch(rows);
@@ -557,11 +763,22 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
         // release / add-mod by resource id — a later reconfiguration that
         // carries a pdsch-Config without these lists keeps the resources.
         for id in &p.zp_csi_rs_resource_to_release_list {
-            phy.pdsch.csi_rs_rate_match.retain(|r| !(r.zero_power && r.id == *id));
+            phy.pdsch
+                .csi_rs_rate_match
+                .retain(|r| !(r.zero_power && r.id == *id));
         }
         for z in &p.zp_csi_rs_resource_to_add_mod_list {
-            phy.pdsch.csi_rs_rate_match.retain(|r| !(r.zero_power && r.id == z.zp_csi_rs_resource_id));
-            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(z.zp_csi_rs_resource_id, &z.resource_mapping, z.periodicity_and_offset, true, 0, false));
+            phy.pdsch
+                .csi_rs_rate_match
+                .retain(|r| !(r.zero_power && r.id == z.zp_csi_rs_resource_id));
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(
+                z.zp_csi_rs_resource_id,
+                &z.resource_mapping,
+                z.periodicity_and_offset,
+                true,
+                0,
+                false,
+            ));
         }
     }
     phy.pdsch.nof_harq_processes = c.nrof_harq_processes_for_pdsch();
@@ -569,21 +786,49 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
     // --- NZP CSI-RS (rate matching + TRS/CQI measurement) and periodic reports.
     if let Some(m) = c.csi_meas_config() {
         for id in &m.nzp_csi_rs_resource_to_release_list {
-            phy.pdsch.csi_rs_rate_match.retain(|r| r.zero_power || r.id != *id);
+            phy.pdsch
+                .csi_rs_rate_match
+                .retain(|r| r.zero_power || r.id != *id);
         }
-        let trs_ids: Vec<u8> = m.nzp_csi_rs_resource_set_to_add_mod_list.iter().filter(|s| s.trs_info).flat_map(|s| s.nzp_csi_rs_resources.iter().copied()).collect();
+        let trs_ids: Vec<u8> = m
+            .nzp_csi_rs_resource_set_to_add_mod_list
+            .iter()
+            .filter(|s| s.trs_info)
+            .flat_map(|s| s.nzp_csi_rs_resources.iter().copied())
+            .collect();
         for r in &m.nzp_csi_rs_resource_to_add_mod_list {
-            let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id) || phy.pdsch.csi_rs_rate_match.iter().any(|x| !x.zero_power && x.id == r.nzp_csi_rs_resource_id && x.trs);
-            phy.pdsch.csi_rs_rate_match.retain(|x| x.zero_power || x.id != r.nzp_csi_rs_resource_id);
-            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(r.nzp_csi_rs_resource_id, &r.resource_mapping, r.periodicity_and_offset, false, r.scrambling_id, trs));
+            let trs = trs_ids.contains(&r.nzp_csi_rs_resource_id)
+                || phy
+                    .pdsch
+                    .csi_rs_rate_match
+                    .iter()
+                    .any(|x| !x.zero_power && x.id == r.nzp_csi_rs_resource_id && x.trs);
+            phy.pdsch
+                .csi_rs_rate_match
+                .retain(|x| x.zero_power || x.id != r.nzp_csi_rs_resource_id);
+            phy.pdsch.csi_rs_rate_match.push(csi_rs_resource_of(
+                r.nzp_csi_rs_resource_id,
+                &r.resource_mapping,
+                r.periodicity_and_offset,
+                false,
+                r.scrambling_id,
+                trs,
+            ));
         }
         for id in &m.csi_report_config_to_release_list {
             phy.csi_reports.retain(|c| c.report_id != *id);
         }
         for rc in &m.csi_report_config_to_add_mod_list {
-            phy.csi_reports.retain(|c| c.report_id != rc.report_config_id);
-            if let acsi::CsiReportConfigType::Periodic { report_slot_config, pucch_csi_resource_list } = &rc.report_config_type {
-                let Some(res) = pucch_csi_resource_list.first() else { continue };
+            phy.csi_reports
+                .retain(|c| c.report_id != rc.report_config_id);
+            if let acsi::CsiReportConfigType::Periodic {
+                report_slot_config,
+                pucch_csi_resource_list,
+            } = &rc.report_config_type
+            {
+                let Some(res) = pucch_csi_resource_list.first() else {
+                    continue;
+                };
                 phy.csi_reports.push(CsiReportConfig {
                     report_id: rc.report_config_id,
                     period_slots: report_slot_config.period_slots,
@@ -595,12 +840,16 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
                         _ => 0,
                     },
                     quantity: match rc.report_quantity {
-                        acsi::CsiReportQuantity::CriRiPmiCqi | acsi::CsiReportQuantity::CriRiLiPmiCqi => CsiReportQuantity::RiPmiCqi,
+                        acsi::CsiReportQuantity::CriRiPmiCqi
+                        | acsi::CsiReportQuantity::CriRiLiPmiCqi => CsiReportQuantity::RiPmiCqi,
                         acsi::CsiReportQuantity::CriRiCqi => CsiReportQuantity::RiCqi,
                         _ => CsiReportQuantity::Cqi,
                     },
                     nof_ports: rc.codebook_config.as_ref().map_or(1, |c| c.nof_ports()),
-                    ri_restriction: rc.codebook_config.as_ref().map_or(0x80, |c| c.ri_restriction),
+                    ri_restriction: rc
+                        .codebook_config
+                        .as_ref()
+                        .map_or(0x01, |c| c.ri_restriction),
                 });
             }
         }
@@ -608,19 +857,36 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
 
     // --- PUSCH.
     if let Some(p) = ul_ded.and_then(|d| d.pusch_config.as_ref()?.setup()) {
-        phy.pusch.dmrs_type_a = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_a.as_ref(), phy.pusch.dmrs_type_a);
-        phy.pusch.dmrs_type_b = dmrs_ul(p.dmrs_uplink_for_pusch_mapping_type_b.as_ref(), phy.pusch.dmrs_type_b);
+        phy.pusch.dmrs_type_a = dmrs_ul(
+            p.dmrs_uplink_for_pusch_mapping_type_a.as_ref(),
+            phy.pusch.dmrs_type_a,
+        );
+        phy.pusch.dmrs_type_b = dmrs_ul(
+            p.dmrs_uplink_for_pusch_mapping_type_b.as_ref(),
+            phy.pusch.dmrs_type_b,
+        );
         phy.pusch.mcs_table = mcs_table_of(p.mcs_table);
         if let Some(rows) = p.tdra_list() {
             phy.pusch.tdra = tdra_rows_pusch(rows, mu);
         }
         // TS 38.214 §6.1.3: without `transformPrecoder` the UE follows `msg3-transformPrecoder`.
-        phy.pusch.transform_precoder = p.transform_precoder_enabled.unwrap_or(phy.pusch.msg3_transform_precoder);
+        phy.pusch.transform_precoder = p
+            .transform_precoder_enabled
+            .unwrap_or(phy.pusch.msg3_transform_precoder);
         phy.pusch.mcs_table_tp = mcs_table_of(p.mcs_table_transform_precoder);
         phy.pusch.tp_pi2_bpsk = p.tp_pi2_bpsk;
         phy.pusch.data_scrambling_identity = p.data_scrambling_identity_pusch;
-        if let Some(t) = p.dmrs_uplink_for_pusch_mapping_type_a.as_ref().and_then(|s| s.setup()).and_then(|c| c.transform_precoding_enabled) {
-            phy.pusch.tp_dmrs = TpDmrsConfig { n_pusch_identity: t.n_pusch_identity, group_hopping_disabled: t.sequence_group_hopping_disabled, sequence_hopping: t.sequence_hopping_enabled };
+        if let Some(t) = p
+            .dmrs_uplink_for_pusch_mapping_type_a
+            .as_ref()
+            .and_then(|s| s.setup())
+            .and_then(|c| c.transform_precoding_enabled)
+        {
+            phy.pusch.tp_dmrs = TpDmrsConfig {
+                n_pusch_identity: t.n_pusch_identity,
+                group_hopping_disabled: t.sequence_group_hopping_disabled,
+                sequence_hopping: t.sequence_hopping_enabled,
+            };
         }
         phy.pusch.frequency_hopping = p.frequency_hopping_intra_slot.is_some();
         if let Some(u) = p.uci_on_pusch.as_ref().and_then(|s| s.setup()) {
@@ -648,8 +914,14 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             phy.pucch.resource_sets.retain(|x| x.id != *id);
         }
         for s in &p.resource_set_to_add_mod_list {
-            phy.pucch.resource_sets.retain(|x| x.id != s.pucch_resource_set_id);
-            phy.pucch.resource_sets.push(PucchResourceSet { id: s.pucch_resource_set_id, resources: s.resource_list.clone(), max_payload: s.max_payload_size });
+            phy.pucch
+                .resource_sets
+                .retain(|x| x.id != s.pucch_resource_set_id);
+            phy.pucch.resource_sets.push(PucchResourceSet {
+                id: s.pucch_resource_set_id,
+                resources: s.resource_list.clone(),
+                max_payload: s.max_payload_size,
+            });
         }
         for id in &p.resource_to_release_list {
             phy.pucch.resources.retain(|x| x.id != *id);
@@ -666,10 +938,24 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             phy.pucch.sr_resources.retain(|x| x.sr_resource_id != *id);
         }
         for sr in &p.scheduling_request_resource_to_add_mod_list {
-            let Some(cg::SrPeriodicityAndOffset::Slots { period_slots, offset }) = sr.periodicity_and_offset else { continue };
+            let Some(cg::SrPeriodicityAndOffset::Slots {
+                period_slots,
+                offset,
+            }) = sr.periodicity_and_offset
+            else {
+                continue;
+            };
             let Some(res) = sr.resource else { continue };
-            phy.pucch.sr_resources.retain(|x| x.sr_resource_id != sr.scheduling_request_resource_id);
-            phy.pucch.sr_resources.push(SrResource { sr_resource_id: sr.scheduling_request_resource_id, sr_id: sr.scheduling_request_id, period_slots, offset_slots: offset, pucch_resource: res });
+            phy.pucch
+                .sr_resources
+                .retain(|x| x.sr_resource_id != sr.scheduling_request_resource_id);
+            phy.pucch.sr_resources.push(SrResource {
+                sr_resource_id: sr.scheduling_request_resource_id,
+                sr_id: sr.scheduling_request_id,
+                period_slots,
+                offset_slots: offset,
+                pucch_resource: res,
+            });
         }
         if !p.dl_data_to_ul_ack.is_empty() {
             phy.pucch.k1_list = p.dl_data_to_ul_ack.clone();
@@ -677,7 +963,8 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
     }
 
     if let Some(pg) = &c.physical_cell_group_config {
-        phy.harq_codebook_dynamic = matches!(pg.pdsch_harq_ack_codebook, cg::HarqAckCodebook::Dynamic);
+        phy.harq_codebook_dynamic =
+            matches!(pg.pdsch_harq_ack_codebook, cg::HarqAckCodebook::Dynamic);
     }
 
     // --- MAC: logical channels from the RLC bearers.
@@ -686,11 +973,16 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
     }
     for b in &c.rlc_bearer_to_add_mod_list {
         let lcid = b.logical_channel_identity;
-        let ul = b.mac_logical_channel_config.as_ref().and_then(|m| m.ul_specific_parameters.as_ref());
+        let ul = b
+            .mac_logical_channel_config
+            .as_ref()
+            .and_then(|m| m.ul_specific_parameters.as_ref());
         let cfg = LogicalChannelConfig {
             lcid,
             priority: ul.map_or(if lcid <= 3 { lcid } else { 8 }, |u| u.priority),
-            pbr_bytes_per_ms: ul.and_then(|u| u.prioritised_bit_rate_kbps).map(|kbps| kbps / 8),
+            pbr_bytes_per_ms: ul
+                .and_then(|u| u.prioritised_bit_rate_kbps)
+                .map(|kbps| kbps / 8),
             bsd_ms: ul.map_or(1000, |u| u.bucket_size_duration_ms as u32),
             lcg: ul.and_then(|u| u.logical_channel_group).unwrap_or(0),
             sr_id: ul.and_then(|u| u.scheduling_request_id),
@@ -709,14 +1001,23 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             }
             for s in &src.scheduling_request_to_add_mod_list {
                 mac.sr.retain(|x| x.sr_id != s.scheduling_request_id);
-                mac.sr.push(SrConfig { sr_id: s.scheduling_request_id, prohibit_ms: s.sr_prohibit_timer_ms.map_or(0, u32::from), trans_max: s.sr_trans_max as u32, resources: Vec::new() });
+                mac.sr.push(SrConfig {
+                    sr_id: s.scheduling_request_id,
+                    prohibit_ms: s.sr_prohibit_timer_ms.map_or(0, u32::from),
+                    trans_max: s.sr_trans_max as u32,
+                    resources: Vec::new(),
+                });
             }
         }
         if let Some(b) = &m.bsr_config {
             mac.periodic_bsr_ms = b.periodic_bsr_timer_sf.map_or(0, u32::from);
             mac.retx_bsr_ms = b.retx_bsr_timer_sf as u32;
         }
-        if let Some(t) = m.tag_config.as_ref().and_then(|t| t.tag_to_add_mod_list.first()) {
+        if let Some(t) = m
+            .tag_config
+            .as_ref()
+            .and_then(|t| t.tag_to_add_mod_list.first())
+        {
             mac.time_alignment_timer_ms = t.time_alignment_timer.0.map_or(0, u32::from);
         }
         if let Some(p) = &m.phr_config {
@@ -731,7 +1032,9 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             mac.drx = d.setup().map(|d| ferrite_mac::DrxMacConfig {
                 on_duration_slots: match d.drx_on_duration_timer {
                     // 1/32 ms units: round up to whole slots.
-                    cg::DrxOnDurationTimer::SubMilliSeconds(n) => (u32::from(n) * spsf).div_ceil(32).max(1),
+                    cg::DrxOnDurationTimer::SubMilliSeconds(n) => {
+                        (u32::from(n) * spsf).div_ceil(32).max(1)
+                    }
                     cg::DrxOnDurationTimer::MilliSeconds(ms) => (u32::from(ms) * spsf).max(1),
                 },
                 inactivity_slots: u32::from(d.drx_inactivity_timer_ms) * spsf,
@@ -742,7 +1045,10 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
                 long_cycle_ms: u32::from(d.drx_long_cycle_ms),
                 start_offset_ms: u32::from(d.drx_long_cycle_start_offset),
                 slot_offset_slots: (u32::from(d.drx_slot_offset) * spsf) / 32,
-                short: d.short_drx.map(|s| ferrite_mac::ShortDrxMacConfig { cycle_ms: u32::from(s.drx_short_cycle_ms), timer_cycles: u32::from(s.drx_short_cycle_timer) }),
+                short: d.short_drx.map(|s| ferrite_mac::ShortDrxMacConfig {
+                    cycle_ms: u32::from(s.drx_short_cycle_ms),
+                    timer_cycles: u32::from(s.drx_short_cycle_timer),
+                }),
             });
         }
     }
@@ -753,8 +1059,14 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
         }
         for r in &s.srs_resource_to_add_mod_list {
             let (k_tc, comb_offset, cyclic_shift) = match r.transmission_comb {
-                cg::SrsTransmissionComb::N2 { comb_offset, cyclic_shift } => (2u8, comb_offset, cyclic_shift),
-                cg::SrsTransmissionComb::N4 { comb_offset, cyclic_shift } => (4u8, comb_offset, cyclic_shift),
+                cg::SrsTransmissionComb::N2 {
+                    comb_offset,
+                    cyclic_shift,
+                } => (2u8, comb_offset, cyclic_shift),
+                cg::SrsTransmissionComb::N4 {
+                    comb_offset,
+                    cyclic_shift,
+                } => (4u8, comb_offset, cyclic_shift),
             };
             let (period_slots, offset_slots) = match r.resource_type {
                 cg::SrsResourceType::Periodic(po) => (po.period_slots, po.offset),
@@ -783,11 +1095,22 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             phy.srs.push(cfg);
         }
     }
-    mac.srs_occasions = phy.srs.iter().filter(|r| r.period_slots > 0).map(|r| (r.id, r.period_slots, r.offset_slots)).collect();
+    mac.srs_occasions = phy
+        .srs
+        .iter()
+        .filter(|r| r.period_slots > 0)
+        .map(|r| (r.id, r.period_slots, r.offset_slots))
+        .collect();
 
     // SR resources (PUCCH) attached to their SR configurations.
     for s in &mut mac.sr {
-        s.resources = phy.pucch.sr_resources.iter().filter(|r| r.sr_id == s.sr_id).map(|r| (r.period_slots, r.offset_slots, r.pucch_resource)).collect();
+        s.resources = phy
+            .pucch
+            .sr_resources
+            .iter()
+            .filter(|r| r.sr_id == s.sr_id)
+            .map(|r| (r.period_slots, r.offset_slots, r.pucch_resource))
+            .collect();
     }
 
     // --- MAC view of PUCCH / CSI.
@@ -798,7 +1121,13 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             .pucch
             .resource_sets
             .iter()
-            .map(|s| (s.id, s.resources.clone(), s.max_payload.unwrap_or(if s.id == 0 { 2 } else { 1706 })))
+            .map(|s| {
+                (
+                    s.id,
+                    s.resources.clone(),
+                    s.max_payload.unwrap_or(if s.id == 0 { 2 } else { 1706 }),
+                )
+            })
             .collect(),
         resources: phy
             .pucch
@@ -817,7 +1146,18 @@ pub fn apply_cell_group_bwp(base_phy: &PhyConfig, base_mac: &MacConfig, c: &cg::
             .collect(),
         simultaneous_harq_ack_csi: f2.simultaneous_harq_ack_csi,
     };
-    mac.csi_reports = phy.csi_reports.iter().map(|r| CsiReportMacConfig { period_slots: r.period_slots, offset_slots: r.offset_slots, pucch_resource: r.pucch_resource, quantity: r.quantity, nof_ports: r.nof_ports, allowed_ranks: r.allowed_ranks() }).collect();
+    mac.csi_reports = phy
+        .csi_reports
+        .iter()
+        .map(|r| CsiReportMacConfig {
+            period_slots: r.period_slots,
+            offset_slots: r.offset_slots,
+            pucch_resource: r.pucch_resource,
+            quantity: r.quantity,
+            nof_ports: r.nof_ports,
+            allowed_ranks: r.allowed_ranks(),
+        })
+        .collect();
     mac.csi_enabled = !mac.csi_reports.is_empty();
     mac.harq_codebook_dynamic = phy.harq_codebook_dynamic;
     mac.nof_dl_harq = phy.pdsch.nof_harq_processes.max(1);
@@ -839,22 +1179,43 @@ fn rlc_setup_of(r: Option<&cg::RlcConfig>, rb: RbId, previous: Option<&RlcSetup>
             t_reassembly_ms: dl.t_reassembly_ms as u32,
             t_status_prohibit_ms: dl.t_status_prohibit_ms as u32,
         },
-        Some(cg::RlcConfig::UmBiDirectional { ul, dl }) => RlcSetup::Um { sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
-        Some(cg::RlcConfig::UmUniDirectionalUl { ul }) => RlcSetup::Um { sn_len: ul.sn_field_length.unwrap_or(6), t_reassembly_ms: 35 },
-        Some(cg::RlcConfig::UmUniDirectionalDl { dl }) => RlcSetup::Um { sn_len: dl.sn_field_length.unwrap_or(6), t_reassembly_ms: dl.t_reassembly_ms as u32 },
+        Some(cg::RlcConfig::UmBiDirectional { ul, dl }) => RlcSetup::Um {
+            sn_len: ul.sn_field_length.or(dl.sn_field_length).unwrap_or(6),
+            t_reassembly_ms: dl.t_reassembly_ms as u32,
+        },
+        Some(cg::RlcConfig::UmUniDirectionalUl { ul }) => RlcSetup::Um {
+            sn_len: ul.sn_field_length.unwrap_or(6),
+            t_reassembly_ms: 35,
+        },
+        Some(cg::RlcConfig::UmUniDirectionalDl { dl }) => RlcSetup::Um {
+            sn_len: dl.sn_field_length.unwrap_or(6),
+            t_reassembly_ms: dl.t_reassembly_ms as u32,
+        },
         // rlc-Config is "Need M": absent for a bearer the UE already has means
         // keep the previous configuration (e.g. the reconfiguration after a
         // re-establishment). Otherwise the TS 38.331 §9.2.1 SRB defaults.
         None => match (previous, rb) {
             (Some(p), _) => p.clone(),
-            (None, RbId::Srb(_) | RbId::Drb(_)) => RlcSetup::Am { sn_len: 12, t_poll_retransmit_ms: 45, poll_pdu: None, poll_byte: None, max_retx: 8, t_reassembly_ms: 35, t_status_prohibit_ms: 0 },
+            (None, RbId::Srb(_) | RbId::Drb(_)) => RlcSetup::Am {
+                sn_len: 12,
+                t_poll_retransmit_ms: 45,
+                poll_pdu: None,
+                poll_byte: None,
+                max_retx: 8,
+                t_reassembly_ms: 35,
+                t_status_prohibit_ms: 0,
+            },
         },
     }
 }
 
 /// Bearer setups from the RLC bearers of a cell group and the PDCP/SDAP
 /// parameters of a `RadioBearerConfig` (when the message carries one).
-fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>, previous: &std::collections::BTreeMap<u8, RlcSetup>) -> Vec<BearerSetup> {
+fn bearers_of(
+    c: &cg::CellGroupConfig,
+    rbc: Option<&rrc::RadioBearerConfig>,
+    previous: &std::collections::BTreeMap<u8, RlcSetup>,
+) -> Vec<BearerSetup> {
     let mut out = Vec::new();
     for b in &c.rlc_bearer_to_add_mod_list {
         let rb = match b.served_radio_bearer {
@@ -862,7 +1223,11 @@ fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>, pre
             Some(cg::ServedRadioBearer::Drb(n)) => RbId::Drb(n),
             None => continue,
         };
-        let rlc = rlc_setup_of(b.rlc_config.as_ref(), rb, previous.get(&b.logical_channel_identity));
+        let rlc = rlc_setup_of(
+            b.rlc_config.as_ref(),
+            rb,
+            previous.get(&b.logical_channel_identity),
+        );
         let mut setup = BearerSetup {
             lcid: b.logical_channel_identity,
             rb,
@@ -881,18 +1246,31 @@ fn bearers_of(c: &cg::CellGroupConfig, rbc: Option<&rrc::RadioBearerConfig>, pre
         if let Some(rbc) = rbc {
             match rb {
                 RbId::Srb(id) => {
-                    if let Some(s) = rbc.srb_to_add_mod_list.iter().find(|s| s.srb_identity == id) {
-                        setup.t_reordering_ms = s.pdcp_config.as_ref().and_then(|p| p.t_reordering_ms).map(u32::from);
+                    if let Some(s) = rbc
+                        .srb_to_add_mod_list
+                        .iter()
+                        .find(|s| s.srb_identity == id)
+                    {
+                        setup.t_reordering_ms = s
+                            .pdcp_config
+                            .as_ref()
+                            .and_then(|p| p.t_reordering_ms)
+                            .map(u32::from);
                         setup.reestablish_pdcp = s.reestablish_pdcp;
                     }
                 }
                 RbId::Drb(id) => {
-                    if let Some(d) = rbc.drb_to_add_mod_list.iter().find(|d| d.drb_identity == id) {
+                    if let Some(d) = rbc
+                        .drb_to_add_mod_list
+                        .iter()
+                        .find(|d| d.drb_identity == id)
+                    {
                         setup.reestablish_pdcp = d.reestablish_pdcp;
                         if let Some(p) = &d.pdcp_config {
                             setup.t_reordering_ms = p.t_reordering_ms.map(u32::from);
                             if let Some(drb) = &p.drb {
-                                setup.pdcp_sn_len = drb.pdcp_sn_size_ul.or(drb.pdcp_sn_size_dl).unwrap_or(12);
+                                setup.pdcp_sn_len =
+                                    drb.pdcp_sn_size_ul.or(drb.pdcp_sn_size_dl).unwrap_or(12);
                                 setup.pdcp_integrity = drb.integrity_protection;
                                 setup.discard_timer_ms = match drb.discard_timer {
                                     Some(rrc::PdcpDiscardTimer::Ms(ms)) => Some(ms as u32),
@@ -945,12 +1323,31 @@ pub fn cell_group_bwps(cell: &CellInfo, c: &cg::CellGroupConfig) -> BwpConfigs {
             None if id == cell.phy.dl_bwp.id => (&cell.phy, &cell.mac),
             None => (&cell.common_phy, &cell.common_mac),
         };
-        let ul_id = if id == 0 || ul_ids.contains(&id) || cell.bwps.get(&id).is_some_and(|(p, _)| p.ul_bwp.id == id) { id } else { 0 };
+        let ul_id = if id == 0
+            || ul_ids.contains(&id)
+            || cell.bwps.get(&id).is_some_and(|(p, _)| p.ul_bwp.id == id)
+        {
+            id
+        } else {
+            0
+        };
         by_id.insert(id, apply_cell_group_bwp(base_phy, base_mac, c, id, ul_id));
     }
-    let active_id = c.serving_cell().and_then(|s| s.first_active_downlink_bwp_id).filter(|id| by_id.contains_key(id)).unwrap_or(cell.phy.dl_bwp.id);
-    let active = by_id.get(&active_id).or_else(|| by_id.get(&0)).cloned().expect("BWP 0 is always present");
-    BwpConfigs { by_id, active_id, active }
+    let active_id = c
+        .serving_cell()
+        .and_then(|s| s.first_active_downlink_bwp_id)
+        .filter(|id| by_id.contains_key(id))
+        .unwrap_or(cell.phy.dl_bwp.id);
+    let active = by_id
+        .get(&active_id)
+        .or_else(|| by_id.get(&0))
+        .cloned()
+        .expect("BWP 0 is always present");
+    BwpConfigs {
+        by_id,
+        active_id,
+        active,
+    }
 }
 
 /// Msg4: `DL-CCCH-Message`.
@@ -960,40 +1357,72 @@ pub fn decode_dl_ccch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlCc
         rrc::DlCcchMessage::RrcSetup(s) => {
             let bwps = cell_group_bwps(cell, &s.master_cell_group);
             let (phy, mac) = bwps.active.clone();
-            let bearers = bearers_of(&s.master_cell_group, Some(&s.radio_bearer_config), &cell.rlc_bearers);
-            Ok(DlCcch::Setup { tid: s.rrc_transaction_identifier, phy, mac, bearers, bwps })
+            let bearers = bearers_of(
+                &s.master_cell_group,
+                Some(&s.radio_bearer_config),
+                &cell.rlc_bearers,
+            );
+            Ok(DlCcch::Setup {
+                tid: s.rrc_transaction_identifier,
+                phy,
+                mac,
+                bearers,
+                bwps,
+            })
         }
     }
 }
 
 /// `DL-DCCH-Message` (a PDCP SDU on SRB1/2).
 pub fn decode_dl_dcch(pdu: &[u8], cell: &CellInfo, _tx_lead: u16) -> Result<DlDcch, String> {
-    Ok(match rrc::DlDcchMessage::decode(pdu).map_err(err("DL-DCCH"))? {
-        rrc::DlDcchMessage::RrcReconfiguration(r) => {
-            let cgc = r.master_cell_group();
-            let bwps = cgc.map(|c| cell_group_bwps(cell, c));
-            let (phy, mac) = match &bwps {
-                Some(b) => (Some(b.active.0.clone()), Some(b.active.1.clone())),
-                None => (None, None),
-            };
-            let bearers = cgc.map(|c| bearers_of(c, r.radio_bearer_config.as_ref(), &cell.rlc_bearers)).unwrap_or_default();
-            let released = cgc.map(|c| c.rlc_bearer_to_release_list.clone()).unwrap_or_default();
-            DlDcch::Reconfiguration { tid: r.rrc_transaction_identifier, phy, mac, bearers, released, nas: r.dedicated_nas_messages().to_vec(), meas: r.meas_config.clone(), bwps }
-        }
-        rrc::DlDcchMessage::SecurityModeCommand(m) => {
-            let a = &m.security_algorithm_config;
-            DlDcch::SecurityModeCommand {
-                tid: m.rrc_transaction_identifier,
-                integrity_alg: a.integrity_prot_algorithm.map_or(0, |i| i as u8),
-                ciphering_alg: a.ciphering_algorithm as u8,
+    Ok(
+        match rrc::DlDcchMessage::decode(pdu).map_err(err("DL-DCCH"))? {
+            rrc::DlDcchMessage::RrcReconfiguration(r) => {
+                let cgc = r.master_cell_group();
+                let bwps = cgc.map(|c| cell_group_bwps(cell, c));
+                let (phy, mac) = match &bwps {
+                    Some(b) => (Some(b.active.0.clone()), Some(b.active.1.clone())),
+                    None => (None, None),
+                };
+                let bearers = cgc
+                    .map(|c| bearers_of(c, r.radio_bearer_config.as_ref(), &cell.rlc_bearers))
+                    .unwrap_or_default();
+                let released = cgc
+                    .map(|c| c.rlc_bearer_to_release_list.clone())
+                    .unwrap_or_default();
+                DlDcch::Reconfiguration {
+                    tid: r.rrc_transaction_identifier,
+                    phy,
+                    mac,
+                    bearers,
+                    released,
+                    nas: r.dedicated_nas_messages().to_vec(),
+                    meas: r.meas_config.clone(),
+                    bwps,
+                }
             }
-        }
-        rrc::DlDcchMessage::UeCapabilityEnquiry(m) => DlDcch::UeCapabilityEnquiry { tid: m.rrc_transaction_identifier },
-        rrc::DlDcchMessage::DlInformationTransfer(m) => DlDcch::DlInformationTransfer { nas: m.dedicated_nas_message },
-        rrc::DlDcchMessage::RrcRelease(_) => DlDcch::Release,
-        rrc::DlDcchMessage::RrcReestablishment(m) => DlDcch::Reestablishment { tid: m.rrc_transaction_identifier, ncc: m.next_hop_chaining_count },
-        rrc::DlDcchMessage::CounterCheck(_) => DlDcch::Other("CounterCheck"),
-    })
+            rrc::DlDcchMessage::SecurityModeCommand(m) => {
+                let a = &m.security_algorithm_config;
+                DlDcch::SecurityModeCommand {
+                    tid: m.rrc_transaction_identifier,
+                    integrity_alg: a.integrity_prot_algorithm.map_or(0, |i| i as u8),
+                    ciphering_alg: a.ciphering_algorithm as u8,
+                }
+            }
+            rrc::DlDcchMessage::UeCapabilityEnquiry(m) => DlDcch::UeCapabilityEnquiry {
+                tid: m.rrc_transaction_identifier,
+            },
+            rrc::DlDcchMessage::DlInformationTransfer(m) => DlDcch::DlInformationTransfer {
+                nas: m.dedicated_nas_message,
+            },
+            rrc::DlDcchMessage::RrcRelease(_) => DlDcch::Release,
+            rrc::DlDcchMessage::RrcReestablishment(m) => DlDcch::Reestablishment {
+                tid: m.rrc_transaction_identifier,
+                ncc: m.next_hop_chaining_count,
+            },
+            rrc::DlDcchMessage::CounterCheck(_) => DlDcch::Other("CounterCheck"),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,7 +1453,11 @@ pub fn encode_setup_request(random_id: u64, s_tmsi_part1: Option<u64>, cause: u8
         Some(v) => rrc::InitialUeIdentity::Ng5gSTmsiPart1(v & ((1 << 39) - 1)),
         None => rrc::InitialUeIdentity::RandomValue(random_id & ((1 << 39) - 1)),
     };
-    let pdu = rrc::UlCcchMessage::RrcSetupRequest(rrc::RrcSetupRequest { ue_identity, establishment_cause: cause_of(cause) }).encode();
+    let pdu = rrc::UlCcchMessage::RrcSetupRequest(rrc::RrcSetupRequest {
+        ue_identity,
+        establishment_cause: cause_of(cause),
+    })
+    .encode();
     let mut out = [0u8; 6];
     out[..pdu.len().min(6)].copy_from_slice(&pdu[..pdu.len().min(6)]);
     out
@@ -1032,7 +1465,12 @@ pub fn encode_setup_request(random_id: u64, s_tmsi_part1: Option<u64>, cause: u8
 
 /// `RRCSetupComplete`: `s_tmsi` carries the 9 MSBs (`ng-5G-S-TMSI-Part2`)
 /// when the request used `ng-5G-S-TMSI-Part1`.
-pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8], s_tmsi: Option<u64>) -> Vec<u8> {
+pub fn encode_setup_complete(
+    tid: u8,
+    selected_plmn: u8,
+    nas: &[u8],
+    s_tmsi: Option<u64>,
+) -> Vec<u8> {
     rrc::UlDcchMessage::RrcSetupComplete(rrc::RrcSetupComplete {
         rrc_transaction_identifier: tid,
         selected_plmn_identity: selected_plmn.max(1),
@@ -1046,24 +1484,47 @@ pub fn encode_setup_complete(tid: u8, selected_plmn: u8, nas: &[u8], s_tmsi: Opt
 }
 
 pub fn encode_security_mode_complete(tid: u8) -> Vec<u8> {
-    rrc::UlDcchMessage::SecurityModeComplete { rrc_transaction_identifier: tid }.encode()
+    rrc::UlDcchMessage::SecurityModeComplete {
+        rrc_transaction_identifier: tid,
+    }
+    .encode()
 }
 
 pub fn encode_security_mode_failure(tid: u8) -> Vec<u8> {
-    rrc::UlDcchMessage::SecurityModeFailure { rrc_transaction_identifier: tid }.encode()
+    rrc::UlDcchMessage::SecurityModeFailure {
+        rrc_transaction_identifier: tid,
+    }
+    .encode()
 }
 
 pub fn encode_reconfiguration_complete(tid: u8) -> Vec<u8> {
-    rrc::UlDcchMessage::RrcReconfigurationComplete { rrc_transaction_identifier: tid }.encode()
+    rrc::UlDcchMessage::RrcReconfigurationComplete {
+        rrc_transaction_identifier: tid,
+    }
+    .encode()
 }
 
 pub fn encode_ue_capability_information(tid: u8, bands: &[u16]) -> Vec<u8> {
-    let bands: Vec<u16> = if bands.is_empty() { vec![78] } else { bands.to_vec() };
+    let bands: Vec<u16> = if bands.is_empty() {
+        vec![78]
+    } else {
+        bands.to_vec()
+    };
     // The modem does 256-QAM in both directions (PDSCH demapper, PUSCH mapper).
-    let container = rrc::UeNrCapability { access_stratum_release: rrc::AccessStratumRelease::Rel15, supported_band_list_nr: bands, pdsch_256qam_fr1: true, pusch_256qam: true, drx: true }.encode();
+    let container = rrc::UeNrCapability {
+        access_stratum_release: rrc::AccessStratumRelease::Rel15,
+        supported_band_list_nr: bands,
+        pdsch_256qam_fr1: true,
+        pusch_256qam: true,
+        drx: true,
+    }
+    .encode();
     rrc::UlDcchMessage::UeCapabilityInformation(rrc::UeCapabilityInformation {
         rrc_transaction_identifier: tid,
-        ue_capability_rat_container_list: vec![rrc::UeCapabilityRatContainer { rat_type: rrc::RatType::Nr, container }],
+        ue_capability_rat_container_list: vec![rrc::UeCapabilityRatContainer {
+            rat_type: rrc::RatType::Nr,
+            container,
+        }],
     })
     .encode()
 }
@@ -1071,13 +1532,24 @@ pub fn encode_ue_capability_information(tid: u8, bands: &[u16]) -> Vec<u8> {
 /// `RRCReestablishmentRequest` (SRB0, 48-bit CCCH): `short_mac_i` from
 /// [`short_mac_i`], `cause` 0 = reconfigurationFailure, 1 = handoverFailure,
 /// 2 = otherFailure.
-pub fn encode_reestablishment_request(c_rnti: u16, pci: u16, short_mac_i: u16, cause: u8) -> [u8; 6] {
+pub fn encode_reestablishment_request(
+    c_rnti: u16,
+    pci: u16,
+    short_mac_i: u16,
+    cause: u8,
+) -> [u8; 6] {
     let reestablishment_cause = match cause {
         0 => rrc::ReestablishmentCause::ReconfigurationFailure,
         1 => rrc::ReestablishmentCause::HandoverFailure,
         _ => rrc::ReestablishmentCause::OtherFailure,
     };
-    let pdu = rrc::UlCcchMessage::RrcReestablishmentRequest(rrc::RrcReestablishmentRequest { c_rnti, phys_cell_id: pci, short_mac_i, reestablishment_cause }).encode();
+    let pdu = rrc::UlCcchMessage::RrcReestablishmentRequest(rrc::RrcReestablishmentRequest {
+        c_rnti,
+        phys_cell_id: pci,
+        short_mac_i,
+        reestablishment_cause,
+    })
+    .encode();
     let mut out = [0u8; 6];
     out[..pdu.len().min(6)].copy_from_slice(&pdu[..pdu.len().min(6)]);
     out
@@ -1087,19 +1559,30 @@ pub fn encode_reestablishment_request(c_rnti: u16, pci: u16, short_mac_i: u16, c
 /// the current K_RRCint / integrity algorithm over the UPER-encoded
 /// `VarShortMAC-Input { sourcePhysCellId, targetCellIdentity, source-c-RNTI }`
 /// with COUNT = 2^32 − 1, BEARER = 31 and DIRECTION = 1.
-pub fn short_mac_i(k_rrc_int: &[u8; 16], integrity_alg: ferrite_security::IntegrityAlg, source_pci: u16, target_cell_identity: u64, source_c_rnti: u16) -> u16 {
+pub fn short_mac_i(
+    k_rrc_int: &[u8; 16],
+    integrity_alg: ferrite_security::IntegrityAlg,
+    source_pci: u16,
+    target_cell_identity: u64,
+    source_c_rnti: u16,
+) -> u16 {
     let mut w = ferrite_asn1::uper::BitWriter::new();
     w.uint(u32::from(source_pci), 0, 1007);
     w.bitstring(target_cell_identity & ((1 << 36) - 1), 36);
     w.uint(u32::from(source_c_rnti), 0, 65535);
     let input = w.finish();
-    let mac = ferrite_security::integrity_mac(integrity_alg, k_rrc_int, 0xffff_ffff, 0x1f, 1, &input).unwrap_or([0u8; 4]);
+    let mac =
+        ferrite_security::integrity_mac(integrity_alg, k_rrc_int, 0xffff_ffff, 0x1f, 1, &input)
+            .unwrap_or([0u8; 4]);
     u16::from_be_bytes([mac[2], mac[3]])
 }
 
 /// `RRCReestablishmentComplete` on SRB1.
 pub fn encode_reestablishment_complete(tid: u8) -> Vec<u8> {
-    rrc::UlDcchMessage::RrcReestablishmentComplete { rrc_transaction_identifier: tid }.encode()
+    rrc::UlDcchMessage::RrcReestablishmentComplete {
+        rrc_transaction_identifier: tid,
+    }
+    .encode()
 }
 
 pub use ferrite_security::kdf::k_ng_ran_star;
@@ -1110,5 +1593,8 @@ pub fn encode_measurement_report(results: &ferrite_asn1::meas::MeasResults) -> V
 }
 
 pub fn encode_ul_information_transfer(nas: &[u8]) -> Vec<u8> {
-    rrc::UlDcchMessage::UlInformationTransfer(rrc::UlInformationTransfer { dedicated_nas_message: Some(nas.to_vec()) }).encode()
+    rrc::UlDcchMessage::UlInformationTransfer(rrc::UlInformationTransfer {
+        dedicated_nas_message: Some(nas.to_vec()),
+    })
+    .encode()
 }

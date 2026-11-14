@@ -52,7 +52,10 @@ pub fn info_mask_rm(n: usize, k: usize, e: usize) -> Vec<bool> {
             placed += 1;
         }
     }
-    assert_eq!(placed, k, "not enough usable positions for K={k}, N={n}, E={e}");
+    assert_eq!(
+        placed, k,
+        "not enough usable positions for K={k}, N={n}, E={e}"
+    );
     mask
 }
 
@@ -370,7 +373,10 @@ mod tests {
         let mut rng = Rng(0x1234_5678);
         let msg: Vec<u8> = (0..k).map(|_| rng.bit()).collect();
         let coded = polar_encode(&msg, &mask);
-        let llr: Vec<f32> = coded.iter().map(|&b| if b == 0 { 10.0 } else { -10.0 }).collect();
+        let llr: Vec<f32> = coded
+            .iter()
+            .map(|&b| if b == 0 { 10.0 } else { -10.0 })
+            .collect();
         assert_eq!(sc_decode(&llr, &mask), msg);
     }
 

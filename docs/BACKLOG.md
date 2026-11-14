@@ -69,9 +69,17 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       `codebookConfig` decoder, and the CSI report in the Table 6.3.1.1.2-7
       wideband PUCCH layout with RI 1 / PMI 0 — the two-antenna cell T5
       attaches and pings with antenna 0 (before the layout fix OCUDU read the
-      4-bit CQI as RI 2 and scheduled two layers). Open: per-antenna channel
-      estimation and the 2-layer MMSE demapper, DCI 1_1 two-layer antenna
-      ports and TBS, RI/PMI measurement on the two-port (row 3) CSI-RS.
+      4-bit CQI as RI 2 and scheduled two layers). Also done 2026-11-14: the
+      per-antenna / per-port channel estimation and the two-layer MMSE
+      demapper (`extract_pdsch_mimo`, loopback-tested on a full-rank 2x2
+      channel), DCI 1_1 two-layer antenna ports and TBS, and the
+      `ri-Restriction` bit order (LSB = rank 1): T5 stage S28 passes with
+      two-layer PDSCHs decoded. Open: RI/PMI measurement on the two-port
+      CSI-RS (today RI = number of receive antennas, PMI 0), the Type I
+      two-port codebook (`i2`: rank 1 `[1, e^{jπn/2}]/√2`, rank 2
+      `[[1, 1], [e^{jπn/2}, −e^{jπn/2}]]/2`; OCUDU passes the raw `i2`
+      field as `pmi`), three/four layers, the SDR two-channel receive path,
+      and the Sionna RT / TS 38.901 channel emulator (step 2).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC

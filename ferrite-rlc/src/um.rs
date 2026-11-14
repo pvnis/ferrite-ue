@@ -59,7 +59,10 @@ impl UmEntity {
 
     pub fn tx_sdu(&mut self, sdu: Vec<u8>) {
         if sdu.len() > u16::MAX as usize {
-            log::warn!("rlc um: discarding {}-byte SDU (exceeds SO range)", sdu.len());
+            log::warn!(
+                "rlc um: discarding {}-byte SDU (exceeds SO range)",
+                sdu.len()
+            );
             return;
         }
         self.tx_queue.push_back(sdu);
@@ -83,12 +86,21 @@ impl UmEntity {
         // TX_Next only for segmented SDUs).
         if off == 0 && len < max_bytes {
             let mut pdu = Vec::with_capacity(1 + len);
-            UmdHeader { si: Si::Full, sn: 0, so: 0 }.encode(self.sn_len, &mut pdu);
+            UmdHeader {
+                si: Si::Full,
+                sn: 0,
+                so: 0,
+            }
+            .encode(self.sn_len, &mut pdu);
             pdu.extend_from_slice(sdu);
             self.tx_cur = None;
             return Some(pdu);
         }
-        let hdr = if off == 0 { self.first_seg_hdr() } else { self.first_seg_hdr() + 2 };
+        let hdr = if off == 0 {
+            self.first_seg_hdr()
+        } else {
+            self.first_seg_hdr() + 2
+        };
         if max_bytes <= hdr {
             return None;
         }
@@ -96,7 +108,12 @@ impl UmEntity {
         let end = off + take;
         let si = Si::of_range(off, end, len);
         let mut pdu = Vec::with_capacity(hdr + take);
-        UmdHeader { si, sn: self.tx_next, so: off as u16 }.encode(self.sn_len, &mut pdu);
+        UmdHeader {
+            si,
+            sn: self.tx_next,
+            so: off as u16,
+        }
+        .encode(self.sn_len, &mut pdu);
         pdu.extend_from_slice(&sdu[off..end]);
         if end == len {
             self.tx_next = (self.tx_next + 1) % self.modulus;
@@ -111,10 +128,9 @@ impl UmEntity {
     /// under segmentation (+ segment header).
     pub fn buffer_status(&self) -> usize {
         let queued: usize = self.tx_queue.iter().map(|s| s.len() + 1).sum();
-        let cur = self
-            .tx_cur
-            .as_ref()
-            .map_or(0, |(s, off)| s.len() - off + self.first_seg_hdr() + if *off > 0 { 2 } else { 0 });
+        let cur = self.tx_cur.as_ref().map_or(0, |(s, off)| {
+            s.len() - off + self.first_seg_hdr() + if *off > 0 { 2 } else { 0 }
+        });
         queued + cur
     }
 
@@ -125,7 +141,11 @@ impl UmEntity {
     /// Position of `sn` relative to the lower edge of the reassembly window
     /// `[RX_Next_Highest − UM_Window_Size, RX_Next_Highest)`.
     fn rel(&self, sn: u32) -> u32 {
-        sn_mod(sn, self.rx_next_highest.wrapping_sub(self.window), self.modulus)
+        sn_mod(
+            sn,
+            self.rx_next_highest.wrapping_sub(self.window),
+            self.modulus,
+        )
     }
 
     fn outside_window(&self, sn: u32) -> bool {
@@ -177,7 +197,11 @@ impl UmEntity {
         }
         let was_outside = self.outside_window(x);
         // Place in the reception buffer.
-        match self.rx.entry(x).or_insert_with(|| UmRx::Pending(RxSdu::default())) {
+        match self
+            .rx
+            .entry(x)
+            .or_insert_with(|| UmRx::Pending(RxSdu::default()))
+        {
             UmRx::Pending(r) => {
                 r.insert(h.so as usize, data, h.si == Si::Last);
             }
@@ -234,7 +258,8 @@ impl UmEntity {
         self.rx_next_reassembly = self.first_not_delivered(self.rx_timer_trigger);
         let rnr_rel = self.rel(self.rx_next_reassembly);
         let lo = self.rx_next_highest.wrapping_sub(self.window);
-        self.rx.retain(|&sn, st| matches!(st, UmRx::Delivered) || sn_mod(sn, lo, m) >= rnr_rel);
+        self.rx
+            .retain(|&sn, st| matches!(st, UmRx::Delivered) || sn_mod(sn, lo, m) >= rnr_rel);
         let ahead = sn_mod(self.rx_next_highest, self.rx_next_reassembly, m);
         if ahead > 1 || (ahead == 1 && self.gap_before_last(self.rx_next_reassembly)) {
             self.t_reassembly.start(now);

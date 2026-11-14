@@ -81,7 +81,15 @@ fn running(t: Option<SlotPoint>, now: SlotPoint) -> bool {
 
 impl Drx {
     pub fn new(cfg: Option<DrxMacConfig>) -> Self {
-        let mut d = Self { cfg: None, state: DrxState::Off, on_duration_until: None, inactivity_until: None, dl: BTreeMap::new(), ul: BTreeMap::new(), active: true };
+        let mut d = Self {
+            cfg: None,
+            state: DrxState::Off,
+            on_duration_until: None,
+            inactivity_until: None,
+            dl: BTreeMap::new(),
+            ul: BTreeMap::new(),
+            active: true,
+        };
         d.configure(cfg);
         d
     }
@@ -112,7 +120,11 @@ impl Drx {
 
     /// MAC reset (§5.12): every DRX timer stopped, back to the long cycle.
     pub fn reset(&mut self) {
-        self.state = if self.cfg.is_some() { DrxState::Long } else { DrxState::Off };
+        self.state = if self.cfg.is_some() {
+            DrxState::Long
+        } else {
+            DrxState::Off
+        };
         self.on_duration_until = None;
         self.inactivity_until = None;
         self.dl.clear();
@@ -137,7 +149,13 @@ impl Drx {
     /// `ra_running` covers ra-ContentionResolutionTimer (and the RAR window),
     /// `sr_pending` a scheduling request sent on PUCCH and still pending,
     /// `dl_not_decoded(harq)` whether the DL HARQ process still lacks its TB.
-    pub fn on_slot(&mut self, now: SlotPoint, ra_running: bool, sr_pending: bool, dl_not_decoded: impl Fn(u8) -> bool) -> bool {
+    pub fn on_slot(
+        &mut self,
+        now: SlotPoint,
+        ra_running: bool,
+        sr_pending: bool,
+        dl_not_decoded: impl Fn(u8) -> bool,
+    ) -> bool {
         let Some(cfg) = self.cfg else {
             self.active = true;
             return true;
@@ -163,7 +181,11 @@ impl Drx {
                     None if now.diff(&t.rtt_until) >= 0 => {
                         // RTT elapsed: a retransmission may follow (DL: only if
                         // the TB was not decoded; UL: the UE cannot know).
-                        let slots = if is_dl { cfg.retx_dl_slots } else { cfg.retx_ul_slots };
+                        let slots = if is_dl {
+                            cfg.retx_dl_slots
+                        } else {
+                            cfg.retx_ul_slots
+                        };
                         let start = !is_dl || dl_not_decoded(harq);
                         if start && slots > 0 {
                             t.retx_until = Some(now.add(u64::from(slots)));
@@ -180,7 +202,9 @@ impl Drx {
         let sub = u32::from(now.sfn) * 10 + u32::from(now.subframe());
         let at_start = match self.state {
             DrxState::Off => false,
-            DrxState::Long => sub % cfg.long_cycle_ms.max(1) == cfg.start_offset_ms % cfg.long_cycle_ms.max(1),
+            DrxState::Long => {
+                sub % cfg.long_cycle_ms.max(1) == cfg.start_offset_ms % cfg.long_cycle_ms.max(1)
+            }
             DrxState::Short { .. } => {
                 let c = cfg.short.map_or(cfg.long_cycle_ms, |s| s.cycle_ms).max(1);
                 sub % c == cfg.start_offset_ms % c
@@ -189,8 +213,16 @@ impl Drx {
         if at_start && u32::from(now.slot_in_subframe()) == cfg.slot_offset_slots {
             self.on_duration_until = Some(now.add(u64::from(cfg.on_duration_slots.max(1))));
         }
-        let retx_running = self.dl.values().chain(self.ul.values()).any(|t| running(t.retx_until, now));
-        self.active = running(self.on_duration_until, now) || running(self.inactivity_until, now) || retx_running || ra_running || sr_pending;
+        let retx_running = self
+            .dl
+            .values()
+            .chain(self.ul.values())
+            .any(|t| running(t.retx_until, now));
+        self.active = running(self.on_duration_until, now)
+            || running(self.inactivity_until, now)
+            || retx_running
+            || ra_running
+            || sr_pending;
         self.active
     }
 
@@ -198,7 +230,9 @@ impl Drx {
         let Some(cfg) = self.cfg else { return };
         if let Some(s) = cfg.short {
             let spsf = u64::from(now.numerology.slots_per_subframe());
-            self.state = DrxState::Short { until: now.add(u64::from(s.cycle_ms) * u64::from(s.timer_cycles) * spsf) };
+            self.state = DrxState::Short {
+                until: now.add(u64::from(s.cycle_ms) * u64::from(s.timer_cycles) * spsf),
+            };
         } else {
             self.state = DrxState::Long;
         }
@@ -232,13 +266,25 @@ impl Drx {
     /// retransmission timer stops).
     pub fn on_dl_assignment(&mut self, harq_id: u8, ack_slot: SlotPoint) {
         let Some(cfg) = self.cfg else { return };
-        self.dl.insert(harq_id, HarqTimers { rtt_until: Self::rtt_expiry(ack_slot, cfg.harq_rtt_dl_symbols), retx_until: None });
+        self.dl.insert(
+            harq_id,
+            HarqTimers {
+                rtt_until: Self::rtt_expiry(ack_slot, cfg.harq_rtt_dl_symbols),
+                retx_until: None,
+            },
+        );
     }
 
     /// An UL grant for `harq_id` whose PUSCH goes out in `pusch_slot`.
     pub fn on_ul_grant(&mut self, harq_id: u8, pusch_slot: SlotPoint) {
         let Some(cfg) = self.cfg else { return };
-        self.ul.insert(harq_id, HarqTimers { rtt_until: Self::rtt_expiry(pusch_slot, cfg.harq_rtt_ul_symbols), retx_until: None });
+        self.ul.insert(
+            harq_id,
+            HarqTimers {
+                rtt_until: Self::rtt_expiry(pusch_slot, cfg.harq_rtt_ul_symbols),
+                retx_until: None,
+            },
+        );
     }
 
     /// DRX Command (`long = false`) / Long DRX Command MAC CE (§5.7, §6.1.3.5/6).
@@ -306,7 +352,11 @@ mod tests {
 
     #[test]
     fn slot_offset_moves_the_on_duration() {
-        let mut d = Drx::new(Some(DrxMacConfig { slot_offset_slots: 1, start_offset_ms: 20, ..cfg() }));
+        let mut d = Drx::new(Some(DrxMacConfig {
+            slot_offset_slots: 1,
+            start_offset_ms: 20,
+            ..cfg()
+        }));
         let active: Vec<u64> = (0..200).filter(|&n| tick(&mut d, n)).collect();
         // subframe 20 → slot 40, plus one slot offset.
         assert_eq!(active, vec![41, 42, 43, 44]);
@@ -336,7 +386,9 @@ mod tests {
         tick(&mut d, 10);
         // HARQ-ACK (NACK) in slot 20 → RTT (4 slots) ends at 25 → retx timer 25..33.
         d.on_dl_assignment(1, slot(20));
-        let active: Vec<u64> = (10..40).filter(|&n| d.on_slot(slot(n), false, false, |_| true)).collect();
+        let active: Vec<u64> = (10..40)
+            .filter(|&n| d.on_slot(slot(n), false, false, |_| true))
+            .collect();
         assert_eq!(active, (25..33).collect::<Vec<_>>());
         // Decoded TB: no retransmission timer.
         let mut d = Drx::new(Some(cfg()));
@@ -345,7 +397,9 @@ mod tests {
         // UL: the retransmission timer always follows the RTT.
         let mut d = Drx::new(Some(cfg()));
         d.on_ul_grant(0, slot(20));
-        let active: Vec<u64> = (10..40).filter(|&n| d.on_slot(slot(n), false, false, |_| false)).collect();
+        let active: Vec<u64> = (10..40)
+            .filter(|&n| d.on_slot(slot(n), false, false, |_| false))
+            .collect();
         assert_eq!(active, (21..29).collect::<Vec<_>>());
     }
 
@@ -361,7 +415,10 @@ mod tests {
 
     #[test]
     fn drx_command_ends_the_on_duration_and_short_cycle_follows_inactivity() {
-        let short = Some(ShortDrxMacConfig { cycle_ms: 20, timer_cycles: 2 });
+        let short = Some(ShortDrxMacConfig {
+            cycle_ms: 20,
+            timer_cycles: 2,
+        });
         let mut d = Drx::new(Some(DrxMacConfig { short, ..cfg() }));
         assert!(tick(&mut d, 0));
         d.on_drx_command(slot(1), false);
@@ -370,7 +427,10 @@ mod tests {
         // slots) for 2 cycles, then back to long.
         assert!(matches!(d.state(), DrxState::Short { .. }));
         let active: Vec<u64> = (1..200).filter(|&n| tick(&mut d, n)).collect();
-        assert_eq!(active, vec![40, 41, 42, 43, 80, 81, 82, 83, 160, 161, 162, 163]);
+        assert_eq!(
+            active,
+            vec![40, 41, 42, 43, 80, 81, 82, 83, 160, 161, 162, 163]
+        );
         assert_eq!(d.state(), DrxState::Long);
         // Inactivity expiry also enters the short cycle; Long DRX Command leaves it.
         d.on_crnti_pdcch(slot(200));

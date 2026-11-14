@@ -198,10 +198,7 @@ mod tests {
         let sigma = sig_rms * 0.5;
         let mut rng = Rng(0x00C0_FFEE_1234_5678);
         for s in sig.iter_mut() {
-            *s += Complex32::new(
-                rng.normal() * sigma / SQRT_2,
-                rng.normal() * sigma / SQRT_2,
-            );
+            *s += Complex32::new(rng.normal() * sigma / SQRT_2, rng.normal() * sigma / SQRT_2);
         }
 
         let d = detector.search(&sig).unwrap();
@@ -226,6 +223,10 @@ mod tests {
             .map(|_| Complex32::new(rng.normal(), rng.normal()))
             .collect();
         let d = detector.search(&sig).unwrap();
-        assert!(d.metric < 0.3, "noise metric unexpectedly high: {}", d.metric);
+        assert!(
+            d.metric < 0.3,
+            "noise metric unexpectedly high: {}",
+            d.metric
+        );
     }
 }

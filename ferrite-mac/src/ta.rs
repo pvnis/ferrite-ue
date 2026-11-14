@@ -27,7 +27,12 @@ pub struct TimingAdvance {
 
 impl TimingAdvance {
     pub fn new(numerology: Numerology, timer_ms: u32) -> Self {
-        Self { n_ta_tc: 0, timer_slots: timer_ms.saturating_mul(numerology.slots_per_subframe()), state: TaState::NotAligned, numerology }
+        Self {
+            n_ta_tc: 0,
+            timer_slots: timer_ms.saturating_mul(numerology.slots_per_subframe()),
+            state: TaState::NotAligned,
+            numerology,
+        }
     }
 
     pub fn state(&self) -> TaState {
@@ -44,12 +49,17 @@ impl TimingAdvance {
     pub fn apply_ce(&mut self, ta_cmd: u8, now: SlotPoint) {
         let before = self.n_ta_tc;
         self.n_ta_tc = ta::n_ta_apply_ce(self.n_ta_tc, ta_cmd, self.numerology);
-        log::debug!("TA command {ta_cmd} at {now}: N_TA {before} → {} T_c", self.n_ta_tc);
+        log::debug!(
+            "TA command {ta_cmd} at {now}: N_TA {before} → {} T_c",
+            self.n_ta_tc
+        );
         self.restart(now);
     }
 
     fn restart(&mut self, now: SlotPoint) {
-        self.state = TaState::Aligned { expiry: (self.timer_slots > 0).then(|| now.add(self.timer_slots as u64)) };
+        self.state = TaState::Aligned {
+            expiry: (self.timer_slots > 0).then(|| now.add(self.timer_slots as u64)),
+        };
     }
 
     /// Per-slot step: `true` exactly once when the timeAlignmentTimer expires.

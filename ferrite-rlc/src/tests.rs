@@ -10,7 +10,13 @@ fn at(slot: u64) -> SlotPoint {
 }
 
 fn um(sn_len: SnLen, t_reassembly_ms: u32) -> RlcEntity {
-    RlcEntity::new(RlcMode::Um(UmConfig { sn_len, t_reassembly_ms }), MU)
+    RlcEntity::new(
+        RlcMode::Um(UmConfig {
+            sn_len,
+            t_reassembly_ms,
+        }),
+        MU,
+    )
 }
 
 fn am_with(sn_len: SnLen, max_retx_threshold: u32, t_poll_retransmit_ms: u32) -> RlcEntity {
@@ -33,7 +39,9 @@ fn am(sn_len: SnLen) -> RlcEntity {
 }
 
 fn sdu(seed: u8, len: usize) -> Vec<u8> {
-    (0..len).map(|i| seed.wrapping_mul(31).wrapping_add((i * 7) as u8)).collect()
+    (0..len)
+        .map(|i| seed.wrapping_mul(31).wrapping_add((i * 7) as u8))
+        .collect()
 }
 
 /// Tiny deterministic PRNG (xorshift64*) for the channel simulations.
@@ -128,7 +136,10 @@ fn um_segmentation_roundtrip_small_grants() {
 fn um_segment_headers_carry_si_and_so() {
     let mut tx = um(SnLen::Bits12, 35);
     tx.tx_sdu(sdu(1, 30));
-    assert!(tx.pull_pdu(2, at(0)).is_none(), "header only does not fit a byte");
+    assert!(
+        tx.pull_pdu(2, at(0)).is_none(),
+        "header only does not fit a byte"
+    );
     let p1 = tx.pull_pdu(12, at(0)).unwrap(); // first: 2-byte hdr + 10
     assert_eq!(p1.len(), 12);
     assert_eq!(p1[0] >> 6, 0b01);
@@ -241,7 +252,13 @@ fn am_duplex(sn_len: SnLen, seed: u64, loss_pct: u64, count: usize, slots: u64) 
     // NACK legitimately increments RETX_COUNT (§5.3.2).
     let mut a = am_with(sn_len, 64, 20);
     let mut b = am_with(sn_len, 64, 20);
-    let mut ch = Channel { rng: Rng(seed), loss_pct, max_delay: 6, inflight: Vec::new(), dropped: 0 };
+    let mut ch = Channel {
+        rng: Rng(seed),
+        loss_pct,
+        max_delay: 6,
+        inflight: Vec::new(),
+        dropped: 0,
+    };
     let mut rng = Rng(seed ^ 0xDEAD_BEEF);
     let (mut sent_a, mut sent_b) = (0usize, 0usize);
     let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
@@ -275,7 +292,12 @@ fn am_duplex(sn_len: SnLen, seed: u64, loss_pct: u64, count: usize, slots: u64) 
     }
     assert!(ch.dropped > 0 || loss_pct == 0);
     assert_eq!(sent_a, count);
-    assert_eq!(got_b.len(), count, "B received all of A's SDUs (dropped {})", ch.dropped);
+    assert_eq!(
+        got_b.len(),
+        count,
+        "B received all of A's SDUs (dropped {})",
+        ch.dropped
+    );
     assert_eq!(got_a.len(), count, "A received all of B's SDUs");
     for (i, s) in got_b.iter().enumerate() {
         assert_eq!(s[0], sdu(i as u8, 1)[0], "B: SDU {i} in order");
@@ -338,7 +360,11 @@ fn am_headers_and_poll_on_buffer_empty() {
     // Last PDU empties the buffer → P=1, SN=1.
     assert_eq!(&p2[..2], &[0xC0, 0x01]);
     assert_eq!(tx.unacked_sdus(), 2);
-    assert_eq!(tx.buffer_status(), 0, "transmitted-but-unacked data is not buffer status");
+    assert_eq!(
+        tx.buffer_status(),
+        0,
+        "transmitted-but-unacked data is not buffer status"
+    );
 }
 
 #[test]
@@ -351,7 +377,10 @@ fn am_poll_pdu_counter() {
     assert_eq!(pdus.len(), 10);
     let polls: Vec<bool> = pdus.iter().map(|p| p[0] & 0x40 != 0).collect();
     // 4th, 8th (pollPDU) and 10th (buffer empty).
-    assert_eq!(polls, [false, false, false, true, false, false, false, true, false, true]);
+    assert_eq!(
+        polls,
+        [false, false, false, true, false, false, false, true, false, true]
+    );
 }
 
 #[test]
@@ -367,7 +396,10 @@ fn am_status_reports_nack_ranges_and_segments() {
     let pdus: Vec<Vec<u8>> = (0..7).map(|_| tx.pull_pdu(100, at(0)).unwrap()).collect();
     let s7a = tx.pull_pdu(12, at(0)).unwrap();
     let s7b = tx.pull_pdu(14, at(0)).unwrap();
-    assert_eq!(AmdHeader::decode(SnLen::Bits12, &s7b).unwrap().0.si, Si::Middle);
+    assert_eq!(
+        AmdHeader::decode(SnLen::Bits12, &s7b).unwrap().0.si,
+        Si::Middle
+    );
     let s7c = tx.pull_pdu(100, at(0)).unwrap();
     assert!(tx.pull_pdu(100, at(0)).is_none());
     // Deliver SN 0, 1, 4, 6 whole; SN 7 first + last segment (middle lost).
@@ -378,7 +410,10 @@ fn am_status_reports_nack_ranges_and_segments() {
     rx.rx_pdu(&s7c, at(1));
     assert_eq!(rx.pop_rx_sdu().unwrap(), sdu(0, 30));
     assert_eq!(rx.pop_rx_sdu().unwrap(), sdu(1, 30));
-    assert!(rx.pop_rx_sdu().is_none(), "in-sequence delivery holds SN 4, 6");
+    assert!(
+        rx.pop_rx_sdu().is_none(),
+        "in-sequence delivery holds SN 4, 6"
+    );
     // Nothing is reported before t-Reassembly (10 ms = 20 slots) expires.
     assert!(rx.pull_pdu(100, at(2)).is_none());
     // t-Reassembly started when SN 4 arrived (trigger = RX_Next_Highest = 5);
@@ -387,16 +422,31 @@ fn am_status_reports_nack_ranges_and_segments() {
     for s in 2..=41 {
         rx.tick(at(s));
     }
-    assert!(rx.buffer_status() > 0, "a triggered STATUS counts as data volume");
+    assert!(
+        rx.buffer_status() > 0,
+        "a triggered STATUS counts as data volume"
+    );
     let st = rx.pull_pdu(100, at(42)).unwrap();
     let st = StatusPdu::decode(SnLen::Bits12, &st).unwrap();
     assert_eq!(st.ack_sn, 8);
     assert_eq!(
         st.nacks,
         vec![
-            Nack { sn: 2, so: None, range: Some(2) },
-            Nack { sn: 5, so: None, range: None },
-            Nack { sn: 7, so: Some((10, 19)), range: None },
+            Nack {
+                sn: 2,
+                so: None,
+                range: Some(2)
+            },
+            Nack {
+                sn: 5,
+                so: None,
+                range: None
+            },
+            Nack {
+                sn: 7,
+                so: Some((10, 19)),
+                range: None
+            },
         ]
     );
     // t-StatusProhibit (5 ms = 10 slots) holds a second report.
@@ -414,7 +464,10 @@ fn am_status_reports_nack_ranges_and_segments() {
     let (h, hl) = AmdHeader::decode(SnLen::Bits12, &r[3]).unwrap();
     assert_eq!((h.sn, h.si, h.so), (7, Si::Middle, 10));
     assert_eq!(&r[3][hl..], &sdu(7, 30)[10..20]);
-    assert!(r[3][0] & 0x40 != 0, "last retransmission with empty buffers polls");
+    assert!(
+        r[3][0] & 0x40 != 0,
+        "last retransmission with empty buffers polls"
+    );
     for p in &r {
         rx.rx_pdu(p, at(45));
     }
@@ -426,7 +479,13 @@ fn am_status_reports_nack_ranges_and_segments() {
         rx.tick(at(s));
     }
     let st = StatusPdu::decode(SnLen::Bits12, &rx.pull_pdu(100, at(60)).unwrap()).unwrap();
-    assert_eq!(st, StatusPdu { ack_sn: 8, nacks: vec![] });
+    assert_eq!(
+        st,
+        StatusPdu {
+            ack_sn: 8,
+            nacks: vec![]
+        }
+    );
     tx.rx_pdu(&st.encode(SnLen::Bits12), at(61));
     assert_eq!(tx.unacked_sdus(), 0);
 }
@@ -438,7 +497,14 @@ fn am_retransmission_is_resegmented_to_fit() {
     let p = tx.pull_pdu(200, at(0)).unwrap();
     assert_eq!(p.len(), 102);
     // NACK the whole SDU.
-    let st = StatusPdu { ack_sn: 1, nacks: vec![Nack { sn: 0, so: None, range: None }] };
+    let st = StatusPdu {
+        ack_sn: 1,
+        nacks: vec![Nack {
+            sn: 0,
+            so: None,
+            range: None,
+        }],
+    };
     tx.rx_pdu(&st.encode(SnLen::Bits12), at(1));
     let mut rx = am(SnLen::Bits12);
     let mut n = 0;
@@ -473,7 +539,10 @@ fn am_status_truncates_to_grant() {
     // Full report would be 3 + 5·2 = 13 bytes; an 8-byte grant holds 2 NACKs.
     let st = StatusPdu::decode(SnLen::Bits12, &rx.pull_pdu(8, at(46)).unwrap()).unwrap();
     assert_eq!(st.nacks.len(), 2);
-    assert_eq!(st.ack_sn, 5, "ACK_SN moves to the first unreported missing SN");
+    assert_eq!(
+        st.ack_sn, 5,
+        "ACK_SN moves to the first unreported missing SN"
+    );
     assert_eq!(st.nacks[0].sn, 1);
     assert_eq!(st.nacks[1].sn, 3);
 }
@@ -494,7 +563,10 @@ fn am_t_poll_retransmit_retransmits_and_max_retx_event() {
         if let Some(p) = tx.pull_pdu(100, at(now)) {
             let (h, _) = AmdHeader::decode(SnLen::Bits12, &p).unwrap();
             assert_eq!(h.sn, 0);
-            assert!(h.poll, "retransmission after t-PollRetransmit carries a poll");
+            assert!(
+                h.poll,
+                "retransmission after t-PollRetransmit carries a poll"
+            );
             retx += 1;
         }
     }
@@ -519,13 +591,30 @@ fn am_window_stall_and_ack_release() {
     assert!(pdus[2047][0] & 0x40 != 0, "poll when stalling");
     assert_eq!(tx.unacked_sdus(), 2048);
     // ACK the first 100 → window slides.
-    tx.rx_pdu(&StatusPdu { ack_sn: 100, nacks: vec![] }.encode(SnLen::Bits12), at(1));
+    tx.rx_pdu(
+        &StatusPdu {
+            ack_sn: 100,
+            nacks: vec![],
+        }
+        .encode(SnLen::Bits12),
+        at(1),
+    );
     assert_eq!(tx.unacked_sdus(), 1948);
     let more = drain(&mut tx, 100, 2);
     assert_eq!(more.len(), 2);
-    assert_eq!(AmdHeader::decode(SnLen::Bits12, &more[0]).unwrap().0.sn, 2048);
+    assert_eq!(
+        AmdHeader::decode(SnLen::Bits12, &more[0]).unwrap().0.sn,
+        2048
+    );
     // ACK_SN beyond TX_Next is ignored.
-    tx.rx_pdu(&StatusPdu { ack_sn: 3000, nacks: vec![] }.encode(SnLen::Bits12), at(3));
+    tx.rx_pdu(
+        &StatusPdu {
+            ack_sn: 3000,
+            nacks: vec![],
+        }
+        .encode(SnLen::Bits12),
+        at(3),
+    );
     assert_eq!(tx.unacked_sdus(), 1950);
 }
 
@@ -576,9 +665,20 @@ fn am_18bit_segment_roundtrip() {
 
 #[test]
 fn invalid_sn_lengths_are_clamped() {
-    let u = RlcEntity::new(RlcMode::Um(UmConfig { sn_len: SnLen::Bits18, t_reassembly_ms: 1 }), MU);
+    let u = RlcEntity::new(
+        RlcMode::Um(UmConfig {
+            sn_len: SnLen::Bits18,
+            t_reassembly_ms: 1,
+        }),
+        MU,
+    );
     assert!(matches!(u.mode(), RlcMode::Um(_)));
-    let a = RlcEntity::new(RlcMode::Am(AmConfig { sn_len: SnLen::Bits6, ..AmConfig::srb_default() }), MU);
+    let a = RlcEntity::new(
+        RlcMode::Am(AmConfig {
+            sn_len: SnLen::Bits6,
+            ..AmConfig::srb_default()
+        }),
+        MU,
+    );
     assert!(matches!(a.mode(), RlcMode::Am(_)));
 }
-

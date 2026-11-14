@@ -21,9 +21,9 @@ pub mod derive;
 pub mod meas;
 
 use ferrite_common::SlotPoint;
-pub use ferrite_security::{CipherAlg, IntegrityAlg};
 use ferrite_fapi::config::PhyConfig;
 use ferrite_mac::MacConfig;
+pub use ferrite_security::{CipherAlg, IntegrityAlg};
 
 /// RRC states (§4.2.1).
 /// RRC state (TS 38.331 §4.2.1 `RRC_IDLE` / `RRC_CONNECTED`, with the two
@@ -81,7 +81,12 @@ impl AsSecurity {
 impl std::fmt::Debug for AsSecurity {
     /// Keys are never printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AsSecurity({} / {})", self.integrity_alg.name(), self.ciphering_alg.name())
+        write!(
+            f,
+            "AsSecurity({} / {})",
+            self.integrity_alg.name(),
+            self.ciphering_alg.name()
+        )
     }
 }
 
@@ -118,27 +123,54 @@ pub enum RbId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RlcSetup {
     Tm,
-    Um { sn_len: u8, t_reassembly_ms: u32 },
-    Am { sn_len: u8, t_poll_retransmit_ms: u32, poll_pdu: Option<u32>, poll_byte: Option<u32>, max_retx: u32, t_reassembly_ms: u32, t_status_prohibit_ms: u32 },
+    Um {
+        sn_len: u8,
+        t_reassembly_ms: u32,
+    },
+    Am {
+        sn_len: u8,
+        t_poll_retransmit_ms: u32,
+        poll_pdu: Option<u32>,
+        poll_byte: Option<u32>,
+        max_retx: u32,
+        t_reassembly_ms: u32,
+        t_status_prohibit_ms: u32,
+    },
 }
 
 /// What RRC asks the stack / lower layers to do.
 #[derive(Clone, Debug)]
 pub enum RrcEvent {
     /// SIB1 decoded and the cell is suitable: the PHY/MAC common configuration.
-    CellConfigured { phy: Box<PhyConfig>, mac: Box<MacConfig>, plmn: String, tac: u32, cell_id: u64 },
+    CellConfigured {
+        phy: Box<PhyConfig>,
+        mac: Box<MacConfig>,
+        plmn: String,
+        tac: u32,
+        cell_id: u64,
+    },
     /// Start the random access with this CCCH SDU (RRCSetupRequest).
-    StartRa { ccch: [u8; 6] },
+    StartRa {
+        ccch: [u8; 6],
+    },
     /// Dedicated configuration (after RRCSetup / RRCReconfiguration).
-    Reconfigure { phy: Box<PhyConfig>, mac: Box<MacConfig> },
+    Reconfigure {
+        phy: Box<PhyConfig>,
+        mac: Box<MacConfig>,
+    },
     SetupBearer(BearerSetup),
-    ReleaseBearer { lcid: u8 },
+    ReleaseBearer {
+        lcid: u8,
+    },
     /// Verify the pending SecurityModeCommand with these keys/algorithms and, if
     /// the MAC-I checks, activate AS security (the stack answers with
     /// [`RrcUe::security_verified`]).
     VerifySecurity(AsSecurity),
     /// Send an RRC PDU on an SRB (the PDCP entity applies security).
-    TxSrb { srb: u8, pdu: Vec<u8> },
+    TxSrb {
+        srb: u8,
+        pdu: Vec<u8>,
+    },
     /// A NAS PDU for the NAS layer.
     DlNas(Vec<u8>),
     Connected,
@@ -163,7 +195,9 @@ pub enum RrcEvent {
 /// What the stack tells RRC about.
 #[derive(Clone, Debug)]
 pub enum MacNotification {
-    RaSucceeded { c_rnti: u16 },
+    RaSucceeded {
+        c_rnti: u16,
+    },
     /// Random access problem (preambleTransMax): a radio link failure while
     /// connected (TS 38.331 §5.3.10.3), a failed connection attempt otherwise.
     RaFailed,
@@ -172,15 +206,22 @@ pub enum MacNotification {
     /// timeAlignmentTimer expired: the uplink is not aligned until the next RA.
     TimeAlignmentExpired,
     /// RLC reached maxRetxThreshold on an SRB/DRB (TS 38.331 §5.3.10.3).
-    RlcMaxRetx { lcid: u8 },
+    RlcMaxRetx {
+        lcid: u8,
+    },
     /// The PHY lost synchronisation (or the radio failed).
     RadioLinkFailure,
     /// One radio link monitoring indication from the PHY (§5.3.10.1): `false`
     /// = out-of-sync (RLM-RS below Q_out), `true` = in-sync (above Q_in).
-    SyncIndication { in_sync: bool },
+    SyncIndication {
+        in_sync: bool,
+    },
     /// MAC switches the active bandwidth part (TS 38.321 §5.15): RRC applies
     /// the BWP's configuration (`Reconfigure`).
-    BwpSwitch { dl_bwp: Option<u8>, ul_bwp: Option<u8> },
+    BwpSwitch {
+        dl_bwp: Option<u8>,
+        ul_bwp: Option<u8>,
+    },
 }
 
 /// RRC configuration knobs.
@@ -200,7 +241,13 @@ pub struct RrcConfig {
 
 impl Default for RrcConfig {
     fn default() -> Self {
-        Self { bands: vec![3, 78], establishment_cause: 3, ue_random_id: None, t300_ms: 1000, tx_lead_slots: 3 }
+        Self {
+            bands: vec![3, 78],
+            establishment_cause: 3,
+            ue_random_id: None,
+            t300_ms: 1000,
+            tx_lead_slots: 3,
+        }
     }
 }
 
@@ -314,7 +361,11 @@ impl RrcUe {
         match derive::cell_from_sib1(tb, mib, radio, self.cfg.tx_lead_slots) {
             Ok(info) => {
                 if !info.si_scheduled.is_empty() {
-                    log::info!("SI scheduling: SIB{:?} broadcast, SI window {} slots", info.si_scheduled, info.si_window_slots);
+                    log::info!(
+                        "SI scheduling: SIB{:?} broadcast, SI window {} slots",
+                        info.si_scheduled,
+                        info.si_window_slots
+                    );
                 }
                 let (phy, mac) = (info.phy.clone(), info.mac.clone());
                 self.events.push(RrcEvent::CellConfigured {
@@ -362,7 +413,9 @@ impl RrcUe {
         if self.state != RrcState::Connected {
             return;
         }
-        let Some(cell) = self.cell.as_ref() else { return };
+        let Some(cell) = self.cell.as_ref() else {
+            return;
+        };
         let (t310_ms, n310, n311) = (cell.t310_ms, cell.n310.max(1), cell.n311.max(1));
         match (self.t310_expiry, in_sync) {
             (None, true) => self.n310_count = 0,
@@ -372,7 +425,10 @@ impl RrcUe {
                     let Some(now) = self.now else { return };
                     self.n310_count = 0;
                     self.n311_count = 0;
-                    self.t310_expiry = Some(now.add(u64::from(t310_ms) * u64::from(now.numerology.slots_per_subframe())));
+                    self.t310_expiry =
+                        Some(now.add(
+                            u64::from(t310_ms) * u64::from(now.numerology.slots_per_subframe()),
+                        ));
                     log::warn!("T310 started: {n310} out-of-sync indication(s), radio link failure in {t310_ms} ms unless {n311} in-sync");
                     if t310_ms == 0 {
                         self.on_t310_expiry();
@@ -416,7 +472,10 @@ impl RrcUe {
             return;
         }
         let id = self.cfg.ue_random_id.unwrap_or_else(|| {
-            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x5eed);
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x5eed);
             t.wrapping_mul(0x9E37_79B9_7F4A_7C15) & ((1 << 39) - 1)
         });
         self.setup_used_s_tmsi = self.s_tmsi.is_some();
@@ -438,7 +497,9 @@ impl RrcUe {
                     self.set_state(RrcState::Idle);
                     self.events.push(RrcEvent::Failed("random access failed"));
                 }
-                RrcState::Reestablishing => self.abort_reestablishment("random access failed during re-establishment"),
+                RrcState::Reestablishing => {
+                    self.abort_reestablishment("random access failed during re-establishment")
+                }
                 // §5.3.10.3: a random access problem while connected is an RLF.
                 RrcState::Connected => self.start_reestablishment(),
                 RrcState::Idle => {}
@@ -462,7 +523,9 @@ impl RrcUe {
         if self.state != RrcState::Connected {
             return;
         }
-        let Some(cell) = self.cell.as_mut() else { return };
+        let Some(cell) = self.cell.as_mut() else {
+            return;
+        };
         let Some((phy, mac)) = cell.bwps.get(&id).cloned() else {
             log::warn!("BWP {id} is not configured: switch ignored");
             return;
@@ -470,10 +533,19 @@ impl RrcUe {
         if cell.phy.dl_bwp.id == id && cell.phy.ul_bwp.id == phy.ul_bwp.id {
             return;
         }
-        log::info!("BWP switch: DL {} → {id} (CRB {}+{}), UL {}", cell.phy.dl_bwp.id, phy.dl_bwp.start_crb, phy.dl_bwp.n_rb, phy.ul_bwp.id);
+        log::info!(
+            "BWP switch: DL {} → {id} (CRB {}+{}), UL {}",
+            cell.phy.dl_bwp.id,
+            phy.dl_bwp.start_crb,
+            phy.dl_bwp.n_rb,
+            phy.ul_bwp.id
+        );
         cell.phy = phy.clone();
         cell.mac = mac.clone();
-        self.events.push(RrcEvent::Reconfigure { phy: Box::new(phy), mac: Box::new(mac) });
+        self.events.push(RrcEvent::Reconfigure {
+            phy: Box::new(phy),
+            mac: Box::new(mac),
+        });
     }
 
     /// The active DL BWP id.
@@ -485,7 +557,9 @@ impl RrcUe {
     /// (RRCReestablishmentRequest on SRB0 with the shortMAC-I of the current
     /// context); without security the connection is simply lost.
     fn start_reestablishment(&mut self) {
-        let (Some(sec), Some(c_rnti), Some(cell)) = (self.security, self.c_rnti, self.cell.as_ref()) else {
+        let (Some(sec), Some(c_rnti), Some(cell)) =
+            (self.security, self.c_rnti, self.cell.as_ref())
+        else {
             // §5.3.7.2: without AS security the UE goes to RRC_IDLE instead.
             self.meas.clear();
             self.security = None;
@@ -494,7 +568,13 @@ impl RrcUe {
             return;
         };
         let pci = cell.phy.ssb.pci;
-        let smac = derive::short_mac_i(&sec.k_rrc_int, sec.integrity_alg, pci, cell.cell_identity, c_rnti);
+        let smac = derive::short_mac_i(
+            &sec.k_rrc_int,
+            sec.integrity_alg,
+            pci,
+            cell.cell_identity,
+            c_rnti,
+        );
         let ccch = derive::encode_reestablishment_request(c_rnti, pci, smac, 2);
         let (common_phy, common_mac) = (cell.common_phy.clone(), cell.common_mac.clone());
         log::info!("radio link failure: RRC re-establishment (C-RNTI {c_rnti:#x}, PCI {pci}, shortMAC-I {smac:#06x})");
@@ -512,7 +592,10 @@ impl RrcUe {
             c.mac = common_mac.clone();
         }
         self.events.push(RrcEvent::Reestablishing);
-        self.events.push(RrcEvent::Reconfigure { phy: Box::new(common_phy), mac: Box::new(common_mac) });
+        self.events.push(RrcEvent::Reconfigure {
+            phy: Box::new(common_phy),
+            mac: Box::new(common_mac),
+        });
         self.events.push(RrcEvent::StartRa { ccch });
         // §5.3.7.2: T301 starts with the RRCReestablishmentRequest.
         if let Some(now) = self.now {
@@ -537,14 +620,19 @@ impl RrcUe {
 
     /// The stack verified (or not) the RRCReestablishment MAC-I with the new keys.
     pub fn reestablishment_verified(&mut self, ok: bool) {
-        let Some(tid) = self.pending_reest.take() else { return };
+        let Some(tid) = self.pending_reest.take() else {
+            return;
+        };
         if !ok {
             self.abort_reestablishment("RRCReestablishment integrity check failed");
             return;
         }
         self.set_state(RrcState::Connected);
         self.t301_expiry = None;
-        self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_reestablishment_complete(tid) });
+        self.events.push(RrcEvent::TxSrb {
+            srb: 1,
+            pdu: derive::encode_reestablishment_complete(tid),
+        });
         self.events.push(RrcEvent::Reestablished);
         log::info!("RRC re-established");
     }
@@ -583,24 +671,44 @@ impl RrcUe {
 
     fn send_measurement_reports(&mut self) {
         for r in self.meas.take_reports() {
-            log::info!("MeasurementReport: measId {} serving {:?}", r.meas_id, r.serving.first().map(|s| s.serving_cell.results_ssb_cell));
+            log::info!(
+                "MeasurementReport: measId {} serving {:?}",
+                r.meas_id,
+                r.serving.first().map(|s| s.serving_cell.results_ssb_cell)
+            );
             self.stats.meas_reports += 1;
-            self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_measurement_report(&r) });
+            self.events.push(RrcEvent::TxSrb {
+                srb: 1,
+                pdu: derive::encode_measurement_report(&r),
+            });
         }
     }
 
     /// A DL-CCCH PDU (Msg4: RRCSetup / RRCReject), §5.3.3.4.
     pub fn on_dl_ccch(&mut self, pdu: &[u8]) {
-        let Some(cell) = self.cell.as_ref() else { return };
+        let Some(cell) = self.cell.as_ref() else {
+            return;
+        };
         match derive::decode_dl_ccch(pdu, cell, self.cfg.tx_lead_slots) {
             Ok(derive::DlCcch::Setup { .. }) if self.state == RrcState::Reestablishing => {
-                log::warn!("RRCSetup instead of RRCReestablishment: the network fell back; reconnecting");
+                log::warn!(
+                    "RRCSetup instead of RRCReestablishment: the network fell back; reconnecting"
+                );
                 self.abort_reestablishment("re-establishment fallback to RRCSetup");
             }
             Ok(derive::DlCcch::Setup { .. }) if self.state != RrcState::Connecting => {
-                log::warn!("RRCSetup received in state {:?} without a pending request: ignored", self.state);
+                log::warn!(
+                    "RRCSetup received in state {:?} without a pending request: ignored",
+                    self.state
+                );
             }
-            Ok(derive::DlCcch::Setup { tid, phy, mac, bearers, bwps }) => {
+            Ok(derive::DlCcch::Setup {
+                tid,
+                phy,
+                mac,
+                bearers,
+                bwps,
+            }) => {
                 self.t300_expiry = None;
                 self.set_state(RrcState::Connected);
                 // The dedicated configuration becomes the baseline later
@@ -616,9 +724,17 @@ impl RrcUe {
                     }
                     self.events.push(RrcEvent::SetupBearer(b));
                 }
-                self.events.push(RrcEvent::Reconfigure { phy: Box::new(phy), mac: Box::new(mac) });
+                self.events.push(RrcEvent::Reconfigure {
+                    phy: Box::new(phy),
+                    mac: Box::new(mac),
+                });
                 let nas = self.pending_nas.take().unwrap_or_default();
-                let pdu = derive::encode_setup_complete(tid, 1, &nas, self.s_tmsi.filter(|_| self.setup_used_s_tmsi));
+                let pdu = derive::encode_setup_complete(
+                    tid,
+                    1,
+                    &nas,
+                    self.s_tmsi.filter(|_| self.setup_used_s_tmsi),
+                );
                 self.events.push(RrcEvent::TxSrb { srb: 1, pdu });
                 self.events.push(RrcEvent::Connected);
             }
@@ -638,7 +754,9 @@ impl RrcUe {
     /// A DL-DCCH RRC PDU (PDCP SDU) on `srb`.
     pub fn on_dl_dcch(&mut self, srb: u8, pdu: &[u8]) {
         self.stats.dl_dcch += 1;
-        let Some(cell) = self.cell.as_ref() else { return };
+        let Some(cell) = self.cell.as_ref() else {
+            return;
+        };
         let msg = match derive::decode_dl_dcch(pdu, cell, self.cfg.tx_lead_slots) {
             Ok(m) => m,
             Err(e) => {
@@ -647,20 +765,38 @@ impl RrcUe {
             }
         };
         match msg {
-            derive::DlDcch::SecurityModeCommand { tid, integrity_alg, ciphering_alg } => {
+            derive::DlDcch::SecurityModeCommand {
+                tid,
+                integrity_alg,
+                ciphering_alg,
+            } => {
                 // §5.3.4.3: derive the keys from K_gNB; the stack verifies the MAC-I.
                 let Some(k) = self.k_gnb else {
                     log::warn!("SecurityModeCommand before K_gNB is known");
-                    self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_security_mode_failure(tid) });
+                    self.events.push(RrcEvent::TxSrb {
+                        srb: 1,
+                        pdu: derive::encode_security_mode_failure(tid),
+                    });
                     return;
                 };
                 // §5.3.4.3: an algorithm the UE cannot run is a SecurityModeFailure.
-                let algs = IntegrityAlg::try_from(integrity_alg).and_then(|i| i.check_supported()).and_then(|i| CipherAlg::try_from(ciphering_alg).and_then(|c| c.check_supported()).map(|c| (i, c)));
+                let algs = IntegrityAlg::try_from(integrity_alg)
+                    .and_then(|i| i.check_supported())
+                    .and_then(|i| {
+                        CipherAlg::try_from(ciphering_alg)
+                            .and_then(|c| c.check_supported())
+                            .map(|c| (i, c))
+                    });
                 let (ia, ea) = match algs {
                     Ok(a) => a,
                     Err(e) => {
-                        log::warn!("SecurityModeCommand with NIA{integrity_alg} / NEA{ciphering_alg}: {e}");
-                        self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_security_mode_failure(tid) });
+                        log::warn!(
+                            "SecurityModeCommand with NIA{integrity_alg} / NEA{ciphering_alg}: {e}"
+                        );
+                        self.events.push(RrcEvent::TxSrb {
+                            srb: 1,
+                            pdu: derive::encode_security_mode_failure(tid),
+                        });
                         return;
                     }
                 };
@@ -673,7 +809,16 @@ impl RrcUe {
                 let pdu = derive::encode_ue_capability_information(tid, &self.cfg.bands);
                 self.events.push(RrcEvent::TxSrb { srb: 1, pdu });
             }
-            derive::DlDcch::Reconfiguration { tid, phy, mac, bearers, released, nas, meas, bwps } => {
+            derive::DlDcch::Reconfiguration {
+                tid,
+                phy,
+                mac,
+                bearers,
+                released,
+                nas,
+                meas,
+                bwps,
+            } => {
                 self.stats.reconfigurations += 1;
                 if let (Some(b), Some(c)) = (bwps, self.cell.as_mut()) {
                     if b.active_id != c.phy.dl_bwp.id {
@@ -683,7 +828,12 @@ impl RrcUe {
                 }
                 if let Some(mc) = &meas {
                     self.meas.apply(mc);
-                    log::info!("measConfig applied: {} objects, {} report configs, {} measIds", mc.meas_object_to_add_mod_list.len(), mc.report_config_to_add_mod_list.len(), mc.meas_id_to_add_mod_list.len());
+                    log::info!(
+                        "measConfig applied: {} objects, {} report configs, {} measIds",
+                        mc.meas_object_to_add_mod_list.len(),
+                        mc.report_config_to_add_mod_list.len(),
+                        mc.meas_id_to_add_mod_list.len()
+                    );
                 }
                 for b in bearers {
                     if let Some(c) = self.cell.as_mut() {
@@ -699,10 +849,16 @@ impl RrcUe {
                         c.phy = phy.clone();
                         c.mac = mac.clone();
                     }
-                    self.events.push(RrcEvent::Reconfigure { phy: Box::new(phy), mac: Box::new(mac) });
+                    self.events.push(RrcEvent::Reconfigure {
+                        phy: Box::new(phy),
+                        mac: Box::new(mac),
+                    });
                 }
                 // Complete first, then hand the NAS PDUs up (§5.3.5.3).
-                self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_reconfiguration_complete(tid) });
+                self.events.push(RrcEvent::TxSrb {
+                    srb: 1,
+                    pdu: derive::encode_reconfiguration_complete(tid),
+                });
                 for n in nas {
                     self.events.push(RrcEvent::DlNas(n));
                 }
@@ -717,7 +873,9 @@ impl RrcUe {
                     log::warn!("RRCReestablishment while {:?}: ignored", self.state);
                     return;
                 }
-                let (Some(k), Some(old), Some(cell)) = (self.k_gnb, self.security, self.cell.as_ref()) else {
+                let (Some(k), Some(old), Some(cell)) =
+                    (self.k_gnb, self.security, self.cell.as_ref())
+                else {
                     self.abort_reestablishment("RRCReestablishment without a security context");
                     return;
                 };
@@ -751,7 +909,11 @@ impl RrcUe {
         match ferrite_asn1::rrc::PagingMessage::decode(pdu) {
             Ok(m) => {
                 let mine = self.s_tmsi.is_some_and(|mine| m.records.iter().any(|r| matches!(r, ferrite_asn1::rrc::PagingUeIdentity::Ng5gSTmsi(v) if *v == mine)));
-                log::info!("Paging: {} record(s){}", m.records.len(), if mine { ", this UE" } else { "" });
+                log::info!(
+                    "Paging: {} record(s){}",
+                    m.records.len(),
+                    if mine { ", this UE" } else { "" }
+                );
                 if mine {
                     self.events.push(RrcEvent::Paged);
                 }
@@ -762,8 +924,14 @@ impl RrcUe {
 
     /// The stack verified (or not) the pending SecurityModeCommand.
     pub fn security_verified(&mut self, ok: bool) {
-        let Some(tid) = self.pending_smc.take() else { return };
-        let pdu = if ok { derive::encode_security_mode_complete(tid) } else { derive::encode_security_mode_failure(tid) };
+        let Some(tid) = self.pending_smc.take() else {
+            return;
+        };
+        let pdu = if ok {
+            derive::encode_security_mode_complete(tid)
+        } else {
+            derive::encode_security_mode_failure(tid)
+        };
         if !ok {
             self.security = None;
         }
@@ -777,7 +945,10 @@ impl RrcUe {
             return;
         }
         self.stats.ul_dcch += 1;
-        self.events.push(RrcEvent::TxSrb { srb: 1, pdu: derive::encode_ul_information_transfer(nas) });
+        self.events.push(RrcEvent::TxSrb {
+            srb: 1,
+            pdu: derive::encode_ul_information_transfer(nas),
+        });
     }
 
     pub fn security(&self) -> Option<&AsSecurity> {

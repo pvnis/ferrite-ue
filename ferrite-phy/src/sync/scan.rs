@@ -85,7 +85,9 @@ pub fn gscn_scan(
         return None;
     }
 
-    let n_threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(gscns.len());
+    let n_threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(gscns.len());
     let chunk = gscns.len().div_ceil(n_threads);
     let mut hits: Vec<ScanHit> = std::thread::scope(|scope| {
         let handles: Vec<_> = gscns
@@ -95,37 +97,61 @@ pub fn gscn_scan(
                 scope.spawn(move || {
                     group
                         .iter()
-                        .filter_map(|&g| try_gscn(capture, fs, searcher, g, gscn_to_hz(g) - center_hz))
+                        .filter_map(|&g| {
+                            try_gscn(capture, fs, searcher, g, gscn_to_hz(g) - center_hz)
+                        })
                         .collect::<Vec<_>>()
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("scan thread panicked")).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("scan thread panicked"))
+            .collect()
     });
     // Strongest PSS peak first; a decodable MIB beats any metric.
     hits.sort_by(|a, b| {
-        b.pbch
-            .is_some()
-            .cmp(&a.pbch.is_some())
-            .then(b.result.pss_metric.partial_cmp(&a.result.pss_metric).unwrap_or(std::cmp::Ordering::Equal))
+        b.pbch.is_some().cmp(&a.pbch.is_some()).then(
+            b.result
+                .pss_metric
+                .partial_cmp(&a.result.pss_metric)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     hits.into_iter().next()
 }
 
 /// Shift the capture onto one GSCN, search it and attempt the MIB decode.
-fn try_gscn(capture: &[Complex32], fs: f64, searcher: &CellSearcher, gscn: u32, df: f64) -> Option<ScanHit> {
+fn try_gscn(
+    capture: &[Complex32],
+    fs: f64,
+    searcher: &CellSearcher,
+    gscn: u32,
+    df: f64,
+) -> Option<ScanHit> {
     let shifted = freq_shift(capture, -df, fs, 0);
     let result = searcher.search(&shifted)?;
     let mut corrected = shifted.clone();
     correct_cfo(&mut corrected, result.cfo_hz, fs);
     let pbch = searcher.decode_mib(&corrected, &result);
-    Some(ScanHit { gscn, df_hz: df, result, pbch, shifted })
+    Some(ScanHit {
+        gscn,
+        df_hz: df,
+        result,
+        pbch,
+        shifted,
+    })
 }
 
 /// Mix `samples` by `shift_hz` (positive = shift spectrum up), with the phase
 /// reference at absolute sample index `start_index` so successive buffers of a
 /// stream stay phase-continuous.
-pub fn freq_shift(samples: &[Complex32], shift_hz: f64, fs: f64, start_index: usize) -> Vec<Complex32> {
+pub fn freq_shift(
+    samples: &[Complex32],
+    shift_hz: f64,
+    fs: f64,
+    start_index: usize,
+) -> Vec<Complex32> {
     // The mixing phase advances by a constant `dph` per sample, so rotate
     // incrementally (one complex multiply per sample) instead of a sin/cos per
     // sample. `dph` is reduced mod 2π and the start phase computed once at full
@@ -138,7 +164,10 @@ pub fn freq_shift(samples: &[Complex32], shift_hz: f64, fs: f64, start_index: us
     let mut out = Vec::with_capacity(samples.len());
     for s in samples {
         let (x, y) = (f64::from(s.re), f64::from(s.im));
-        out.push(Complex32::new((x * rr - y * ri) as f32, (x * ri + y * rr) as f32));
+        out.push(Complex32::new(
+            (x * rr - y * ri) as f32,
+            (x * ri + y * rr) as f32,
+        ));
         let nr = rr * sr - ri * si;
         ri = rr * si + ri * sr;
         rr = nr;
@@ -172,7 +201,11 @@ impl FreqShifter {
             ri = rr * si + ri * sr;
             rr = nr;
         }
-        Self { table, fs, shift_hz }
+        Self {
+            table,
+            fs,
+            shift_hz,
+        }
     }
 
     /// The shift this mixer applies (Hz).
@@ -184,7 +217,10 @@ impl FreqShifter {
     /// `start`, into `out` (cleared and refilled, so the buffer can be reused
     /// without reallocating).
     pub fn shift_into(&self, samples: &[Complex32], start: usize, out: &mut Vec<Complex32>) {
-        assert!(samples.len() <= self.table.len(), "buffer longer than the phasor table");
+        assert!(
+            samples.len() <= self.table.len(),
+            "buffer longer than the phasor table"
+        );
         let ph0 = (TAU * self.shift_hz * start as f64 / self.fs).rem_euclid(TAU);
         let ps = Complex32::new(ph0.cos() as f32, ph0.sin() as f32);
         out.clear();
@@ -344,9 +380,19 @@ impl FrameTracker {
         self.arm(&hit.result, &pbch, hit.shifted.len())
     }
 
-    fn arm(&mut self, found: &CellSearchResult, pbch: &PbchDecode, buf_len: usize) -> Option<Acquired> {
+    fn arm(
+        &mut self,
+        found: &CellSearchResult,
+        pbch: &PbchDecode,
+        buf_len: usize,
+    ) -> Option<Acquired> {
         let first_symbol = *self.candidates.get(usize::from(pbch.i_ssb))?;
-        let pss_off = pss_useful_offset_in_frame(first_symbol, pbch.half_frame, self.mu, self.searcher.ofdm());
+        let pss_off = pss_useful_offset_in_frame(
+            first_symbol,
+            pbch.half_frame,
+            self.mu,
+            self.searcher.ofdm(),
+        );
         let frame_start = found.timing_index as i64 - pss_off as i64;
         // First frame boundary at or after the end of this buffer.
         let frame_len = self.frame_len as i64;
@@ -399,7 +445,10 @@ impl FrameTracker {
         // Narrow PSS re-correlation around the expected position.
         let lo = self.pss_off.saturating_sub(self.window);
         let hi = self.pss_off + self.window;
-        let det = self.searcher.pss_detector().track(frame, self.n_id_2, lo..hi)?;
+        let det = self
+            .searcher
+            .pss_detector()
+            .track(frame, self.n_id_2, lo..hi)?;
         if det.metric < 0.2 {
             return None;
         }
@@ -411,27 +460,31 @@ impl FrameTracker {
         let (n, cp) = (ofdm.fft_size(), ofdm.cp_len(1, self.mu));
         if det.sample_index >= cp {
             let scs_hz = f64::from(15_000u32 << self.mu);
-            let cfo_now = estimate_cfo_hz_multi(&frame[det.sample_index - cp..], cp, n, SSB_SYMBOLS, scs_hz);
+            let cfo_now =
+                estimate_cfo_hz_multi(&frame[det.sample_index - cp..], cp, n, SSB_SYMBOLS, scs_hz);
             self.cfo_hz = 0.8 * self.cfo_hz + 0.2 * cfo_now;
         }
 
-        let mib_ok = self.ssb_occasions.is_multiple_of(self.verify_every).then(|| {
-            let region_start = det.sample_index.saturating_sub(cp);
-            let mut region = frame[region_start..].to_vec();
-            correct_cfo(&mut region, self.cfo_hz, self.fs);
-            let found = CellSearchResult {
-                cell_id: self.cell_id,
-                n_id_1: self.cell_id / 3,
-                n_id_2: self.n_id_2,
-                timing_index: det.sample_index - region_start,
-                cfo_hz: self.cfo_hz,
-                pss_metric: det.metric,
-                sss_metric: 0.0,
-            };
-            self.searcher
-                .decode_mib(&region, &found)
-                .is_some_and(|p| p.mib.sfn == sfn && p.i_ssb == self.i_ssb)
-        });
+        let mib_ok = self
+            .ssb_occasions
+            .is_multiple_of(self.verify_every)
+            .then(|| {
+                let region_start = det.sample_index.saturating_sub(cp);
+                let mut region = frame[region_start..].to_vec();
+                correct_cfo(&mut region, self.cfo_hz, self.fs);
+                let found = CellSearchResult {
+                    cell_id: self.cell_id,
+                    n_id_1: self.cell_id / 3,
+                    n_id_2: self.n_id_2,
+                    timing_index: det.sample_index - region_start,
+                    cfo_hz: self.cfo_hz,
+                    pss_metric: det.metric,
+                    sss_metric: 0.0,
+                };
+                self.searcher
+                    .decode_mib(&region, &found)
+                    .is_some_and(|p| p.mib.sfn == sfn && p.i_ssb == self.i_ssb)
+            });
 
         Some(FrameReport {
             sfn,
@@ -455,16 +508,17 @@ mod tests {
     /// including at the large `start_index` a long run reaches (no phase drift).
     #[test]
     fn freq_shift_matches_reference() {
-        let reference = |samples: &[Complex32], shift_hz: f64, fs: f64, start: usize| -> Vec<Complex32> {
-            samples
-                .iter()
-                .enumerate()
-                .map(|(m, s)| {
-                    let ph = TAU * shift_hz * (start + m) as f64 / fs;
-                    s * Complex32::new(ph.cos() as f32, ph.sin() as f32)
-                })
-                .collect()
-        };
+        let reference =
+            |samples: &[Complex32], shift_hz: f64, fs: f64, start: usize| -> Vec<Complex32> {
+                samples
+                    .iter()
+                    .enumerate()
+                    .map(|(m, s)| {
+                        let ph = TAU * shift_hz * (start + m) as f64 / fs;
+                        s * Complex32::new(ph.cos() as f32, ph.sin() as f32)
+                    })
+                    .collect()
+            };
         let fs = 11_520_000.0;
         let samples: Vec<Complex32> = (0..6144)
             .map(|i| Complex32::new((i as f32 * 0.31).sin(), (i as f32 * 0.17).cos()))
@@ -473,13 +527,27 @@ mod tests {
             for &start in &[0usize, 5760, 400_000_000, 4_000_000_000] {
                 let got = freq_shift(&samples, shift, fs, start);
                 let want = reference(&samples, shift, fs, start);
-                let max_err = got.iter().zip(&want).map(|(a, b)| (a - b).norm()).fold(0.0f32, f32::max);
-                assert!(max_err < 1e-3, "shift={shift} start={start}: max_err={max_err}");
+                let max_err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).norm())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_err < 1e-3,
+                    "shift={shift} start={start}: max_err={max_err}"
+                );
                 let shifter = FreqShifter::new(shift, fs, samples.len());
                 let mut out = Vec::new();
                 shifter.shift_into(&samples, start, &mut out);
-                let max_err = out.iter().zip(&want).map(|(a, b)| (a - b).norm()).fold(0.0f32, f32::max);
-                assert!(max_err < 1e-3, "table shift={shift} start={start}: max_err={max_err}");
+                let max_err = out
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).norm())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_err < 1e-3,
+                    "table shift={shift} start={start}: max_err={max_err}"
+                );
             }
         }
     }
@@ -501,7 +569,15 @@ mod tests {
     /// Synthesize back-to-back 10 ms frames carrying an SSB (candidate `i_ssb`
     /// in half frame `hf`, every `period_ms`) with per-frame SFN, then acquire
     /// from an unaligned start and track the rest.
-    fn acquire_and_track(fft: usize, case: SsbCase, carrier_hz: f64, i_ssb: u8, hf: u8, period_ms: u32, sfn0: u16) {
+    fn acquire_and_track(
+        fft: usize,
+        case: SsbCase,
+        carrier_hz: f64,
+        i_ssb: u8,
+        hf: u8,
+        period_ms: u32,
+        sfn0: u16,
+    ) {
         let mu = case.mu();
         let ofdm = Ofdm::new(fft);
         let cell_id = 623u16;
@@ -518,7 +594,14 @@ mod tests {
             let mut frame = vec![Complex32::default(); frame_len];
             if sfn.is_multiple_of(period_frames) {
                 let mib = mib_for(sfn & 0x3FF, hf, mu);
-                let ssb = build_ssb_waveform(&mib, cell_id, pbch_dmrs_index(i_ssb, hf, l_max), l_max, &ofdm, mu);
+                let ssb = build_ssb_waveform(
+                    &mib,
+                    cell_id,
+                    pbch_dmrs_index(i_ssb, hf, l_max),
+                    l_max,
+                    &ofdm,
+                    mu,
+                );
                 frame[ssb_start..ssb_start + ssb.len()].copy_from_slice(&ssb);
             }
             frame
@@ -539,19 +622,30 @@ mod tests {
         let first_ssb_sfn = (sfn0..).find(|s| s % period_frames == 0).unwrap();
         assert_eq!(acq.mib.sfn, first_ssb_sfn, "first SSB in the buffer");
         // The frame start must land on the synthetic frame grid.
-        let expected_start = (frame_len * 3 / 10 + usize::from(first_ssb_sfn - sfn0) * frame_len) as i64;
+        let expected_start =
+            (frame_len * 3 / 10 + usize::from(first_ssb_sfn - sfn0) * frame_len) as i64;
         assert_eq!(acq.frame_start, expected_start);
-        assert_eq!((acq_len + acq.skip_to_frame - frame_len * 3 / 10) % frame_len, 0);
+        assert_eq!(
+            (acq_len + acq.skip_to_frame - frame_len * 3 / 10) % frame_len,
+            0
+        );
 
         // Skip to the frame boundary, then track the remaining frames.
         let mut pos = acq_len + acq.skip_to_frame;
         let mut expect_sfn = acq.next_sfn;
         let (mut tracked, mut ssb_frames) = (0, 0);
         while pos + frame_len <= stream.len() {
-            let rep = sync.track(&stream[pos..pos + frame_len]).expect("lost lock");
+            let rep = sync
+                .track(&stream[pos..pos + frame_len])
+                .expect("lost lock");
             assert_eq!(rep.sfn, expect_sfn, "SFN continuity");
             if rep.ssb_frame {
-                assert_eq!(rep.mib_ok, Some(true), "MIB should verify at SFN {}", rep.sfn);
+                assert_eq!(
+                    rep.mib_ok,
+                    Some(true),
+                    "MIB should verify at SFN {}",
+                    rep.sfn
+                );
                 assert_eq!(rep.timing_err, 0, "no drift in a synthetic stream");
                 assert!(rep.pss_metric > 0.9);
                 ssb_frames += 1;
@@ -562,8 +656,14 @@ mod tests {
             pos += frame_len;
             tracked += 1;
         }
-        assert!(tracked >= 4, "should have tracked several frames, got {tracked}");
-        assert!(ssb_frames >= 2, "should have seen several SSBs, got {ssb_frames}");
+        assert!(
+            tracked >= 4,
+            "should have tracked several frames, got {tracked}"
+        );
+        assert!(
+            ssb_frames >= 2,
+            "should have seen several SSBs, got {ssb_frames}"
+        );
     }
 
     /// Place an SSB on a GSCN away from the capture centre, on either raster,
@@ -578,7 +678,14 @@ mod tests {
         let (center_hz, ssb_hz) = (gscn_to_hz(center_gscn), gscn_to_hz(ssb_gscn));
         let l_max = case.l_max(ssb_hz);
         let (cell_id, i_ssb, sfn) = (301u16, 1u8, 77u16);
-        let ssb = build_ssb_waveform(&mib_for(sfn, 0, mu), cell_id, pbch_dmrs_index(i_ssb, 0, l_max), l_max, &ofdm, mu);
+        let ssb = build_ssb_waveform(
+            &mib_for(sfn, 0, mu),
+            cell_id,
+            pbch_dmrs_index(i_ssb, 0, l_max),
+            l_max,
+            &ofdm,
+            mu,
+        );
         let mut base = vec![Complex32::default(); 700];
         base.extend_from_slice(&ssb);
         base.extend(std::iter::repeat_n(Complex32::default(), 900));

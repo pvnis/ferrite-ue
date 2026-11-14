@@ -35,20 +35,38 @@ impl CellGeometry {
         let dl_base_sc = -(12 * cfg.dl_carrier.offset_crb as i64 + 6 * cfg.dl_carrier.n_rb as i64);
         let scs = numerology.scs_hz() as f64;
         // SSB subcarrier 0 = CRB `ssb_crb` subcarrier 0 + k_SSB (15 kHz units).
-        let ssb_sc0_hz = (dl_base_sc + 12 * cfg.ssb_crb as i64) as f64 * scs + cfg.ssb.k_ssb as f64 * 15e3;
+        let ssb_sc0_hz =
+            (dl_base_sc + 12 * cfg.ssb_crb as i64) as f64 * scs + cfg.ssb.k_ssb as f64 * 15e3;
         let ssb_df_hz = ssb_sc0_hz + 120.0 * cfg.ssb.scs.scs_hz() as f64;
-        Self { fs, numerology, fft, ul: cfg.ul_carrier, dl_base_sc, ssb_df_hz, dl_center_hz }
+        Self {
+            fs,
+            numerology,
+            fft,
+            ul: cfg.ul_carrier,
+            dl_base_sc,
+            ssb_df_hz,
+            dl_center_hz,
+        }
     }
 
     /// Pre-SIB1 geometry: CRB 0 := CORESET#0's lowest RB, whose first subcarrier
     /// sits `coreset0_sc_from_dc` data-SCS subcarriers from the DL stream DC.
-    pub fn from_coreset0(fs: f64, dl_center_hz: f64, numerology: Numerology, coreset0_sc_from_dc: i64, ssb_df_hz: f64) -> Self {
+    pub fn from_coreset0(
+        fs: f64,
+        dl_center_hz: f64,
+        numerology: Numerology,
+        coreset0_sc_from_dc: i64,
+        ssb_df_hz: f64,
+    ) -> Self {
         let fft = (fs / numerology.scs_hz() as f64).round() as usize;
         Self {
             fs,
             numerology,
             fft,
-            ul: Carrier { offset_crb: 0, n_rb: 0 },
+            ul: Carrier {
+                offset_crb: 0,
+                n_rb: 0,
+            },
             dl_base_sc: coreset0_sc_from_dc,
             ssb_df_hz,
             dl_center_hz,

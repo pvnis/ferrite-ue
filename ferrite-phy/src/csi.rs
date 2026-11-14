@@ -70,8 +70,16 @@ impl CsiRsPattern {
 /// Whether any of `patterns` occupies RE `(symbol, crb, k)` in `slot` — the
 /// `rm_skip` predicate of [`crate::pdsch::extract_pdsch`] (with the caller
 /// translating its BWP-relative PRB to a CRB).
-pub fn csi_rs_rate_match(patterns: &[CsiRsPattern], slot: SlotPoint, symbol: usize, crb: usize, k_in_rb: usize) -> bool {
-    patterns.iter().any(|p| p.occupies(slot, symbol, crb, k_in_rb))
+pub fn csi_rs_rate_match(
+    patterns: &[CsiRsPattern],
+    slot: SlotPoint,
+    symbol: usize,
+    crb: usize,
+    k_in_rb: usize,
+) -> bool {
+    patterns
+        .iter()
+        .any(|p| p.occupies(slot, symbol, crb, k_in_rb))
 }
 
 /// The NZP-CSI-RS sequence `r(0..len)` for one OFDM symbol (§7.4.1.5.2):
@@ -80,7 +88,9 @@ pub fn csi_rs_rate_match(patterns: &[CsiRsPattern], slot: SlotPoint, symbol: usi
 /// `n` for density 1 (row 2), with `n` the CRB index; pass `len` to cover the
 /// highest CRB of the resource.
 pub fn csi_rs_sequence(n_id: u16, slot: u32, symbol: u32, len: usize) -> Vec<Complex32> {
-    let c_init = (((1u64 << 10) * (14 * u64::from(slot) + u64::from(symbol) + 1) * (2 * u64::from(n_id) + 1)
+    let c_init = (((1u64 << 10)
+        * (14 * u64::from(slot) + u64::from(symbol) + 1)
+        * (2 * u64::from(n_id) + 1)
         + u64::from(n_id))
         % (1u64 << 31)) as u32;
     let c = gold_sequence(c_init, 2 * len);
@@ -119,7 +129,12 @@ pub struct CsiRsMeasurement {
 /// RB estimate (robust to a slow phase slope across RBs). Row 2 (one RE per
 /// RB): the noise is the half-difference power between adjacent RBs'
 /// estimates.
-pub fn measure_csi_rs_sinr(grid: &[Complex32], sc_to_bin: impl Fn(usize) -> usize, res: &CsiRsMeasurement, slot: u32) -> f32 {
+pub fn measure_csi_rs_sinr(
+    grid: &[Complex32],
+    sc_to_bin: impl Fn(usize) -> usize,
+    res: &CsiRsMeasurement,
+    slot: u32,
+) -> f32 {
     let density = match res.row {
         CsiRsRow::Row1 => 3,
         CsiRsRow::Row2 => 1,
@@ -127,14 +142,20 @@ pub fn measure_csi_rs_sinr(grid: &[Complex32], sc_to_bin: impl Fn(usize) -> usiz
         // "no signal" rather than abort the timeline thread.
         CsiRsRow::Row4 => return f32::NEG_INFINITY,
     };
-    let seq = csi_rs_sequence(res.n_id, slot, res.symbol as u32, density * (res.start_rb + res.n_rb));
+    let seq = csi_rs_sequence(
+        res.n_id,
+        slot,
+        res.symbol as u32,
+        density * (res.start_rb + res.n_rb),
+    );
     let rbs = res.start_rb..res.start_rb + res.n_rb;
     let (mut sig, mut noise, mut n_noise) = (0.0f32, 0.0f32, 0usize);
     if density == 3 {
         for n in rbs {
             let mut h = [Complex32::new(0.0, 0.0); 3];
             for (i, hi) in h.iter_mut().enumerate() {
-                *hi = grid[sc_to_bin(12 * n + res.k0 + 4 * i)] * seq[3 * n + i].conj(); // |seq| = 1
+                *hi = grid[sc_to_bin(12 * n + res.k0 + 4 * i)] * seq[3 * n + i].conj();
+                // |seq| = 1
             }
             let rb_h = (h[0] + h[1] + h[2]) / 3.0;
             sig += rb_h.norm_sqr();
@@ -144,7 +165,9 @@ pub fn measure_csi_rs_sinr(grid: &[Complex32], sc_to_bin: impl Fn(usize) -> usiz
             }
         }
     } else {
-        let h: Vec<Complex32> = rbs.map(|n| grid[sc_to_bin(12 * n + res.k0)] * seq[n].conj()).collect();
+        let h: Vec<Complex32> = rbs
+            .map(|n| grid[sc_to_bin(12 * n + res.k0)] * seq[n].conj())
+            .collect();
         sig = h.iter().map(|x| x.norm_sqr()).sum();
         for w in h.windows(2) {
             noise += (w[1] - w[0]).norm_sqr() / 2.0;
@@ -187,7 +210,14 @@ mod tests {
         let mu0 = Numerology::from_scs_khz(15).unwrap();
         let pats: Vec<CsiRsPattern> = [(4usize, 12u32), (8, 12), (4, 13), (8, 13)]
             .into_iter()
-            .map(|(l, off)| CsiRsPattern { period_slots: 20, offset_slots: off, symbols: vec![l], start_rb: 0, n_rb: 52, re_mask: 0b010001000100 })
+            .map(|(l, off)| CsiRsPattern {
+                period_slots: 20,
+                offset_slots: off,
+                symbols: vec![l],
+                start_rb: 0,
+                n_rb: 52,
+                re_mask: 0b010001000100,
+            })
             .collect();
         let trs_slot = SlotPoint::new(mu0, 279, 2);
         assert!(trs_slot.is_occasion(20, 12), "index {} ", trs_slot.index());
@@ -195,8 +225,20 @@ mod tests {
         assert!(csi_rs_rate_match(&pats, trs_slot, 8, 51, 10));
         assert!(!csi_rs_rate_match(&pats, trs_slot, 4, 0, 3));
         assert!(!csi_rs_rate_match(&pats, trs_slot, 5, 0, 2));
-        assert!(!csi_rs_rate_match(&pats, SlotPoint::new(mu0, 128, 8), 4, 0, 2));
-        assert!(csi_rs_rate_match(&pats, SlotPoint::new(mu0, 279, 3), 8, 3, 6));
+        assert!(!csi_rs_rate_match(
+            &pats,
+            SlotPoint::new(mu0, 128, 8),
+            4,
+            0,
+            2
+        ));
+        assert!(csi_rs_rate_match(
+            &pats,
+            SlotPoint::new(mu0, 279, 3),
+            8,
+            3,
+            6
+        ));
     }
 
     use super::*;
@@ -209,7 +251,11 @@ mod tests {
     fn measure_lossless_csi_rs() {
         let (n_id, slot, symbol) = (1u16, 3u32, 4usize);
         let h = Complex32::new(0.8, -0.6); // an arbitrary flat channel
-        for (row, start_rb, n_rb, k0) in [(CsiRsRow::Row1, 0usize, 24usize, 1usize), (CsiRsRow::Row1, 5, 20, 2), (CsiRsRow::Row2, 3, 30, 7)] {
+        for (row, start_rb, n_rb, k0) in [
+            (CsiRsRow::Row1, 0usize, 24usize, 1usize),
+            (CsiRsRow::Row1, 5, 20, 2),
+            (CsiRsRow::Row2, 3, 30, 7),
+        ] {
             let density = if row == CsiRsRow::Row1 { 3 } else { 1 };
             let seq = csi_rs_sequence(n_id, slot, symbol as u32, density * (start_rb + n_rb));
             let mut grid = vec![Complex32::new(0.0, 0.0); 12 * (start_rb + n_rb)];
@@ -218,7 +264,14 @@ mod tests {
                     grid[12 * n + k0 + 4 * i] = h * seq[density * n + i];
                 }
             }
-            let res = CsiRsMeasurement { row, n_id, k0, symbol, start_rb, n_rb };
+            let res = CsiRsMeasurement {
+                row,
+                n_id,
+                k0,
+                symbol,
+                start_rb,
+                n_rb,
+            };
             let sinr = measure_csi_rs_sinr(&grid, |sc| sc, &res, slot);
             assert!(sinr >= 30.0, "lossless SINR should be high, got {sinr}");
             assert_eq!(sinr_to_cqi(sinr), 15);
@@ -242,7 +295,14 @@ mod tests {
                 grid[12 * n + k0 + 4 * i] = seq[3 * n + i] + Complex32::new(noise(), noise());
             }
         }
-        let res = CsiRsMeasurement { row: CsiRsRow::Row1, n_id, k0, symbol, start_rb: 0, n_rb };
+        let res = CsiRsMeasurement {
+            row: CsiRsRow::Row1,
+            n_id,
+            k0,
+            symbol,
+            start_rb: 0,
+            n_rb,
+        };
         let sinr = measure_csi_rs_sinr(&grid, |sc| sc, &res, slot);
         assert!((5.0..30.0).contains(&sinr), "sinr {sinr}");
     }
@@ -282,6 +342,12 @@ mod tests {
         assert!(!p.occupies(SlotPoint::new(n, 3, 2), 5, 10, 5));
         assert!(!p.occupies(SlotPoint::new(n, 3, 3), 4, 10, 5));
         assert!(!p.occupies(SlotPoint::new(n, 3, 2), 4, 52, 5));
-        assert!(csi_rs_rate_match(std::slice::from_ref(&p), SlotPoint::new(n, 1, 2), 8, 51, 9));
+        assert!(csi_rs_rate_match(
+            std::slice::from_ref(&p),
+            SlotPoint::new(n, 1, 2),
+            8,
+            51,
+            9
+        ));
     }
 }

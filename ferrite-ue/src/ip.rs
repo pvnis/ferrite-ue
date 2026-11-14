@@ -21,7 +21,13 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 /// Build an IPv4 packet carrying an ICMP echo request (ping) from `src` to `dst`
 /// (TS-agnostic; RFC 791 + RFC 792). `id`/`seq` identify the echo; `payload` is
 /// the ICMP data. Returns the full IPv4 datagram.
-pub fn ipv4_icmp_echo_request(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+pub fn ipv4_icmp_echo_request(
+    src: [u8; 4],
+    dst: [u8; 4],
+    id: u16,
+    seq: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     // ICMP echo request: type 8, code 0, checksum, id, seq, payload.
     let mut icmp = Vec::with_capacity(8 + payload.len());
     icmp.extend_from_slice(&[8, 0, 0, 0]); // type, code, checksum placeholder
@@ -81,7 +87,6 @@ pub fn parse_ipv4_icmp_echo_reply(pkt: &[u8]) -> Option<IcmpEchoReply> {
     })
 }
 
-
 /// If `pkt` is an IPv4 ICMP echo request addressed to us, build the echo
 /// reply (addresses swapped, type 0, same id/seq/payload) as a full datagram.
 pub fn ipv4_icmp_echo_reply_for(pkt: &[u8]) -> Option<Vec<u8>> {
@@ -128,10 +133,16 @@ mod echo_tests {
         let req = ipv4_icmp_echo_request([10, 255, 0, 1], [10, 255, 0, 2], 0x1234, 7, b"hello");
         let rep = ipv4_icmp_echo_reply_for(&req).expect("reply");
         let r = parse_ipv4_icmp_echo_reply(&rep).expect("parse");
-        assert_eq!((r.src, r.dst, r.id, r.seq), ([10, 255, 0, 2], [10, 255, 0, 1], 0x1234, 7));
+        assert_eq!(
+            (r.src, r.dst, r.id, r.seq),
+            ([10, 255, 0, 2], [10, 255, 0, 1], 0x1234, 7)
+        );
         assert_eq!(&rep[28..], b"hello");
         assert_eq!(internet_checksum(&rep[..20]), 0);
         assert_eq!(internet_checksum(&rep[20..]), 0);
-        assert!(ipv4_icmp_echo_reply_for(&rep).is_none(), "a reply is not a request");
+        assert!(
+            ipv4_icmp_echo_reply_for(&rep).is_none(),
+            "a reply is not a request"
+        );
     }
 }

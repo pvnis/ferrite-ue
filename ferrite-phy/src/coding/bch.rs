@@ -69,15 +69,30 @@ impl Mib {
         push(0, 1, &mut bits, &mut i);
         // MIB fields (TS 38.331), UPER field order.
         push(u32::from(self.sfn >> 4), 6, &mut bits, &mut i); // systemFrameNumber: 6 MSBs
-        push(u32::from(self.scs_common_is_30_or_120), 1, &mut bits, &mut i);
-        push(u32::from(self.ssb_subcarrier_offset & 0xF), 4, &mut bits, &mut i);
+        push(
+            u32::from(self.scs_common_is_30_or_120),
+            1,
+            &mut bits,
+            &mut i,
+        );
+        push(
+            u32::from(self.ssb_subcarrier_offset & 0xF),
+            4,
+            &mut bits,
+            &mut i,
+        );
         push(u32::from(self.dmrs_typea_pos3), 1, &mut bits, &mut i);
         push(u32::from(self.pdcch_config_sib1), 8, &mut bits, &mut i);
         // 38.331 enum values: cellBarred {barred(0), notBarred(1)} and
         // intraFreqReselection {allowed(0), notAllowed(1)} — both encode the
         // *negation* of the natural boolean (caught by srsRAN cross-validation).
         push(u32::from(!self.cell_barred), 1, &mut bits, &mut i);
-        push(u32::from(!self.intra_freq_reselection_allowed), 1, &mut bits, &mut i);
+        push(
+            u32::from(!self.intra_freq_reselection_allowed),
+            1,
+            &mut bits,
+            &mut i,
+        );
         push(0, 1, &mut bits, &mut i); // spare
         debug_assert_eq!(i, 24);
         // §7.1.1 additional timing bits: SFN 4th,3rd,2nd,1st LSB; HRF; k_SSB MSB;

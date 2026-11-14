@@ -26,9 +26,9 @@ const SSB_DC_SC: i32 = 120;
 
 // The SSB case / candidate-symbol tables (TS 38.213 §4.1) live in
 // `ferrite_ran::ssb`; re-exported here for the sync code.
-pub use ferrite_ran::ssb::{l_max_fr1, SsbCase};
 #[cfg(test)]
 use ferrite_common::DuplexMode;
+pub use ferrite_ran::ssb::{l_max_fr1, SsbCase};
 
 #[cfg(test)]
 fn is_long_cp_symbol(symbol_in_half_frame: usize, mu: u8) -> bool {
@@ -40,15 +40,26 @@ fn is_long_cp_symbol(symbol_in_half_frame: usize, mu: u8) -> bool {
 /// an SSB's first symbol: candidate `first_symbol` (from
 /// [`SsbCase::candidate_symbols`], indexed within the half frame) in half frame
 /// `half_frame` (0/1), at SSB numerology `mu`.
-pub fn ssb_sample_offset_in_frame(first_symbol: usize, half_frame: u8, mu: u8, ofdm: &Ofdm) -> usize {
+pub fn ssb_sample_offset_in_frame(
+    first_symbol: usize,
+    half_frame: u8,
+    mu: u8,
+    ofdm: &Ofdm,
+) -> usize {
     let per_sf = symbols_per_subframe(mu);
     let subframe = usize::from(half_frame) * 5 + first_symbol / per_sf;
-    subframe * ofdm.samples_per_subframe(mu) + ofdm.symbol_offset_in_subframe(first_symbol % per_sf, mu)
+    subframe * ofdm.samples_per_subframe(mu)
+        + ofdm.symbol_offset_in_subframe(first_symbol % per_sf, mu)
 }
 
 /// Sample offset, from the frame start, of the PSS symbol's *useful part* for
 /// the given SSB candidate (the quantity the PSS correlator reports).
-pub fn pss_useful_offset_in_frame(first_symbol: usize, half_frame: u8, mu: u8, ofdm: &Ofdm) -> usize {
+pub fn pss_useful_offset_in_frame(
+    first_symbol: usize,
+    half_frame: u8,
+    mu: u8,
+    ofdm: &Ofdm,
+) -> usize {
     let cp = ofdm.cp_len(first_symbol % symbols_per_subframe(mu), mu);
     ssb_sample_offset_in_frame(first_symbol, half_frame, mu, ofdm) + cp
 }
@@ -67,7 +78,8 @@ pub fn frame_start_from_pss(
     mu: u8,
     ofdm: &Ofdm,
 ) -> i64 {
-    pss_sample_index as i64 - pss_useful_offset_in_frame(candidate_first_symbol, half_frame, mu, ofdm) as i64
+    pss_sample_index as i64
+        - pss_useful_offset_in_frame(candidate_first_symbol, half_frame, mu, ofdm) as i64
 }
 
 /// FFT bin index (natural order) for SSB subcarrier `ssb_sc`, centred at DC.
@@ -209,13 +221,22 @@ mod tests {
     #[test]
     fn candidate_symbols_match_38_213() {
         assert_eq!(SsbCase::A.candidate_symbols(1.8e9), vec![2, 8, 16, 22]);
-        assert_eq!(SsbCase::A.candidate_symbols(3.5e9), vec![2, 8, 16, 22, 30, 36, 44, 50]);
+        assert_eq!(
+            SsbCase::A.candidate_symbols(3.5e9),
+            vec![2, 8, 16, 22, 30, 36, 44, 50]
+        );
         assert_eq!(SsbCase::B.candidate_symbols(1.9e9), vec![4, 8, 16, 20]);
-        assert_eq!(SsbCase::B.candidate_symbols(3.5e9), vec![4, 8, 16, 20, 32, 36, 44, 48]);
+        assert_eq!(
+            SsbCase::B.candidate_symbols(3.5e9),
+            vec![4, 8, 16, 20, 32, 36, 44, 48]
+        );
         assert_eq!(SsbCase::C.candidate_symbols(2.3e9), vec![2, 8, 16, 22]);
         // Unpaired spectrum: 8 candidates already between 2.4 and 3 GHz (n41).
         assert_eq!(SsbCase::C.candidate_symbols(2.6e9).len(), 8);
-        assert_eq!(SsbCase::C.candidate_symbols(3.5e9), vec![2, 8, 16, 22, 30, 36, 44, 50]);
+        assert_eq!(
+            SsbCase::C.candidate_symbols(3.5e9),
+            vec![2, 8, 16, 22, 30, 36, 44, 50]
+        );
         assert_eq!(SsbCase::C.l_max(3.5e9), 8);
         assert_eq!(SsbCase::A.l_max(1.8e9), 4);
         assert_eq!(l_max_fr1(2.6e9), 4);
@@ -237,8 +258,14 @@ mod tests {
         // Case C candidate 0 at mu=1: symbols 0 (long CP) and 1 precede it.
         let cp_long = ofdm.cp_len(0, 1);
         let cp = ofdm.cp_len(1, 1);
-        assert_eq!(ssb_sample_offset_in_frame(2, 0, 1, &ofdm), (cp_long + 256) + (cp + 256));
-        assert_eq!(pss_useful_offset_in_frame(2, 0, 1, &ofdm), (cp_long + 256) + (cp + 256) + cp);
+        assert_eq!(
+            ssb_sample_offset_in_frame(2, 0, 1, &ofdm),
+            (cp_long + 256) + (cp + 256)
+        );
+        assert_eq!(
+            pss_useful_offset_in_frame(2, 0, 1, &ofdm),
+            (cp_long + 256) + (cp + 256) + cp
+        );
         // Candidate at symbol 30 (mu=1): subframe 1, symbol 2 of that subframe.
         assert_eq!(
             ssb_sample_offset_in_frame(30, 0, 1, &ofdm),
@@ -268,7 +295,10 @@ mod case_tests {
         for case in [SsbCase::A, SsbCase::B, SsbCase::C] {
             for f in [1e9, 2.6e9, 3.5e9] {
                 for s in case.candidate_symbols(f) {
-                    assert!((s..s + SSB_SYMBOLS).all(|l| !is_long_cp_symbol(l, case.mu())), "{case:?} {f} {s}");
+                    assert!(
+                        (s..s + SSB_SYMBOLS).all(|l| !is_long_cp_symbol(l, case.mu())),
+                        "{case:?} {f} {s}"
+                    );
                 }
             }
         }

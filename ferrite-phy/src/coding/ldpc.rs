@@ -188,7 +188,11 @@ impl LdpcGraph {
                 }
             }
         }
-        debug_assert_eq!(net.len(), 1, "p0 column of the core rows must reduce to one rotation");
+        debug_assert_eq!(
+            net.len(),
+            1,
+            "p0 column of the core rows must reduce to one rotation"
+        );
         let x = net.first().copied().unwrap_or(0);
         let p0 = unrotate(&total, x);
         c[kb * zc..(kb + 1) * zc].copy_from_slice(&p0);
@@ -197,7 +201,11 @@ impl LdpcGraph {
         for _ in 0..3 {
             let mut progressed = false;
             for m in 0..4 {
-                let unknown: Vec<(usize, usize)> = self.rows[m].iter().copied().filter(|&(n, _)| n >= kb && n < kb + 4 && !known[n - kb]).collect();
+                let unknown: Vec<(usize, usize)> = self.rows[m]
+                    .iter()
+                    .copied()
+                    .filter(|&(n, _)| n >= kb && n < kb + 4 && !known[n - kb])
+                    .collect();
                 if unknown.len() != 1 {
                     continue;
                 }
@@ -223,7 +231,9 @@ impl LdpcGraph {
         }
         // Extension parities: one degree-1 column per remaining row.
         for m in 4..self.m_base {
-            let Some(&(n_u, s_u)) = self.rows[m].iter().find(|&&(n, _)| n >= kb + 4) else { continue };
+            let Some(&(n_u, s_u)) = self.rows[m].iter().find(|&&(n, _)| n >= kb + 4) else {
+                continue;
+            };
             let rhs = syndrome(&c, m, n_u);
             let p = unrotate(&rhs, s_u);
             c[n_u * zc..(n_u + 1) * zc].copy_from_slice(&p);
@@ -537,7 +547,11 @@ mod tests {
     #[test]
     #[ignore = "quick inline timing; the real benchmark is benches/ldpc_decode.rs (cargo bench)"]
     fn bench_encode_decode() {
-        for (bg, zc) in [(BaseGraph::Bg2, 192u16), (BaseGraph::Bg2, 80), (BaseGraph::Bg1, 96)] {
+        for (bg, zc) in [
+            (BaseGraph::Bg2, 192u16),
+            (BaseGraph::Bg2, 80),
+            (BaseGraph::Bg1, 96),
+        ] {
             let g = LdpcGraph::new(bg, zc).unwrap();
             let info: Vec<u8> = (0..g.k()).map(|i| (i % 3 == 0) as u8).collect();
             let t0 = std::time::Instant::now();
@@ -555,7 +569,11 @@ mod tests {
                 let _ = g.decode(&llr, 20, 0.75);
             }
             let dec = t.elapsed().as_micros() as f64 / 100.0;
-            println!("{bg:?} Zc={zc} (k={}, np={}): encode {enc:.0}us  decode {dec:.0}us  [slot=500us]", g.k(), g.m());
+            println!(
+                "{bg:?} Zc={zc} (k={}, np={}): encode {enc:.0}us  decode {dec:.0}us  [slot=500us]",
+                g.k(),
+                g.m()
+            );
         }
     }
 
@@ -583,7 +601,11 @@ mod tests {
     #[test]
     fn encode_produces_valid_codewords() {
         let mut rng = Rng(0x1CDC_0001);
-        for (bg, zc) in [(BaseGraph::Bg2, 16u16), (BaseGraph::Bg2, 20), (BaseGraph::Bg1, 16)] {
+        for (bg, zc) in [
+            (BaseGraph::Bg2, 16u16),
+            (BaseGraph::Bg2, 20),
+            (BaseGraph::Bg1, 16),
+        ] {
             let g = LdpcGraph::new(bg, zc).unwrap();
             let info: Vec<u8> = (0..g.k()).map(|_| rng.bit()).collect();
             let c = g.encode(&info);
@@ -622,7 +644,10 @@ mod tests {
     #[test]
     fn roundtrip_every_lifting_size() {
         let mut rng = Rng(0x1CDC_0003);
-        let mut sizes: Vec<u16> = LIFTING_SETS.iter().flat_map(|s| s.iter().copied()).collect();
+        let mut sizes: Vec<u16> = LIFTING_SETS
+            .iter()
+            .flat_map(|s| s.iter().copied())
+            .collect();
         sizes.sort_unstable();
         sizes.dedup();
         // Smallest Zc of each lifting set — one representative per iLS folding path.
@@ -631,7 +656,11 @@ mod tests {
         for bg in [BaseGraph::Bg1, BaseGraph::Bg2] {
             for &zc in &sizes {
                 let g = LdpcGraph::new(bg, zc).unwrap();
-                assert_eq!(g.k(), bg.info_cols() * zc as usize, "k() for {bg:?} Zc={zc}");
+                assert_eq!(
+                    g.k(),
+                    bg.info_cols() * zc as usize,
+                    "k() for {bg:?} Zc={zc}"
+                );
                 assert_eq!(g.n(), g.k() + g.m(), "n = k + parity for {bg:?} Zc={zc}");
                 assert_eq!(g.zc(), zc as usize, "Zc round-trip for {bg:?} Zc={zc}");
 

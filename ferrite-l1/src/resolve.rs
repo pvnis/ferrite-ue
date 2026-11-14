@@ -68,10 +68,29 @@ impl DciResolver {
         // Fallback formats in a USS only when one is configured for them
         // (TS 38.212 §7.3.1.0 step 1/2: the 0_0/1_0 USS size and the 0_1
         // one-bit padding exist only then).
-        sc.monitor_0_0_1_0_in_uss = cfg.search_spaces.iter().any(|s| s.kind == SearchSpaceKind::UeSpecificFallback);
-        sc.harq_ack_codebook = if cfg.harq_codebook_dynamic { HarqAckCodebook::Dynamic } else { HarqAckCodebook::SemiStatic };
-        let pdsch_rows = if !cfg.pdsch.tdra.is_empty() { cfg.pdsch.tdra.len() } else if !cfg.pdsch_tdra_common.is_empty() { cfg.pdsch_tdra_common.len() } else { 16 };
-        let pusch_rows = if !cfg.pusch.tdra.is_empty() { cfg.pusch.tdra.len() } else if !cfg.pusch_tdra_common.is_empty() { cfg.pusch_tdra_common.len() } else { 16 };
+        sc.monitor_0_0_1_0_in_uss = cfg
+            .search_spaces
+            .iter()
+            .any(|s| s.kind == SearchSpaceKind::UeSpecificFallback);
+        sc.harq_ack_codebook = if cfg.harq_codebook_dynamic {
+            HarqAckCodebook::Dynamic
+        } else {
+            HarqAckCodebook::SemiStatic
+        };
+        let pdsch_rows = if !cfg.pdsch.tdra.is_empty() {
+            cfg.pdsch.tdra.len()
+        } else if !cfg.pdsch_tdra_common.is_empty() {
+            cfg.pdsch_tdra_common.len()
+        } else {
+            16
+        };
+        let pusch_rows = if !cfg.pusch.tdra.is_empty() {
+            cfg.pusch.tdra.len()
+        } else if !cfg.pusch_tdra_common.is_empty() {
+            cfg.pusch_tdra_common.len()
+        } else {
+            16
+        };
         sc.nof_pdsch_tdra_rows = pdsch_rows;
         sc.nof_pusch_tdra_rows = pusch_rows;
         sc.nof_k1 = cfg.pucch.k1_list.len().max(1);
@@ -109,15 +128,19 @@ impl DciResolver {
             } else {
                 sel(cfg.pusch.mcs_table)
             },
-            msg3_tp: cfg.pusch.msg3_transform_precoder.then_some(TransformPrecoding {
-                n_id_rs: cfg.ssb.pci,
-                group_hopping: cfg.pusch.msg3_group_hopping,
-                sequence_hopping: false,
-                pi2_bpsk: false,
-            }),
+            msg3_tp: cfg
+                .pusch
+                .msg3_transform_precoder
+                .then_some(TransformPrecoding {
+                    n_id_rs: cfg.ssb.pci,
+                    group_hopping: cfg.pusch.msg3_group_hopping,
+                    sequence_hopping: false,
+                    pi2_bpsk: false,
+                }),
             ded_tp: cfg.pusch.transform_precoder.then_some(TransformPrecoding {
                 n_id_rs: cfg.pusch.tp_dmrs.n_pusch_identity.unwrap_or(cfg.ssb.pci),
-                group_hopping: cfg.pusch.msg3_group_hopping && !cfg.pusch.tp_dmrs.group_hopping_disabled,
+                group_hopping: cfg.pusch.msg3_group_hopping
+                    && !cfg.pusch.tp_dmrs.group_hopping_disabled,
                 sequence_hopping: cfg.pusch.tp_dmrs.sequence_hopping,
                 pi2_bpsk: cfg.pusch.tp_pi2_bpsk,
             }),
@@ -155,7 +178,11 @@ impl DciResolver {
     }
 
     pub fn pusch_tdra_row(&self, row: usize, dedicated: bool) -> Option<TdraRow> {
-        let list: &[TdraRow] = if dedicated && !self.pusch_tdra.is_empty() { &self.pusch_tdra } else { &self.pusch_tdra_common };
+        let list: &[TdraRow] = if dedicated && !self.pusch_tdra.is_empty() {
+            &self.pusch_tdra
+        } else {
+            &self.pusch_tdra_common
+        };
         if let Some(r) = list.get(row) {
             return Some(*r);
         }
@@ -183,9 +210,24 @@ impl DciResolver {
     fn direction_ok(&self, slot: SlotPoint, row: &TdraRow, ul: bool) -> bool {
         use crate::config::LinkDirection;
         let Some(t) = &self.tdd else { return true };
-        let dir = if ul { LinkDirection::Ul } else { LinkDirection::Dl };
-        if t.conflicts(slot.index(), slot.numerology, row.start_symbol, row.n_symbols, dir) {
-            log::debug!("{} at {slot} symbols {}+{} conflicts with the TDD pattern: grant dropped", if ul { "PUSCH" } else { "PDSCH" }, row.start_symbol, row.n_symbols);
+        let dir = if ul {
+            LinkDirection::Ul
+        } else {
+            LinkDirection::Dl
+        };
+        if t.conflicts(
+            slot.index(),
+            slot.numerology,
+            row.start_symbol,
+            row.n_symbols,
+            dir,
+        ) {
+            log::debug!(
+                "{} at {slot} symbols {}+{} conflicts with the TDD pattern: grant dropped",
+                if ul { "PUSCH" } else { "PDSCH" },
+                row.start_symbol,
+                row.n_symbols
+            );
             return false;
         }
         true
@@ -196,7 +238,11 @@ impl DciResolver {
             Some((qm, r)) => (qm, Some(r)),
             None => (mcs::mcs_modulation_order(table, i).unwrap_or(2), None),
         };
-        Mcs { index: i, qm, r_x1024: r }
+        Mcs {
+            index: i,
+            qm,
+            r_x1024: r,
+        }
     }
 
     /// PUSCH MCS: the `q` rows of Table 6.1.4.1-1 are `Q_m = 1` (π/2-BPSK) only
@@ -204,16 +250,24 @@ impl DciResolver {
     fn pusch_mcs_of(&self, table: McsTable, i: u8, pi2_bpsk: bool) -> Mcs {
         let m = self.mcs(table, i);
         if m.qm == 1 && !pi2_bpsk {
-            Mcs { index: i, qm: 2, r_x1024: m.r_x1024.map(|r| r / 2) }
+            Mcs {
+                index: i,
+                qm: 2,
+                r_x1024: m.r_x1024.map(|r| r / 2),
+            }
         } else {
             m
         }
     }
 
-    fn pdsch_tbs(&self, row: &TdraRow, n_prb: usize, mcs: &Mcs, cdm: u8) -> u32 {
+    fn pdsch_tbs(&self, row: &TdraRow, n_prb: usize, mcs: &Mcs, cdm: u8, n_layers: usize) -> u32 {
         let Some(r) = mcs.r_x1024 else { return 0 };
         let dm = dmrs::pdsch_dmrs_symbols(
-            if row.mapping_type_a { MappingType::TypeA } else { MappingType::TypeB },
+            if row.mapping_type_a {
+                MappingType::TypeA
+            } else {
+                MappingType::TypeB
+            },
             self.dmrs_typea_pos,
             self.dl_dmrs_add_pos,
             row.start_symbol as usize,
@@ -221,14 +275,22 @@ impl DciResolver {
         )
         .map(|v| v.len())
         .unwrap_or(1);
-        let n_re = pdsch_params::n_re_per_prb(row.n_symbols as usize, pdsch_params::dmrs_re_per_prb(dm, cdm), 0);
-        pdsch_params::tbs(n_re, n_prb, mcs.qm, r, 1) as u32
+        let n_re = pdsch_params::n_re_per_prb(
+            row.n_symbols as usize,
+            pdsch_params::dmrs_re_per_prb(dm, cdm),
+            0,
+        );
+        pdsch_params::tbs(n_re, n_prb, mcs.qm, r, n_layers) as u32
     }
 
     fn pusch_tbs(&self, row: &TdraRow, n_prb: usize, mcs: &Mcs, cdm: u8, add_pos: u8) -> u32 {
         let Some(r) = mcs.r_x1024 else { return 0 };
         let dm = dmrs::pusch_dmrs_symbols(
-            if row.mapping_type_a { MappingType::TypeA } else { MappingType::TypeB },
+            if row.mapping_type_a {
+                MappingType::TypeA
+            } else {
+                MappingType::TypeB
+            },
             self.dmrs_typea_pos,
             add_pos,
             row.start_symbol as usize,
@@ -236,14 +298,31 @@ impl DciResolver {
         )
         .map(|v| v.len())
         .unwrap_or(1);
-        let n_re = pdsch_params::n_re_per_prb(row.n_symbols as usize, pdsch_params::dmrs_re_per_prb(dm, cdm), 0);
+        let n_re = pdsch_params::n_re_per_prb(
+            row.n_symbols as usize,
+            pdsch_params::dmrs_re_per_prb(dm, cdm),
+            0,
+        );
         pdsch_params::tbs(n_re, n_prb, mcs.qm, r, 1) as u32
     }
 
     /// Resolve a DCI 1_0 payload decoded in a CSS (`in_css`) or USS.
     #[allow(clippy::too_many_arguments)]
-    pub fn resolve_1_0(&self, bits: &[u8], rnti: Rnti, kind: RntiKind, in_css: bool, slot: SlotPoint, cce0: usize, n_cce: usize) -> Option<Dci> {
-        let size = if in_css { &self.sizes.f1_0_css } else { self.sizes.f1_0_uss.as_ref().unwrap_or(&self.sizes.f1_0_css) };
+    pub fn resolve_1_0(
+        &self,
+        bits: &[u8],
+        rnti: Rnti,
+        kind: RntiKind,
+        in_css: bool,
+        slot: SlotPoint,
+        cce0: usize,
+        n_cce: usize,
+    ) -> Option<Dci> {
+        let size = if in_css {
+            &self.sizes.f1_0_css
+        } else {
+            self.sizes.f1_0_uss.as_ref().unwrap_or(&self.sizes.f1_0_css)
+        };
         let rk = match kind {
             RntiKind::Si => dci::RntiKind::Si,
             RntiKind::Ra => dci::RntiKind::Ra,
@@ -253,34 +332,53 @@ impl DciResolver {
         };
         let d = dci::parse_dci_1_0(bits, rk, size).ok()?;
         if d.pdcch_order.is_some() {
-            return Some(Dci::Other { format: "1_0 pdcch-order" });
+            return Some(Dci::Other {
+                format: "1_0 pdcch-order",
+            });
         }
         // P-RNTI: only a DCI whose short-messages indicator says "scheduling
         // information for paging present" (bit 0) schedules a PDSCH.
         if matches!(kind, RntiKind::P) && d.short_messages_indicator.is_none_or(|v| v & 1 == 0) {
-            return Some(Dci::Other { format: "1_0 paging (short message only)" });
+            return Some(Dci::Other {
+                format: "1_0 paging (short message only)",
+            });
         }
         // Frequency domain: in a CSS with CORESET0 the RIV spans CORESET0 and is
         // numbered from its lowest RB; else the active BWP.
         let (rb_start, n_rb) = if let Some(n) = self.coreset0_rb.filter(|_| in_css) {
             let (s, l) = dci::riv_decode(d.fdra, n)?;
             // A dedicated BWP starting above CORESET#0 cannot carry this PDSCH.
-            ((self.coreset0_first_crb + s).checked_sub(self.dl_bwp_start)?, l)
+            (
+                (self.coreset0_first_crb + s).checked_sub(self.dl_bwp_start)?,
+                l,
+            )
         } else {
             dci::riv_decode(d.fdra, self.dl_bwp_rb)?
         };
-        let row = self.pdsch_tdra_row(d.tdra as usize, false, if kind == RntiKind::P { RntiKind::Si } else { kind })?;
+        let row = self.pdsch_tdra_row(
+            d.tdra as usize,
+            false,
+            if kind == RntiKind::P {
+                RntiKind::Si
+            } else {
+                kind
+            },
+        )?;
         let mcs = self.mcs(McsTable::Qam64, d.mcs);
         // DCI 1_0: 2 CDM groups without data (1 for a 2-symbol allocation).
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
         // RA / paging: TB scaling (TS 38.214 Table 5.1.3.2-2) applies to N_info.
-        let scale = match d.tb_scaling { Some(1) => 0.5, Some(2) => 0.25, _ => 1.0 };
+        let scale = match d.tb_scaling {
+            Some(1) => 0.5,
+            Some(2) => 0.25,
+            _ => 1.0,
+        };
         let tbs = if scale < 1.0 {
             let mut m = mcs;
             m.r_x1024 = m.r_x1024.map(|r| (f32::from(r) * scale) as u16);
-            self.pdsch_tbs(&row, n_rb, &m, cdm)
+            self.pdsch_tbs(&row, n_rb, &m, cdm, 1)
         } else {
-            self.pdsch_tbs(&row, n_rb, &mcs, cdm)
+            self.pdsch_tbs(&row, n_rb, &mcs, cdm, 1)
         };
         let pdsch_slot = slot.add(row.k as u64);
         if !self.direction_ok(pdsch_slot, &row, false) {
@@ -289,7 +387,16 @@ impl DciResolver {
         let (ack_slot, harq_id, ndi, rv, dai, pri, tpc, k1) = match kind {
             RntiKind::Tc | RntiKind::C => {
                 let k1 = d.k1_idx.map_or(4, |i| i + 1); // DCI 1_0: field value + 1
-                (Some(pdsch_slot.add(k1 as u64)), d.harq_id.unwrap_or(0), u8::from(d.ndi.unwrap_or(false)), d.rv.unwrap_or(0), d.dai.unwrap_or(0), d.pri.unwrap_or(0), d.tpc.unwrap_or(1), k1)
+                (
+                    Some(pdsch_slot.add(k1 as u64)),
+                    d.harq_id.unwrap_or(0),
+                    u8::from(d.ndi.unwrap_or(false)),
+                    d.rv.unwrap_or(0),
+                    d.dai.unwrap_or(0),
+                    d.pri.unwrap_or(0),
+                    d.tpc.unwrap_or(1),
+                    k1,
+                )
             }
             _ => (None, 0, 0, d.rv.unwrap_or(0), 0, 0, 1, 0),
         };
@@ -301,7 +408,11 @@ impl DciResolver {
             pdsch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            time: TimeAlloc {
+                mapping_type_a: row.mapping_type_a,
+                start_symbol: row.start_symbol,
+                n_symbols: row.n_symbols,
+            },
             mcs,
             tbs_bits: tbs,
             harq_id,
@@ -312,19 +423,40 @@ impl DciResolver {
             pri,
             tpc,
             cdm_groups_wo_data: cdm,
+            n_layers: 1,
+            dmrs_ports: vec![0],
             dmrs_add_pos: 2,
             vrb_to_prb_interleaved: d.vrb_to_prb_interleaved,
             r_pucch_common: r_pucch,
         }))
     }
 
-    pub fn resolve_0_0(&self, bits: &[u8], rnti: Rnti, kind: RntiKind, in_css: bool, slot: SlotPoint) -> Option<Dci> {
-        let size = if in_css { &self.sizes.f0_0_css } else { self.sizes.f0_0_uss.as_ref().unwrap_or(&self.sizes.f0_0_css) };
-        let rk = if kind == RntiKind::Tc { dci::RntiKind::Tc } else { dci::RntiKind::C };
+    pub fn resolve_0_0(
+        &self,
+        bits: &[u8],
+        rnti: Rnti,
+        kind: RntiKind,
+        in_css: bool,
+        slot: SlotPoint,
+    ) -> Option<Dci> {
+        let size = if in_css {
+            &self.sizes.f0_0_css
+        } else {
+            self.sizes.f0_0_uss.as_ref().unwrap_or(&self.sizes.f0_0_css)
+        };
+        let rk = if kind == RntiKind::Tc {
+            dci::RntiKind::Tc
+        } else {
+            dci::RntiKind::C
+        };
         let d = dci::parse_dci_0_0(bits, rk, size, self.ul_bwp_rb).ok()?;
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.ul_bwp_rb)?;
         let row = self.pusch_tdra_row(d.tdra as usize, false)?;
-        let table = if self.msg3_tp.is_some() { McsTable::Qam64TransformPrecoding } else { McsTable::Qam64 };
+        let table = if self.msg3_tp.is_some() {
+            McsTable::Qam64TransformPrecoding
+        } else {
+            McsTable::Qam64
+        };
         let mcs = self.pusch_mcs_of(table, d.mcs, false);
         // Common PUSCH DMRS: pos2, 2 CDM groups (1 for ≤2 symbols).
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
@@ -338,7 +470,11 @@ impl DciResolver {
             pusch_slot: slot.add(row.k as u64),
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            time: TimeAlloc {
+                mapping_type_a: row.mapping_type_a,
+                start_symbol: row.start_symbol,
+                n_symbols: row.n_symbols,
+            },
             mcs,
             tbs_bits: tbs,
             harq_id: d.harq_id.unwrap_or(0),
@@ -355,13 +491,23 @@ impl DciResolver {
         }))
     }
 
-    pub fn resolve_1_1(&self, bits: &[u8], rnti: Rnti, slot: SlotPoint, cce0: usize, n_cce: usize) -> Option<Dci> {
+    pub fn resolve_1_1(
+        &self,
+        bits: &[u8],
+        rnti: Rnti,
+        slot: SlotPoint,
+        cce0: usize,
+        n_cce: usize,
+    ) -> Option<Dci> {
         let size = self.sizes.f1_1.as_ref()?;
         let d = dci::parse_dci_1_1(bits, size).ok()?;
         if let Some(b) = d.bwp_indicator {
             let id = Self::bwp_id_of(b, self.nof_dl_bwp_rrc);
             if id != self.dl_bwp_id {
-                return Some(Dci::BwpSwitch { dl_bwp: Some(id), ul_bwp: None });
+                return Some(Dci::BwpSwitch {
+                    dl_bwp: Some(id),
+                    ul_bwp: None,
+                });
             }
         }
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.dl_bwp_rb)?;
@@ -369,12 +515,22 @@ impl DciResolver {
         let mcs = self.mcs(self.pdsch_mcs, d.mcs);
         let ports = dmrs::dci_1_1_antenna_ports_type1_len1(d.antenna_ports)?;
         let cdm = ports.nof_cdm_groups_without_data;
-        let tbs = self.pdsch_tbs(&row, n_rb, &mcs, cdm);
+        if ports.ports.len() > 2 {
+            log::debug!(
+                "DCI 1_1 with {} layers: not supported, grant dropped",
+                ports.ports.len()
+            );
+            return None;
+        }
+        let tbs = self.pdsch_tbs(&row, n_rb, &mcs, cdm, ports.ports.len());
         let pdsch_slot = slot.add(row.k as u64);
         if !self.direction_ok(pdsch_slot, &row, false) {
             return None;
         }
-        let k1 = d.k1_idx.and_then(|i| self.k1_list.get(i as usize).copied()).unwrap_or(*self.k1_list.first().unwrap_or(&4));
+        let k1 = d
+            .k1_idx
+            .and_then(|i| self.k1_list.get(i as usize).copied())
+            .unwrap_or(*self.k1_list.first().unwrap_or(&4));
         let r_pucch = ((2 * cce0) / n_cce.max(1) + 2 * d.pri as usize) as u8;
         Some(Dci::Dl(DlGrant {
             rnti,
@@ -382,7 +538,11 @@ impl DciResolver {
             pdsch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            time: TimeAlloc {
+                mapping_type_a: row.mapping_type_a,
+                start_symbol: row.start_symbol,
+                n_symbols: row.n_symbols,
+            },
             mcs,
             tbs_bits: tbs,
             harq_id: d.harq_id,
@@ -393,6 +553,8 @@ impl DciResolver {
             pri: d.pri,
             tpc: d.tpc,
             cdm_groups_wo_data: cdm,
+            n_layers: ports.ports.len() as u8,
+            dmrs_ports: ports.ports.to_vec(),
             dmrs_add_pos: self.dl_dmrs_add_pos,
             vrb_to_prb_interleaved: d.vrb_to_prb_interleaved.unwrap_or(false),
             r_pucch_common: r_pucch,
@@ -406,7 +568,12 @@ impl DciResolver {
     /// larger BWP the 14 bits are the RIV, the hopping bits being ignored), MCS
     /// from Table 6.1.4.1-1 or 5.1.3.1-1 per `msg3-transformPrecoder`, HARQ
     /// process 0, NDI 0.
-    pub fn resolve_rar_grant(&self, rar_slot: SlotPoint, tc_rnti: Rnti, g: &RarUlGrant) -> Option<UlGrant> {
+    pub fn resolve_rar_grant(
+        &self,
+        rar_slot: SlotPoint,
+        tc_rnti: Rnti,
+        g: &RarUlGrant,
+    ) -> Option<UlGrant> {
         let n = self.ul_bwp_rb;
         let riv = if n <= 180 {
             let m = n * (n + 1) / 2;
@@ -417,7 +584,11 @@ impl DciResolver {
         };
         let (rb_start, n_rb) = dci::riv_decode(riv, n)?;
         let row = self.pusch_tdra_row(g.time_resource as usize, false)?;
-        let table = if self.msg3_tp.is_some() { McsTable::Qam64TransformPrecoding } else { McsTable::Qam64 };
+        let table = if self.msg3_tp.is_some() {
+            McsTable::Qam64TransformPrecoding
+        } else {
+            McsTable::Qam64
+        };
         let mcs = self.pusch_mcs_of(table, g.mcs, false);
         let cdm = if row.n_symbols <= 2 { 1 } else { 2 };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, 2);
@@ -431,7 +602,11 @@ impl DciResolver {
             pusch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            time: TimeAlloc {
+                mapping_type_a: row.mapping_type_a,
+                start_symbol: row.start_symbol,
+                n_symbols: row.n_symbols,
+            },
             mcs,
             tbs_bits: tbs,
             harq_id: 0,
@@ -454,15 +629,27 @@ impl DciResolver {
         if let Some(b) = d.bwp_indicator {
             let id = Self::bwp_id_of(b, self.nof_ul_bwp_rrc);
             if id != self.ul_bwp_id {
-                return Some(Dci::BwpSwitch { dl_bwp: None, ul_bwp: Some(id) });
+                return Some(Dci::BwpSwitch {
+                    dl_bwp: None,
+                    ul_bwp: Some(id),
+                });
             }
         }
         let (rb_start, n_rb) = dci::riv_decode(d.fdra, self.ul_bwp_rb)?;
         let row = self.pusch_tdra_row(d.tdra as usize, true)?;
-        let mcs = self.pusch_mcs_of(self.pusch_mcs, d.mcs, self.ded_tp.is_some_and(|t| t.pi2_bpsk));
+        let mcs = self.pusch_mcs_of(
+            self.pusch_mcs,
+            d.mcs,
+            self.ded_tp.is_some_and(|t| t.pi2_bpsk),
+        );
         // Antenna ports: Table 7.3.1.1.2-6 with transform precoding (always 2
         // CDM groups without data, port = value), Table 7.3.1.1.2-8 otherwise.
-        let cdm = if self.ded_tp.is_some() { 2 } else { dmrs::dci_0_1_antenna_ports_type1_len1_rank1(d.antenna_ports).map_or(2, |p| p.nof_cdm_groups_without_data) };
+        let cdm = if self.ded_tp.is_some() {
+            2
+        } else {
+            dmrs::dci_0_1_antenna_ports_type1_len1_rank1(d.antenna_ports)
+                .map_or(2, |p| p.nof_cdm_groups_without_data)
+        };
         let tbs = self.pusch_tbs(&row, n_rb, &mcs, cdm, self.ul_dmrs_add_pos);
         if !self.direction_ok(slot.add(row.k as u64), &row, true) {
             return None;
@@ -473,7 +660,11 @@ impl DciResolver {
             pusch_slot: slot.add(row.k as u64),
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
-            time: TimeAlloc { mapping_type_a: row.mapping_type_a, start_symbol: row.start_symbol, n_symbols: row.n_symbols },
+            time: TimeAlloc {
+                mapping_type_a: row.mapping_type_a,
+                start_symbol: row.start_symbol,
+                n_symbols: row.n_symbols,
+            },
             mcs,
             tbs_bits: tbs,
             harq_id: d.harq_id,
@@ -512,7 +703,11 @@ mod tests {
             self
         }
         fn pad_to(&mut self, total: usize) -> Vec<u8> {
-            assert!(self.0.len() <= total, "payload {} bits exceeds the format size {total}", self.0.len());
+            assert!(
+                self.0.len() <= total,
+                "payload {} bits exceeds the format size {total}",
+                self.0.len()
+            );
             self.0.resize(total, 0);
             self.0.clone()
         }
@@ -546,9 +741,34 @@ mod tests {
     }
 
     /// DCI 1_0 payload for the C-/TC-RNTI (§7.3.1.2.1) in the CSS size.
-    fn dci_1_0_c(r: &DciResolver, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, tpc: u32, pri: u32, k1_idx: u32) -> Vec<u8> {
+    fn dci_1_0_c(
+        r: &DciResolver,
+        riv: u32,
+        tdra: u32,
+        mcs: u32,
+        ndi: u32,
+        rv: u32,
+        harq: u32,
+        dai: u32,
+        tpc: u32,
+        pri: u32,
+        k1_idx: u32,
+    ) -> Vec<u8> {
         let s = &r.sizes.f1_0_css;
-        Bits::new().put(1, 1).put(riv, s.fdra).put(tdra, 4).put(0, 1).put(mcs, 5).put(ndi, 1).put(rv, 2).put(harq, 4).put(dai, 2).put(tpc, 2).put(pri, 3).put(k1_idx, 3).pad_to(s.total)
+        Bits::new()
+            .put(1, 1)
+            .put(riv, s.fdra)
+            .put(tdra, 4)
+            .put(0, 1)
+            .put(mcs, 5)
+            .put(ndi, 1)
+            .put(rv, 2)
+            .put(harq, 4)
+            .put(dai, 2)
+            .put(tpc, 2)
+            .put(pri, 3)
+            .put(k1_idx, 3)
+            .pad_to(s.total)
     }
 
     #[test]
@@ -558,7 +778,10 @@ mod tests {
         assert_eq!(r.sizes.f1_0_css.fdra, 9);
         assert_eq!(r.sizes.f1_0_css.total, 37);
         assert_eq!(r.sizes.f0_0_css.total, 37);
-        assert!(r.sizes.f1_1.is_none(), "no 1_1 before the dedicated configuration");
+        assert!(
+            r.sizes.f1_1.is_none(),
+            "no 1_1 before the dedicated configuration"
+        );
         assert_eq!(r.msg3_delta, 3, "Δ for 30 kHz (Table 6.1.2.1.1-5)");
     }
 
@@ -567,19 +790,31 @@ mod tests {
         let r = DciResolver::new(&cfg(), false);
         let s = &r.sizes.f1_0_css;
         // fdra | tdra 0 | vrb 0 | mcs 5 | rv 0 | si 0 | 15 reserved
-        let bits = Bits::new().put(riv_encode(0, N_RB, N_RB), s.fdra).put(0, 4).put(0, 1).put(5, 5).put(0, 2).put(0, 1).pad_to(s.total);
+        let bits = Bits::new()
+            .put(riv_encode(0, N_RB, N_RB), s.fdra)
+            .put(0, 4)
+            .put(0, 1)
+            .put(5, 5)
+            .put(0, 2)
+            .put(0, 1)
+            .pad_to(s.total);
         let g = dl(r.resolve_1_0(&bits, Rnti(0xffff), RntiKind::Si, true, slot(10), 0, 4));
         assert_eq!((g.prb_start, g.n_prb), (0, 24));
         // Default table A row 1 with dmrs-TypeA-Position 2: k0 = 0, S = 2, L = 12.
         assert_eq!(g.pdsch_slot, slot(10));
-        assert_eq!((g.time.start_symbol, g.time.n_symbols, g.time.mapping_type_a), (2, 12, true));
+        assert_eq!(
+            (g.time.start_symbol, g.time.n_symbols, g.time.mapping_type_a),
+            (2, 12, true)
+        );
         assert_eq!(g.ack_slot, None, "SI-RNTI: no HARQ-ACK");
         assert_eq!((g.mcs.qm, g.mcs.r_x1024), (2, Some(379)));
         assert_eq!(g.cdm_groups_wo_data, 2);
         // Fallback DCI: dmrs-AdditionalPosition pos2 (§5.1.6.2) → 3 DM-RS symbols
         // for S + L = 14, 2 CDM groups; TBS from the §5.1.3.2 procedure.
         assert_eq!(g.dmrs_add_pos, 2);
-        let dm = dmrs::pdsch_dmrs_symbols(MappingType::TypeA, 2, 2, 2, 12).unwrap().len();
+        let dm = dmrs::pdsch_dmrs_symbols(MappingType::TypeA, 2, 2, 2, 12)
+            .unwrap()
+            .len();
         assert_eq!(dm, 3);
         let n_re = pdsch_params::n_re_per_prb(12, pdsch_params::dmrs_re_per_prb(dm, 2), 0);
         assert_eq!(g.tbs_bits as usize, pdsch_params::tbs(n_re, 24, 2, 379, 1));
@@ -592,7 +827,10 @@ mod tests {
         let bits = dci_1_0_c(&r, riv_encode(2, 6, N_RB), 0, 10, 1, 2, 5, 1, 3, 2, 3);
         let g = dl(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(20), 4, 8));
         assert_eq!((g.prb_start, g.n_prb), (2, 6));
-        assert_eq!((g.harq_id, g.ndi, g.rv, g.dai, g.tpc, g.pri), (5, 1, 2, 1, 3, 2));
+        assert_eq!(
+            (g.harq_id, g.ndi, g.rv, g.dai, g.tpc, g.pri),
+            (5, 1, 2, 1, 3, 2)
+        );
         assert_eq!(g.mcs.qm, 4, "table 1 index 10 is 16-QAM");
         // k1 = field + 1 for the fallback DCI; PUCCH at pdsch_slot + k1.
         assert_eq!(g.ack_slot, Some(slot(20 + 4)));
@@ -616,8 +854,17 @@ mod tests {
         let s = &r.sizes.f1_0_css;
         let all_ones = (1u32 << s.fdra) - 1;
         // ident | fdra = all ones | preamble 6 | ul/sul 1 | ssb 6 | mask 4 | 10 reserved
-        let bits = Bits::new().put(1, 1).put(all_ones, s.fdra).put(7, 6).put(0, 1).put(0, 6).put(0, 4).pad_to(s.total);
-        assert!(matches!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(0), 0, 4), Some(Dci::Other { format }) if format.contains("pdcch-order")));
+        let bits = Bits::new()
+            .put(1, 1)
+            .put(all_ones, s.fdra)
+            .put(7, 6)
+            .put(0, 1)
+            .put(0, 6)
+            .put(0, 4)
+            .pad_to(s.total);
+        assert!(
+            matches!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(0), 0, 4), Some(Dci::Other { format }) if format.contains("pdcch-order"))
+        );
     }
 
     #[test]
@@ -626,17 +873,66 @@ mod tests {
         let s = &r.sizes.f1_0_css;
         let paging = |indicator: u32, tb_scaling: u32| -> Vec<u8> {
             // short-messages indicator 2 | short messages 8 | fdra | tdra 4 | vrb 1 | mcs 5 | tb scaling 2 | 6 reserved
-            Bits::new().put(indicator, 2).put(0, 8).put(riv_encode(0, N_RB, N_RB), s.fdra).put(0, 4).put(0, 1).put(4, 5).put(tb_scaling, 2).pad_to(s.total)
+            Bits::new()
+                .put(indicator, 2)
+                .put(0, 8)
+                .put(riv_encode(0, N_RB, N_RB), s.fdra)
+                .put(0, 4)
+                .put(0, 1)
+                .put(4, 5)
+                .put(tb_scaling, 2)
+                .pad_to(s.total)
         };
         // 2 = short messages only: nothing to receive.
-        assert!(matches!(r.resolve_1_0(&paging(2, 0), Rnti(0xfffe), RntiKind::P, true, slot(0), 0, 4), Some(Dci::Other { .. })));
-        let full = dl(r.resolve_1_0(&paging(1, 0), Rnti(0xfffe), RntiKind::P, true, slot(0), 0, 4));
+        assert!(matches!(
+            r.resolve_1_0(
+                &paging(2, 0),
+                Rnti(0xfffe),
+                RntiKind::P,
+                true,
+                slot(0),
+                0,
+                4
+            ),
+            Some(Dci::Other { .. })
+        ));
+        let full = dl(r.resolve_1_0(
+            &paging(1, 0),
+            Rnti(0xfffe),
+            RntiKind::P,
+            true,
+            slot(0),
+            0,
+            4,
+        ));
         assert_eq!(full.rnti_kind, RntiKind::P);
         assert_eq!(full.ack_slot, None);
         // TB scaling 0.5 / 0.25 (Table 5.1.3.2-2) shrinks the TBS.
-        let half = dl(r.resolve_1_0(&paging(3, 1), Rnti(0xfffe), RntiKind::P, true, slot(0), 0, 4));
-        let quarter = dl(r.resolve_1_0(&paging(3, 2), Rnti(0xfffe), RntiKind::P, true, slot(0), 0, 4));
-        assert!(full.tbs_bits > half.tbs_bits && half.tbs_bits > quarter.tbs_bits, "{} {} {}", full.tbs_bits, half.tbs_bits, quarter.tbs_bits);
+        let half = dl(r.resolve_1_0(
+            &paging(3, 1),
+            Rnti(0xfffe),
+            RntiKind::P,
+            true,
+            slot(0),
+            0,
+            4,
+        ));
+        let quarter = dl(r.resolve_1_0(
+            &paging(3, 2),
+            Rnti(0xfffe),
+            RntiKind::P,
+            true,
+            slot(0),
+            0,
+            4,
+        ));
+        assert!(
+            full.tbs_bits > half.tbs_bits && half.tbs_bits > quarter.tbs_bits,
+            "{} {} {}",
+            full.tbs_bits,
+            half.tbs_bits,
+            quarter.tbs_bits
+        );
     }
 
     #[test]
@@ -646,18 +942,64 @@ mod tests {
         c.dl_bwp.start_crb = 10;
         let r = DciResolver::new(&c, true);
         let s = &r.sizes.f1_0_css;
-        let si = |riv: u32| Bits::new().put(riv, s.fdra).put(0, 4).put(0, 1).put(5, 5).put(0, 2).put(0, 1).pad_to(s.total);
+        let si = |riv: u32| {
+            Bits::new()
+                .put(riv, s.fdra)
+                .put(0, 4)
+                .put(0, 1)
+                .put(5, 5)
+                .put(0, 2)
+                .put(0, 1)
+                .pad_to(s.total)
+        };
         // CORESET#0 RBs 12..16 → BWP RBs 2..6.
-        let g = dl(r.resolve_1_0(&si(riv_encode(12, 4, N_RB)), Rnti(0xffff), RntiKind::Si, true, slot(0), 0, 4));
+        let g = dl(r.resolve_1_0(
+            &si(riv_encode(12, 4, N_RB)),
+            Rnti(0xffff),
+            RntiKind::Si,
+            true,
+            slot(0),
+            0,
+            4,
+        ));
         assert_eq!((g.prb_start, g.n_prb), (2, 4));
         // A PDSCH starting below the BWP cannot be received: no grant rather than a wrapped index.
-        assert!(r.resolve_1_0(&si(riv_encode(0, 24, N_RB)), Rnti(0xffff), RntiKind::Si, true, slot(0), 0, 4).is_none());
+        assert!(r
+            .resolve_1_0(
+                &si(riv_encode(0, 24, N_RB)),
+                Rnti(0xffff),
+                RntiKind::Si,
+                true,
+                slot(0),
+                0,
+                4
+            )
+            .is_none());
     }
 
     /// DCI 0_0 payload (§7.3.1.1.1) in the CSS size.
-    fn dci_0_0(r: &DciResolver, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, tpc: u32) -> Vec<u8> {
+    fn dci_0_0(
+        r: &DciResolver,
+        riv: u32,
+        tdra: u32,
+        mcs: u32,
+        ndi: u32,
+        rv: u32,
+        harq: u32,
+        tpc: u32,
+    ) -> Vec<u8> {
         let s = &r.sizes.f0_0_css;
-        Bits::new().put(0, 1).put(riv, s.fdra).put(tdra, 4).put(0, 1).put(mcs, 5).put(ndi, 1).put(rv, 2).put(harq, 4).put(tpc, 2).pad_to(s.total)
+        Bits::new()
+            .put(0, 1)
+            .put(riv, s.fdra)
+            .put(tdra, 4)
+            .put(0, 1)
+            .put(mcs, 5)
+            .put(ndi, 1)
+            .put(rv, 2)
+            .put(harq, 4)
+            .put(tpc, 2)
+            .pad_to(s.total)
     }
 
     #[test]
@@ -688,11 +1030,31 @@ mod tests {
         let r = DciResolver::new(&c, false);
         // Index 1 of Table 6.1.4.1-1 is a q-row (π/2-BPSK, R = 314/1024): without
         // tp-pi2BPSK it is sent as QPSK at half the rate (same TBS).
-        let g = ul(r.resolve_0_0(&dci_0_0(&r, riv_encode(0, 6, N_RB), 0, 1, 0, 0, 0, 0), Rnti(0x4601), RntiKind::Tc, true, slot(0)));
+        let g = ul(r.resolve_0_0(
+            &dci_0_0(&r, riv_encode(0, 6, N_RB), 0, 1, 0, 0, 0, 0),
+            Rnti(0x4601),
+            RntiKind::Tc,
+            true,
+            slot(0),
+        ));
         assert_eq!((g.mcs.qm, g.mcs.r_x1024), (2, Some(157)));
-        assert_eq!(g.transform_precoding, Some(TransformPrecoding { n_id_rs: PCI, group_hopping: true, sequence_hopping: false, pi2_bpsk: false }));
+        assert_eq!(
+            g.transform_precoding,
+            Some(TransformPrecoding {
+                n_id_rs: PCI,
+                group_hopping: true,
+                sequence_hopping: false,
+                pi2_bpsk: false
+            })
+        );
         // A plain QPSK row stays as it is.
-        let g = ul(r.resolve_0_0(&dci_0_0(&r, riv_encode(0, 6, N_RB), 0, 4, 0, 0, 0, 0), Rnti(0x4601), RntiKind::Tc, true, slot(0)));
+        let g = ul(r.resolve_0_0(
+            &dci_0_0(&r, riv_encode(0, 6, N_RB), 0, 4, 0, 0, 0, 0),
+            Rnti(0x4601),
+            RntiKind::Tc,
+            true,
+            slot(0),
+        ));
         assert_eq!((g.mcs.qm, g.mcs.r_x1024), (2, Some(308)));
     }
 
@@ -700,16 +1062,46 @@ mod tests {
     fn invalid_riv_is_rejected() {
         let r = DciResolver::new(&cfg(), false);
         // 24·25/2 = 300 valid RIVs; 300.. are not.
-        assert!(r.resolve_0_0(&dci_0_0(&r, 300, 0, 0, 0, 0, 0, 0), Rnti(0x4601), RntiKind::C, true, slot(0)).is_none());
-        assert!(r.resolve_rar_grant(slot(0), Rnti(0x4601), &RarUlGrant { freq_hopping: false, fdra: 511, time_resource: 0, mcs: 0, tpc: 0, csi_request: false }).is_none());
+        assert!(r
+            .resolve_0_0(
+                &dci_0_0(&r, 300, 0, 0, 0, 0, 0, 0),
+                Rnti(0x4601),
+                RntiKind::C,
+                true,
+                slot(0)
+            )
+            .is_none());
+        assert!(r
+            .resolve_rar_grant(
+                slot(0),
+                Rnti(0x4601),
+                &RarUlGrant {
+                    freq_hopping: false,
+                    fdra: 511,
+                    time_resource: 0,
+                    mcs: 0,
+                    tpc: 0,
+                    csi_request: false
+                }
+            )
+            .is_none());
     }
 
     #[test]
     fn rar_grant_resolves_msg3_at_k2_plus_delta() {
         let r = DciResolver::new(&cfg(), false);
         let riv = riv_encode(4, 3, N_RB) as u16;
-        let grant = RarUlGrant { freq_hopping: false, fdra: riv, time_resource: 0, mcs: 0, tpc: 7, csi_request: false };
-        let g = r.resolve_rar_grant(slot(100), Rnti(0x4601), &grant).expect("grant");
+        let grant = RarUlGrant {
+            freq_hopping: false,
+            fdra: riv,
+            time_resource: 0,
+            mcs: 0,
+            tpc: 7,
+            csi_request: false,
+        };
+        let g = r
+            .resolve_rar_grant(slot(100), Rnti(0x4601), &grant)
+            .expect("grant");
         assert_eq!((g.rnti, g.rnti_kind), (Rnti(0x4601), RntiKind::Tc));
         assert_eq!((g.prb_start, g.n_prb), (4, 3));
         // Table 6.1.2.1.1-2 row 1 at 30 kHz: k2 = 1, S = 0, L = 14; Δ = 3.
@@ -720,48 +1112,161 @@ mod tests {
         assert!(g.tbs_bits > 0);
         // N_BWP ≤ 180: only the ⌈log2(N(N+1)/2)⌉ LSBs are the RIV; the hopping
         // bits above them must not change the allocation.
-        let with_hop_bits = RarUlGrant { fdra: riv | 0x3e00, ..grant };
-        let g2 = r.resolve_rar_grant(slot(100), Rnti(0x4601), &with_hop_bits).expect("grant");
-        assert_eq!((g2.prb_start, g2.n_prb, g2.tbs_bits), (g.prb_start, g.n_prb, g.tbs_bits));
+        let with_hop_bits = RarUlGrant {
+            fdra: riv | 0x3e00,
+            ..grant
+        };
+        let g2 = r
+            .resolve_rar_grant(slot(100), Rnti(0x4601), &with_hop_bits)
+            .expect("grant");
+        assert_eq!(
+            (g2.prb_start, g2.n_prb, g2.tbs_bits),
+            (g.prb_start, g.n_prb, g.tbs_bits)
+        );
     }
 
     #[test]
     fn rar_grant_uses_the_sib1_pusch_tdra_list() {
         let mut c = cfg();
-        c.pusch_tdra_common = vec![TdraRow { k: 4, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }, TdraRow { k: 5, mapping_type_a: false, start_symbol: 2, n_symbols: 10 }];
+        c.pusch_tdra_common = vec![
+            TdraRow {
+                k: 4,
+                mapping_type_a: true,
+                start_symbol: 0,
+                n_symbols: 14,
+            },
+            TdraRow {
+                k: 5,
+                mapping_type_a: false,
+                start_symbol: 2,
+                n_symbols: 10,
+            },
+        ];
         let r = DciResolver::new(&c, false);
-        let g = r.resolve_rar_grant(slot(0), Rnti(1), &RarUlGrant { freq_hopping: false, fdra: riv_encode(0, 2, N_RB) as u16, time_resource: 1, mcs: 0, tpc: 0, csi_request: false }).expect("grant");
+        let g = r
+            .resolve_rar_grant(
+                slot(0),
+                Rnti(1),
+                &RarUlGrant {
+                    freq_hopping: false,
+                    fdra: riv_encode(0, 2, N_RB) as u16,
+                    time_resource: 1,
+                    mcs: 0,
+                    tpc: 0,
+                    csi_request: false,
+                },
+            )
+            .expect("grant");
         assert_eq!(g.pusch_slot, slot(5 + 3));
-        assert_eq!((g.time.mapping_type_a, g.time.start_symbol, g.time.n_symbols), (false, 2, 10));
+        assert_eq!(
+            (g.time.mapping_type_a, g.time.start_symbol, g.time.n_symbols),
+            (false, 2, 10)
+        );
         // A row beyond the list is not a grant.
-        assert!(r.resolve_rar_grant(slot(0), Rnti(1), &RarUlGrant { freq_hopping: false, fdra: 0, time_resource: 2, mcs: 0, tpc: 0, csi_request: false }).is_none() || r.pusch_tdra_row(2, false).is_some());
+        assert!(
+            r.resolve_rar_grant(
+                slot(0),
+                Rnti(1),
+                &RarUlGrant {
+                    freq_hopping: false,
+                    fdra: 0,
+                    time_resource: 2,
+                    mcs: 0,
+                    tpc: 0,
+                    csi_request: false
+                }
+            )
+            .is_none()
+                || r.pusch_tdra_row(2, false).is_some()
+        );
     }
 
     fn dedicated_cfg() -> PhyConfig {
         let mut c = cfg();
         c.pucch.k1_list = vec![4, 5, 6, 7];
         c.pdsch.mcs_table = McsTableSel::Qam256;
-        c.pdsch.tdra = vec![TdraRow { k: 0, mapping_type_a: true, start_symbol: 1, n_symbols: 13 }];
+        c.pdsch.tdra = vec![TdraRow {
+            k: 0,
+            mapping_type_a: true,
+            start_symbol: 1,
+            n_symbols: 13,
+        }];
         c.pdsch.dmrs_type_a.additional_position = 1;
-        c.pusch.tdra = vec![TdraRow { k: 2, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }, TdraRow { k: 3, mapping_type_a: true, start_symbol: 0, n_symbols: 14 }];
+        c.pusch.tdra = vec![
+            TdraRow {
+                k: 2,
+                mapping_type_a: true,
+                start_symbol: 0,
+                n_symbols: 14,
+            },
+            TdraRow {
+                k: 3,
+                mapping_type_a: true,
+                start_symbol: 0,
+                n_symbols: 14,
+            },
+        ];
         c.pusch.dmrs_type_a.additional_position = 1;
         c
     }
 
     /// DCI 1_1 payload with the resolver's field widths.
-    fn dci_1_1(r: &DciResolver, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, pri: u32, k1_idx: u32, ports: u32) -> Vec<u8> {
+    fn dci_1_1(
+        r: &DciResolver,
+        riv: u32,
+        tdra: u32,
+        mcs: u32,
+        ndi: u32,
+        rv: u32,
+        harq: u32,
+        dai: u32,
+        pri: u32,
+        k1_idx: u32,
+        ports: u32,
+    ) -> Vec<u8> {
         dci_1_1_bwp(r, 0, riv, tdra, mcs, ndi, rv, harq, dai, pri, k1_idx, ports)
     }
 
-    fn dci_1_1_bwp(r: &DciResolver, bwp: u32, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, pri: u32, k1_idx: u32, ports: u32) -> Vec<u8> {
+    fn dci_1_1_bwp(
+        r: &DciResolver,
+        bwp: u32,
+        riv: u32,
+        tdra: u32,
+        mcs: u32,
+        ndi: u32,
+        rv: u32,
+        harq: u32,
+        dai: u32,
+        pri: u32,
+        k1_idx: u32,
+        ports: u32,
+    ) -> Vec<u8> {
         let s = r.sizes.f1_1.as_ref().expect("1_1 size");
         let mut b = Bits::new();
-        b.put(1, 1).put(0, s.carrier_indicator).put(bwp, s.bwp_indicator).put(riv, s.fdra).put(tdra, s.tdra).put(0, s.vrb_to_prb).put(0, s.prb_bundling).put(0, s.rate_matching).put(0, s.zp_csi_rs_trigger);
+        b.put(1, 1)
+            .put(0, s.carrier_indicator)
+            .put(bwp, s.bwp_indicator)
+            .put(riv, s.fdra)
+            .put(tdra, s.tdra)
+            .put(0, s.vrb_to_prb)
+            .put(0, s.prb_bundling)
+            .put(0, s.rate_matching)
+            .put(0, s.zp_csi_rs_trigger);
         b.put(mcs, 5).put(ndi, 1).put(rv, 2);
         if s.tb2 > 0 {
             b.put(0, 8);
         }
-        b.put(harq, s.harq_id).put(dai, s.dai).put(0, 2).put(pri, 3).put(k1_idx, s.k1).put(ports, s.antenna_ports).put(0, s.tci).put(0, s.srs_request).put(0, s.cbgti).put(0, s.cbgfi).put(0, 1);
+        b.put(harq, s.harq_id)
+            .put(dai, s.dai)
+            .put(0, 2)
+            .put(pri, 3)
+            .put(k1_idx, s.k1)
+            .put(ports, s.antenna_ports)
+            .put(0, s.tci)
+            .put(0, s.srs_request)
+            .put(0, s.cbgti)
+            .put(0, s.cbgfi)
+            .put(0, 1);
         b.pad_to(s.total)
     }
 
@@ -769,7 +1274,11 @@ mod tests {
     fn dci_1_1_uses_the_dedicated_tdra_k1_list_and_mcs_table() {
         let r = DciResolver::new(&dedicated_cfg(), true);
         let s = r.sizes.f1_1.as_ref().expect("1_1 size");
-        assert_eq!((s.tdra, s.k1, s.antenna_ports, s.dai), (0, 2, 4, 2), "one TDRA row, 4 k1 values, type-1 single-symbol ports, dynamic codebook");
+        assert_eq!(
+            (s.tdra, s.k1, s.antenna_ports, s.dai),
+            (0, 2, 4, 2),
+            "one TDRA row, 4 k1 values, type-1 single-symbol ports, dynamic codebook"
+        );
         // Antenna-port value 3 (Table 7.3.1.2.2-1): port 1000 with 2 CDM groups without data.
         let bits = dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
         let g = dl(r.resolve_1_1(&bits, Rnti(0x4601), slot(40), 8, 16));
@@ -781,18 +1290,86 @@ mod tests {
         assert_eq!((g.cdm_groups_wo_data, g.dmrs_add_pos), (2, 1));
         assert_eq!(g.r_pucch_common, (2 * 8) / 16 + 2);
         // Value 0: 1 CDM group without data → more REs → larger TBS.
-        let g1 = dl(r.resolve_1_1(&dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 0), Rnti(0x4601), slot(40), 8, 16));
+        let g1 = dl(r.resolve_1_1(
+            &dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 0),
+            Rnti(0x4601),
+            slot(40),
+            8,
+            16,
+        ));
         assert_eq!(g1.cdm_groups_wo_data, 1);
         assert!(g1.tbs_bits > g.tbs_bits);
+        assert_eq!((g1.n_layers, g1.dmrs_ports.clone()), (1, vec![0]));
+        // Value 2: ports 1000 and 1001 in CDM group 0 → two layers, about twice the TBS.
+        let g2 = dl(r.resolve_1_1(
+            &dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 2),
+            Rnti(0x4601),
+            slot(40),
+            8,
+            16,
+        ));
+        assert_eq!(
+            (g2.n_layers, g2.dmrs_ports.clone(), g2.cdm_groups_wo_data),
+            (2, vec![0, 1], 1)
+        );
+        assert!(
+            g2.tbs_bits as f64 > 1.9 * g1.tbs_bits as f64
+                && g2.tbs_bits as f64 <= 2.05 * g1.tbs_bits as f64,
+            "{} vs {}",
+            g2.tbs_bits,
+            g1.tbs_bits
+        );
+        // Value 10 (four ports) is not supported.
+        assert!(r
+            .resolve_1_1(
+                &dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 10),
+                Rnti(0x4601),
+                slot(40),
+                8,
+                16
+            )
+            .is_none());
     }
 
     /// DCI 0_1 payload with the resolver's field widths.
-    fn dci_0_1(r: &DciResolver, riv: u32, tdra: u32, mcs: u32, ndi: u32, rv: u32, harq: u32, dai: u32, ports: u32, ul_sch: u32) -> Vec<u8> {
+    fn dci_0_1(
+        r: &DciResolver,
+        riv: u32,
+        tdra: u32,
+        mcs: u32,
+        ndi: u32,
+        rv: u32,
+        harq: u32,
+        dai: u32,
+        ports: u32,
+        ul_sch: u32,
+    ) -> Vec<u8> {
         let s = r.sizes.f0_1.as_ref().expect("0_1 size");
         let mut b = Bits::new();
-        b.put(0, 1).put(0, s.carrier_indicator).put(0, s.ul_sul).put(0, s.bwp_indicator).put(riv, s.fdra).put(tdra, s.tdra).put(0, s.frequency_hopping_flag);
-        b.put(mcs, 5).put(ndi, 1).put(rv, 2).put(harq, s.harq_id).put(dai, s.first_dai).put(0, s.second_dai).put(0, 2);
-        b.put(0, s.srs_resource_indicator).put(0, s.precoding_info).put(ports, s.antenna_ports).put(0, s.srs_request).put(0, s.csi_request).put(0, s.cbgti).put(0, s.ptrs_dmrs_association).put(0, s.beta_offset).put(0, s.dmrs_seq_init).put(ul_sch, 1);
+        b.put(0, 1)
+            .put(0, s.carrier_indicator)
+            .put(0, s.ul_sul)
+            .put(0, s.bwp_indicator)
+            .put(riv, s.fdra)
+            .put(tdra, s.tdra)
+            .put(0, s.frequency_hopping_flag);
+        b.put(mcs, 5)
+            .put(ndi, 1)
+            .put(rv, 2)
+            .put(harq, s.harq_id)
+            .put(dai, s.first_dai)
+            .put(0, s.second_dai)
+            .put(0, 2);
+        b.put(0, s.srs_resource_indicator)
+            .put(0, s.precoding_info)
+            .put(ports, s.antenna_ports)
+            .put(0, s.srs_request)
+            .put(0, s.csi_request)
+            .put(0, s.cbgti)
+            .put(0, s.ptrs_dmrs_association)
+            .put(0, s.beta_offset)
+            .put(0, s.dmrs_seq_init)
+            .put(ul_sch, 1);
         b.pad_to(s.total)
     }
 
@@ -802,7 +1379,11 @@ mod tests {
         let r = DciResolver::new(&dedicated_cfg(), true);
         let s = r.sizes.f0_1.as_ref().expect("0_1 size");
         assert_eq!(s.tdra, 1, "two dedicated TDRA rows");
-        let g = ul(r.resolve_0_1(&dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 1), Rnti(0x4601), slot(50)));
+        let g = ul(r.resolve_0_1(
+            &dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 1),
+            Rnti(0x4601),
+            slot(50),
+        ));
         assert_eq!((g.prb_start, g.n_prb), (2, 8));
         assert_eq!(g.pusch_slot, slot(50 + 3), "row 2: k2 = 3");
         assert_eq!((g.harq_id, g.ndi, g.dai, g.ul_sch), (9, 1, Some(1), true));
@@ -810,7 +1391,11 @@ mod tests {
         assert_eq!((g.cdm_groups_wo_data, g.dmrs_add_pos), (1, 1));
         assert_eq!(g.transform_precoding, None);
         // CSI-only PUSCH: no UL-SCH.
-        let g = ul(r.resolve_0_1(&dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 0), Rnti(0x4601), slot(50)));
+        let g = ul(r.resolve_0_1(
+            &dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 0),
+            Rnti(0x4601),
+            slot(50),
+        ));
         assert!(!g.ul_sch);
         // With transform precoding: Table 7.3.1.1.2-6 — always 2 CDM groups,
         // the dedicated DM-RS identity, π/2-BPSK off unless tp-pi2BPSK.
@@ -818,15 +1403,31 @@ mod tests {
         c.pusch.transform_precoder = true;
         c.pusch.tp_dmrs.n_pusch_identity = Some(777);
         let r = DciResolver::new(&c, true);
-        let g = ul(r.resolve_0_1(&dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 1), Rnti(0x4601), slot(50)));
+        let g = ul(r.resolve_0_1(
+            &dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 12, 1, 0, 9, 1, 0, 1),
+            Rnti(0x4601),
+            slot(50),
+        ));
         assert_eq!(g.cdm_groups_wo_data, 2);
-        assert_eq!(g.transform_precoding, Some(TransformPrecoding { n_id_rs: 777, group_hopping: false, sequence_hopping: false, pi2_bpsk: false }));
+        assert_eq!(
+            g.transform_precoding,
+            Some(TransformPrecoding {
+                n_id_rs: 777,
+                group_hopping: false,
+                sequence_hopping: false,
+                pi2_bpsk: false
+            })
+        );
         // mcs 12 of Table 6.1.4.1-1 is 16-QAM as well.
         assert_eq!(g.mcs.qm, 4);
         // A q-row (index 1) with tp-pi2BPSK keeps Q_m = 1.
         c.pusch.tp_pi2_bpsk = true;
         let r = DciResolver::new(&c, true);
-        let g = ul(r.resolve_0_1(&dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 1, 1, 0, 9, 1, 0, 1), Rnti(0x4601), slot(50)));
+        let g = ul(r.resolve_0_1(
+            &dci_0_1(&r, riv_encode(2, 8, N_RB), 1, 1, 1, 0, 9, 1, 0, 1),
+            Rnti(0x4601),
+            slot(50),
+        ));
         assert_eq!((g.mcs.qm, g.mcs.r_x1024), (1, Some(314)));
         assert_eq!(g.transform_precoding.map(|t| t.pi2_bpsk), Some(true));
     }
@@ -834,7 +1435,17 @@ mod tests {
     /// T1's pattern: 5 ms = 10 slots, 6 DL, special (8 DL symbols), 3 UL.
     fn tdd_6d_s_3u() -> crate::config::TddConfig {
         use crate::config::{TddConfig, TddPattern};
-        TddConfig { reference_scs: MU, pattern1: TddPattern { period_slots: 10, dl_slots: 6, dl_symbols: 8, ul_slots: 3, ul_symbols: 0 }, pattern2: None }
+        TddConfig {
+            reference_scs: MU,
+            pattern1: TddPattern {
+                period_slots: 10,
+                dl_slots: 6,
+                dl_symbols: 8,
+                ul_slots: 3,
+                ul_symbols: 0,
+            },
+            pattern2: None,
+        }
     }
 
     #[test]
@@ -844,21 +1455,40 @@ mod tests {
         let r = DciResolver::new(&c, false);
         // PDSCH (k0 = 0) in a DL slot: fine; in a UL slot (7): dropped.
         let bits = dci_1_0_c(&r, riv_encode(0, 4, N_RB), 0, 3, 0, 0, 0, 0, 1, 0, 0);
-        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(2), 0, 4).is_some());
-        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4).is_none());
+        assert!(r
+            .resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(2), 0, 4)
+            .is_some());
+        assert!(r
+            .resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4)
+            .is_none());
         // PDSCH symbols 2..14 in the special slot (6): symbols 8..14 are flexible → allowed.
-        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(6), 0, 4).is_some());
+        assert!(r
+            .resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(6), 0, 4)
+            .is_some());
         // PUSCH (k2 = 1 → slot + 1): DCI at slot 6 → PUSCH in UL slot 7: fine; DCI at 2 → slot 3 (DL): dropped.
         let ul = dci_0_0(&r, riv_encode(0, 4, N_RB), 1, 2, 1, 0, 3, 1);
-        assert!(r.resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(6)).is_some());
-        assert!(r.resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(2)).is_none());
+        assert!(r
+            .resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(6))
+            .is_some());
+        assert!(r
+            .resolve_0_0(&ul, Rnti(0x4601), RntiKind::C, true, slot(2))
+            .is_none());
         // Msg3: RAR at slot 3 → PUSCH at 3 + 1 + 3 = 7 (UL): fine; RAR at 5 → 9 (UL): fine; RAR at 6 → 10 (DL): dropped.
-        let g = RarUlGrant { freq_hopping: false, fdra: riv_encode(0, 3, N_RB) as u16, time_resource: 0, mcs: 0, tpc: 0, csi_request: false };
+        let g = RarUlGrant {
+            freq_hopping: false,
+            fdra: riv_encode(0, 3, N_RB) as u16,
+            time_resource: 0,
+            mcs: 0,
+            tpc: 0,
+            csi_request: false,
+        };
         assert!(r.resolve_rar_grant(slot(3), Rnti(1), &g).is_some());
         assert!(r.resolve_rar_grant(slot(6), Rnti(1), &g).is_none());
         // FDD: never dropped.
         let r = DciResolver::new(&cfg(), false);
-        assert!(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4).is_some());
+        assert!(r
+            .resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, true, slot(7), 0, 4)
+            .is_some());
     }
 
     #[test]
@@ -869,9 +1499,18 @@ mod tests {
         let r = DciResolver::new(&c, true);
         assert_eq!(r.sizes.f1_1.as_ref().unwrap().bwp_indicator, 1);
         let same = dci_1_1_bwp(&r, 0, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
-        assert!(matches!(r.resolve_1_1(&same, Rnti(0x4601), slot(40), 8, 16), Some(Dci::Dl(_))));
+        assert!(matches!(
+            r.resolve_1_1(&same, Rnti(0x4601), slot(40), 8, 16),
+            Some(Dci::Dl(_))
+        ));
         let other = dci_1_1_bwp(&r, 1, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
-        assert_eq!(r.resolve_1_1(&other, Rnti(0x4601), slot(40), 8, 16), Some(Dci::BwpSwitch { dl_bwp: Some(1), ul_bwp: None }));
+        assert_eq!(
+            r.resolve_1_1(&other, Rnti(0x4601), slot(40), 8, 16),
+            Some(Dci::BwpSwitch {
+                dl_bwp: Some(1),
+                ul_bwp: None
+            })
+        );
         // Four configured BWPs: 2 bits, value + 1 (the initial BWP is not addressable).
         assert_eq!(DciResolver::bwp_id_of(2, 4), 3);
         assert_eq!(DciResolver::bwp_id_of(2, 3), 2);
@@ -885,15 +1524,36 @@ mod tests {
         let r = DciResolver::new(&cfg(), false);
         // Table 5.1.2.1.1-2 row 2 with pos2: S = 2, L = 10; row 16: type B, S = 8, L = 4 (k0 = 0 for both).
         let row = r.pdsch_tdra_row(1, false, RntiKind::C).unwrap();
-        assert_eq!((row.k, row.mapping_type_a, row.start_symbol, row.n_symbols), (0, true, 2, 10));
+        assert_eq!(
+            (row.k, row.mapping_type_a, row.start_symbol, row.n_symbols),
+            (0, true, 2, 10)
+        );
         let row = r.pdsch_tdra_row(15, false, RntiKind::C).unwrap();
-        assert_eq!((row.mapping_type_a, row.start_symbol, row.n_symbols), (false, 8, 4));
+        assert_eq!(
+            (row.mapping_type_a, row.start_symbol, row.n_symbols),
+            (false, 8, 4)
+        );
         assert!(r.pdsch_tdra_row(16, false, RntiKind::C).is_none());
         // The SI-RNTI always uses the default table, even with a SIB1 list.
         let mut c = cfg();
-        c.pdsch_tdra_common = vec![TdraRow { k: 1, mapping_type_a: true, start_symbol: 3, n_symbols: 5 }];
+        c.pdsch_tdra_common = vec![TdraRow {
+            k: 1,
+            mapping_type_a: true,
+            start_symbol: 3,
+            n_symbols: 5,
+        }];
         let r = DciResolver::new(&c, false);
-        assert_eq!(r.pdsch_tdra_row(0, false, RntiKind::C).unwrap().start_symbol, 3);
-        assert_eq!(r.pdsch_tdra_row(0, false, RntiKind::Si).unwrap().start_symbol, 2);
+        assert_eq!(
+            r.pdsch_tdra_row(0, false, RntiKind::C)
+                .unwrap()
+                .start_symbol,
+            3
+        );
+        assert_eq!(
+            r.pdsch_tdra_row(0, false, RntiKind::Si)
+                .unwrap()
+                .start_symbol,
+            2
+        );
     }
 }

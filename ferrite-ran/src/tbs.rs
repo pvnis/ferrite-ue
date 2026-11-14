@@ -4,7 +4,6 @@
 //!
 //! The MCS tables live in [`crate::mcs`].
 
-
 /// Quantized TBS values (Table 5.1.3.2-1) for `N_info ≤ 3824`, ascending.
 #[rustfmt::skip]
 pub const TBS_TABLE: [u32; 93] = [
@@ -30,7 +29,10 @@ pub fn dmrs_re_per_prb(n_dmrs_symbols: usize, nof_cdm_groups_without_data: u8) -
 /// 1). `x_overhead` is `xOverhead` from PDSCH-ServingCellConfig (0 when absent;
 /// 6, 12 or 18).
 pub fn n_re_per_prb(n_symb: usize, n_dmrs_re_per_prb: usize, x_overhead: usize) -> usize {
-    debug_assert!(matches!(x_overhead, 0 | 6 | 12 | 18), "xOverhead must be 0/6/12/18");
+    debug_assert!(
+        matches!(x_overhead, 0 | 6 | 12 | 18),
+        "xOverhead must be 0/6/12/18"
+    );
     (12 * n_symb).saturating_sub(n_dmrs_re_per_prb + x_overhead)
 }
 
@@ -48,7 +50,13 @@ pub fn n_re_per_prb(n_symb: usize, n_dmrs_re_per_prb: usize, x_overhead: usize) 
 /// `N'_info = max(3840, 2^n·round((N_info − 24)/2^n))`; `C = ⌈(N'_info+24)/3816⌉`
 /// if `R ≤ 1/4`, else `⌈(N'_info+24)/8424⌉` if `N'_info > 8424`, else 1;
 /// `TBS = 8·C·⌈(N'_info+24)/(8·C)⌉ − 24`.
-pub fn tbs_x2048(n_re_per_prb_total: usize, n_prb: usize, qm: u8, r_x2048: u32, n_layers: usize) -> usize {
+pub fn tbs_x2048(
+    n_re_per_prb_total: usize,
+    n_prb: usize,
+    qm: u8,
+    r_x2048: u32,
+    n_layers: usize,
+) -> usize {
     let n_re = n_re_per_prb_total.min(156) * n_prb;
     let r = f64::from(r_x2048) / 2048.0;
     let n_info = n_re as f64 * r * f64::from(qm) * n_layers as f64;
@@ -77,13 +85,31 @@ pub fn tbs_x2048(n_re_per_prb_total: usize, n_prb: usize, qm: u8, r_x2048: u32, 
 }
 
 /// [`tbs_x2048`] with the code rate given ×1024 (the MCS table convention).
-pub fn tbs(n_re_per_prb_total: usize, n_prb: usize, qm: u8, r_x1024: u16, n_layers: usize) -> usize {
-    tbs_x2048(n_re_per_prb_total, n_prb, qm, 2 * u32::from(r_x1024), n_layers)
+pub fn tbs(
+    n_re_per_prb_total: usize,
+    n_prb: usize,
+    qm: u8,
+    r_x1024: u16,
+    n_layers: usize,
+) -> usize {
+    tbs_x2048(
+        n_re_per_prb_total,
+        n_prb,
+        qm,
+        2 * u32::from(r_x1024),
+        n_layers,
+    )
 }
 
 /// Transport block size for a float code rate `r` (legacy signature; rounds `r`
 /// to the nearest ×2048 step, which is exact for every MCS table entry).
-pub fn transport_block_size(n_re_per_prb: usize, n_prb: usize, qm: u8, r: f64, layers: usize) -> usize {
+pub fn transport_block_size(
+    n_re_per_prb: usize,
+    n_prb: usize,
+    qm: u8,
+    r: f64,
+    layers: usize,
+) -> usize {
     tbs_x2048(n_re_per_prb, n_prb, qm, (r * 2048.0).round() as u32, layers)
 }
 
@@ -156,7 +182,11 @@ mod tests {
         for &(i_mcs, n_prb, bytes) in cases {
             let (qm, r) = mcs::mcs_params(McsTable::Qam64, i_mcs).unwrap();
             let t = tbs(n_re, n_prb, qm, r, 1);
-            assert_eq!(t % 8, 0, "MCS {i_mcs} × {n_prb} PRB: {t} bits not byte aligned");
+            assert_eq!(
+                t % 8,
+                0,
+                "MCS {i_mcs} × {n_prb} PRB: {t} bits not byte aligned"
+            );
             assert_eq!(t / 8, bytes, "MCS {i_mcs} × {n_prb} PRB");
         }
     }

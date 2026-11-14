@@ -74,10 +74,24 @@ pub enum EngineCommand {
 /// Events the engine reports to the application.
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
-    CellFound { pci: u16, sfn: u16, cfo_hz: f64, ssb_df_hz: f64, mib: Mib, coreset0: (u16, u8, i32), ssb_index: u8 },
+    CellFound {
+        pci: u16,
+        sfn: u16,
+        cfo_hz: f64,
+        ssb_df_hz: f64,
+        mib: Mib,
+        coreset0: (u16, u8, i32),
+        ssb_index: u8,
+    },
     /// A serving-cell SSB measurement (one per SSB period), in the receiver's
     /// own power scale (dBFS); the stack converts to dBm.
-    Measurement { pci: u16, slot: SlotPoint, rsrp_dbfs: f32, rsrq_db: f32, sinr_db: f32 },
+    Measurement {
+        pci: u16,
+        slot: SlotPoint,
+        rsrp_dbfs: f32,
+        rsrq_db: f32,
+        sinr_db: f32,
+    },
     SyncLost,
     Stopped,
 }
@@ -94,7 +108,10 @@ enum TxCmd {
 enum WorkerCmd {
     Job(PdschJob),
     /// One slot of samples per receive antenna.
-    Measure { slot: SlotPoint, samples: Arc<Vec<Vec<Iq>>> },
+    Measure {
+        slot: SlotPoint,
+        samples: Arc<Vec<Vec<Iq>>>,
+    },
     Reconfigure(Box<WorkerConfig>),
     Stop,
 }
@@ -225,11 +242,16 @@ pub fn run(
     events: crossbeam_channel::Sender<EngineEvent>,
 ) -> Result<EngineStats> {
     let shared = UlShared::new(ul.start_index);
-    let spsl = Numerology::from_scs_khz(params.ssb_scs_khz).map(|n| n.samples_per_slot(params.fs)).unwrap_or(1) as i64;
+    let spsl = Numerology::from_scs_khz(params.ssb_scs_khz)
+        .map(|n| n.samples_per_slot(params.fs))
+        .unwrap_or(1) as i64;
     {
         let shared = shared.clone();
         let fs = params.fs;
-        std::thread::Builder::new().name("ferrite-ultx".into()).spawn(move || serve_uplink(ul, shared, spsl, fs)).map_err(Error::Io)?;
+        std::thread::Builder::new()
+            .name("ferrite-ultx".into())
+            .spawn(move || serve_uplink(ul, shared, spsl, fs))
+            .map_err(Error::Io)?;
     }
     let (tx_cmd, tx_rx) = crossbeam_channel::bounded::<TxCmd>(64);
     let (wk_cmd, wk_rx) = crossbeam_channel::bounded::<WorkerCmd>(8);
@@ -302,7 +324,9 @@ pub fn run(
                         },
                         WorkerCmd::Measure { slot, samples } => {
                             if let Some(w) = worker.as_ref() {
-                                if let Some(grids) = w.demod(slot, &samples[0]) {
+                                let grids: Vec<Vec<Vec<Iq>>> =
+                                    samples.iter().filter_map(|s| w.demod(slot, s)).collect();
+                                if grids.len() == samples.len() {
                                     if let Some(c) = w.measure_csi(slot, &grids) {
                                         let _ = wk_res_tx.send(PhyToMac::Csi(c));
                                     }
@@ -313,18 +337,32 @@ pub fn run(
                             // Every job is answered with exactly one RX_Data (the
                             // engine waits for them before building the HARQ-ACK).
                             let g = &job.grant;
-                            let failed = || RxDataIndication { rnti: g.rnti, rnti_kind: g.rnti_kind, harq_id: g.harq_id, ndi: g.ndi, pdsch_slot: job.slot, tb: None, sinr_db: 0.0 };
+                            let failed = || RxDataIndication {
+                                rnti: g.rnti,
+                                rnti_kind: g.rnti_kind,
+                                harq_id: g.harq_id,
+                                ndi: g.ndi,
+                                pdsch_slot: job.slot,
+                                tb: None,
+                                sinr_db: 0.0,
+                            };
                             let r = match worker.as_mut() {
                                 None => failed(),
-                                Some(w) => match w.demod(job.slot, &job.samples[0]) {
-                                    None => failed(),
-                                    Some(grids) => {
+                                Some(w) => {
+                                    let grids: Vec<Vec<Vec<Iq>>> = job
+                                        .samples
+                                        .iter()
+                                        .filter_map(|s| w.demod(job.slot, s))
+                                        .collect();
+                                    if grids.len() != job.samples.len() {
+                                        failed()
+                                    } else {
                                         if let Some(c) = w.measure_csi(job.slot, &grids) {
                                             let _ = wk_res_tx.send(PhyToMac::Csi(c));
                                         }
                                         w.decode(&job, &grids)
                                     }
-                                },
+                                }
                             };
                             if wk_res_tx.send(PhyToMac::RxData(r)).is_err() {
                                 break;
@@ -350,10 +388,14 @@ pub fn run(
         pending_dl: BTreeMap::new(),
         pending_prach: Vec::new(),
         outstanding_jobs: 0,
-            tx_enabled: false,
-        prach_sweep: std::env::var("FERRITE_PRACH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
+        tx_enabled: false,
+        prach_sweep: std::env::var("FERRITE_PRACH_SWEEP")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
         prach_sweep_idx: 0,
-        pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
+        pusch_sweep: std::env::var("FERRITE_PUSCH_SWEEP")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()),
         pusch_sweep_idx: 0,
         stats: EngineStats::default(),
         started: std::time::Instant::now(),
@@ -376,7 +418,10 @@ impl<'a> Engine<'a> {
     }
 
     fn stopped(&self) -> bool {
-        matches!(self.cmds.try_recv(), Ok(EngineCommand::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected))
+        matches!(
+            self.cmds.try_recv(),
+            Ok(EngineCommand::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected)
+        )
     }
 
     fn run_inner(&mut self) -> Result<()> {
@@ -388,7 +433,8 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let _ = self.events.send(EngineEvent::SyncLost);
-            self.mac.handle(PhyToMac::Error(ErrorIndication::SyncLost), &mut Vec::new());
+            self.mac
+                .handle(PhyToMac::Error(ErrorIndication::SyncLost), &mut Vec::new());
         }
     }
 
@@ -397,8 +443,10 @@ impl<'a> Engine<'a> {
     fn cell_search(&mut self) -> Result<Option<Synced>> {
         self.shared.gate.store(false, Relaxed);
         let p = self.params.clone();
-        let ssb_num = Numerology::from_scs_khz(p.ssb_scs_khz).ok_or_else(|| Error::Config("bad SSB SCS".into()))?;
-        let ssb_case = SsbCase::from_scs(p.ssb_scs_khz, p.duplex).ok_or_else(|| Error::Config("no SSB case".into()))?;
+        let ssb_num = Numerology::from_scs_khz(p.ssb_scs_khz)
+            .ok_or_else(|| Error::Config("bad SSB SCS".into()))?;
+        let ssb_case = SsbCase::from_scs(p.ssb_scs_khz, p.duplex)
+            .ok_or_else(|| Error::Config("no SSB case".into()))?;
         let l_max = ssb::l_max_fr1(p.dl_center_hz);
         let frame_len = ssb_num.samples_per_frame(p.fs);
         let fft_ssb = (p.fs / ssb_num.scs_hz() as f64).round() as usize;
@@ -412,7 +460,14 @@ impl<'a> Engine<'a> {
             let mut cap = vec![Iq::default(); cap_len];
             self.dl.read_exact(&mut cap)?;
             attempts += 1;
-            let Some(hit) = gscn_scan(&cap, p.fs, p.dl_center_hz, p.ssb_scs_khz, l_max, p.gscn_hint) else {
+            let Some(hit) = gscn_scan(
+                &cap,
+                p.fs,
+                p.dl_center_hz,
+                p.ssb_scs_khz,
+                l_max,
+                p.gscn_hint,
+            ) else {
                 log::info!("cell search: no SSB (attempt {attempts})");
                 if p.max_search_attempts > 0 && attempts >= p.max_search_attempts {
                     return Err(Error::Phy("no SSB found".into()));
@@ -421,11 +476,20 @@ impl<'a> Engine<'a> {
             };
             log::info!(
                 "scan hit: gscn {} df {:.0} Hz PCI {} pss {:.2} sss {:.2} cfo {:.0} Hz mib {}",
-                hit.gscn, hit.df_hz, hit.result.cell_id, hit.result.pss_metric, hit.result.sss_metric, hit.result.cfo_hz, hit.pbch.is_some()
+                hit.gscn,
+                hit.df_hz,
+                hit.result.cell_id,
+                hit.result.pss_metric,
+                hit.result.sss_metric,
+                hit.result.cfo_hz,
+                hit.pbch.is_some()
             );
             let mut tracker = FrameTracker::new(fft_ssb, ssb_case, p.dl_center_hz);
             let Some(acq) = tracker.acquire_from_hit(&hit) else {
-                log::info!("cell search: PCI {} seen but MIB not decoded (attempt {attempts})", hit.result.cell_id);
+                log::info!(
+                    "cell search: PCI {} seen but MIB not decoded (attempt {attempts})",
+                    hit.result.cell_id
+                );
                 continue;
             };
             let mib = acq.mib;
@@ -443,23 +507,44 @@ impl<'a> Engine<'a> {
             let min_bw = if p.band == 79 { 40 } else { 10 };
             let cs0_idx = mib.pdcch_config_sib1 >> 4;
             let ss0_idx = mib.pdcch_config_sib1 & 0xf;
-            let Some(cs0) = coreset0::coreset0_config(p.ssb_scs_khz, pdcch_scs, min_bw, cs0_idx) else {
-                return Err(Error::Config(format!("unsupported CORESET0 index {cs0_idx}")));
+            let Some(cs0) = coreset0::coreset0_config(p.ssb_scs_khz, pdcch_scs, min_bw, cs0_idx)
+            else {
+                return Err(Error::Config(format!(
+                    "unsupported CORESET0 index {cs0_idx}"
+                )));
             };
             let k_ssb = (mib.k_ssb_msb << 4) | mib.ssb_subcarrier_offset;
-            let cs0_rel_ssb = match coreset0::coreset0_first_subcarrier_rel_ssb(k_ssb, pdcch_scs, &cs0) {
-                Ok(v) => v,
-                Err(e) => return Err(Error::Config(format!("CORESET0 offset: {e:?}"))),
-            };
+            let cs0_rel_ssb =
+                match coreset0::coreset0_first_subcarrier_rel_ssb(k_ssb, pdcch_scs, &cs0) {
+                    Ok(v) => v,
+                    Err(e) => return Err(Error::Config(format!("CORESET0 offset: {e:?}"))),
+                };
             let scs = numerology.scs_hz() as f64;
             // SSB subcarrier 0 relative to the DL stream DC (data-SCS subcarriers).
             let ssb_sc0 = ((hit.df_hz - 120.0 * ssb_num.scs_hz() as f64) / scs).round() as i64;
-            let geom = CellGeometry::from_coreset0(p.fs, p.dl_center_hz, numerology, ssb_sc0 + cs0_rel_ssb as i64, hit.df_hz);
-            let Some(t0) = coreset0::type0_pdcch_monitoring(ss0_idx, acq.i_ssb, mu_data, &cs0) else {
+            let geom = CellGeometry::from_coreset0(
+                p.fs,
+                p.dl_center_hz,
+                numerology,
+                ssb_sc0 + cs0_rel_ssb as i64,
+                hit.df_hz,
+            );
+            let Some(t0) = coreset0::type0_pdcch_monitoring(ss0_idx, acq.i_ssb, mu_data, &cs0)
+            else {
                 return Err(Error::Config("unsupported searchSpaceZero".into()));
             };
-            let cfg = initial_config(&p, &mib, &cs0, numerology, acq.cell_id, cs0_idx, ss0_idx, k_ssb);
-            let mut monitor = DlMonitor::new(geom.clone(), &cfg, acq.cell_id, Some((cs0, t0)), false);
+            let cfg = initial_config(
+                &p,
+                &mib,
+                &cs0,
+                numerology,
+                acq.cell_id,
+                cs0_idx,
+                ss0_idx,
+                k_ssb,
+            );
+            let mut monitor =
+                DlMonitor::new(geom.clone(), &cfg, acq.cell_id, Some((cs0, t0)), false);
             monitor.rntis.si = true;
             let synced = Synced {
                 clock,
@@ -479,16 +564,34 @@ impl<'a> Engine<'a> {
                 "synced PCI {} SFN {} i_ssb {} hf {} cfo {:.0} Hz ssb df {:.0} Hz mu {} CORESET0 idx {} ({} RB, {} sym) ss0 {}",
                 acq.cell_id, mib.sfn, acq.i_ssb, acq.half_frame, acq.cfo_hz, hit.df_hz, mu_data, cs0_idx, cs0.n_rb, cs0.n_symb, ss0_idx
             );
-            let _ = self.events.send(EngineEvent::CellFound { pci: acq.cell_id, sfn: mib.sfn, cfo_hz: acq.cfo_hz, ssb_df_hz: hit.df_hz, mib, coreset0: (cs0.n_rb as u16, cs0.n_symb as u8, cs0.offset_rb), ssb_index: acq.i_ssb });
+            let _ = self.events.send(EngineEvent::CellFound {
+                pci: acq.cell_id,
+                sfn: mib.sfn,
+                cfo_hz: acq.cfo_hz,
+                ssb_df_hz: hit.df_hz,
+                mib,
+                coreset0: (cs0.n_rb as u16, cs0.n_symb as u8, cs0.offset_rb),
+                ssb_index: acq.i_ssb,
+            });
             self.configure_threads(&synced);
             return Ok(Some(synced));
         }
     }
 
     fn configure_threads(&mut self, s: &Synced) {
-        let wc = worker_config(&s.geom, &s.cfg, s.cell_id, &s.coreset0, s.phase.configured());
+        let wc = worker_config(
+            &s.geom,
+            &s.cfg,
+            s.cell_id,
+            &s.coreset0,
+            s.phase.configured(),
+        );
         let _ = self.wk_cmd.send(WorkerCmd::Reconfigure(Box::new(wc)));
-        let _ = self.tx_cmd.send(TxCmd::Reconfigure(Box::new((s.geom.clone(), s.cfg.clone(), s.cell_id))));
+        let _ = self.tx_cmd.send(TxCmd::Reconfigure(Box::new((
+            s.geom.clone(),
+            s.cfg.clone(),
+            s.cell_id,
+        ))));
     }
 
     // ------------------------------------------------------------ slot loop
@@ -506,7 +609,9 @@ impl<'a> Engine<'a> {
             let back = (pos - start) as usize;
             let prev_len = self.prev.first().map_or(0, Vec::len);
             if back > prev_len {
-                return Err(Error::Phy(format!("timing slew of {back} samples exceeds the kept history")));
+                return Err(Error::Phy(format!(
+                    "timing slew of {back} samples exceeds the kept history"
+                )));
             }
             let need = len.saturating_sub(back);
             let mut rest: Vec<Vec<Iq>> = Vec::new();
@@ -542,7 +647,10 @@ impl<'a> Engine<'a> {
         let served = self.shared.served.load(Relaxed);
         let backlog = served - self.dl.position() as i64;
         if backlog > 2 * sps {
-            log::info!("dropping {backlog} DL samples ({:.1} ms) of search backlog", backlog as f64 / fs * 1e3);
+            log::info!(
+                "dropping {backlog} DL samples ({:.1} ms) of search backlog",
+                backlog as f64 / fs * 1e3
+            );
             self.dl.skip(backlog as usize)?;
             self.prev.iter_mut().for_each(Vec::clear);
         }
@@ -555,15 +663,32 @@ impl<'a> Engine<'a> {
         // uplink is final up to there: release it, or the lockstep gNB (which
         // sends at most ~1 ms of DL beyond the UL it has received) could never
         // deliver the first whole slot.
-        self.shared.committed.store(self.commit_mark(s, slot.add(self.params.tx_lead_slots as u64)), Relaxed);
+        self.shared.committed.store(
+            self.commit_mark(s, slot.add(self.params.tx_lead_slots as u64)),
+            Relaxed,
+        );
         let mut samples: Vec<Vec<Iq>> = Vec::new();
         let mut shifter: Option<FreqShifter> = None;
         let mut shifted: Vec<Iq> = Vec::with_capacity(sps as usize);
         let mut shifted_all: Vec<Vec<Iq>> = Vec::new();
         let ofdm_ssb = Ofdm::new((fs / (15_000u32 << s.ssb_case.mu()) as f64).round() as usize);
-        let searcher = CellSearcher::new(ofdm_ssb.fft_size(), s.ssb_case.mu(), ssb::l_max_fr1(self.params.dl_center_hz));
-        let ssb_first_symbol = s.ssb_case.candidate_symbols(self.params.dl_center_hz).get(s.i_ssb as usize).copied().unwrap_or(2);
-        let ssb_off_in_frame = ssb::ssb_sample_offset_in_frame(ssb_first_symbol, s.half_frame, s.ssb_case.mu(), &ofdm_ssb) as i64;
+        let searcher = CellSearcher::new(
+            ofdm_ssb.fft_size(),
+            s.ssb_case.mu(),
+            ssb::l_max_fr1(self.params.dl_center_hz),
+        );
+        let ssb_first_symbol = s
+            .ssb_case
+            .candidate_symbols(self.params.dl_center_hz)
+            .get(s.i_ssb as usize)
+            .copied()
+            .unwrap_or(2);
+        let ssb_off_in_frame = ssb::ssb_sample_offset_in_frame(
+            ssb_first_symbol,
+            s.half_frame,
+            s.ssb_case.mu(),
+            &ofdm_ssb,
+        ) as i64;
         let mut rlm = RlmState::InSync;
         let mut outbox: Vec<MacToPhy> = Vec::new();
         loop {
@@ -580,11 +705,14 @@ impl<'a> Engine<'a> {
             self.stats.slots += 1;
 
             // --- SSB tracking (timing + CFO) on SSB frames.
-            if slot.sfn % (s.ssb_period_ms / 10).max(1) == 0 && slot.slot as i64 == ssb_off_in_frame / sps {
+            if slot.sfn % (s.ssb_period_ms / 10).max(1) == 0
+                && slot.slot as i64 == ssb_off_in_frame / sps
+            {
                 let in_slot = (ssb_off_in_frame % sps) as usize;
                 let sh = FreqShifter::new(-s.geom.ssb_df_hz - s.cfo_hz, fs, sps as usize);
                 sh.shift_into(&samples[0], start as usize, &mut shifted);
-                let cp = ofdm_ssb.cp_len(ssb_first_symbol % (14 << s.ssb_case.mu()), s.ssb_case.mu());
+                let cp =
+                    ofdm_ssb.cp_len(ssb_first_symbol % (14 << s.ssb_case.mu()), s.ssb_case.mu());
                 let expect = in_slot + cp;
                 let lo = expect.saturating_sub(96);
                 let hi = (expect + 96).min(shifted.len());
@@ -600,9 +728,22 @@ impl<'a> Engine<'a> {
                         rlm = RlmState::InSync;
                         // Found but not measurable: treat as a strong SSB.
                         ssb_sinr = Some(f32::INFINITY);
-                        if let Some(m) = ferrite_phy::sync::measure::ssb_measure(&ofdm_ssb, &shifted, r.timing_index, s.ssb_case.mu(), r.n_id_1, r.n_id_2) {
+                        if let Some(m) = ferrite_phy::sync::measure::ssb_measure(
+                            &ofdm_ssb,
+                            &shifted,
+                            r.timing_index,
+                            s.ssb_case.mu(),
+                            r.n_id_1,
+                            r.n_id_2,
+                        ) {
                             ssb_sinr = Some(m.sinr_db());
-                            let _ = self.events.try_send(EngineEvent::Measurement { pci: s.cell_id, slot, rsrp_dbfs: m.rsrp_db(), rsrq_db: m.rsrq_db(), sinr_db: m.sinr_db() });
+                            let _ = self.events.try_send(EngineEvent::Measurement {
+                                pci: s.cell_id,
+                                slot,
+                                rsrp_dbfs: m.rsrp_db(),
+                                rsrq_db: m.rsrq_db(),
+                                sinr_db: m.sinr_db(),
+                            });
                         }
                     }
                     _ => {
@@ -624,17 +765,28 @@ impl<'a> Engine<'a> {
                     if !in_sync {
                         self.stats.out_of_sync += 1;
                     }
-                    self.mac.handle(PhyToMac::Sync(SyncIndication { slot, in_sync }), &mut outbox);
+                    self.mac.handle(
+                        PhyToMac::Sync(SyncIndication { slot, in_sync }),
+                        &mut outbox,
+                    );
                 }
             }
             // --- CFO correction for the data path (every antenna shares the LO).
-            let arc_samples: Arc<Vec<Vec<Iq>>> = if self.params.cfo_correction && s.cfo_hz.abs() > 1.0 {
-                if shifter.as_ref().is_none_or(|f| (f.shift_hz() + s.cfo_hz).abs() > 0.5) {
+            let arc_samples: Arc<Vec<Vec<Iq>>> = if self.params.cfo_correction
+                && s.cfo_hz.abs() > 1.0
+            {
+                if shifter
+                    .as_ref()
+                    .is_none_or(|f| (f.shift_hz() + s.cfo_hz).abs() > 0.5)
+                {
                     shifter = Some(FreqShifter::new(-s.cfo_hz, fs, sps as usize));
                 }
                 shifted_all.resize_with(samples.len(), Vec::new);
                 for (a, sa) in samples.iter().enumerate() {
-                    shifter.as_ref().unwrap().shift_into(sa, start as usize, &mut shifted_all[a]);
+                    shifter
+                        .as_ref()
+                        .unwrap()
+                        .shift_into(sa, start as usize, &mut shifted_all[a]);
                 }
                 Arc::new(shifted_all.clone())
             } else {
@@ -648,7 +800,10 @@ impl<'a> Engine<'a> {
             // when the DL stream arrives in bursts the engine can get there
             // before the worker (normally ~0.3 ms) has answered.
             while self.outstanding_jobs > 0 {
-                match self.wk_res.recv_timeout(std::time::Duration::from_millis(20)) {
+                match self
+                    .wk_res
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                {
                     Ok(m) => {
                         if matches!(m, PhyToMac::RxData(_)) {
                             self.outstanding_jobs -= 1;
@@ -656,7 +811,10 @@ impl<'a> Engine<'a> {
                         self.mac.handle(m, &mut outbox);
                     }
                     Err(_) => {
-                        log::warn!("{} PDSCH result(s) still outstanding at slot {slot}", self.outstanding_jobs);
+                        log::warn!(
+                            "{} PDSCH result(s) still outstanding at slot {slot}",
+                            self.outstanding_jobs
+                        );
                         break;
                     }
                 }
@@ -664,13 +822,18 @@ impl<'a> Engine<'a> {
             self.drain_outbox(s, &mut outbox, slot)?;
 
             // --- SLOT.indication (MAC issues its UL_TTI requests for slot + lead).
-            self.mac.handle(PhyToMac::Slot(SlotIndication { slot }), &mut outbox);
+            self.mac
+                .handle(PhyToMac::Slot(SlotIndication { slot }), &mut outbox);
             self.drain_outbox(s, &mut outbox, slot)?;
             // PRACH transmitted?
             let mut rach = Vec::new();
             self.pending_prach.retain(|(occ_slot, occ, pre)| {
                 if slot.diff(occ_slot) > 0 {
-                    rach.push(PhyToMac::Rach(RachIndication { slot: *occ_slot, ra_rnti: occ.ra_rnti, preamble: *pre }));
+                    rach.push(PhyToMac::Rach(RachIndication {
+                        slot: *occ_slot,
+                        ra_rnti: occ.ra_rnti,
+                        preamble: *pre,
+                    }));
                     false
                 } else {
                     true
@@ -686,7 +849,10 @@ impl<'a> Engine<'a> {
             self.stats.dcis += dcis.len() as u64;
             for d in dcis {
                 if let Dci::Dl(g) = &d.dci {
-                    self.pending_dl.entry(g.pdsch_slot.index()).or_default().push(g.clone());
+                    self.pending_dl
+                        .entry(g.pdsch_slot.index())
+                        .or_default()
+                        .push(g.clone());
                 }
                 self.mac.handle(PhyToMac::Dci(d), &mut outbox);
             }
@@ -694,13 +860,25 @@ impl<'a> Engine<'a> {
 
             // --- PDSCH jobs for this slot (+ CSI measurement occasions).
             let grants = self.pending_dl.remove(&slot.index()).unwrap_or_default();
-            let has_csi = s.phase.configured() && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot));
+            let has_csi = s.phase.configured()
+                && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| {
+                    r.trs && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot)
+                });
             if grants.is_empty() && has_csi {
-                let _ = self.wk_cmd.try_send(WorkerCmd::Measure { slot, samples: arc_samples.clone() });
+                let _ = self.wk_cmd.try_send(WorkerCmd::Measure {
+                    slot,
+                    samples: arc_samples.clone(),
+                });
             }
             for g in grants {
                 self.stats.pdsch_jobs += 1;
-                let job = PdschJob { slot, samples: arc_samples.clone(), grant: g, skip_decode: false, queued: std::time::Instant::now() };
+                let job = PdschJob {
+                    slot,
+                    samples: arc_samples.clone(),
+                    grant: g,
+                    skip_decode: false,
+                    queued: std::time::Instant::now(),
+                };
                 if self.wk_cmd.try_send(WorkerCmd::Job(job)).is_err() {
                     log::warn!("PDSCH worker queue full: slot {slot} dropped");
                 } else {
@@ -708,7 +886,8 @@ impl<'a> Engine<'a> {
                 }
             }
             // Drop stale pending grants (k0 misses).
-            self.pending_dl.retain(|&k, _| k as i64 >= slot.index() as i64);
+            self.pending_dl
+                .retain(|&k, _| k as i64 >= slot.index() as i64);
 
             // --- Worker results.
             while let Ok(m) = self.wk_res.try_recv() {
@@ -739,27 +918,68 @@ impl<'a> Engine<'a> {
     }
 
     /// Apply MAC → PHY messages.
-    fn drain_outbox(&mut self, s: &mut Synced, outbox: &mut Vec<MacToPhy>, now: SlotPoint) -> Result<()> {
+    fn drain_outbox(
+        &mut self,
+        s: &mut Synced,
+        outbox: &mut Vec<MacToPhy>,
+        now: SlotPoint,
+    ) -> Result<()> {
         // Messages MAC sends while handling our answers to this batch.
         let mut followups: Vec<MacToPhy> = Vec::new();
         for m in outbox.drain(..) {
             match m {
-                MacToPhy::RarGrant { rar_slot, tc_rnti, grant } => match s.monitor.resolver.resolve_rar_grant(rar_slot, tc_rnti, &grant) {
-                    Some(ul) => self.mac.handle(PhyToMac::Dci(DciIndication { slot: rar_slot, dci: Dci::Ul(ul) }), &mut followups),
-                    None => log::warn!("RAR UL grant {grant:?} could not be resolved (BWP {} RBs)", s.cfg.ul_bwp.n_rb),
+                MacToPhy::RarGrant {
+                    rar_slot,
+                    tc_rnti,
+                    grant,
+                } => match s
+                    .monitor
+                    .resolver
+                    .resolve_rar_grant(rar_slot, tc_rnti, &grant)
+                {
+                    Some(ul) => self.mac.handle(
+                        PhyToMac::Dci(DciIndication {
+                            slot: rar_slot,
+                            dci: Dci::Ul(ul),
+                        }),
+                        &mut followups,
+                    ),
+                    None => log::warn!(
+                        "RAR UL grant {grant:?} could not be resolved (BWP {} RBs)",
+                        s.cfg.ul_bwp.n_rb
+                    ),
                 },
                 MacToPhy::Config(cfg) => {
                     let cfg = *cfg;
                     s.geom = CellGeometry::new(self.params.fs, self.params.dl_center_hz, &cfg);
                     s.clock.n_ta_offset_tc = cfg.n_ta_offset_tc as i64;
                     s.ssb_period_ms = cfg.ssb.period_ms;
-                    let dedicated = !cfg.search_spaces.iter().all(|x| x.kind == crate::config::SearchSpaceKind::Common) || !cfg.pucch.resources.is_empty();
-                    let t0 = coreset0::type0_pdcch_monitoring(cfg.ss0_index, s.i_ssb, s.geom.numerology.mu, &s.coreset0);
+                    let dedicated = !cfg
+                        .search_spaces
+                        .iter()
+                        .all(|x| x.kind == crate::config::SearchSpaceKind::Common)
+                        || !cfg.pucch.resources.is_empty();
+                    let t0 = coreset0::type0_pdcch_monitoring(
+                        cfg.ss0_index,
+                        s.i_ssb,
+                        s.geom.numerology.mu,
+                        &s.coreset0,
+                    );
                     let rntis = s.monitor.rntis;
-                    s.monitor = DlMonitor::new(s.geom.clone(), &cfg, s.cell_id, t0.map(|t| (s.coreset0, t)), dedicated);
+                    s.monitor = DlMonitor::new(
+                        s.geom.clone(),
+                        &cfg,
+                        s.cell_id,
+                        t0.map(|t| (s.coreset0, t)),
+                        dedicated,
+                    );
                     s.monitor.rntis = rntis;
                     s.cfg = cfg;
-                    s.phase = if dedicated { CellPhase::Dedicated } else { CellPhase::Common };
+                    s.phase = if dedicated {
+                        CellPhase::Dedicated
+                    } else {
+                        CellPhase::Common
+                    };
                     self.configure_threads(s);
                     log::info!("PHY configured: dl carrier {:?} ul carrier {:?} coresets {} search spaces {} dedicated {}", s.cfg.dl_carrier, s.cfg.ul_carrier, s.cfg.coresets.len(), s.cfg.search_spaces.len(), dedicated);
                 }
@@ -773,7 +993,11 @@ impl<'a> Engine<'a> {
                     log::info!("STOP.request: uplink transmissions disabled");
                     self.tx_enabled = false;
                 }
-                MacToPhy::SetRntis { c_rnti, tc_rnti, ra_rnti } => {
+                MacToPhy::SetRntis {
+                    c_rnti,
+                    tc_rnti,
+                    ra_rnti,
+                } => {
                     s.monitor.rntis.c = c_rnti;
                     s.monitor.rntis.tc = tc_rnti;
                     s.monitor.rntis.ra = ra_rnti;
@@ -789,18 +1013,34 @@ impl<'a> Engine<'a> {
                 }
                 MacToPhy::UlTti(req) => {
                     if !self.tx_enabled {
-                        self.mac.handle(PhyToMac::Error(ErrorIndication::TxDropped { slot: req.slot, pdu: "ul_tti (STOP)" }), &mut followups);
+                        self.mac.handle(
+                            PhyToMac::Error(ErrorIndication::TxDropped {
+                                slot: req.slot,
+                                pdu: "ul_tti (STOP)",
+                            }),
+                            &mut followups,
+                        );
                         continue;
                     }
                     let lead = req.slot.diff(&now);
                     if lead < 1 {
                         self.stats.late_ul += 1;
-                        self.mac.handle(PhyToMac::Error(ErrorIndication::TxDropped { slot: req.slot, pdu: "ul_tti" }), &mut Vec::new());
+                        self.mac.handle(
+                            PhyToMac::Error(ErrorIndication::TxDropped {
+                                slot: req.slot,
+                                pdu: "ul_tti",
+                            }),
+                            &mut Vec::new(),
+                        );
                         continue;
                     }
                     for pdu in &req.pdus {
-                        if let UlTtiPdu::Prach { occasion, preamble, .. } = pdu {
-                            self.pending_prach.push((occasion.slot, *occasion, *preamble));
+                        if let UlTtiPdu::Prach {
+                            occasion, preamble, ..
+                        } = pdu
+                        {
+                            self.pending_prach
+                                .push((occasion.slot, *occasion, *preamble));
                         }
                     }
                     let crnti = s.monitor.rntis.c.map_or(0, |r| r.0) as i64;
@@ -814,7 +1054,10 @@ impl<'a> Engine<'a> {
                             let off = v[self.prach_sweep_idx % v.len()];
                             self.prach_sweep_idx += 1;
                             clock.tx_rx_offset = off;
-                            log::info!("PRACH sweep: slot {} with tx_rx_offset {off} samples", req.slot);
+                            log::info!(
+                                "PRACH sweep: slot {} with tx_rx_offset {off} samples",
+                                req.slot
+                            );
                         }
                     } else if req.pdus.iter().any(|p| matches!(p, UlTtiPdu::Pusch { .. })) {
                         // Same for PUSCH (FERRITE_PUSCH_SWEEP), cycled per PUSCH transmission.
@@ -822,10 +1065,17 @@ impl<'a> Engine<'a> {
                             let off = v[self.pusch_sweep_idx % v.len()];
                             self.pusch_sweep_idx += 1;
                             clock.tx_rx_offset = off;
-                            log::info!("PUSCH sweep: slot {} with tx_rx_offset {off} samples", req.slot);
+                            log::info!(
+                                "PUSCH sweep: slot {} with tx_rx_offset {off} samples",
+                                req.slot
+                            );
                         }
                     }
-                    if self.tx_cmd.try_send(TxCmd::Ul(req, clock, crnti, std::time::Instant::now())).is_err() {
+                    if self
+                        .tx_cmd
+                        .try_send(TxCmd::Ul(req, clock, crnti, std::time::Instant::now()))
+                        .is_err()
+                    {
                         self.stats.late_ul += 1;
                     }
                 }
@@ -840,13 +1090,42 @@ impl<'a> Engine<'a> {
 
 /// The minimal PHY configuration for SIB1 reception, from the MIB.
 #[allow(clippy::too_many_arguments)]
-fn initial_config(p: &EngineParams, mib: &Mib, cs0: &Coreset0Config, numerology: Numerology, cell_id: u16, _cs0_idx: u8, ss0_idx: u8, k_ssb: u8) -> PhyConfig {
+fn initial_config(
+    p: &EngineParams,
+    mib: &Mib,
+    cs0: &Coreset0Config,
+    numerology: Numerology,
+    cell_id: u16,
+    _cs0_idx: u8,
+    ss0_idx: u8,
+    k_ssb: u8,
+) -> PhyConfig {
     let ssb_scs = Numerology::from_scs_khz(p.ssb_scs_khz).unwrap_or(numerology);
-    PhyConfig::initial(p.duplex, numerology, ssb_scs, cell_id, cs0.n_rb, cs0.n_symb as u8, if mib.dmrs_typea_pos3 { 3 } else { 2 }, k_ssb, ss0_idx)
+    PhyConfig::initial(
+        p.duplex,
+        numerology,
+        ssb_scs,
+        cell_id,
+        cs0.n_rb,
+        cs0.n_symb as u8,
+        if mib.dmrs_typea_pos3 { 3 } else { 2 },
+        k_ssb,
+        ss0_idx,
+    )
 }
 
-fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Coreset0Config, configured: bool) -> WorkerConfig {
-    let coreset0_first_crb = cfg.coresets.iter().find(|c| c.id == 0).map_or(0, |c| c.start_crb as usize);
+fn worker_config(
+    geom: &CellGeometry,
+    cfg: &PhyConfig,
+    cell_id: u16,
+    cs0: &Coreset0Config,
+    configured: bool,
+) -> WorkerConfig {
+    let coreset0_first_crb = cfg
+        .coresets
+        .iter()
+        .find(|c| c.id == 0)
+        .map_or(0, |c| c.start_crb as usize);
     let mut patterns = Vec::new();
     let mut meas = Vec::new();
     for r in &cfg.pdsch.csi_rs_rate_match {
@@ -870,14 +1149,29 @@ fn worker_config(geom: &CellGeometry, cfg: &PhyConfig, cell_id: u16, cs0: &Cores
         });
         if !r.zero_power && r.trs && r.row == 1 {
             meas.push((
-                csi::CsiRsMeasurement { row, n_id: r.scrambling_id, k0: r.freq_bits.trailing_zeros() as usize, symbol: r.first_symbol as usize, start_rb: r.start_rb as usize, n_rb: r.n_rb as usize },
+                csi::CsiRsMeasurement {
+                    row,
+                    n_id: r.scrambling_id,
+                    k0: r.freq_bits.trailing_zeros() as usize,
+                    symbol: r.first_symbol as usize,
+                    start_rb: r.start_rb as usize,
+                    n_rb: r.n_rb as usize,
+                },
                 r.period_slots as u32,
                 r.offset_slots as u32,
             ));
         }
     }
     for p in &patterns {
-        log::info!("CSI-RS rate-match pattern: symbols {:?} rb {}+{} re-mask {:#014b} period {} offset {}", p.symbols, p.start_rb, p.n_rb, p.re_mask, p.period_slots, p.offset_slots);
+        log::info!(
+            "CSI-RS rate-match pattern: symbols {:?} rb {}+{} re-mask {:#014b} period {} offset {}",
+            p.symbols,
+            p.start_rb,
+            p.n_rb,
+            p.re_mask,
+            p.period_slots,
+            p.offset_slots
+        );
     }
     WorkerConfig {
         geom: geom.clone(),
@@ -923,6 +1217,11 @@ mod tests {
         for _ in 0..RLM_MAX_MISSED_SSB {
             r = r.miss();
         }
-        assert_eq!(r, RlmState::OutOfSync { misses: RLM_MAX_MISSED_SSB });
+        assert_eq!(
+            r,
+            RlmState::OutOfSync {
+                misses: RLM_MAX_MISSED_SSB
+            }
+        );
     }
 }

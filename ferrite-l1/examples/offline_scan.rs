@@ -17,8 +17,20 @@ fn main() {
     let scs: u32 = a[4].parse().unwrap();
     let df: Option<f64> = a.get(5).and_then(|x| x.parse().ok());
     let bytes = std::fs::read(path).unwrap();
-    let samples: Vec<Iq> = bytes.chunks_exact(8).map(|c| Iq::new(f32::from_le_bytes(c[0..4].try_into().unwrap()), f32::from_le_bytes(c[4..8].try_into().unwrap()))).collect();
-    println!("{} samples ({:.1} ms)", samples.len(), samples.len() as f64 / fs * 1e3);
+    let samples: Vec<Iq> = bytes
+        .chunks_exact(8)
+        .map(|c| {
+            Iq::new(
+                f32::from_le_bytes(c[0..4].try_into().unwrap()),
+                f32::from_le_bytes(c[4..8].try_into().unwrap()),
+            )
+        })
+        .collect();
+    println!(
+        "{} samples ({:.1} ms)",
+        samples.len(),
+        samples.len() as f64 / fs * 1e3
+    );
     let mu = ferrite_common::Numerology::from_scs_khz(scs).unwrap().mu;
     let fft = (fs / (scs as f64 * 1e3)).round() as usize;
     let l_max = l_max_fr1(center);
@@ -29,13 +41,18 @@ fn main() {
         let shifted = freq_shift(&samples, -df, fs, 0);
         match searcher.search(&shifted) {
             Some(r) => {
-                println!("search @df {df}: PCI {} pss {:.3} sss {:.3} t {} cfo {:.0}", r.cell_id, r.pss_metric, r.sss_metric, r.timing_index, r.cfo_hz);
+                println!(
+                    "search @df {df}: PCI {} pss {:.3} sss {:.3} t {} cfo {:.0}",
+                    r.cell_id, r.pss_metric, r.sss_metric, r.timing_index, r.cfo_hz
+                );
                 let mut corr = shifted.clone();
                 ferrite_phy::sync::cfo::correct_cfo(&mut corr, r.cfo_hz, fs);
                 println!("mib: {:?}", searcher.decode_mib(&corr, &r));
                 // PBCH hypotheses in detail.
-                use ferrite_phy::sync::pbch::{extract_pbch, pbch_dmrs, equalize_pbch};
-                if let Some((rx_dmrs, rx_data, layout)) = extract_pbch(searcher.ofdm(), &corr, r.timing_index, mu, r.cell_id) {
+                use ferrite_phy::sync::pbch::{equalize_pbch, extract_pbch, pbch_dmrs};
+                if let Some((rx_dmrs, rx_data, layout)) =
+                    extract_pbch(searcher.ofdm(), &corr, r.timing_index, mu, r.cell_id)
+                {
                     let rx_norm: f32 = rx_dmrs.iter().map(|s| s.norm_sqr()).sum::<f32>().sqrt();
                     for h in 0..8u8 {
                         let refs = pbch_dmrs(r.cell_id, h);
@@ -44,21 +61,35 @@ fn main() {
                         let llrs = equalize_pbch(&rx_dmrs, &rx_data, &layout, r.cell_id, h);
                         let mut ok = Vec::new();
                         for v in 0..8u8 {
-                            if let Some(mib) = ferrite_phy::coding::bch::bch_decode(&llrs, r.cell_id, v) {
+                            if let Some(mib) =
+                                ferrite_phy::coding::bch::bch_decode(&llrs, r.cell_id, v)
+                            {
                                 ok.push((v, mib.sfn));
                             }
                         }
                         println!("  dmrs hyp {h}: metric {m:.3} decodes {ok:?}");
                     }
-                    let pw: f32 = rx_data.iter().map(|s| s.norm_sqr()).sum::<f32>() / rx_data.len() as f32;
-                    println!("  pbch data power {pw:.3e}, dmrs power {:.3e}", rx_norm * rx_norm / rx_dmrs.len() as f32);
+                    let pw: f32 =
+                        rx_data.iter().map(|s| s.norm_sqr()).sum::<f32>() / rx_data.len() as f32;
+                    println!(
+                        "  pbch data power {pw:.3e}, dmrs power {:.3e}",
+                        rx_norm * rx_norm / rx_dmrs.len() as f32
+                    );
                 }
             }
             None => println!("search @df {df}: nothing"),
         }
     }
     match gscn_scan(&samples, fs, center, scs, l_max, None) {
-        Some(h) => println!("gscn_scan: gscn {} df {:.0} PCI {} pss {:.3} sss {:.3} mib {:?}", h.gscn, h.df_hz, h.result.cell_id, h.result.pss_metric, h.result.sss_metric, h.pbch.map(|p| p.mib)),
+        Some(h) => println!(
+            "gscn_scan: gscn {} df {:.0} PCI {} pss {:.3} sss {:.3} mib {:?}",
+            h.gscn,
+            h.df_hz,
+            h.result.cell_id,
+            h.result.pss_metric,
+            h.result.sss_metric,
+            h.pbch.map(|p| p.mib)
+        ),
         None => println!("gscn_scan: nothing"),
     }
     // MIB false-pass rate on random LLRs.

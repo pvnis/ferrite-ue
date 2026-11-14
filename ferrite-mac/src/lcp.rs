@@ -20,7 +20,14 @@ pub struct Lcp {
 
 impl Lcp {
     pub fn new(channels: &[LogicalChannelConfig]) -> Self {
-        let mut buckets: Vec<Bucket> = channels.iter().map(|c| Bucket { cfg: *c, bj: 0, last: None }).collect();
+        let mut buckets: Vec<Bucket> = channels
+            .iter()
+            .map(|c| Bucket {
+                cfg: *c,
+                bj: 0,
+                last: None,
+            })
+            .collect();
         buckets.sort_by_key(|b| b.cfg.priority);
         Self { buckets }
     }
@@ -29,11 +36,12 @@ impl Lcp {
         self.buckets.iter().map(|b| &b.cfg)
     }
 
-
     /// Advance the token buckets to `now` (§5.4.3.1: Bj += PBR × elapsed, capped).
     pub fn tick(&mut self, now: SlotPoint) {
         for b in &mut self.buckets {
-            let elapsed_ms = b.last.map_or(0.0, |l| now.diff(&l).max(0) as f64 * now.numerology.slot_duration_us() / 1000.0);
+            let elapsed_ms = b.last.map_or(0.0, |l| {
+                now.diff(&l).max(0) as f64 * now.numerology.slot_duration_us() / 1000.0
+            });
             b.last = Some(now);
             if let Some(pbr) = b.cfg.pbr_bytes_per_ms {
                 let cap = pbr as i64 * b.cfg.bsd_ms as i64;
@@ -49,7 +57,11 @@ impl Lcp {
     /// in priority order, then the remainder strictly by priority. Returns
     /// `(lcid, bytes)` allocations (bytes excludes MAC subheaders; the caller
     /// accounts for them by passing a budget net of headers).
-    pub fn allocate(&mut self, budget: usize, pending: &mut dyn FnMut(u8) -> usize) -> Vec<(u8, usize)> {
+    pub fn allocate(
+        &mut self,
+        budget: usize,
+        pending: &mut dyn FnMut(u8) -> usize,
+    ) -> Vec<(u8, usize)> {
         let mut left = budget;
         let mut alloc: Vec<(u8, usize)> = Vec::new();
         // Round 1: up to Bj.
@@ -58,7 +70,11 @@ impl Lcp {
                 break;
             }
             let want = pending(b.cfg.lcid);
-            let cap = if b.cfg.pbr_bytes_per_ms.is_some() { b.bj.max(0) as usize } else { usize::MAX };
+            let cap = if b.cfg.pbr_bytes_per_ms.is_some() {
+                b.bj.max(0) as usize
+            } else {
+                usize::MAX
+            };
             let take = want.min(cap).min(left);
             if take > 0 {
                 alloc.push((b.cfg.lcid, take));
@@ -96,8 +112,24 @@ mod tests {
     #[test]
     fn priority_and_pbr() {
         let chans = [
-            LogicalChannelConfig { lcid: 4, priority: 8, pbr_bytes_per_ms: Some(8), bsd_ms: 100, lcg: 1, sr_id: None, sr_mask: false },
-            LogicalChannelConfig { lcid: 1, priority: 1, pbr_bytes_per_ms: None, bsd_ms: 1000, lcg: 0, sr_id: None, sr_mask: false },
+            LogicalChannelConfig {
+                lcid: 4,
+                priority: 8,
+                pbr_bytes_per_ms: Some(8),
+                bsd_ms: 100,
+                lcg: 1,
+                sr_id: None,
+                sr_mask: false,
+            },
+            LogicalChannelConfig {
+                lcid: 1,
+                priority: 1,
+                pbr_bytes_per_ms: None,
+                bsd_ms: 1000,
+                lcg: 0,
+                sr_id: None,
+                sr_mask: false,
+            },
         ];
         let mut lcp = Lcp::new(&chans);
         let now = SlotPoint::new(ferrite_common::Numerology::KHZ30, 0, 0);

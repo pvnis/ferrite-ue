@@ -206,19 +206,27 @@ pub struct UeConfig {
 pub enum RadioConfig {
     /// One downlink endpoint per receive antenna; one uplink endpoint.
     Zmq { tx: Vec<String>, rx: String },
-    Sdr { args: String, rx_gain: f64, tx_gain: f64 },
+    Sdr {
+        args: String,
+        rx_gain: f64,
+        tx_gain: f64,
+    },
 }
 
 fn hex16(s: &str, what: &str) -> Result<[u8; 16], String> {
     let v = ferrite_common::from_hex(s).ok_or_else(|| format!("{what}: bad hex"))?;
-    v.try_into().map_err(|_| format!("{what}: expected 16 bytes"))
+    v.try_into()
+        .map_err(|_| format!("{what}: expected 16 bytes"))
 }
 
 impl UeConfig {
     pub fn load() -> Result<Self, String> {
         let cli = Cli::parse();
         let file: FileConfig = match &cli.config {
-            Some(p) => toml::from_str(&std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|e| format!("config: {e}"))?,
+            Some(p) => toml::from_str(
+                &std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+            )
+            .map_err(|e| format!("config: {e}"))?,
             None => FileConfig::default(),
         };
         macro_rules! pick {
@@ -228,7 +236,14 @@ impl UeConfig {
         }
         let radio_kind = pick!(radio, "zmq".to_string());
         let radio = match radio_kind.as_str() {
-            "zmq" => RadioConfig::Zmq { tx: pick!(tx, "tcp://127.0.0.1:2100".into()).split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), rx: pick!(rx, "tcp://127.0.0.1:2101".into()) },
+            "zmq" => RadioConfig::Zmq {
+                tx: pick!(tx, "tcp://127.0.0.1:2100".into())
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                rx: pick!(rx, "tcp://127.0.0.1:2101".into()),
+            },
             "sdr" => RadioConfig::Sdr {
                 args: pick!(sdr_args, "driver=soapy".into()),
                 rx_gain: pick!(sdr_rx_gain, 50.0),
@@ -237,7 +252,10 @@ impl UeConfig {
             other => return Err(format!("unknown radio backend {other}")),
         };
         let fs = pick!(srate, 15.36) * 1e6;
-        let (dl_center_hz, dl_arfcn) = match (cli.dl_arfcn.or(file.dl_arfcn), cli.center_mhz.or(file.center_mhz)) {
+        let (dl_center_hz, dl_arfcn) = match (
+            cli.dl_arfcn.or(file.dl_arfcn),
+            cli.center_mhz.or(file.center_mhz),
+        ) {
             (Some(a), _) => (arfcn_to_hz(a), a),
             (None, Some(m)) => (m * 1e6, ferrite_common::hz_to_arfcn(m * 1e6)),
             (None, None) => (arfcn_to_hz(626000), 626000),
@@ -250,12 +268,16 @@ impl UeConfig {
                 .map(|b| b.band)
                 .ok_or_else(|| format!("no known band for ARFCN {dl_arfcn}; pass --band"))?,
         };
-        let info = BandInfo::lookup(band).ok_or_else(|| format!("band n{band} not in the band table"))?;
+        let info =
+            BandInfo::lookup(band).ok_or_else(|| format!("band n{band} not in the band table"))?;
         let ssb_scs_khz = pick!(ssb_scs, info.ssb_scs_khz[0]);
         let ul_center_hz = arfcn_to_hz(info.ul_arfcn_for_dl(dl_arfcn));
         let imsi = pick!(imsi, "001010167891203".into());
         let ki = hex16(&pick!(ki, "5122250214c33e723a5dd523fc145fc0".into()), "ki")?;
-        let opc = hex16(&pick!(opc, "981d464c7c52eb6e5036234984ad0bcf".into()), "opc")?;
+        let opc = hex16(
+            &pick!(opc, "981d464c7c52eb6e5036234984ad0bcf".into()),
+            "opc",
+        )?;
         let target = pick!(ping_target, "10.255.0.1".into());
         let mut ping_target = [0u8; 4];
         for (i, p) in target.split('.').take(4).enumerate() {
@@ -288,7 +310,10 @@ impl UeConfig {
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
             rx_power_offset_db: pick!(rx_power_offset_db, 0.0),
             rlf_at_s: pick!(rlf_at_s, 0),
-            rlm_outage: cli.rlm_outage_s.or(file.rlm_outage_s).map(|s| (s, pick!(rlm_outage_ms, 1500))),
+            rlm_outage: cli
+                .rlm_outage_s
+                .or(file.rlm_outage_s)
+                .map(|s| (s, pick!(rlm_outage_ms, 1500))),
             t3512_s: cli.t3512_s.or(file.t3512_s),
             log: pick!(log, "info".into()),
         })

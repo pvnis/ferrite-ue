@@ -124,6 +124,8 @@ pub fn srs_layout(p: &SrsResourceParams) -> Option<(usize, usize)> {
 /// Symbols of the resource in the slot: `l0 + l'`, l0 = 14 − 1 − l_offset.
 pub fn srs_symbols(p: &SrsResourceParams) -> Vec<usize> {
     let l0 = 14usize.saturating_sub(1 + p.start_position as usize);
-    (0..p.nrof_symbols as usize).map(|l| l0 + l).filter(|&l| l < 14).collect()
+    (0..p.nrof_symbols as usize)
+        .map(|l| l0 + l)
+        .filter(|&l| l < 14)
+        .collect()
 }
-

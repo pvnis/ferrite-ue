@@ -226,7 +226,9 @@ impl Guti {
     /// 5G-TMSI (32) (TS 23.003 §2.10.1), the RRC identity for paging and
     /// connection requests.
     pub fn s_tmsi_u64(&self) -> u64 {
-        (u64::from(self.amf_set_id & 0x3ff) << 38) | (u64::from(self.amf_pointer & 0x3f) << 32) | u64::from(self.tmsi)
+        (u64::from(self.amf_set_id & 0x3ff) << 38)
+            | (u64::from(self.amf_pointer & 0x3f) << 32)
+            | u64::from(self.tmsi)
     }
 
     /// The 5G-S-TMSI: AMF set ID (10 bits) | AMF pointer (6 bits) | 5G-TMSI.

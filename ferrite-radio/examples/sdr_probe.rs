@@ -27,8 +27,10 @@ fn main() {
         rx_gain: a.get(4).and_then(|s| s.parse().ok()).unwrap_or(40.0),
         ..Default::default()
     };
-    println!("\n=== opening args={:?} freq={} Hz rate={} Hz rx_gain={} dB ===",
-        cfg.args, cfg.frequency, cfg.sample_rate, cfg.rx_gain);
+    println!(
+        "\n=== opening args={:?} freq={} Hz rate={} Hz rx_gain={} dB ===",
+        cfg.args, cfg.frequency, cfg.sample_rate, cfg.rx_gain
+    );
     let radio = match SeifyRadio::open(&cfg) {
         Ok(r) => r,
         Err(e) => {
@@ -86,12 +88,22 @@ fn main() {
             match rx.read(&mut blk) {
                 Ok(0) => break,
                 Ok(n) => rec.extend_from_slice(&blk[..n]),
-                Err(_) => { ov += 1; if ov > 1_000_000 { break; } }
+                Err(_) => {
+                    ov += 1;
+                    if ov > 1_000_000 {
+                        break;
+                    }
+                }
             }
         }
         let mut bytes = Vec::with_capacity(rec.len() * 8);
-        for c in &rec { bytes.extend(c.re.to_le_bytes()); bytes.extend(c.im.to_le_bytes()); }
-        std::fs::File::create(out).and_then(|mut f| f.write_all(&bytes)).expect("write recording");
+        for c in &rec {
+            bytes.extend(c.re.to_le_bytes());
+            bytes.extend(c.im.to_le_bytes());
+        }
+        std::fs::File::create(out)
+            .and_then(|mut f| f.write_all(&bytes))
+            .expect("write recording");
         println!("recorded {} samples ({ov} overruns) -> {out}", rec.len());
     }
 }

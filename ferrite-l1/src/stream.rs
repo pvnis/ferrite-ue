@@ -3,8 +3,8 @@
 //! DU runs on wall-clock and error-spirals if its TX buffer backs up), while
 //! the consumer reads at its own pace from an unbounded queue.
 
-use ferrite_radio::SampleSource;
 use ferrite_common::{Error, Iq, Result};
+use ferrite_radio::SampleSource;
 use std::sync::mpsc;
 
 /// Consumer end of a continuously drained sample stream.
@@ -100,8 +100,7 @@ impl BufferedStream {
                 self.pos = 0;
             }
             let take = (self.pending.len() - self.pos).min(buf.len() - filled);
-            buf[filled..filled + take]
-                .copy_from_slice(&self.pending[self.pos..self.pos + take]);
+            buf[filled..filled + take].copy_from_slice(&self.pending[self.pos..self.pos + take]);
             self.pos += take;
             filled += take;
         }

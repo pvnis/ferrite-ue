@@ -30,7 +30,15 @@ pub struct BsrProcedure {
 
 impl BsrProcedure {
     pub fn new(periodic_slots: u32, retx_slots: u32) -> Self {
-        Self { periodic_slots, retx_slots, periodic_expiry: None, retx_expiry: None, pending: BsrTrigger::None, last_prio_with_data: None, sr_pending: false }
+        Self {
+            periodic_slots,
+            retx_slots,
+            periodic_expiry: None,
+            retx_expiry: None,
+            pending: BsrTrigger::None,
+            last_prio_with_data: None,
+            sr_pending: false,
+        }
     }
 
     /// Evaluate the buffer state. `prios_with_data` lists the priorities (1 =

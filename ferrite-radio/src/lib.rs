@@ -128,8 +128,14 @@ mod tests {
         for (i, &s) in wave.iter().enumerate() {
             assert_eq!(sink.samples[250 + i], s, "burst sample {i} misplaced");
         }
-        assert!(sink.samples[..250].iter().all(|s| *s == Iq::default()), "pre-burst not silent");
-        assert!(sink.samples[280..].iter().all(|s| *s == Iq::default()), "post-burst not silent");
+        assert!(
+            sink.samples[..250].iter().all(|s| *s == Iq::default()),
+            "pre-burst not silent"
+        );
+        assert!(
+            sink.samples[280..].iter().all(|s| *s == Iq::default()),
+            "post-burst not silent"
+        );
     }
 
     /// `serve_push` loops until the whole block is accepted when the sink writes partially.
@@ -149,7 +155,10 @@ mod tests {
                 Ok(n)
             }
         }
-        let mut sink = PartialSink { written: 0, chunk: 7 };
+        let mut sink = PartialSink {
+            written: 0,
+            chunk: 7,
+        };
         let mut counter = 0u64;
         let mut block = vec![Iq::default(); 20];
         let served = serve_push(&mut sink, &mut counter, &mut block, |_, _| {}).unwrap();

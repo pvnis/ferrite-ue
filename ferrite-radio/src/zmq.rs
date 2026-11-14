@@ -146,7 +146,11 @@ impl ZmqSink {
     /// Because the gNB requests uplink and transmits downlink in lockstep, the
     /// counter tracks the gNB's receive sample index, letting the caller place a
     /// PRACH occasion at a downlink-derived sample position.
-    pub fn serve_with(&mut self, counter: &mut u64, mut fill: impl FnMut(u64, &mut [Complex32])) -> Result<bool> {
+    pub fn serve_with(
+        &mut self,
+        counter: &mut u64,
+        mut fill: impl FnMut(u64, &mut [Complex32]),
+    ) -> Result<bool> {
         match self.socket.recv_msg(0) {
             Ok(_) => {
                 let mut block = vec![Complex32::default(); self.block_len];
@@ -201,7 +205,11 @@ mod tests {
         let mut buf = vec![Complex32::default(); 100];
         assert!(src.read_exact(&mut buf).unwrap());
         for (i, s) in buf.iter().enumerate() {
-            let expect = if i < 50 { i as f32 } else { (i - 50 + 100) as f32 };
+            let expect = if i < 50 {
+                i as f32
+            } else {
+                (i - 50 + 100) as f32
+            };
             assert_eq!(s.re, expect);
             assert_eq!(s.im, -expect);
         }

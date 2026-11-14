@@ -29,4 +29,7 @@ pub use ie::NasError;
 pub use mm::{Guti, Plmn, Snssai, Tai, UeSecurityCapability};
 pub use security::NasSecurityContext;
 pub use sm::PduSessionType;
-pub use ue::{CmState, ConnectionCause, DeregisteredSub, MmState, NasConfig, NasEvent, NasUe, PduSession, RegisteredSub, SmState, UeIdentity};
+pub use ue::{
+    CmState, ConnectionCause, DeregisteredSub, MmState, NasConfig, NasEvent, NasUe, PduSession,
+    RegisteredSub, SmState, UeIdentity,
+};

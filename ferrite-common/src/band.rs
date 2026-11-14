@@ -44,23 +44,125 @@ pub struct BandInfo {
 
 /// FR1 bands the UE knows about (TS 38.101-1 Table 5.2-1). Extend as needed.
 pub const BANDS: &[BandInfo] = &[
-    BandInfo { band: 1, duplex: DuplexMode::Fdd, ul_arfcn: (384000, 396000), dl_arfcn: (422000, 434000), ssb_scs_khz: &[15] },
-    BandInfo { band: 2, duplex: DuplexMode::Fdd, ul_arfcn: (370000, 382000), dl_arfcn: (386000, 398000), ssb_scs_khz: &[15] },
-    BandInfo { band: 3, duplex: DuplexMode::Fdd, ul_arfcn: (342000, 357000), dl_arfcn: (361000, 376000), ssb_scs_khz: &[15] },
-    BandInfo { band: 5, duplex: DuplexMode::Fdd, ul_arfcn: (164800, 169800), dl_arfcn: (173800, 178800), ssb_scs_khz: &[15, 30] },
-    BandInfo { band: 7, duplex: DuplexMode::Fdd, ul_arfcn: (500000, 514000), dl_arfcn: (524000, 538000), ssb_scs_khz: &[15] },
-    BandInfo { band: 8, duplex: DuplexMode::Fdd, ul_arfcn: (176000, 183000), dl_arfcn: (185000, 192000), ssb_scs_khz: &[15] },
-    BandInfo { band: 20, duplex: DuplexMode::Fdd, ul_arfcn: (166400, 172400), dl_arfcn: (158200, 164200), ssb_scs_khz: &[15] },
-    BandInfo { band: 28, duplex: DuplexMode::Fdd, ul_arfcn: (140600, 149600), dl_arfcn: (151600, 160600), ssb_scs_khz: &[15] },
-    BandInfo { band: 38, duplex: DuplexMode::Tdd, ul_arfcn: (514000, 524000), dl_arfcn: (514000, 524000), ssb_scs_khz: &[30] },
-    BandInfo { band: 40, duplex: DuplexMode::Tdd, ul_arfcn: (460000, 480000), dl_arfcn: (460000, 480000), ssb_scs_khz: &[30] },
-    BandInfo { band: 41, duplex: DuplexMode::Tdd, ul_arfcn: (499200, 537999), dl_arfcn: (499200, 537999), ssb_scs_khz: &[15, 30] },
-    BandInfo { band: 48, duplex: DuplexMode::Tdd, ul_arfcn: (636667, 646666), dl_arfcn: (636667, 646666), ssb_scs_khz: &[30] },
-    BandInfo { band: 66, duplex: DuplexMode::Fdd, ul_arfcn: (342000, 356000), dl_arfcn: (422000, 440000), ssb_scs_khz: &[15, 30] },
-    BandInfo { band: 71, duplex: DuplexMode::Fdd, ul_arfcn: (132600, 139600), dl_arfcn: (123400, 130400), ssb_scs_khz: &[15] },
-    BandInfo { band: 77, duplex: DuplexMode::Tdd, ul_arfcn: (620000, 680000), dl_arfcn: (620000, 680000), ssb_scs_khz: &[30] },
-    BandInfo { band: 78, duplex: DuplexMode::Tdd, ul_arfcn: (620000, 653333), dl_arfcn: (620000, 653333), ssb_scs_khz: &[30] },
-    BandInfo { band: 79, duplex: DuplexMode::Tdd, ul_arfcn: (693334, 733333), dl_arfcn: (693334, 733333), ssb_scs_khz: &[30] },
+    BandInfo {
+        band: 1,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (384000, 396000),
+        dl_arfcn: (422000, 434000),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 2,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (370000, 382000),
+        dl_arfcn: (386000, 398000),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 3,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (342000, 357000),
+        dl_arfcn: (361000, 376000),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 5,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (164800, 169800),
+        dl_arfcn: (173800, 178800),
+        ssb_scs_khz: &[15, 30],
+    },
+    BandInfo {
+        band: 7,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (500000, 514000),
+        dl_arfcn: (524000, 538000),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 8,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (176000, 183000),
+        dl_arfcn: (185000, 192000),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 20,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (166400, 172400),
+        dl_arfcn: (158200, 164200),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 28,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (140600, 149600),
+        dl_arfcn: (151600, 160600),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 38,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (514000, 524000),
+        dl_arfcn: (514000, 524000),
+        ssb_scs_khz: &[30],
+    },
+    BandInfo {
+        band: 40,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (460000, 480000),
+        dl_arfcn: (460000, 480000),
+        ssb_scs_khz: &[30],
+    },
+    BandInfo {
+        band: 41,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (499200, 537999),
+        dl_arfcn: (499200, 537999),
+        ssb_scs_khz: &[15, 30],
+    },
+    BandInfo {
+        band: 48,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (636667, 646666),
+        dl_arfcn: (636667, 646666),
+        ssb_scs_khz: &[30],
+    },
+    BandInfo {
+        band: 66,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (342000, 356000),
+        dl_arfcn: (422000, 440000),
+        ssb_scs_khz: &[15, 30],
+    },
+    BandInfo {
+        band: 71,
+        duplex: DuplexMode::Fdd,
+        ul_arfcn: (132600, 139600),
+        dl_arfcn: (123400, 130400),
+        ssb_scs_khz: &[15],
+    },
+    BandInfo {
+        band: 77,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (620000, 680000),
+        dl_arfcn: (620000, 680000),
+        ssb_scs_khz: &[30],
+    },
+    BandInfo {
+        band: 78,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (620000, 653333),
+        dl_arfcn: (620000, 653333),
+        ssb_scs_khz: &[30],
+    },
+    BandInfo {
+        band: 79,
+        duplex: DuplexMode::Tdd,
+        ul_arfcn: (693334, 733333),
+        dl_arfcn: (693334, 733333),
+        ssb_scs_khz: &[30],
+    },
 ];
 
 impl BandInfo {
@@ -178,7 +280,9 @@ mod tests {
         assert_eq!(hz_to_gscn(f), 4517);
         let r = gscn_range(1.80e9, 1.81e9);
         assert!(r.contains(&4517));
-        assert!(r.iter().all(|&g| gscn_to_hz(g) >= 1.80e9 && gscn_to_hz(g) <= 1.81e9));
+        assert!(r
+            .iter()
+            .all(|&g| gscn_to_hz(g) >= 1.80e9 && gscn_to_hz(g) <= 1.81e9));
     }
 
     #[test]

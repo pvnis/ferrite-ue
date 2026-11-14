@@ -39,59 +39,109 @@ pub struct Coreset0Config {
 }
 
 const fn row(n_rb: usize, n_symb: usize, offset_rb: i32) -> Coreset0Config {
-    Coreset0Config { n_rb, n_symb, offset_rb, multiplexing_pattern: MultiplexingPattern::Pattern1 }
+    Coreset0Config {
+        n_rb,
+        n_symb,
+        offset_rb,
+        multiplexing_pattern: MultiplexingPattern::Pattern1,
+    }
 }
 
 /// Table 13-1: {SSB 15 kHz, PDCCH 15 kHz}, minimum channel bandwidth 5 or 10 MHz.
 pub const TABLE_13_1: [Coreset0Config; 15] = [
-    row(24, 2, 0), row(24, 2, 2), row(24, 2, 4),
-    row(24, 3, 0), row(24, 3, 2), row(24, 3, 4),
-    row(48, 1, 12), row(48, 1, 16),
-    row(48, 2, 12), row(48, 2, 16),
-    row(48, 3, 12), row(48, 3, 16),
-    row(96, 1, 38), row(96, 2, 38), row(96, 3, 38),
+    row(24, 2, 0),
+    row(24, 2, 2),
+    row(24, 2, 4),
+    row(24, 3, 0),
+    row(24, 3, 2),
+    row(24, 3, 4),
+    row(48, 1, 12),
+    row(48, 1, 16),
+    row(48, 2, 12),
+    row(48, 2, 16),
+    row(48, 3, 12),
+    row(48, 3, 16),
+    row(96, 1, 38),
+    row(96, 2, 38),
+    row(96, 3, 38),
 ];
 
 /// Table 13-2: {SSB 15 kHz, PDCCH 30 kHz}, minimum channel bandwidth 5 or 10 MHz.
 pub const TABLE_13_2: [Coreset0Config; 14] = [
-    row(24, 2, 5), row(24, 2, 6), row(24, 2, 7), row(24, 2, 8),
-    row(24, 3, 5), row(24, 3, 6), row(24, 3, 7), row(24, 3, 8),
-    row(48, 1, 18), row(48, 1, 20),
-    row(48, 2, 18), row(48, 2, 20),
-    row(48, 3, 18), row(48, 3, 20),
+    row(24, 2, 5),
+    row(24, 2, 6),
+    row(24, 2, 7),
+    row(24, 2, 8),
+    row(24, 3, 5),
+    row(24, 3, 6),
+    row(24, 3, 7),
+    row(24, 3, 8),
+    row(48, 1, 18),
+    row(48, 1, 20),
+    row(48, 2, 18),
+    row(48, 2, 20),
+    row(48, 3, 18),
+    row(48, 3, 20),
 ];
 
 /// Table 13-3: {SSB 30 kHz, PDCCH 15 kHz}, minimum channel bandwidth 5 or 10 MHz.
 pub const TABLE_13_3: [Coreset0Config; 9] = [
-    row(48, 1, 2), row(48, 1, 6),
-    row(48, 2, 2), row(48, 2, 6),
-    row(48, 3, 2), row(48, 3, 6),
-    row(96, 1, 28), row(96, 2, 28), row(96, 3, 28),
+    row(48, 1, 2),
+    row(48, 1, 6),
+    row(48, 2, 2),
+    row(48, 2, 6),
+    row(48, 3, 2),
+    row(48, 3, 6),
+    row(96, 1, 28),
+    row(96, 2, 28),
+    row(96, 3, 28),
 ];
 
 /// Table 13-4: {SSB 30 kHz, PDCCH 30 kHz}, minimum channel bandwidth 5 or 10 MHz.
 pub const TABLE_13_4: [Coreset0Config; 16] = [
-    row(24, 2, 0), row(24, 2, 1), row(24, 2, 2), row(24, 2, 3), row(24, 2, 4),
-    row(24, 3, 0), row(24, 3, 1), row(24, 3, 2), row(24, 3, 3), row(24, 3, 4),
-    row(48, 1, 12), row(48, 1, 14), row(48, 1, 16),
-    row(48, 2, 12), row(48, 2, 14), row(48, 2, 16),
+    row(24, 2, 0),
+    row(24, 2, 1),
+    row(24, 2, 2),
+    row(24, 2, 3),
+    row(24, 2, 4),
+    row(24, 3, 0),
+    row(24, 3, 1),
+    row(24, 3, 2),
+    row(24, 3, 3),
+    row(24, 3, 4),
+    row(48, 1, 12),
+    row(48, 1, 14),
+    row(48, 1, 16),
+    row(48, 2, 12),
+    row(48, 2, 14),
+    row(48, 2, 16),
 ];
 
 /// Table 13-5: {SSB 30 kHz, PDCCH 15 kHz}, minimum channel bandwidth 40 MHz.
 pub const TABLE_13_5: [Coreset0Config; 9] = [
-    row(48, 1, 4), row(48, 2, 4), row(48, 3, 4),
-    row(96, 1, 0), row(96, 1, 56),
-    row(96, 2, 0), row(96, 2, 56),
-    row(96, 3, 0), row(96, 3, 56),
+    row(48, 1, 4),
+    row(48, 2, 4),
+    row(48, 3, 4),
+    row(96, 1, 0),
+    row(96, 1, 56),
+    row(96, 2, 0),
+    row(96, 2, 56),
+    row(96, 3, 0),
+    row(96, 3, 56),
 ];
 
 /// Table 13-6: {SSB 30 kHz, PDCCH 30 kHz}, minimum channel bandwidth 40 MHz.
 pub const TABLE_13_6: [Coreset0Config; 10] = [
-    row(24, 2, 0), row(24, 2, 4),
-    row(24, 3, 0), row(24, 3, 4),
-    row(48, 1, 0), row(48, 1, 28),
-    row(48, 2, 0), row(48, 2, 28),
-    row(48, 3, 0), row(48, 3, 28),
+    row(24, 2, 0),
+    row(24, 2, 4),
+    row(24, 3, 0),
+    row(24, 3, 4),
+    row(48, 1, 0),
+    row(48, 1, 28),
+    row(48, 2, 0),
+    row(48, 2, 28),
+    row(48, 3, 0),
+    row(48, 3, 28),
 ];
 
 /// Select the FR1 CORESET#0 table (13-1 … 13-6) for the {SSB, PDCCH} SCS pair and
@@ -99,7 +149,12 @@ pub const TABLE_13_6: [Coreset0Config; 10] = [
 /// tables), then return row `index` (`controlResourceSetZero`). `None` for a
 /// reserved row or an unsupported combination (e.g. 40 MHz with 15 kHz SSB,
 /// which no FR1 band uses).
-pub fn coreset0_config(ssb_scs_khz: u32, pdcch_scs_khz: u32, min_bw_mhz: u32, index: u8) -> Option<Coreset0Config> {
+pub fn coreset0_config(
+    ssb_scs_khz: u32,
+    pdcch_scs_khz: u32,
+    min_bw_mhz: u32,
+    index: u8,
+) -> Option<Coreset0Config> {
     let table: &[Coreset0Config] = match (ssb_scs_khz, pdcch_scs_khz, min_bw_mhz) {
         (15, 15, 5 | 10) => &TABLE_13_1,
         (15, 30, 5 | 10) => &TABLE_13_2,
@@ -219,7 +274,11 @@ struct OccasionRow {
 }
 
 const fn r(o_x2: u8, m_x2: u8, first_symbol: FirstSymbolRule) -> OccasionRow {
-    OccasionRow { o_x2, m_x2, first_symbol }
+    OccasionRow {
+        o_x2,
+        m_x2,
+        first_symbol,
+    }
 }
 
 /// Table 13-11 (FR1, multiplexing pattern 1), indexed by `searchSpaceZero`.
@@ -294,18 +353,33 @@ pub struct Type0Monitoring {
 /// Table 13-11 (FR1) occasion for `searchSpaceZero = ss0_index`, SSB index
 /// `ssb_index` (`i`), PDCCH numerology `mu` and the CORESET#0 row (for its
 /// symbol count). `None` for a reserved row.
-pub fn type0_pdcch_monitoring(ss0_index: u8, ssb_index: u8, mu: u8, coreset0: &Coreset0Config) -> Option<Type0Monitoring> {
+pub fn type0_pdcch_monitoring(
+    ss0_index: u8,
+    ssb_index: u8,
+    mu: u8,
+    coreset0: &Coreset0Config,
+) -> Option<Type0Monitoring> {
     let row = *TABLE_13_11.get(usize::from(ss0_index))?;
     Some(type0_occasion(row, ssb_index, mu, coreset0))
 }
 
 /// Table 13-12 (FR2) occasion; same contract as [`type0_pdcch_monitoring`].
-pub fn type0_pdcch_monitoring_fr2(ss0_index: u8, ssb_index: u8, mu: u8, coreset0: &Coreset0Config) -> Option<Type0Monitoring> {
+pub fn type0_pdcch_monitoring_fr2(
+    ss0_index: u8,
+    ssb_index: u8,
+    mu: u8,
+    coreset0: &Coreset0Config,
+) -> Option<Type0Monitoring> {
     let row = *TABLE_13_12.get(usize::from(ss0_index))?;
     Some(type0_occasion(row, ssb_index, mu, coreset0))
 }
 
-fn type0_occasion(row: OccasionRow, ssb_index: u8, mu: u8, coreset0: &Coreset0Config) -> Type0Monitoring {
+fn type0_occasion(
+    row: OccasionRow,
+    ssb_index: u8,
+    mu: u8,
+    coreset0: &Coreset0Config,
+) -> Type0Monitoring {
     let slots_per_frame = Numerology::new(mu).slots_per_frame();
     // O·2^µ + ⌊i·M⌋, all in units of slots. O·2^µ = o_x2·2^µ/2 is integral for
     // µ ≥ 1 and for the FR1 (integer O) rows at µ = 0.
@@ -313,7 +387,11 @@ fn type0_occasion(row: OccasionRow, ssb_index: u8, mu: u8, coreset0: &Coreset0Co
     let im = (u32::from(ssb_index) * u32::from(row.m_x2)) / 2;
     let total = o_slots + im;
     let n0 = total % slots_per_frame;
-    let sfn_parity = if (total / slots_per_frame).is_multiple_of(2) { SfnParity::Even } else { SfnParity::Odd };
+    let sfn_parity = if (total / slots_per_frame).is_multiple_of(2) {
+        SfnParity::Even
+    } else {
+        SfnParity::Odd
+    };
     let first_symbol = match row.first_symbol {
         FirstSymbolRule::Fixed(s) => s,
         FirstSymbolRule::ZeroOrCoresetLen => {
@@ -331,7 +409,13 @@ fn type0_occasion(row: OccasionRow, ssb_index: u8, mu: u8, coreset0: &Coreset0Co
             }
         }
     };
-    Type0Monitoring { o_x2: row.o_x2, m_x2: row.m_x2, n0, sfn_parity, first_symbol }
+    Type0Monitoring {
+        o_x2: row.o_x2,
+        m_x2: row.m_x2,
+        n0,
+        sfn_parity,
+        first_symbol,
+    }
 }
 
 #[cfg(test)]
@@ -372,7 +456,14 @@ mod tests {
 
     #[test]
     fn table_sizes_and_fr1_pattern() {
-        for t in [&TABLE_13_1[..], &TABLE_13_2, &TABLE_13_3, &TABLE_13_4, &TABLE_13_5, &TABLE_13_6] {
+        for t in [
+            &TABLE_13_1[..],
+            &TABLE_13_2,
+            &TABLE_13_3,
+            &TABLE_13_4,
+            &TABLE_13_5,
+            &TABLE_13_6,
+        ] {
             for c in t {
                 assert_eq!(c.multiplexing_pattern, MultiplexingPattern::Pattern1);
                 assert!(matches!(c.n_rb, 24 | 48 | 96));
@@ -393,23 +484,38 @@ mod tests {
     fn first_subcarrier_offsets() {
         let c = row(24, 2, 2);
         assert_eq!(coreset0_first_subcarrier_rel_ssb(16, 30, &c), Ok(-8 - 24));
-        assert_eq!(coreset0_first_subcarrier_rel_ssb_centre(16, 30, 30, &c), Ok(-152));
+        assert_eq!(
+            coreset0_first_subcarrier_rel_ssb_centre(16, 30, 30, &c),
+            Ok(-152)
+        );
         assert_eq!(
             coreset0_first_subcarrier_rel_ssb(7, 30, &c),
             Err(Coreset0Error::HalfSubcarrierOffset { k_ssb: 7 })
         );
         // 15/15: one subcarrier per k_SSB unit.
         let c15 = row(96, 1, 38);
-        assert_eq!(coreset0_first_subcarrier_rel_ssb(7, 15, &c15), Ok(-7 - 12 * 38));
-        assert_eq!(coreset0_first_subcarrier_rel_ssb_centre(0, 15, 15, &c15), Ok(-120 - 456));
+        assert_eq!(
+            coreset0_first_subcarrier_rel_ssb(7, 15, &c15),
+            Ok(-7 - 12 * 38)
+        );
+        assert_eq!(
+            coreset0_first_subcarrier_rel_ssb_centre(0, 15, 15, &c15),
+            Ok(-120 - 456)
+        );
         // 15 kHz SSB under 30 kHz PDCCH: the SSB is 120 subcarriers (10 RB) wide
         // on the PDCCH grid, so its centre is 60 PDCCH subcarriers above its edge.
         let c2 = row(24, 2, 5);
         assert_eq!(coreset0_first_subcarrier_rel_ssb(2, 30, &c2), Ok(-1 - 60));
-        assert_eq!(coreset0_first_subcarrier_rel_ssb_centre(2, 15, 30, &c2), Ok(-61 - 60));
+        assert_eq!(
+            coreset0_first_subcarrier_rel_ssb_centre(2, 15, 30, &c2),
+            Ok(-61 - 60)
+        );
         // 30 kHz SSB under 15 kHz PDCCH: SSB 480 subcarriers wide on the 15 kHz grid.
         let c3 = row(48, 1, 2);
-        assert_eq!(coreset0_first_subcarrier_rel_ssb_centre(4, 30, 15, &c3), Ok(-4 - 24 - 240));
+        assert_eq!(
+            coreset0_first_subcarrier_rel_ssb_centre(4, 30, 15, &c3),
+            Ok(-4 - 24 - 240)
+        );
     }
 
     /// Table 13-11 semantics: M = 1/2 rows alternate first symbol with the SSB
@@ -437,7 +543,10 @@ mod tests {
         let m = type0_pdcch_monitoring(8, 5, 1, &c).unwrap();
         assert_eq!(m.n0, 10);
         // Row 11: first symbol 2.
-        assert_eq!(type0_pdcch_monitoring(11, 0, 1, &c).unwrap().first_symbol, 2);
+        assert_eq!(
+            type0_pdcch_monitoring(11, 0, 1, &c).unwrap().first_symbol,
+            2
+        );
         assert!(type0_pdcch_monitoring(16, 0, 1, &c).is_none());
     }
 
@@ -448,7 +557,12 @@ mod tests {
         let m = type0_pdcch_monitoring_fr2(2, 0, 3, &c).unwrap();
         assert_eq!(m.n0, 20);
         // Row 1: M = 1/2, first symbol 0 / 7.
-        assert_eq!(type0_pdcch_monitoring_fr2(1, 1, 3, &c).unwrap().first_symbol, 7);
+        assert_eq!(
+            type0_pdcch_monitoring_fr2(1, 1, 3, &c)
+                .unwrap()
+                .first_symbol,
+            7
+        );
         assert!(type0_pdcch_monitoring_fr2(14, 0, 3, &c).is_none());
     }
 }

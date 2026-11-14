@@ -89,7 +89,11 @@ impl SlotPoint {
     pub fn new(numerology: Numerology, sfn: u16, slot: u16) -> Self {
         debug_assert!(sfn < 1024);
         debug_assert!((slot as u32) < numerology.slots_per_frame());
-        Self { numerology, sfn, slot }
+        Self {
+            numerology,
+            sfn,
+            slot,
+        }
     }
 
     /// Build from an absolute slot count (wraps at 1024 frames).
@@ -97,7 +101,11 @@ impl SlotPoint {
         let spf = numerology.slots_per_frame() as u64;
         let total = spf * 1024;
         let i = index % total;
-        Self { numerology, sfn: (i / spf) as u16, slot: (i % spf) as u16 }
+        Self {
+            numerology,
+            sfn: (i / spf) as u16,
+            slot: (i % spf) as u16,
+        }
     }
 
     pub const fn mu(&self) -> u8 {
@@ -135,7 +143,10 @@ impl SlotPoint {
     /// `self - n` slots (wrapping).
     pub fn sub(&self, n: u64) -> Self {
         let total = self.slots_per_frame() as u64 * 1024;
-        Self::from_index(self.numerology, (self.index() + total - (n % total)) % total)
+        Self::from_index(
+            self.numerology,
+            (self.index() + total - (n % total)) % total,
+        )
     }
 
     /// Signed slot difference `self - other`, shortest way around the 1024-frame
@@ -153,7 +164,8 @@ impl SlotPoint {
     /// `(sfn·slots_per_frame + slot) mod period == offset` — the generic
     /// periodicity test used by SR/CSI/PRACH/SSB occasions.
     pub fn is_occasion(&self, period_slots: u32, offset_slots: u32) -> bool {
-        period_slots > 0 && (self.index() % period_slots as u64) == offset_slots as u64 % period_slots as u64
+        period_slots > 0
+            && (self.index() % period_slots as u64) == offset_slots as u64 % period_slots as u64
     }
 
     /// The same instant expressed at another numerology (slot index scaled).

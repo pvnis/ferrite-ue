@@ -11,13 +11,27 @@ use std::io::Write;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let out = args.get(1).cloned().unwrap_or_else(|| "/tmp/capture.iq".into());
-    let fs: f64 = args.get(2).and_then(|a| a.parse::<f64>().ok()).unwrap_or(15.36) * 1e6;
+    let out = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/capture.iq".into());
+    let fs: f64 = args
+        .get(2)
+        .and_then(|a| a.parse::<f64>().ok())
+        .unwrap_or(15.36)
+        * 1e6;
     let ms: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(60);
     let block = 1920;
-    let src = ferrite_radio::zmq::ZmqSource::connect("tcp://127.0.0.1:2100", fs, 5_000).expect("DL");
+    let src =
+        ferrite_radio::zmq::ZmqSource::connect("tcp://127.0.0.1:2100", fs, 5_000).expect("DL");
     let sink = ferrite_radio::zmq::ZmqSink::bind("tcp://127.0.0.1:2101", fs, block).expect("UL");
-    let server = UlServer { sink: Box::new(ZmqUlSink(sink)), pacing: UlPacing::FreeRunning, tx_rx_offset: 0, block_len: block, start_index: 0 };
+    let server = UlServer {
+        sink: Box::new(ZmqUlSink(sink)),
+        pacing: UlPacing::FreeRunning,
+        tx_rx_offset: 0,
+        block_len: block,
+        start_index: 0,
+    };
     let shared = UlShared::new(0);
     {
         let shared = shared.clone();
@@ -32,6 +46,8 @@ fn main() {
         file.write_all(&s.re.to_le_bytes()).unwrap();
         file.write_all(&s.im.to_le_bytes()).unwrap();
     }
-    shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .stop
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     eprintln!("captured {} samples to {out}", buf.len());
 }

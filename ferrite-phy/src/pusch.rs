@@ -59,11 +59,19 @@ pub struct TransformPrecoding {
 /// PUSCH DM-RS symbol `l` in slot `n_slot` (TS 38.211 §6.4.1.1.1.2 with §6.3.1.4
 /// group `u = (f_gh + n_ID^RS) mod 30` and sequence number `v`). `None` when
 /// `6·n_rb` is not a supported low-PAPR length (`n_rb` not of the form 2^a·3^b·5^c).
-pub fn tp_dmrs_sequence(tp: &TransformPrecoding, n_rb: usize, n_slot: u32, l: usize) -> Option<Vec<Complex32>> {
+pub fn tp_dmrs_sequence(
+    tp: &TransformPrecoding,
+    n_rb: usize,
+    n_slot: u32,
+    l: usize,
+) -> Option<Vec<Complex32>> {
     let n_id = tp.n_id_rs as u32;
     let f_gh = if tp.group_hopping {
         let c = gold_sequence(n_id / 30, 8 * (14 * n_slot as usize + l) + 8);
-        (0..8).map(|m| (c[8 * (14 * n_slot as usize + l) + m] as u32) << m).sum::<u32>() % 30
+        (0..8)
+            .map(|m| (c[8 * (14 * n_slot as usize + l) + m] as u32) << m)
+            .sum::<u32>()
+            % 30
     } else {
         0
     };
@@ -97,12 +105,20 @@ pub fn tp_prb_valid(n_rb: usize) -> bool {
 fn pi2_bpsk(b: u8, i: usize) -> Complex32 {
     let v = (1 - 2 * b as i32) as f32 * std::f32::consts::FRAC_1_SQRT_2;
     let d = Complex32::new(v, v);
-    if i % 2 == 1 { Complex32::new(-d.im, d.re) } else { d }
+    if i % 2 == 1 {
+        Complex32::new(-d.im, d.re)
+    } else {
+        d
+    }
 }
 
 /// Modulate one RE's bits: π/2-BPSK (`Q_m = 1`, needs the symbol index) or QAM.
 fn modulate_re(bits: &[u8], i: usize) -> Complex32 {
-    if bits.len() == 1 { pi2_bpsk(bits[0], i) } else { qam_modulate(bits) }
+    if bits.len() == 1 {
+        pi2_bpsk(bits[0], i)
+    } else {
+        qam_modulate(bits)
+    }
 }
 
 /// Map `Q_m = bits.len()` bits (2, 4, 6 or 8) to one QPSK / 16-QAM / 64-QAM /
@@ -111,7 +127,10 @@ fn modulate_re(bits: &[u8], i: usize) -> Complex32 {
 /// sign and every further bit folds the magnitude.
 pub fn qam_modulate(bits: &[u8]) -> Complex32 {
     let qm = bits.len();
-    debug_assert!(matches!(qm, 2 | 4 | 6 | 8), "unsupported modulation order {qm}");
+    debug_assert!(
+        matches!(qm, 2 | 4 | 6 | 8),
+        "unsupported modulation order {qm}"
+    );
     let m = qm / 2;
     let axis = |first: usize| {
         let b = |i: usize| 1.0 - 2.0 * f32::from(bits[first + 2 * i]);
@@ -148,7 +167,21 @@ pub fn pusch_modulate_slot(
     center_freq_hz: f64,
     fs: f64,
 ) -> Vec<Complex32> {
-    pusch_modulate_slot_uci(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, mu, tc_rnti, center_freq_hz, fs, &[], 0.0, 0)
+    pusch_modulate_slot_uci(
+        ofdm,
+        ulsch,
+        alloc,
+        cell_id,
+        slot_in_frame,
+        slot_in_subframe,
+        mu,
+        tc_rnti,
+        center_freq_hz,
+        fs,
+        &[],
+        0.0,
+        0,
+    )
 }
 
 /// As `pusch_modulate_slot`, but multiplex up to 2 HARQ-ACK bits onto the PUSCH
@@ -174,7 +207,23 @@ pub fn pusch_modulate_slot_uci(
     beta_harq: f32,
     tb_bits: usize,
 ) -> Vec<Complex32> {
-    pusch_modulate_slot_uci_csi(ofdm, ulsch, alloc, cell_id, slot_in_frame, slot_in_subframe, mu, tc_rnti, center_freq_hz, fs, harq_ack, beta_harq, tb_bits, &[], &[])
+    pusch_modulate_slot_uci_csi(
+        ofdm,
+        ulsch,
+        alloc,
+        cell_id,
+        slot_in_frame,
+        slot_in_subframe,
+        mu,
+        tc_rnti,
+        center_freq_hz,
+        fs,
+        harq_ack,
+        beta_harq,
+        tb_bits,
+        &[],
+        &[],
+    )
 }
 
 /// As `pusch_modulate_slot_uci`, additionally multiplexing a CSI part 1 report
@@ -206,7 +255,9 @@ pub fn pusch_modulate_slot_uci_csi(
     let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
 
     let dmrs_set: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym).filter(|l| !dmrs_set.contains(l)).collect();
+    let data_syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym)
+        .filter(|l| !dmrs_set.contains(l))
+        .collect();
     let n_sc = 12 * alloc.n_rb;
     let n_re = data_syms.len() * n_sc;
     let qm = alloc.qm;
@@ -233,7 +284,11 @@ pub fn pusch_modulate_slot_uci_csi(
     // skipping the CSI REs (the UL-SCH is rate-matched around them).
     let mut src = 0usize; // next UL-SCH bit
     let mut re_bits = vec![0u8; qm];
-    for (di, (&l, kp)) in data_syms.iter().flat_map(|l| (0..n_sc).map(move |kp| (l, kp))).enumerate() {
+    for (di, (&l, kp)) in data_syms
+        .iter()
+        .flat_map(|l| (0..n_sc).map(move |kp| (l, kp)))
+        .enumerate()
+    {
         let sc = 12 * alloc.rb_start + kp;
         if let Some(&ci) = csi_at.get(&di) {
             for i in 0..qm {
@@ -265,11 +320,17 @@ pub fn pusch_modulate_slot_uci_csi(
         }
         // Gold sequence referenced to CRB 0 (point A): index by
         // 6·(crb_offset + PRB) + j.
-        let refs = pdsch_dmrs(cell_id, slot_in_frame, l as u32, 6 * (alloc.crb_offset + alloc.carrier_rb));
+        let refs = pdsch_dmrs(
+            cell_id,
+            slot_in_frame,
+            l as u32,
+            6 * (alloc.crb_offset + alloc.carrier_rb),
+        );
         for rb in 0..alloc.n_rb {
             for j in 0..6 {
                 let sc = 12 * (alloc.rb_start + rb) + 2 * j;
-                grids[l][bin(sc)] = refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j] * dmrs_boost;
+                grids[l][bin(sc)] =
+                    refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j] * dmrs_boost;
             }
         }
     }
@@ -287,9 +348,20 @@ pub fn pusch_modulate_slot_uci_csi(
     if !harq_ack.is_empty() && harq_ack.len() <= 11 {
         let o_ack = harq_ack.len();
         let n_sc = 12 * alloc.n_rb;
-        let res = harq_ack_pusch_res(&alloc.dmrs_symbols, (alloc.sym_start, alloc.n_sym), alloc.n_rb, o_ack, beta_harq, tb_bits);
+        let res = harq_ack_pusch_res(
+            &alloc.dmrs_symbols,
+            (alloc.sym_start, alloc.n_sym),
+            alloc.n_rb,
+            o_ack,
+            beta_harq,
+            tb_bits,
+        );
         // Coded bit `k` of the UCI (per RE-pair): ≤2 use the small-block form, ≥3 RM.
-        let rm = if o_ack >= 3 { rm_encode(harq_ack, res.len() * qm) } else { Vec::new() };
+        let rm = if o_ack >= 3 {
+            rm_encode(harq_ack, res.len() * qm)
+        } else {
+            Vec::new()
+        };
         for (i, &(l, sc_a)) in res.iter().enumerate() {
             let di = data_syms.iter().position(|&x| x == l).unwrap() * n_sc + sc_a;
             let m = &c[qm * di..qm * di + qm];
@@ -342,7 +414,9 @@ pub fn pusch_modulate_slot_uci_csi(
 
     let mut out = Vec::with_capacity(14 * (n + 40));
     // Sample offset from the subframe start to this slot's first symbol.
-    let mut sub_off: usize = (0..slot_in_subframe * 14).map(|k| ofdm.cp_len(k, mu) + n).sum();
+    let mut sub_off: usize = (0..slot_in_subframe * 14)
+        .map(|k| ofdm.cp_len(k, mu) + n)
+        .sum();
     for (l, grid) in grids.iter().enumerate() {
         let cp = ofdm.cp_len(slot_in_subframe * 14 + l, mu);
         let sym = ofdm.modulate_symbol(grid, cp);
@@ -363,17 +437,50 @@ pub fn pusch_modulate_slot_uci_csi(
 /// Reed-Muller (32, O) basis sequences (TS 38.212 Table 5.3.3.2-1), for encoding
 /// 3-11 UCI bits.
 const RM_BASIS: [[u8; 32]; 11] = [
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0],
-    [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0],
-    [0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0],
-    [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0],
-    [0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0],
-    [0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0],
-    [0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0],
-    [0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0],
+    [
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1,
+    ],
+    [
+        1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0,
+        1, 0,
+    ],
+    [
+        0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1,
+        1, 0,
+    ],
+    [
+        0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1,
+        1, 0,
+    ],
+    [
+        0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0,
+        1, 0,
+    ],
+    [
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0,
+        1, 0,
+    ],
 ];
 
 /// Encode 3-11 UCI bits with the (32, O) Reed-Muller code (TS 38.212 §5.3.3.2),
@@ -395,10 +502,19 @@ pub(crate) fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
 /// symbols starting after the first DM-RS symbol (strided so each symbol carries a
 /// fair share), then place the actual Q'_ACK REs on a strided subset of the reserved
 /// ones. Returns each ACK RE as `(symbol, subcarrier-within-alloc)`, in gNB order.
-fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: usize, o_ack: usize, beta: f32, tb_bits: usize) -> Vec<(usize, usize)> {
+fn harq_ack_pusch_res(
+    dmrs_symbols: &[usize],
+    sym_range: (usize, usize),
+    n_rb: usize,
+    o_ack: usize,
+    beta: f32,
+    tb_bits: usize,
+) -> Vec<(usize, usize)> {
     let n_sc = 12 * n_rb;
     let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1).filter(|l| !dmrs.contains(l)).collect();
+    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1)
+        .filter(|l| !dmrs.contains(l))
+        .collect();
     let first_dmrs = *dmrs_symbols.iter().min().unwrap();
     let l1 = match data_syms.iter().find(|&&l| l > first_dmrs) {
         Some(&l) => l,
@@ -423,7 +539,11 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: u
         for &l in data_syms.iter().filter(|&&l| l >= l1) {
             let rem = q_ack - placed;
             if rem > 0 {
-                let (d, cnt) = if rem < n_sc { (n_sc / rem, rem) } else { (1, n_sc) };
+                let (d, cnt) = if rem < n_sc {
+                    (n_sc / rem, rem)
+                } else {
+                    (1, n_sc)
+                };
                 for i in 0..cnt {
                     res.push((l, i * d));
                 }
@@ -445,7 +565,11 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: u
         // Step 1: reserve REs in this symbol (strided across all subcarriers).
         let rem_rvd = q_rvd - rvd_placed;
         let reserved: Vec<usize> = if rem_rvd > 0 {
-            let (d, cnt) = if rem_rvd < m_uci { (m_uci / rem_rvd, rem_rvd) } else { (1, m_uci) };
+            let (d, cnt) = if rem_rvd < m_uci {
+                (m_uci / rem_rvd, rem_rvd)
+            } else {
+                (1, m_uci)
+            };
             rvd_placed += cnt;
             (0..cnt).map(|i| i * d).collect()
         } else {
@@ -455,7 +579,11 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: u
         let rem_ack = q_ack - ack_placed;
         if !reserved.is_empty() && rem_ack > 0 {
             let m_rvd = reserved.len();
-            let (d2, cnt2) = if rem_ack < m_rvd { (m_rvd / rem_ack, rem_ack) } else { (1, m_rvd) };
+            let (d2, cnt2) = if rem_ack < m_rvd {
+                (m_rvd / rem_ack, rem_ack)
+            } else {
+                (1, m_rvd)
+            };
             for i in 0..cnt2 {
                 res.push((l, reserved[i * d2]));
             }
@@ -471,8 +599,10 @@ fn harq_ack_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: u
 /// β_offset for CSI part 1/2 on PUSCH by betaOffsetCSI-Part-Index (TS 38.213
 /// Table 9.3-2; normative constants).
 pub fn beta_offset_csi(index: u8) -> f32 {
-    const T: [f32; 19] = [1.125, 1.25, 1.375, 1.625, 1.75, 2.0, 2.25, 2.5, 2.875,
-        3.125, 3.5, 4.0, 5.0, 6.25, 8.0, 10.0, 12.625, 15.875, 20.0];
+    const T: [f32; 19] = [
+        1.125, 1.25, 1.375, 1.625, 1.75, 2.0, 2.25, 2.5, 2.875, 3.125, 3.5, 4.0, 5.0, 6.25, 8.0,
+        10.0, 12.625, 15.875, 20.0,
+    ];
     *T.get(index as usize).unwrap_or(&6.25)
 }
 
@@ -484,10 +614,20 @@ pub fn beta_offset_csi(index: u8) -> f32 {
 /// (one RE of difference shifts the whole data map). The UL-SCH is RATE-MATCHED
 /// around these REs — the caller must shrink its data E by 2·len() and the mapper
 /// must skip them. Returns each CSI RE as `(symbol, subcarrier-within-alloc)`.
-pub fn csi1_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: usize, o_csi: usize, beta: f32, alpha: f32, sum_kr: usize) -> Vec<(usize, usize)> {
+pub fn csi1_pusch_res(
+    dmrs_symbols: &[usize],
+    sym_range: (usize, usize),
+    n_rb: usize,
+    o_csi: usize,
+    beta: f32,
+    alpha: f32,
+    sum_kr: usize,
+) -> Vec<(usize, usize)> {
     let n_sc = 12 * n_rb;
     let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1).filter(|l| !dmrs.contains(l)).collect();
+    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1)
+        .filter(|l| !dmrs.contains(l))
+        .collect();
     let nof_re_uci = data_syms.len() * n_sc;
     let sum_cb = sum_kr as f32;
     let q_csi = (((o_csi as f32) * beta * nof_re_uci as f32 / sum_cb).ceil() as usize)
@@ -498,7 +638,11 @@ pub fn csi1_pusch_res(dmrs_symbols: &[usize], sym_range: (usize, usize), n_rb: u
     for &l in &data_syms {
         let rem = q_csi - placed;
         if rem > 0 {
-            let (d, cnt) = if rem < n_sc { (n_sc / rem, rem) } else { (1, n_sc) };
+            let (d, cnt) = if rem < n_sc {
+                (n_sc / rem, rem)
+            } else {
+                (1, n_sc)
+            };
             for i in 0..cnt {
                 res.push((l, i * d));
             }
@@ -576,7 +720,17 @@ mod tests {
         // Every constellation has unit mean power.
         for qm in [2usize, 4, 6, 8] {
             let n = 1usize << qm;
-            let pw: f32 = (0..n).map(|v| qam_modulate(&(0..qm).map(|i| ((v >> (qm - 1 - i)) & 1) as u8).collect::<Vec<_>>()).norm_sqr()).sum::<f32>() / n as f32;
+            let pw: f32 = (0..n)
+                .map(|v| {
+                    qam_modulate(
+                        &(0..qm)
+                            .map(|i| ((v >> (qm - 1 - i)) & 1) as u8)
+                            .collect::<Vec<_>>(),
+                    )
+                    .norm_sqr()
+                })
+                .sum::<f32>()
+                / n as f32;
             assert!((pw - 1.0).abs() < 1e-5, "qm {qm}: mean power {pw}");
         }
     }
@@ -588,15 +742,35 @@ mod tests {
     fn pusch_transform_precoding_round_trip() {
         let ofdm = Ofdm::new(512);
         let (cell_id, rnti) = (1u16, 0x4601u16);
-        let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
-        let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
-        let tp = TransformPrecoding { n_id_rs: 1, group_hopping: false, sequence_hopping: false };
+        let tb_bytes = [
+            0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00,
+        ];
+        let tb: Vec<u8> = tb_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1))
+            .collect();
+        let tp = TransformPrecoding {
+            n_id_rs: 1,
+            group_hopping: false,
+            sequence_hopping: false,
+        };
         for (qm, n_rb) in [(1usize, 5usize), (2, 5), (4, 6), (6, 8)] {
-            let alloc = PuschAlloc { rb_start: 2, n_rb, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0, transform_precoding: Some(tp) };
+            let alloc = PuschAlloc {
+                rb_start: 2,
+                n_rb,
+                sym_start: 0,
+                n_sym: 14,
+                dmrs_symbols: vec![2, 7, 11],
+                qm,
+                carrier_rb: 24,
+                crb_offset: 0,
+                transform_precoding: Some(tp),
+            };
             let e = pusch_e_len(&alloc);
             let r = 0.05 * qm as f64;
             let ulsch = dlsch_encode_single(&tb, e, r, qm.max(2), 0);
-            let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, rnti, 0.0, 15.36e6);
+            let slot =
+                pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, rnti, 0.0, 15.36e6);
             let center = alloc.carrier_rb as i32 * 6;
             let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
             let n_sc = 12 * n_rb;
@@ -612,7 +786,10 @@ mod tests {
                 if alloc.dmrs_symbols.contains(&l) {
                     let seq = tp_dmrs_sequence(&tp, n_rb, 5, l).unwrap();
                     for (k, r) in seq.iter().enumerate() {
-                        assert!((g[bin(12 * 2 + 2 * k)] - r * 2f32.sqrt()).norm() < 1e-3, "dmrs l={l} k={k}");
+                        assert!(
+                            (g[bin(12 * 2 + 2 * k)] - r * 2f32.sqrt()).norm() < 1e-3,
+                            "dmrs l={l} k={k}"
+                        );
                         assert!(g[bin(12 * 2 + 2 * k + 1)].norm() < 1e-4);
                     }
                     continue;
@@ -624,7 +801,11 @@ mod tests {
                     let x = x * scale;
                     if qm == 1 {
                         // Undo the π/2 rotation, then read the BPSK sign.
-                        let d = if i % 2 == 1 { Complex32::new(x.im, -x.re) } else { x };
+                        let d = if i % 2 == 1 {
+                            Complex32::new(x.im, -x.re)
+                        } else {
+                            x
+                        };
                         llr.push(d.re + d.im);
                         i += 1;
                     } else {
@@ -638,8 +819,12 @@ mod tests {
                 let hard: Vec<u8> = llr.iter().map(|&v| u8::from(v < 0.0)).collect();
                 assert_eq!(&hard[..ulsch.len()], &ulsch[..], "pi/2-BPSK bits");
             } else {
-                let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40).unwrap_or_else(|| panic!("decode failed at qm {qm}"));
-                let out_bytes: Vec<u8> = out.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+                let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40)
+                    .unwrap_or_else(|| panic!("decode failed at qm {qm}"));
+                let out_bytes: Vec<u8> = out
+                    .chunks(8)
+                    .map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b))
+                    .collect();
                 assert_eq!(out_bytes, tb_bytes, "qm {qm}");
             }
         }
@@ -654,20 +839,38 @@ mod tests {
     fn pusch_round_trip_all_orders() {
         let ofdm = Ofdm::new(512);
         let (cell_id, tc_rnti) = (1u16, 0x4601u16);
-        let tb_bytes = [0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00];
-        let tb: Vec<u8> = tb_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1)).collect();
+        let tb_bytes = [
+            0x00u8, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x3f, 0x00, 0x00, 0x00,
+        ];
+        let tb: Vec<u8> = tb_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| (b >> (7 - i)) & 1))
+            .collect();
         for qm in [2usize, 4, 6, 8] {
-            let alloc = PuschAlloc { rb_start: 4, n_rb: 3, sym_start: 0, n_sym: 14, dmrs_symbols: vec![2, 7, 11], qm, carrier_rb: 24, crb_offset: 0, transform_precoding: None };
+            let alloc = PuschAlloc {
+                rb_start: 4,
+                n_rb: 3,
+                sym_start: 0,
+                n_sym: 14,
+                dmrs_symbols: vec![2, 7, 11],
+                qm,
+                carrier_rb: 24,
+                crb_offset: 0,
+                transform_precoding: None,
+            };
             let e = pusch_e_len(&alloc);
             assert_eq!(e, 396 * qm);
             let r = 0.117 * qm as f64 / 2.0;
             let ulsch = dlsch_encode_single(&tb, e, r, qm, 0);
-            let slot = pusch_modulate_slot(&ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, tc_rnti, 0.0, 15.36e6);
+            let slot = pusch_modulate_slot(
+                &ofdm, &ulsch, &alloc, cell_id, 5, 1, 1, tc_rnti, 0.0, 15.36e6,
+            );
 
             // Demodulate: extract the data REs (skip DM-RS symbols), soft-demap.
             let center = alloc.carrier_rb as i32 * 6;
             let bin = |sc: usize| (sc as i32 - center).rem_euclid(512) as usize;
-            let dmrs: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
+            let dmrs: std::collections::HashSet<usize> =
+                alloc.dmrs_symbols.iter().copied().collect();
             let mut grids = Vec::new();
             let mut off = 0;
             for l in 0..14 {
@@ -687,8 +890,12 @@ mod tests {
                 }
             }
             descramble_llrs(&mut llr, pdsch_scramble_c_init(tc_rnti, cell_id));
-            let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40).unwrap_or_else(|| panic!("decode failed at qm {qm}"));
-            let out_bytes: Vec<u8> = out.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)).collect();
+            let out = dlsch_decode_single(&llr, 88, r, qm, 0, 40)
+                .unwrap_or_else(|| panic!("decode failed at qm {qm}"));
+            let out_bytes: Vec<u8> = out
+                .chunks(8)
+                .map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b))
+                .collect();
             assert_eq!(out_bytes, tb_bytes, "qm {qm}");
         }
     }

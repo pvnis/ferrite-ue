@@ -52,10 +52,19 @@ fn main() {
         k_ssb_msb: 0,
     };
 
-    println!("Ferrite — 5G NR cell search + MIB decode (fs = {:.2} MHz, N = {FFT}, mu = {MU})", fs / 1e6);
-    println!("TX: PCI {cell_id}, i_SSB {i_ssb}, SFN {:#05x} ({})", mib.sfn, mib.sfn);
+    println!(
+        "Ferrite — 5G NR cell search + MIB decode (fs = {:.2} MHz, N = {FFT}, mu = {MU})",
+        fs / 1e6
+    );
+    println!(
+        "TX: PCI {cell_id}, i_SSB {i_ssb}, SFN {:#05x} ({})",
+        mib.sfn, mib.sfn
+    );
     println!();
-    println!("  {:>7} {:>7} | {:>5} {:>6} {:>10} {:>5} {:>6} {:>8}", "CFO/kHz", "SNR/dB", "PCI", "i_SSB", "cfo_est/Hz", "SFN", "pdcch", "result");
+    println!(
+        "  {:>7} {:>7} | {:>5} {:>6} {:>10} {:>5} {:>6} {:>8}",
+        "CFO/kHz", "SNR/dB", "PCI", "i_SSB", "cfo_est/Hz", "SFN", "pdcch", "result"
+    );
 
     let ssb = build_ssb_waveform(&mib, cell_id, i_ssb, L_MAX_FR1_ABOVE_3GHZ, &ofdm, MU);
     let rms = (ssb.iter().map(|s| s.norm_sqr()).sum::<f32>() / ssb.len() as f32).sqrt();

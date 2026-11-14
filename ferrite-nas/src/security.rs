@@ -141,8 +141,14 @@ impl NasSecurityContext {
     /// Derive a context from K_AMF and the algorithms selected by the SMC
     /// (TS 33.501 A.8: K_NASenc = KDF(K_AMF, 0x69, 0x01, NEA), K_NASint = (.., 0x02, NIA)).
     pub fn new(k_amf: [u8; 32], ngksi: u8, ea: u8, ia: u8) -> Result<Self, NasError> {
-        let ea_alg = CipherAlg::try_from(ea).ok().filter(|a| a.is_supported()).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
-        let ia_alg = IntegrityAlg::try_from(ia).ok().filter(|a| a.is_supported()).ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
+        let ea_alg = CipherAlg::try_from(ea)
+            .ok()
+            .filter(|a| a.is_supported())
+            .ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
+        let ia_alg = IntegrityAlg::try_from(ia)
+            .ok()
+            .filter(|a| a.is_supported())
+            .ok_or(NasError::UnsupportedAlgorithm { ea, ia })?;
         Ok(NasSecurityContext {
             k_amf,
             ngksi,

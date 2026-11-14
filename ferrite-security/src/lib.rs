@@ -128,7 +128,14 @@ impl TryFrom<u8> for CipherAlg {
 
 /// 32-bit MAC-I with `alg` over `msg` (TS 33.501 D.3.1.1 inputs). NIA0 yields
 /// all zeros; NIA1 / NIA3 fail with [`SecurityError::Unsupported`].
-pub fn integrity_mac(alg: IntegrityAlg, key: &[u8; 16], count: u32, bearer: u8, direction: u8, msg: &[u8]) -> Result<[u8; 4], SecurityError> {
+pub fn integrity_mac(
+    alg: IntegrityAlg,
+    key: &[u8; 16],
+    count: u32,
+    bearer: u8,
+    direction: u8,
+    msg: &[u8],
+) -> Result<[u8; 4], SecurityError> {
     match alg {
         IntegrityAlg::Nia0 => Ok([0; 4]),
         IntegrityAlg::Nia2 => Ok(nia::nia2_mac(key, count, bearer, direction, msg)),
@@ -138,7 +145,14 @@ pub fn integrity_mac(alg: IntegrityAlg, key: &[u8; 16], count: u32, bearer: u8, 
 
 /// Cipher / decipher `data` in place with `alg` (the two are the same
 /// operation). NEA0 leaves the data untouched; NEA1 / NEA3 fail.
-pub fn cipher_in_place(alg: CipherAlg, key: &[u8; 16], count: u32, bearer: u8, direction: u8, data: &mut [u8]) -> Result<(), SecurityError> {
+pub fn cipher_in_place(
+    alg: CipherAlg,
+    key: &[u8; 16],
+    count: u32,
+    bearer: u8,
+    direction: u8,
+    data: &mut [u8],
+) -> Result<(), SecurityError> {
     match alg {
         CipherAlg::Nea0 => Ok(()),
         CipherAlg::Nea2 => {
@@ -159,11 +173,20 @@ mod tests {
             assert_eq!(IntegrityAlg::try_from(id).unwrap().id(), id);
             assert_eq!(CipherAlg::try_from(id).unwrap().id(), id);
         }
-        assert_eq!(IntegrityAlg::try_from(7), Err(SecurityError::UnknownAlgorithm(7)));
+        assert_eq!(
+            IntegrityAlg::try_from(7),
+            Err(SecurityError::UnknownAlgorithm(7))
+        );
         assert!(IntegrityAlg::Nia2.is_supported() && !IntegrityAlg::Nia1.is_supported());
         assert!(CipherAlg::Nea0.is_supported() && !CipherAlg::Nea3.is_supported());
-        assert_eq!(integrity_mac(IntegrityAlg::Nia3, &[0; 16], 0, 0, 0, b"x"), Err(SecurityError::Unsupported("NIA3 (ZUC)")));
-        assert_eq!(integrity_mac(IntegrityAlg::Nia0, &[0; 16], 0, 0, 0, b"x"), Ok([0; 4]));
+        assert_eq!(
+            integrity_mac(IntegrityAlg::Nia3, &[0; 16], 0, 0, 0, b"x"),
+            Err(SecurityError::Unsupported("NIA3 (ZUC)"))
+        );
+        assert_eq!(
+            integrity_mac(IntegrityAlg::Nia0, &[0; 16], 0, 0, 0, b"x"),
+            Ok([0; 4])
+        );
         let mut d = *b"hello";
         cipher_in_place(CipherAlg::Nea0, &[0; 16], 0, 0, 0, &mut d).unwrap();
         assert_eq!(&d, b"hello");

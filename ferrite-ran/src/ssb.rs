@@ -60,7 +60,9 @@ impl SsbCase {
             SsbCase::B => (&[4, 8, 16, 20], 28, if carrier_hz <= 3e9 { 1 } else { 2 }),
             SsbCase::C => (&[2, 8], 14, if carrier_hz <= 2.4e9 { 2 } else { 4 }),
         };
-        (0..n_count).flat_map(|n| bases.iter().map(move |&b| b + stride * n)).collect()
+        (0..n_count)
+            .flat_map(|n| bases.iter().map(move |&b| b + stride * n))
+            .collect()
     }
 
     /// `L_max`, the number of candidate SSBs in a half frame (TS 38.213 §4.1):
@@ -93,7 +95,10 @@ mod tests {
         assert_eq!(SsbCase::A.candidate_symbols(2e9), vec![2, 8, 16, 22]);
         assert_eq!(SsbCase::A.candidate_symbols(3.5e9).len(), 8);
         assert_eq!(SsbCase::B.candidate_symbols(2e9), vec![4, 8, 16, 20]);
-        assert_eq!(SsbCase::C.candidate_symbols(3.5e9), vec![2, 8, 16, 22, 30, 36, 44, 50]);
+        assert_eq!(
+            SsbCase::C.candidate_symbols(3.5e9),
+            vec![2, 8, 16, 22, 30, 36, 44, 50]
+        );
         assert_eq!(SsbCase::C.l_max(2.6e9), 8);
         assert_eq!(l_max_fr1(2.6e9), 4);
         assert_eq!(SsbCase::from_scs(30, DuplexMode::Tdd), Some(SsbCase::C));

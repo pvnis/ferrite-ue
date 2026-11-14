@@ -157,11 +157,24 @@ transmission on the new BWP is lost and retransmitted — a known simplification
 Receive antennas: `radio::DlStream` holds one `BufferedStream` per antenna
 and reads them in lockstep (same sample index everywhere); cell search and
 the SSB tracking read antenna 0, the slot loop reads all antennas and hands
-`Arc<Vec<Vec<Iq>>>` (per antenna) to the PDSCH worker. The PDCCH monitor and,
-until the two-layer demapper lands, the PDSCH decoder use antenna 0; the CSI
-report carries RI 1 / PMI 0 in the TS 38.212 Table 6.3.1.1.2-7 layout
-(`RI | padding | PMI | CQI`, sized from the codebook's ports and
-`ri-Restriction`), so a two-antenna gNB keeps scheduling one layer.
+`Arc<Vec<Vec<Iq>>>` (per antenna) to the PDSCH worker, which demodulates every
+antenna. The PDCCH monitor uses antenna 0. PDSCH: the 1x1 case keeps the
+single-port extractor; with several antennas or two layers
+`pdsch::extract_pdsch_mimo` estimates the channel of every (antenna, DM-RS
+port) from the type-1 DM-RS (ports 0/1 of a CDM group separated by the
+frequency OCC over each RE pair, TS 38.211 §7.4.1.1.2), averages the
+de-rotated per-symbol estimates per RB, takes the noise variance from the
+spread of the pair estimates and equalises every data RE with a regularised
+zero-forcing combiner (MRC for one layer); the LLRs come out in codeword
+order (layer 0 then layer 1 per RE, §7.3.1.3) and the TBS/rate matching use
+`n_layers`. DCI 1_1 antenna-port values with one or two DM-RS ports are
+resolved (`DlGrant::{n_layers, dmrs_ports}`); three and four layers are
+dropped. The CSI report goes out in the TS 38.212 Table 6.3.1.1.2-7 layout
+(`RI | padding | PMI | CQI`, sized from the codebook's ports and the
+`ri-Restriction` whose bit `i` (LSB = rank 1) allows rank `i + 1`); until the
+two-port CSI-RS measurement exists the PHY reports one rank per receive
+antenna (up to two) with PMI 0, which is right for the lab's identity
+channel.
 
 Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the
 serving SSB: `rlm_evaluate` turns the SSB SINR into `SYNC.indication

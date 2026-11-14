@@ -41,7 +41,14 @@ fn config() -> MacConfig {
             nof_cb_preambles: 64,
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
-                phy: ferrite_ran::prach_config::PrachConfig { index: 159, duplex: ferrite_common::DuplexMode::Tdd, mu: 1, msg1_scs_mu: 1, msg1_fdm: 1, msg1_frequency_start: 5 },
+                phy: ferrite_ran::prach_config::PrachConfig {
+                    index: 159,
+                    duplex: ferrite_common::DuplexMode::Tdd,
+                    mu: 1,
+                    msg1_scs_mu: 1,
+                    msg1_fdm: 1,
+                    msg1_frequency_start: 5,
+                },
                 tdd: None,
                 ssb_symbols: Vec::new(),
                 ssb_period_ms: 20,
@@ -57,7 +64,12 @@ fn config() -> MacConfig {
     );
     c.pucch.resource_sets = vec![(0, vec![0, 1], 2), (1, vec![8], 11)];
     c.pucch.resources = vec![(0, 1, 2), (1, 1, 2), (8, 2, 11)];
-    c.sr = vec![SrConfig { sr_id: 0, prohibit_ms: 0, trans_max: 64, resources: vec![(10, 7, 1)] }];
+    c.sr = vec![SrConfig {
+        sr_id: 0,
+        prohibit_ms: 0,
+        trans_max: 64,
+        resources: vec![(10, 7, 1)],
+    }];
     c
 }
 
@@ -74,17 +86,27 @@ fn step(mac: &mut MacEntity, up: &mut FakeUpper, msg: PhyToMac) -> Vec<MacToPhy>
 #[test]
 fn attach_flow() {
     let mut mac = MacEntity::new(config());
-    let mut up = FakeUpper { pending: Vec::new(), rx: Vec::new() };
+    let mut up = FakeUpper {
+        pending: Vec::new(),
+        rx: Vec::new(),
+    };
     let ccch = [0x1f, 0xaa, 0xbb, 0xcc, 0xdd, 0x06];
     mac.start_ra(ccch);
     // Slots until a PRACH request appears.
     let mut prach: Option<(PrachOccasion, u8)> = None;
     let mut n = 0u64;
     while prach.is_none() && n < 100 {
-        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) })) {
+        for m in step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: slot(n) }),
+        ) {
             if let MacToPhy::UlTti(req) = m {
                 for p in req.pdus {
-                    if let UlTtiPdu::Prach { occasion, preamble, .. } = p {
+                    if let UlTtiPdu::Prach {
+                        occasion, preamble, ..
+                    } = p
+                    {
                         prach = Some((occasion, preamble));
                     }
                 }
@@ -95,8 +117,18 @@ fn attach_flow() {
     let (occ, preamble) = prach.expect("PRACH requested");
     assert_eq!(occ.slot.slot, 19);
     // PHY reports the preamble sent; MAC must now monitor the RA-RNTI.
-    let out = step(&mut mac, &mut up, PhyToMac::Rach(RachIndication { slot: occ.slot, ra_rnti: occ.ra_rnti, preamble }));
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { ra_rnti: Some(r), .. } if *r == occ.ra_rnti)));
+    let out = step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Rach(RachIndication {
+            slot: occ.slot,
+            ra_rnti: occ.ra_rnti,
+            preamble,
+        }),
+    );
+    assert!(out
+        .iter()
+        .any(|m| matches!(m, MacToPhy::SetRntis { ra_rnti: Some(r), .. } if *r == occ.ra_rnti)));
     // RAR: TA 5, grant fdra RIV for 3 RBs at RB 4 (N=24), time 0, mcs 0, tpc 7, tc-rnti 0x4601.
     let riv = (3 - 1) * 24 + 4; // RIV = N(L-1)+S for L-1 <= N/2
     let g: u32 = ((riv as u32) << 12) | (7 << 1);
@@ -107,17 +139,58 @@ fn attach_flow() {
     rar.extend_from_slice(&[(g >> 16) as u8, (g >> 8) as u8, g as u8]);
     rar.extend_from_slice(&0x4601u16.to_be_bytes());
     let rar_slot = occ.slot.add(5);
-    let out = step(&mut mac, &mut up, PhyToMac::RxData(RxDataIndication { rnti: occ.ra_rnti, rnti_kind: RntiKind::Ra, harq_id: 0, ndi: 0, pdsch_slot: rar_slot, tb: Some(rar), sinr_db: 30.0 }));
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::TimingAdvance { n_ta_tc } if *n_ta_tc == 5 * 512)));
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { tc_rnti: Some(Rnti(0x4601)), .. })));
+    let out = step(
+        &mut mac,
+        &mut up,
+        PhyToMac::RxData(RxDataIndication {
+            rnti: occ.ra_rnti,
+            rnti_kind: RntiKind::Ra,
+            harq_id: 0,
+            ndi: 0,
+            pdsch_slot: rar_slot,
+            tb: Some(rar),
+            sinr_db: 30.0,
+        }),
+    );
+    assert!(out
+        .iter()
+        .any(|m| matches!(m, MacToPhy::TimingAdvance { n_ta_tc } if *n_ta_tc == 5 * 512)));
+    assert!(out.iter().any(|m| matches!(
+        m,
+        MacToPhy::SetRntis {
+            tc_rnti: Some(Rnti(0x4601)),
+            ..
+        }
+    )));
     // MAC parses the RAR grant fields and asks the PHY to resolve them.
     let rar_grant = out
         .iter()
-        .find_map(|m| if let MacToPhy::RarGrant { rar_slot: s, tc_rnti, grant } = m { Some((*s, *tc_rnti, *grant)) } else { None })
+        .find_map(|m| {
+            if let MacToPhy::RarGrant {
+                rar_slot: s,
+                tc_rnti,
+                grant,
+            } = m
+            {
+                Some((*s, *tc_rnti, *grant))
+            } else {
+                None
+            }
+        })
         .expect("RAR grant handed to the PHY");
     assert_eq!(rar_grant.0, rar_slot);
     assert_eq!(rar_grant.1, Rnti(0x4601));
-    assert_eq!(rar_grant.2, RarUlGrant { freq_hopping: false, fdra: riv as u16, time_resource: 0, mcs: 0, tpc: 7, csi_request: false });
+    assert_eq!(
+        rar_grant.2,
+        RarUlGrant {
+            freq_hopping: false,
+            fdra: riv as u16,
+            time_resource: 0,
+            mcs: 0,
+            tpc: 7,
+            csi_request: false
+        }
+    );
     // The PHY's answer: the Msg3 grant (k2 = 4, Δ = 3 at 30 kHz), 3 RBs at RB 4.
     let msg3_grant = UlGrant {
         rnti: Rnti(0x4601),
@@ -125,8 +198,16 @@ fn attach_flow() {
         pusch_slot: rar_slot.add(4 + 3),
         prb_start: 4,
         n_prb: 3,
-        time: TimeAlloc { mapping_type_a: true, start_symbol: 0, n_symbols: 14 },
-        mcs: Mcs { index: 0, qm: 2, r_x1024: Some(120) },
+        time: TimeAlloc {
+            mapping_type_a: true,
+            start_symbol: 0,
+            n_symbols: 14,
+        },
+        mcs: Mcs {
+            index: 0,
+            qm: 2,
+            r_x1024: Some(120),
+        },
         tbs_bits: 88,
         harq_id: 0,
         ndi: 0,
@@ -140,9 +221,22 @@ fn attach_flow() {
         freq_hopping: false,
         transform_precoding: None,
     };
-    let out = step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: rar_slot, dci: Dci::Ul(msg3_grant) }));
+    let out = step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: rar_slot,
+            dci: Dci::Ul(msg3_grant),
+        }),
+    );
     let msg3 = out.iter().find_map(|m| match m {
-        MacToPhy::UlTti(r) => r.pdus.iter().find_map(|p| if let UlTtiPdu::Pusch { grant, tb, .. } = p { Some((r.slot, grant.clone(), tb.clone())) } else { None }),
+        MacToPhy::UlTti(r) => r.pdus.iter().find_map(|p| {
+            if let UlTtiPdu::Pusch { grant, tb, .. } = p {
+                Some((r.slot, grant.clone(), tb.clone()))
+            } else {
+                None
+            }
+        }),
         _ => None,
     });
     let (msg3_slot, grant, tb) = msg3.expect("Msg3 scheduled");
@@ -160,8 +254,16 @@ fn attach_flow() {
         pdsch_slot: m4_slot,
         prb_start: 0,
         n_prb: 21,
-        time: TimeAlloc { mapping_type_a: true, start_symbol: 2, n_symbols: 12 },
-        mcs: Mcs { index: 7, qm: 2, r_x1024: Some(526) },
+        time: TimeAlloc {
+            mapping_type_a: true,
+            start_symbol: 2,
+            n_symbols: 12,
+        },
+        mcs: Mcs {
+            index: 7,
+            qm: 2,
+            r_x1024: Some(526),
+        },
         tbs_bits: 2664,
         harq_id: 0,
         ndi: 0,
@@ -171,24 +273,63 @@ fn attach_flow() {
         pri: 0,
         tpc: 1,
         cdm_groups_wo_data: 2,
+        n_layers: 1,
+        dmrs_ports: vec![0],
         dmrs_add_pos: 2,
         vrb_to_prb_interleaved: false,
         r_pucch_common: 0,
     };
-    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: m4_slot, dci: Dci::Dl(dl.clone()) }));
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: m4_slot,
+            dci: Dci::Dl(dl.clone()),
+        }),
+    );
     let mut pdu = vec![62];
     pdu.extend_from_slice(&ccch);
     pdu.extend_from_slice(&[0, 3, 0x20, 0x40, 0x08, 63, 0, 0]);
-    let out = step(&mut mac, &mut up, PhyToMac::RxData(RxDataIndication { rnti: Rnti(0x4601), rnti_kind: RntiKind::Tc, harq_id: 0, ndi: 0, pdsch_slot: m4_slot, tb: Some(pdu), sinr_db: 30.0 }));
-    assert!(out.iter().any(|m| matches!(m, MacToPhy::SetRntis { c_rnti: Some(Rnti(0x4601)), tc_rnti: None, .. })));
+    let out = step(
+        &mut mac,
+        &mut up,
+        PhyToMac::RxData(RxDataIndication {
+            rnti: Rnti(0x4601),
+            rnti_kind: RntiKind::Tc,
+            harq_id: 0,
+            ndi: 0,
+            pdsch_slot: m4_slot,
+            tb: Some(pdu),
+            sinr_db: 30.0,
+        }),
+    );
+    assert!(out.iter().any(|m| matches!(
+        m,
+        MacToPhy::SetRntis {
+            c_rnti: Some(Rnti(0x4601)),
+            tc_rnti: None,
+            ..
+        }
+    )));
     let evs = mac.take_events();
-    assert!(evs.iter().any(|e| matches!(e, MacEvent::RaSucceeded { c_rnti: Rnti(0x4601) })));
-    assert!(evs.iter().any(|e| matches!(e, MacEvent::Ccch(c) if c == &[0x20, 0x40, 0x08])));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        MacEvent::RaSucceeded {
+            c_rnti: Rnti(0x4601)
+        }
+    )));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, MacEvent::Ccch(c) if c == &[0x20, 0x40, 0x08])));
     // Run slots up to the ACK slot − lead: a PUCCH with ACK=1 must be requested.
     let mut pucch = None;
     let mut s = m4_slot.add(1);
     for _ in 0..8 {
-        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s })) {
+        for m in step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: s }),
+        ) {
             if let MacToPhy::UlTti(r) = m {
                 for p in r.pdus {
                     if let UlTtiPdu::Pucch { resource, uci } = p {
@@ -211,8 +352,16 @@ fn attach_flow() {
         pusch_slot: s.add(4),
         prb_start: 0,
         n_prb: 5,
-        time: TimeAlloc { mapping_type_a: true, start_symbol: 0, n_symbols: 14 },
-        mcs: Mcs { index: 9, qm: 2, r_x1024: Some(679) },
+        time: TimeAlloc {
+            mapping_type_a: true,
+            start_symbol: 0,
+            n_symbols: 14,
+        },
+        mcs: Mcs {
+            index: 9,
+            qm: 2,
+            r_x1024: Some(679),
+        },
         tbs_bits: 640,
         harq_id: 1,
         ndi: 1,
@@ -226,12 +375,27 @@ fn attach_flow() {
         freq_hopping: false,
         transform_precoding: None,
     };
-    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s }));
-    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: s, dci: Dci::Ul(ul.clone()) }));
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Slot(SlotIndication { slot: s }),
+    );
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: s,
+            dci: Dci::Ul(ul.clone()),
+        }),
+    );
     let mut pusch = None;
     for _ in 0..4 {
         s = s.add(1);
-        for m in step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: s })) {
+        for m in step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: s }),
+        ) {
             if let MacToPhy::UlTti(r) = m {
                 for p in r.pdus {
                     if let UlTtiPdu::Pusch { grant, tb, uci } = p {
@@ -246,7 +410,9 @@ fn attach_flow() {
     assert_eq!(g.harq_id, 1);
     assert_eq!(tb.len(), 80);
     let subs = ferrite_mac::pdu::parse_dl_pdu(&tb); // same subheader layout
-    assert!(subs.iter().any(|x| matches!(x, ferrite_mac::pdu::DlSubPdu::Sdu { lcid: 1, sdu } if sdu.len() == 40)));
+    assert!(subs
+        .iter()
+        .any(|x| matches!(x, ferrite_mac::pdu::DlSubPdu::Sdu { lcid: 1, sdu } if sdu.len() == 40)));
     assert!(uci.harq_ack.is_empty()); // T-DAI 3 with nothing booked → no ACK bits
     assert_eq!(mac.stats().ul_tb, 2);
 }
@@ -261,10 +427,22 @@ fn bwp_inactivity_timer_and_switch_requests() {
     c.default_dl_bwp_id = 0;
     c.bwp_inactivity_timer_ms = Some(10); // 20 slots
     let mut mac = MacEntity::new(c);
-    let mut up = FakeUpper { pending: Vec::new(), rx: Vec::new() };
-    let switches = |mac: &mut MacEntity| mac.take_events().into_iter().filter(|e| matches!(e, MacEvent::BwpSwitch { .. })).collect::<Vec<_>>();
+    let mut up = FakeUpper {
+        pending: Vec::new(),
+        rx: Vec::new(),
+    };
+    let switches = |mac: &mut MacEntity| {
+        mac.take_events()
+            .into_iter()
+            .filter(|e| matches!(e, MacEvent::BwpSwitch { .. }))
+            .collect::<Vec<_>>()
+    };
     for n in 0..19 {
-        step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) }));
+        step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: slot(n) }),
+        );
     }
     assert!(switches(&mut mac).is_empty());
     // A C-RNTI DL assignment at slot 19 restarts the timer.
@@ -274,8 +452,16 @@ fn bwp_inactivity_timer_and_switch_requests() {
         pdsch_slot: slot(19),
         prb_start: 0,
         n_prb: 4,
-        time: TimeAlloc { mapping_type_a: true, start_symbol: 2, n_symbols: 12 },
-        mcs: Mcs { index: 7, qm: 2, r_x1024: Some(526) },
+        time: TimeAlloc {
+            mapping_type_a: true,
+            start_symbol: 2,
+            n_symbols: 12,
+        },
+        mcs: Mcs {
+            index: 7,
+            qm: 2,
+            r_x1024: Some(526),
+        },
         tbs_bits: 500,
         harq_id: 0,
         ndi: 1,
@@ -285,22 +471,74 @@ fn bwp_inactivity_timer_and_switch_requests() {
         pri: 0,
         tpc: 1,
         cdm_groups_wo_data: 2,
+        n_layers: 1,
+        dmrs_ports: vec![0],
         dmrs_add_pos: 2,
         vrb_to_prb_interleaved: false,
         r_pucch_common: 0,
     };
-    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: slot(19), dci: Dci::Dl(dl) }));
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: slot(19),
+            dci: Dci::Dl(dl),
+        }),
+    );
     for n in 19..38 {
-        step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(n) }));
+        step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: slot(n) }),
+        );
     }
-    assert!(switches(&mut mac).is_empty(), "restarted at slot 19: no expiry before 39");
-    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(39) }));
-    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) }]);
+    assert!(
+        switches(&mut mac).is_empty(),
+        "restarted at slot 19: no expiry before 39"
+    );
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Slot(SlotIndication { slot: slot(39) }),
+    );
+    assert_eq!(
+        switches(&mut mac),
+        vec![MacEvent::BwpSwitch {
+            dl_bwp: Some(0),
+            ul_bwp: Some(0)
+        }]
+    );
     // A DCI with a bandwidth-part indicator is passed up as a switch request.
-    step(&mut mac, &mut up, PhyToMac::Dci(DciIndication { slot: slot(40), dci: Dci::BwpSwitch { dl_bwp: Some(2), ul_bwp: None } }));
-    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(2), ul_bwp: None }]);
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: slot(40),
+            dci: Dci::BwpSwitch {
+                dl_bwp: Some(2),
+                ul_bwp: None,
+            },
+        }),
+    );
+    assert_eq!(
+        switches(&mut mac),
+        vec![MacEvent::BwpSwitch {
+            dl_bwp: Some(2),
+            ul_bwp: None
+        }]
+    );
     // A random access from a non-initial BWP asks for the initial one first.
     mac.start_ra([0x1f, 1, 2, 3, 4, 5]);
-    step(&mut mac, &mut up, PhyToMac::Slot(SlotIndication { slot: slot(41) }));
-    assert_eq!(switches(&mut mac), vec![MacEvent::BwpSwitch { dl_bwp: Some(0), ul_bwp: Some(0) }]);
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Slot(SlotIndication { slot: slot(41) }),
+    );
+    assert_eq!(
+        switches(&mut mac),
+        vec![MacEvent::BwpSwitch {
+            dl_bwp: Some(0),
+            ul_bwp: Some(0)
+        }]
+    );
 }

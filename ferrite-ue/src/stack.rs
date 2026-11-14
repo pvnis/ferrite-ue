@@ -16,23 +16,38 @@ use ferrite_common::{Numerology, SlotPoint};
 use ferrite_fapi::*;
 use ferrite_mac::{MacConfig, MacEntity, MacEvent, MacStats};
 use ferrite_nas::{NasConfig, NasEvent, NasUe, UeIdentity};
-use ferrite_rrc::{derive, AsSecurity, MacNotification, RbId, RrcConfig, RrcEvent, RrcState, RrcUe};
+use ferrite_rrc::{
+    derive, AsSecurity, MacNotification, RbId, RrcConfig, RrcEvent, RrcState, RrcUe,
+};
 use std::collections::VecDeque;
 
 /// Application-level events the stack reports.
 #[derive(Clone, Debug)]
 pub enum StackEvent {
-    CellConfigured { plmn: String, tac: u32 },
+    CellConfigured {
+        plmn: String,
+        tac: u32,
+    },
     RrcConnected,
     Registered,
-    PduSessionUp { ip: [u8; 4] },
-    PingReply { seq: u16, rtt_ms: f64 },
-    PingDone { sent: u32, received: u32 },
+    PduSessionUp {
+        ip: [u8; 4],
+    },
+    PingReply {
+        seq: u16,
+        rtt_ms: f64,
+    },
+    PingDone {
+        sent: u32,
+        received: u32,
+    },
     Failed(String),
     /// RRC connection released by the network (idle, still registered).
     RrcReleased,
     /// The UE was paged (or had uplink data while idle) and asked for service.
-    ServiceRequest { cause: &'static str },
+    ServiceRequest {
+        cause: &'static str,
+    },
     /// Radio link failure: RRC re-establishment started / completed.
     Reestablishing,
     Reestablished,
@@ -90,9 +105,21 @@ impl Stack {
     pub fn new(cfg: UeConfig, mib: Option<derive::MibInfo>) -> Self {
         let numerology = Numerology::from_scs_khz(cfg.ssb_scs_khz).unwrap_or(Numerology::KHZ30);
         let id = UeIdentity::from_imsi(&cfg.imsi, cfg.ki, cfg.opc);
-        let nas_cfg = NasConfig { dnn: cfg.dnn.clone(), t3512_override_ms: cfg.t3512_s.map(|s| s * 1000), ..NasConfig::default() };
-        let radio = derive::RadioInfo { fs: cfg.fs, duplex: cfg.duplex, band: cfg.band };
-        let rrc = RrcUe::new(RrcConfig { bands: vec![cfg.band], tx_lead_slots: cfg.tx_lead, ..RrcConfig::default() });
+        let nas_cfg = NasConfig {
+            dnn: cfg.dnn.clone(),
+            t3512_override_ms: cfg.t3512_s.map(|s| s * 1000),
+            ..NasConfig::default()
+        };
+        let radio = derive::RadioInfo {
+            fs: cfg.fs,
+            duplex: cfg.duplex,
+            band: cfg.band,
+        };
+        let rrc = RrcUe::new(RrcConfig {
+            bands: vec![cfg.band],
+            tx_lead_slots: cfg.tx_lead,
+            ..RrcConfig::default()
+        });
         // A placeholder MAC config until SIB1 (reconfigured by RRC).
         let mac = MacEntity::new(placeholder_mac(numerology, cfg.duplex, cfg.tx_lead));
         Self {
@@ -145,7 +172,10 @@ impl Stack {
     /// message in RRCSetupComplete (mo-Signalling), AS keys from that
     /// message's uplink NAS COUNT (TS 33.501 §6.9.2.1).
     fn nas_connect(&mut self, now: SlotPoint) {
-        if !self.nas_connect_pending || self.rrc.state() != RrcState::Idle || self.rrc.cell().is_none() {
+        if !self.nas_connect_pending
+            || self.rrc.state() != RrcState::Idle
+            || self.rrc.cell().is_none()
+        {
             return;
         }
         self.nas_connect_pending = false;
@@ -164,8 +194,20 @@ impl Stack {
 
     /// A serving-cell SSB measurement from the PHY (dBFS → dBm with the
     /// configured receiver calibration) for the RRC measurement procedure.
-    pub fn on_measurement(&mut self, pci: u16, slot: SlotPoint, rsrp_dbfs: f32, rsrq_db: f32, sinr_db: f32) {
-        let m = ferrite_rrc::meas::CellMeasurement { pci, rsrp_dbm: rsrp_dbfs + self.cfg.rx_power_offset_db, rsrq_db, sinr_db };
+    pub fn on_measurement(
+        &mut self,
+        pci: u16,
+        slot: SlotPoint,
+        rsrp_dbfs: f32,
+        rsrq_db: f32,
+        sinr_db: f32,
+    ) {
+        let m = ferrite_rrc::meas::CellMeasurement {
+            pci,
+            rsrp_dbm: rsrp_dbfs + self.cfg.rx_power_offset_db,
+            rsrq_db,
+            sinr_db,
+        };
         self.rrc.on_measurement(slot, &m);
     }
 
@@ -201,13 +243,20 @@ impl Stack {
 
     fn on_rrc_event(&mut self, ev: RrcEvent, phy: &mut dyn MacToPhySink, now: SlotPoint) {
         match ev {
-            RrcEvent::CellConfigured { phy: p, mac: m, plmn, tac, cell_id } => {
+            RrcEvent::CellConfigured {
+                phy: p,
+                mac: m,
+                plmn,
+                tac,
+                cell_id,
+            } => {
                 log::info!("SIB1: PLMN {plmn} TAC {tac} cell {cell_id:#x}");
                 self.numerology = p.numerology;
                 self.bearers.set_numerology(p.numerology);
                 phy.send(MacToPhy::Config(p));
                 self.mac.reconfigure(*m);
-                self.events.push_back(StackEvent::CellConfigured { plmn, tac });
+                self.events
+                    .push_back(StackEvent::CellConfigured { plmn, tac });
                 // Start registration: NAS → RRC connection request.
                 if !self.conn.started {
                     self.conn.started = true;
@@ -282,7 +331,9 @@ impl Stack {
                 self.bearers.clear();
                 self.security = None;
                 self.mac.reset(phy);
-                let backoff_slots = 200 * self.numerology.slots_per_subframe() as u64 * (1 + self.conn.attempts.min(4) as u64);
+                let backoff_slots = 200
+                    * self.numerology.slots_per_subframe() as u64
+                    * (1 + self.conn.attempts.min(4) as u64);
                 self.conn.retry_at = Some(now.add(backoff_slots));
             }
         }
@@ -304,7 +355,10 @@ impl Stack {
     /// then install the new keys on SRB1.
     fn on_verify_reestablishment(&mut self, sec: AsSecurity) {
         let ok = match (self.pending_reest_pdu.as_ref(), self.bearers.srb(1)) {
-            (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
+            (Some(pdu), Some(b)) => b
+                .pdcp
+                .verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int)
+                .is_some(),
             _ => false,
         };
         if ok {
@@ -323,14 +377,22 @@ impl Stack {
     /// itself is integrity protected but not ciphered.
     fn on_verify_security(&mut self, sec: AsSecurity, phy: &mut dyn MacToPhySink, now: SlotPoint) {
         let ok = match (self.pending_smc_pdu.as_ref(), self.bearers.srb(1)) {
-            (Some(pdu), Some(b)) => b.pdcp.verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int).is_some(),
+            (Some(pdu), Some(b)) => b
+                .pdcp
+                .verify_only(pdu, sec.integrity_alg, &sec.k_rrc_int)
+                .is_some(),
             _ => false,
         };
         if ok {
             self.security = Some(sec);
-            self.bearers.install_security(&sec, |rb| matches!(rb, RbId::Srb(_)));
+            self.bearers
+                .install_security(&sec, |rb| matches!(rb, RbId::Srb(_)));
             self.bearers.set_srb_tx_cipher(false);
-            log::info!("AS security activated ({} / {})", sec.integrity_alg.name(), sec.ciphering_alg.name());
+            log::info!(
+                "AS security activated ({} / {})",
+                sec.integrity_alg.name(),
+                sec.ciphering_alg.name()
+            );
         } else {
             log::warn!("SecurityModeCommand MAC-I check failed");
         }
@@ -364,7 +426,9 @@ impl Stack {
                 if let Some(k) = self.nas.k_gnb_for_last_message() {
                     self.rrc.set_k_gnb(k);
                 }
-                self.events.push_back(StackEvent::ServiceRequest { cause: if cause == 2 { "mt-Access" } else { "mo-Data" } });
+                self.events.push_back(StackEvent::ServiceRequest {
+                    cause: if cause == 2 { "mt-Access" } else { "mo-Data" },
+                });
                 self.rrc.connect_for(pdu, now, cause);
             }
             None => log::warn!("service request not possible (NAS not registered)"),
@@ -479,7 +543,9 @@ impl Stack {
         for ev in self.user_plane.take_events() {
             self.events.push_back(match ev {
                 UserPlaneEvent::PingReply { seq, rtt_ms } => StackEvent::PingReply { seq, rtt_ms },
-                UserPlaneEvent::PingDone { sent, received } => StackEvent::PingDone { sent, received },
+                UserPlaneEvent::PingDone { sent, received } => {
+                    StackEvent::PingDone { sent, received }
+                }
             });
         }
     }
@@ -523,14 +589,21 @@ impl Stack {
                 MacEvent::Pcch(pdu) => self.rrc.on_pcch(&pdu),
                 MacEvent::RaSucceeded { c_rnti } => {
                     log::info!("RA succeeded, C-RNTI {c_rnti}");
-                    self.rrc.on_mac(MacNotification::RaSucceeded { c_rnti: c_rnti.0 });
+                    self.rrc
+                        .on_mac(MacNotification::RaSucceeded { c_rnti: c_rnti.0 });
                 }
                 MacEvent::RaFailed => self.rrc.on_mac(MacNotification::RaFailed),
                 MacEvent::SrFailure => self.rrc.on_mac(MacNotification::SrFailure),
-                MacEvent::TimeAlignmentExpired => self.rrc.on_mac(MacNotification::TimeAlignmentExpired),
+                MacEvent::TimeAlignmentExpired => {
+                    self.rrc.on_mac(MacNotification::TimeAlignmentExpired)
+                }
                 MacEvent::RadioLinkFailure => self.rrc.on_mac(MacNotification::RadioLinkFailure),
-                MacEvent::Sync { in_sync } => self.rrc.on_mac(MacNotification::SyncIndication { in_sync }),
-                MacEvent::BwpSwitch { dl_bwp, ul_bwp } => self.rrc.on_mac(MacNotification::BwpSwitch { dl_bwp, ul_bwp }),
+                MacEvent::Sync { in_sync } => {
+                    self.rrc.on_mac(MacNotification::SyncIndication { in_sync })
+                }
+                MacEvent::BwpSwitch { dl_bwp, ul_bwp } => self
+                    .rrc
+                    .on_mac(MacNotification::BwpSwitch { dl_bwp, ul_bwp }),
             }
         }
         self.apply_rrc_events(phy, now);
@@ -546,14 +619,21 @@ impl MacHandler for Stack {
             PhyToMac::Csi(c) => c.slot,
             PhyToMac::Rach(r) => r.slot,
             PhyToMac::Sync(s) => s.slot,
-            PhyToMac::Error(_) => self.last_slot.unwrap_or(SlotPoint::new(self.numerology, 0, 0)),
+            PhyToMac::Error(_) => self
+                .last_slot
+                .unwrap_or(SlotPoint::new(self.numerology, 0, 0)),
         };
         self.last_slot = Some(now);
         let is_slot = matches!(msg, PhyToMac::Slot(_));
         if let Some(ue_id) = self.pending_paging_cfg.take() {
             phy.send(MacToPhy::Paging { ue_id });
         }
-        if is_slot && self.cfg.rlf_at_s > 0 && !self.rlf_injected && self.rrc.state() == RrcState::Connected && self.start.elapsed().as_secs() >= self.cfg.rlf_at_s {
+        if is_slot
+            && self.cfg.rlf_at_s > 0
+            && !self.rlf_injected
+            && self.rrc.state() == RrcState::Connected
+            && self.start.elapsed().as_secs() >= self.cfg.rlf_at_s
+        {
             self.rlf_injected = true;
             log::warn!("test: injecting a radio link failure");
             self.rrc.on_mac(MacNotification::RadioLinkFailure);
@@ -566,13 +646,19 @@ impl MacHandler for Stack {
             self.bearers.tick(now);
             self.rrc.tick(now);
             if let Some(t) = self.conn.retry_at {
-                if now.diff(&t) >= 0 && self.rrc.state() == RrcState::Idle && self.rrc.cell().is_some() {
+                if now.diff(&t) >= 0
+                    && self.rrc.state() == RrcState::Idle
+                    && self.rrc.cell().is_some()
+                {
                     self.conn.retry_at = None;
                     if self.nas.is_registered() || self.nas_connect_pending {
                         // A registered UE's NAS owns its retries (T3511 / T3502).
                         self.nas_connect_pending = true;
                     } else {
-                        log::info!("retrying the connection (attempt {})", self.conn.attempts + 1);
+                        log::info!(
+                            "retrying the connection (attempt {})",
+                            self.conn.attempts + 1
+                        );
                         self.start_connection(now);
                     }
                 }
@@ -592,7 +678,11 @@ impl MacHandler for Stack {
 }
 
 /// MAC configuration before SIB1 is known (nothing to do yet).
-fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, tx_lead: u16) -> MacConfig {
+fn placeholder_mac(
+    numerology: Numerology,
+    duplex: ferrite_common::DuplexMode,
+    tx_lead: u16,
+) -> MacConfig {
     use ferrite_fapi::config::PrachConfig;
     MacConfig::initial(
         numerology,
@@ -605,7 +695,14 @@ fn placeholder_mac(numerology: Numerology, duplex: ferrite_common::DuplexMode, t
             nof_cb_preambles: 64,
             cb_preambles_per_ssb: 64,
             prach: PrachConfig {
-                phy: ferrite_ran::prach_config::PrachConfig { index: 0, duplex, mu: numerology.mu, msg1_scs_mu: numerology.mu, msg1_fdm: 1, msg1_frequency_start: 0 },
+                phy: ferrite_ran::prach_config::PrachConfig {
+                    index: 0,
+                    duplex,
+                    mu: numerology.mu,
+                    msg1_scs_mu: numerology.mu,
+                    msg1_fdm: 1,
+                    msg1_frequency_start: 0,
+                },
                 tdd: None,
                 ssb_symbols: Vec::new(),
                 ssb_period_ms: 20,
