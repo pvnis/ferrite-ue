@@ -62,6 +62,7 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S27 | Periodic registration update | `UE_ARGS="--t3512-s 8 --ping-rounds 2 --ping-round-gap-s 25"` on a config with the gNB's inactivity release (T1): after the release the UE is in 5GMM-IDLE, T3512 expires, the UE connects (mo-Signalling) with REGISTRATION REQUEST (periodic) and the core accepts (`registration update complete`); the second ping round, after the next release, still goes through a service request (S14) |
 | S28 | Two-layer PDSCH (2x2) | gNB with `nof_antennas_dl: 2` / `max_rank: 2` (T5), the UE's two RX ports wired to the two TX ports: the UE measures the two-port CSI-RS and reports RI 2 (`CSI: … ri=2` in the gNB log; the UE's `CSI <slot>: … ri 2` debug line), the gNB schedules two-layer PDSCHs (`nof_layers=2`) and the UE decodes them with its MMSE demapper (DL TB failures < 10 %); ping 10/10 |
 | S29 | CFO tracking, UL frequency pre-compensation | `UE_ARGS="--emulate-lo-ppm 1"` (any config; the ZMQ source and sink mix in the frequency error of a UE oscillator 1 ppm high: DL −ppm·f_DL, UL +ppm·f_UL, sample clock ideal): the UE's `tracking:` CFO equals the injected DL offset within 50 Hz, the gNB's mean `cfo=` over the UE's uplink is within 50 Hz (without the pre-compensation it would be +ppm·f_UL), and no timing step is taken. Verified 2026-11-15 on T1 at +1 and −3 ppm and F1 at +2 ppm (FDD, UL scaled by f_UL/f_DL): gNB UL CFO mean 0 Hz, spread ±4 Hz |
+| S30 | Channel emulator | `CHANEM="<ferrite-chanem options>"` (any config; §5.2): the attach, ping and the configuration's other stages pass through the emulated channel, the emulator reports traffic in both directions, and with `--ppm` the UE's `tracking:` drift matches the emulated clock error within 0.1 ppm. Results 2026-11-15 in §5.2 |
 | S25 | Connected-mode DRX | gNB with `cell_cfg.drx` (T4): the UE applies the DRX-Config (`DRX configured`), stops monitoring the C-RNTI PDCCH and sending periodic CSI outside Active Time (`drx_sleep_slots > 0` in the final MAC stats) and the ping probe still completes through the on-duration / SR wake-ups. Note: the periodic SRS is kept during sleep (`MacConfig::srs_outside_active_time`): OCUDU feeds the timing-advance estimate of every SRS occasion to its TA manager, detected or not, and empty occasions produce a −1 TA command per DRX cycle until the uplink leaves the cyclic prefix (observed: UL dead after ~8 cycles, RLF) |
 | S20 | SRS | gNB with `cell_cfg.srs.type_enabled: periodic`: the UE transmits its periodic SRS resource; the gNB PHY log shows `SRS:` detections with a sane SINR/EPRE for the UE's C-RNTI |
 | S22 | Transform-precoded PUSCH | gNB with `pusch.enable_transform_precoding: true` (T3): Msg3, fallback-DCI and DCI 0_1 PUSCHs are DFT-s-OFDM with the low-PAPR DM-RS and the Table 6.1.4.1-1 MCS mapping; ≥90 % of the gNB's PUSCH CRCs pass |
@@ -136,7 +137,7 @@ flags, `UE_LOG` sets the UE log filter.
 Prerequisites on the host: qcore's network (`cd /home/dmd/qcore &&
 ./setup-routing <external-if>`, creates `qcoretun`/veth; lost on reboot).
 
-### Timing calibration aids
+### 5.1 Timing calibration aids
 
 The UE derives all uplink timing from the spec (§6); two knobs exist for lab
 calibration, both in samples and positive = transmit earlier:
@@ -152,6 +153,51 @@ To find such offsets, `FERRITE_PRACH_SWEEP="o1,o2,…"` / `FERRITE_PUSCH_SWEEP`
 cycle the uplink timing offset per PRACH attempt / PUSCH transmission and the
 gNB PHY log shows which ones were detected (`PRACH: … detected_preambles=[…
 ta=…]`, `PUSCH: … crc=OK`).
+
+### 5.2 Channel emulator (`ferrite-chanem`)
+
+`ferrite-chanem` (`ferrite-radio`, feature `zmq`) sits between the gNB and
+the UE on the ZMQ transport and applies what an over-the-air link would:
+multipath fading (TS 38.901 TDL-A/B/C scaled to a delay spread, or TS 36.101
+EPA/EVA/ETU; Jakes Doppler by sum of sinusoids, independent per antenna pair),
+a propagation delay, a UE oscillator error (`--ppm`: the sample clock is
+resampled by 1+ε and the carrier offset is −ε·f_DL on the downlink, +ε·f_UL on
+the uplink, as one crystal would do) and AWGN at a given SNR (measured over the
+full sample bandwidth, against the mean power of the non-silent samples).
+Without a fading model a multi-antenna link is the identity (each port wired
+straight through). `--bench S` measures its throughput without a radio.
+
+`lab.sh` splices it in with `CHANEM`: the gNB keeps its ports, the emulator
+binds the UE-facing ports +100 and the UE is pointed at them, e.g.
+
+```
+CHANEM="--model tdla --ds-ns 30 --doppler-hz 5 --ppm 1 --delay-ns 500 \
+        --dl-snr-db 25 --ul-snr-db 25" scripts/lab.sh T1 --ping 20
+```
+
+The emulator log is `chanem.log` in the run directory (every 10 s: samples
+in/out, signal power, pace against real time, and the share of time spent
+waiting upstream / processing / waiting downstream). The emulator processes up
+to six blocks ahead of the downstream requests, per direction; the ZMQ
+transport aligns by sample count, so the added wall-clock latency does not
+move the radio timing. Lockstep ZMQ runs at whatever pace the slowest stage
+allows: a 2x2 fading link is the emulator's heaviest case and slows the whole
+system to ~0.3× real time, which the gNB and UE tolerate.
+
+Results 2026-11-15 (1 ppm, 500 ns, 25 dB SNR both ways, unless noted):
+
+| Config | Channel | Ping | UE DL TB ok/ko | gNB PUSCH ok/ko | UE tracking |
+|---|---|---|---|---|---|
+| T1 | TDL-A 30 ns, 5 Hz | 20/20 | 182/5 | 153/10 | drift +1.03 ppm, CFO −3414 Hz |
+| T1 | EPA, 5 Hz | 20/20 | 178/15 | 129/11 | drift +0.99 ppm |
+| T1 | TDL-C 300 ns, 10 Hz | 20/20 | 155/15 | 117/54 | — |
+| T5 | ideal 2x2, 0 ppm | 20/20 | 182/2 (61 two-layer PDSCHs, S28 pass) | — | — |
+| T5 | TDL-A 30 ns, 5 Hz, 2x2 | 20/20 | 119/14 (59 two-layer PDSCHs) | — | — |
+
+TDL-C at 300 ns reaches 2.6 µs, beyond the 2.3 µs cyclic prefix at 30 kHz:
+the late taps' inter-symbol interference shows in the uplink. The fading
+two-layer case misses S28's 10 % TB-failure limit (set for the clean channel)
+by a little; link adaptation, not the receiver, sets that rate.
 
 ## 6. Over-the-air addendum (L4)
 

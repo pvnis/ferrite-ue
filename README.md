@@ -164,6 +164,7 @@ ferrite-phy       signal processing: OFDM, sync (PSS/SSS/SSB/PBCH), PDCCH, PDSCH
                   PUSCH (CP-OFDM / DFT-s-OFDM), PUCCH F0-F3, PRACH, SRS, CSI,
                   LDPC / polar coding
 ferrite-radio     IQ transports (SampleSource / SampleSink): ZMQ, file, SDR [feature]
+                  and the ferrite-chanem fading channel emulator (ZMQ proxy)
 ferrite-fapi      the PHY <-> MAC interface (FAPI-style messages) and PhyConfig
 ferrite-l1        the slot engine: cell search, PDCCH monitoring, PDSCH + HARQ,
                   DCI -> grant resolution, UL timing, PRACH/PUSCH/PUCCH/SRS tx
@@ -178,7 +179,8 @@ ferrite-ue        the binary: config, engine wiring, stack glue, bearers, user p
 ```
 
 See `docs/ARCHITECTURE.md` for the layer contracts and state machines and
-`docs/TEST_PLAN.md` for the lab matrix (`scripts/lab.sh`).
+`docs/TEST_PLAN.md` for the lab matrix (`scripts/lab.sh`; `CHANEM="…"` runs
+it through the channel emulator, TEST_PLAN §5.2).
 
 ## Roadmap
 

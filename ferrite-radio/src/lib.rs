@@ -16,6 +16,7 @@
 
 use ferrite_common::{Error, Iq, Result};
 
+pub mod channel;
 pub mod file;
 pub mod impair;
 #[cfg(feature = "soapy")]

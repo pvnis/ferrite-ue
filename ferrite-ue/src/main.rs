@@ -51,9 +51,10 @@ fn main() {
         prach_offset: cfg.prach_offset,
         pacing: ul.pacing,
         ul_block_len: block_len,
+        // Always on: over ZMQ the estimate is exactly 0 Hz and the correction
+        // is skipped, unless a channel emulator or `--emulate-lo-ppm` adds one.
+        cfo_correction: true,
         // The emulated LO error impairs the frequency only, not the sample clock.
-        cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. })
-            || cfg.emulate_lo_ppm.is_some(),
         sro_from_cfo: !cfg.independent_lo && cfg.emulate_lo_ppm.is_none(),
         max_search_attempts: 0,
         rlm_outage: cfg.rlm_outage,

@@ -81,9 +81,13 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       OCUDU logs the raw `i2` as `pmi`), rank chosen by sum spectral
       efficiency with post-MMSE SINRs; the MAC keeps the multi-port rank
       across single-port TRS measurements. T5 S28: gNB receives `ri=2`, 82
-      two-layer PDSCHs in a 40 s run. Open: three/four layers, the SDR
-      two-channel receive path, and the Sionna RT / TS 38.901 channel
-      emulator (step 2).
+      two-layer PDSCHs in a 40 s run. Done 2026-11-15: the channel
+      emulator in Rust (`ferrite-chanem`: TDL-A/B/C, EPA/EVA/ETU fading per
+      antenna pair, delay, UE clock error, AWGN; `lab.sh CHANEM=…`, stage
+      S30): T5 keeps two layers through 2x2 TDL-A. Open: three/four layers,
+      the SDR two-channel receive path, CDL / Sionna RT ray-traced channels
+      (spatially correlated antennas), and a faster 2x2 fading path (the
+      emulator runs 2x2 TDL at ~0.3–0.6× real time).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC

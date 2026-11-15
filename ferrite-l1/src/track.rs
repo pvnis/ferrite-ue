@@ -42,8 +42,9 @@ pub struct TrackerConfig {
     pub timing_bandwidth_hz: f64,
     /// Time constant of the CFO filter (s).
     pub cfo_time_constant_s: f64,
-    /// Timing errors beyond this (samples) are taken at once (re-alignment
-    /// after a gap or a transport jump) instead of being filtered.
+    /// Timing errors beyond this (samples) are not filtered: two consecutive
+    /// ones that agree (a gap, a transport jump) re-align at once, a lone one
+    /// (a measurement in a deep fade) is dropped.
     pub coarse_limit: f64,
 }
 
@@ -65,8 +66,10 @@ impl TrackerConfig {
 pub struct TrackStats {
     /// One-sample anchor steps from the model.
     pub steps: u64,
-    /// Coarse re-alignments (errors beyond `coarse_limit`).
+    /// Coarse re-alignments (confirmed errors beyond `coarse_limit`).
     pub coarse: u64,
+    /// Lone timing errors beyond `coarse_limit`, dropped.
+    pub outliers: u64,
     pub timing_measurements: u64,
     pub cfo_measurements: u64,
 }
@@ -91,6 +94,8 @@ const FIRST_DT_S: f64 = 0.02;
 const STEP_THRESHOLD: f64 = 0.75;
 /// Plausibility limit on the loop's own rate state (ppm).
 const MAX_RATE_PPM: f64 = 50.0;
+/// Two coarse errors confirm each other within this (samples).
+const COARSE_AGREEMENT: f64 = 1.5;
 
 /// The tracker. See the module documentation.
 #[derive(Clone, Debug)]
@@ -107,6 +112,8 @@ pub struct SyncTracker {
     last_advance: Option<i64>,
     last_timing: Option<i64>,
     last_cfo: Option<i64>,
+    /// A coarse error waiting for confirmation.
+    pending_coarse: Option<f64>,
     stats: TrackStats,
 }
 
@@ -122,6 +129,7 @@ impl SyncTracker {
             last_advance: None,
             last_timing: None,
             last_cfo: None,
+            pending_coarse: None,
             stats: TrackStats::default(),
         }
     }
@@ -184,11 +192,21 @@ impl SyncTracker {
         let e = measured - (self.applied - tag.applied) as f64 - self.offset;
         let dt = Self::elapsed(self.cfg.fs, &mut self.last_timing, tag.at);
         if e.abs() > self.cfg.coarse_limit {
-            self.offset += e;
-            self.stats.coarse += 1;
-            log::info!("timing tracking: re-aligned by {e:.1} samples");
+            match self.pending_coarse.take() {
+                Some(p) if (p - e).abs() < COARSE_AGREEMENT => {
+                    self.offset += e;
+                    self.stats.coarse += 1;
+                    log::info!("timing tracking: re-aligned by {e:.1} samples");
+                }
+                _ => {
+                    self.pending_coarse = Some(e);
+                    self.stats.outliers += 1;
+                    log::debug!("timing tracking: {e:.1}-sample error held for confirmation");
+                }
+            }
             return;
         }
+        self.pending_coarse = None;
         let wn = std::f64::consts::TAU * self.cfg.timing_bandwidth_hz;
         let k1 = (2.0 * std::f64::consts::FRAC_1_SQRT_2 * wn * dt).min(0.5);
         let k2 = wn * wn * dt;
@@ -362,14 +380,32 @@ mod tests {
         assert!((t.offset() - before).abs() < 1e-9);
     }
 
-    /// A large error is taken at once and handed out as one step.
+    /// A large error confirmed by the next measurement is taken at once and
+    /// handed out as one step.
     #[test]
-    fn coarse_errors_realign_at_once() {
+    fn confirmed_coarse_errors_realign_at_once() {
         let mut t = SyncTracker::new(TrackerConfig::new(FS, FC), 0.0);
         t.advance(0);
         t.on_timing(tag(&t, 0), -12.0);
-        assert_eq!(t.advance(SLOT), -12);
+        assert_eq!(t.advance(SLOT), 0, "a lone error is held");
+        t.on_timing(tag(&t, SLOT), -11.6);
+        assert_eq!(t.advance(2 * SLOT), -12);
         assert_eq!(t.stats().coarse, 1);
         assert_eq!(t.applied(), -12);
+    }
+
+    /// A lone outlier (a DM-RS measurement in a fade) moves nothing, and a
+    /// good measurement in between cancels the pending one.
+    #[test]
+    fn lone_outliers_are_dropped() {
+        let mut t = SyncTracker::new(TrackerConfig::new(FS, FC), 0.0);
+        t.advance(0);
+        t.on_timing(tag(&t, 0), 4.3);
+        t.on_timing(tag(&t, SLOT), 0.0);
+        t.on_timing(tag(&t, 2 * SLOT), 4.1);
+        assert_eq!(t.advance(3 * SLOT), 0);
+        assert!(t.offset().abs() < 0.1, "offset {}", t.offset());
+        assert_eq!(t.stats().coarse, 0);
+        assert_eq!(t.stats().outliers, 2);
     }
 }

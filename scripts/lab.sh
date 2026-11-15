@@ -29,13 +29,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$ID" in
-  T1) CFG=gnb_zmq_tdd_n78_10mhz;       ARFCN=626000; SRATE=15.36;;
-  T2) CFG=gnb_zmq_tdd_n78_10mhz_dddsu; ARFCN=626000; SRATE=15.36;;
-  T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72;;
-  T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36;;
-  T5) CFG=gnb_zmq_tdd_n78_10mhz_2x2;   ARFCN=626000; SRATE=15.36; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102";;
-  F1) CFG=gnb_zmq_fdd_n3_10mhz;        ARFCN=368500; SRATE=11.52;;
-  F2) CFG=gnb_zmq_fdd_n3_20mhz;        ARFCN=368500; SRATE=23.04;;
+  T1) CFG=gnb_zmq_tdd_n78_10mhz;       ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
+  T2) CFG=gnb_zmq_tdd_n78_10mhz_dddsu; ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
+  T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72; DLF=3390; ULF=3390;;
+  T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
+  T5) CFG=gnb_zmq_tdd_n78_10mhz_2x2;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102";;
+  F1) CFG=gnb_zmq_fdd_n3_10mhz;        ARFCN=368500; SRATE=11.52; DLF=1842.5; ULF=1747.5;;
+  F2) CFG=gnb_zmq_fdd_n3_20mhz;        ARFCN=368500; SRATE=23.04; DLF=1842.5; ULF=1747.5;;
   *) echo "unknown config id $ID"; exit 2;;
 esac
 OUT="$ROOT/test/results/$ID-$(date +%Y%m%d-%H%M%S)"
@@ -44,6 +44,7 @@ echo "== $ID: $CFG → $OUT"
 
 cleanup() {
   [ -n "${UE_PID:-}" ] && kill "$UE_PID" 2>/dev/null
+  [ -n "${CHANEM_PID:-}" ] && kill "$CHANEM_PID" 2>/dev/null
   [ -n "${GNB_PID:-}" ] && kill "$GNB_PID" 2>/dev/null
   [ -n "${QCORE_PID:-}" ] && sudo kill "$QCORE_PID" 2>/dev/null
   # The sudo'd qcore is a grandchild: kill it by name so no stale core (with
@@ -56,7 +57,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Make sure nothing stale holds the ports.
-for p in $(pgrep -x gnb); do kill "$p" 2>/dev/null; done
+for p in $(pgrep -x gnb) $(pgrep -x ferrite-chanem); do kill "$p" 2>/dev/null; done
 [ "$CORE" = 1 ] && pgrep -x qcore >/dev/null && { sudo pkill -x qcore; sleep 1; }
 sleep 1
 
@@ -80,8 +81,26 @@ for _ in $(seq 1 30); do grep -q "gNB started" "$OUT/gnb.out" 2>/dev/null && bre
 grep -q "gNB started" "$OUT/gnb.out" || { echo "gNB did not start"; cat "$OUT/gnb.out" | tail -20; exit 1; }
 sleep 1
 
+# CHANEM="<ferrite-chanem options>": splice the channel emulator into the ZMQ
+# transport (gNB ports unchanged; the UE moves to ports +100), e.g.
+#   CHANEM="--model tdlc --ds-ns 300 --doppler-hz 5 --ppm 1 --delay-ns 500 --dl-snr-db 25 --ul-snr-db 25"
+UE_PORTS=()
+if [ -n "${CHANEM:-}" ]; then
+  ( cd "$ROOT" && cargo build --release -q -p ferrite-radio --features zmq --bin ferrite-chanem ) || { echo "chanem build failed"; exit 1; }
+  DL_UP=${UE_TX:-tcp://127.0.0.1:2100}
+  DL_BIND=$(echo "$DL_UP" | sed -E 's/:21([0-9][0-9])/:22\1/g')
+  # shellcheck disable=SC2086
+  "$ROOT/target/release/ferrite-chanem" --dl-up "$DL_UP" --dl-bind "$DL_BIND" \
+      --ul-up tcp://127.0.0.1:2201 --ul-bind tcp://127.0.0.1:2101 \
+      --srate "$SRATE" --dl-freq-mhz "$DLF" --ul-freq-mhz "$ULF" $CHANEM > "$OUT/chanem.log" 2>&1 &
+  CHANEM_PID=$!
+  sleep 0.5
+  kill -0 "$CHANEM_PID" 2>/dev/null || { echo "chanem did not start"; cat "$OUT/chanem.log"; exit 1; }
+  UE_TX=$DL_BIND
+  UE_PORTS=(--rx tcp://127.0.0.1:2201)
+fi
 ( cd "$ROOT" && RUST_LOG="${UE_LOG:-info}" cargo run --release -p ferrite-ue -q -- --dl-arfcn "$ARFCN" --srate "$SRATE" \
-    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_TX:+--tx "$UE_TX"} ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
+    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_TX:+--tx "$UE_TX"} "${UE_PORTS[@]}" ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
 UE_PID=$!
 # DL_PING=1: once the gNB has released the UE to idle, ping its IP from the
 # host (through qcore) so the network has to page it.
@@ -174,6 +193,23 @@ if grep -q "emulating a .* ppm LO error" "$UE"; then
     pass "S29 CFO tracking (DL $WANT Hz tracked as $GOT Hz, gNB sees UL at $UL Hz)"
   else
     fail "S29 CFO tracking (DL ${WANT:-?} Hz, tracked ${GOT:-?} Hz, gNB UL ${UL:-?} Hz, steps ${STEPS:-?})"
+  fi
+fi
+# S30: channel emulator (only with `CHANEM`): the emulator carried both
+# directions (its 10 s report lines; the last DL pace is shown), and when it
+# emulates a UE clock error (`--ppm`) the UE's sample-clock tracking converges
+# on it (drift within 0.1 ppm, from the UE's last `tracking:` line).
+if [ -n "${CHANEM:-}" ]; then
+  PACE=$(grep "^DL:.*pace" "$OUT/chanem.log" 2>/dev/null | tail -1 | grep -o "pace [0-9.]*" | awk '{print $2}')
+  ULOK=$(grep -c "^UL:.*pace" "$OUT/chanem.log" 2>/dev/null)
+  PPM=$(echo " $CHANEM " | grep -o -- " --ppm [-+0-9.e]*" | awk '{print $2}')
+  DRIFT=$(grep -o "drift [-+0-9.]* ppm" "$UE" | tail -1 | awk '{print $2}')
+  if [ -z "$PACE" ] || [ "${ULOK:-0}" -eq 0 ]; then
+    fail "S30 channel emulator (no traffic report in chanem.log)"
+  elif [ -n "$PPM" ] && ! awk -v w="$PPM" -v g="${DRIFT:-nan}" 'BEGIN {d=w-g; exit !(w==0 || (d<0.1 && d>-0.1))}'; then
+    fail "S30 channel emulator (clock error $PPM ppm, UE tracked ${DRIFT:-?} ppm)"
+  else
+    pass "S30 channel emulator ($CHANEM; pace ${PACE}x real time${DRIFT:+, UE drift $DRIFT ppm})"
   fi
 fi
 # S25: connected-mode DRX (only when the gNB config has a `drx` section): the

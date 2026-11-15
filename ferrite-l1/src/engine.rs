@@ -811,12 +811,13 @@ impl<'a> Engine<'a> {
             if slot.slot == 0 && slot.sfn == 0 {
                 let t = s.track.stats();
                 log::info!(
-                    "tracking: cfo {:.0} Hz, drift {:+.3} ppm, offset {:+.2} samples, {} steps, {} re-alignments ({} timing / {} CFO measurements)",
+                    "tracking: cfo {:.0} Hz, drift {:+.3} ppm, offset {:+.2} samples, {} steps, {} re-alignments, {} outliers ({} timing / {} CFO measurements)",
                     s.track.cfo_hz(),
                     s.track.drift_ppm(),
                     s.track.offset(),
                     t.steps,
                     t.coarse,
+                    t.outliers,
                     t.timing_measurements,
                     t.cfo_measurements
                 );

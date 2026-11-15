@@ -34,3 +34,8 @@ required-features = ["soapy"]
 [[example]]
 name = "tx_rx_cal"
 required-features = ["soapy"]
+
+# Channel emulator spliced into the ZMQ transport (test aid).
+[[bin]]
+name = "ferrite-chanem"
+required-features = ["zmq"]

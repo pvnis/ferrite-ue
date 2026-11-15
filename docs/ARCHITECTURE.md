@@ -107,6 +107,16 @@ samples (overflows) come out as zeros, and the shared `TimeBase` publishes the
 origin and the receive head to the transmit side. The L1 engine only sees
 sample indices; the pacing policy (`UlPacing`) is selected by the backend.
 
+`channel` is a test aid, not a backend: a multipath fading channel
+(`Link`) for the `ferrite-chanem` ZMQ proxy (TEST_PLAN §5.2). Per block it
+resamples (windowed-sinc, 1024 phases; the sample-clock error), filters with
+a per-antenna-pair FIR rebuilt every 64 samples from the faded TDL taps, mixes
+the carrier offset and adds noise. The proxy pulls each direction's upstream
+blocks in a fetcher thread, keeps the antenna ports sample-aligned when the
+transmitter's replies differ in length (carry-over buffers), and answers each
+downstream port from its own thread, so a reader that drains one port before
+the next never stalls the others.
+
 ## 4. L1 — the slot engine (ferrite-l1)
 
 `ferrite-l1` turns a sample stream into slot-synchronous FAPI messages for MAC
