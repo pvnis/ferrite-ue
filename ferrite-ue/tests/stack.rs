@@ -68,6 +68,8 @@ fn config() -> UeConfig {
         netns: None,
         timeout_s: 0,
         exit_after_ping: false,
+        independent_lo: false,
+        emulate_lo_ppm: None,
         tx_lead: 2,
         tx_rx_offset: 0,
         prach_offset: 0,

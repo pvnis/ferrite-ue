@@ -125,8 +125,8 @@ It is the only crate that knows about sample indices.
                                        tx-build thread ─▶ InjectionTable ─▶ UL serve thread
 ```
 
-T0 owns the slot clock: per DL slot it reads the samples, tracks timing/CFO on
-the SSB, runs the PDCCH monitor, hands PDSCH jobs to the worker, waits for the
+T0 owns the slot clock: per DL slot it reads the samples, tracks timing/CFO
+(§4.2b), runs the PDCCH monitor, hands PDSCH jobs to the worker, waits for the
 worker's results of earlier slots, then delivers `SLOT.indication` and applies
 the MAC's requests.
 
@@ -144,6 +144,35 @@ receive side, and skips (counts, logs) a block whose air time is nearer than the
 device's write-to-air latency budget (`--sdr-tx-latency-us`) instead of handing
 it over late. The RX→TX chain latency of a device is `--tx-rx-offset`,
 measured with the `tx_rx_cal` example (loopback burst).
+
+### 4.2b Synchronisation tracking (`track`)
+
+`SyncTracker` owns the CFO estimate and every move of the sample clock's
+anchor. It is fed, relative to what the anchor predicts:
+
+* at every SSB, the integer PSS position plus the fractional delay from the
+  SSS phase slope (`SsbMeasurement::delay_samples`), and the CP-correlation
+  CFO residual;
+* for every PDSCH that passes its CRC, the delay from the DM-RS phase rotation
+  four subcarriers apart (`pdsch::dmrs_delay`, unaffected by a second port in
+  the CDM group or a PRB-wise precoder) and the residual CFO from the rotation
+  between DM-RS symbols (`PdschLlrs::cfo_slope`).
+
+Each measurement carries a `SyncTag` (DL index, anchor steps applied so far,
+CFO removed from those samples), so results from the worker that arrive after
+a step are referred to the current anchor. Timing is a critically damped
+second-order loop (offset and drift, 0.5 Hz natural frequency) whose gains
+scale with the time between measurements, so the bandwidth does not depend on
+the scheduling; the CFO is a first-order filter (100 ms). When LO and sample
+clock share a reference (`--independent-lo` says otherwise), the drift is fed
+forward as `−CFO/f_c · f_s` samples per second, and the loop's own rate state
+only takes the remainder. `advance()` integrates the drift once per slot and
+hands out one-sample anchor steps when the modelled offset passes ¾ of a
+sample; errors beyond 3 samples (a gap, a transport jump) are taken at once.
+Downlink and uplink follow the same anchor, so the transmit timing drifts with
+the downlink in small steps. Every 10.24 s the engine logs a `tracking:` line
+with CFO, drift (ppm), offset and step counts. Over ZMQ every measurement is
+zero and no step is taken.
 
 ### 4.2a Receive gain (`agc`)
 

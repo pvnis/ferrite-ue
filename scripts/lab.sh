@@ -160,6 +160,22 @@ if grep -q "nof_antennas_dl: 2" "$ROOT/test/$CFG.yml" 2>/dev/null; then
   OK=$(grep -o "dl_tb_ok: [0-9]*" "$UE" | tail -1 | awk '{print $2}'); KO=$(grep -o "dl_tb_ko: [0-9]*" "$UE" | tail -1 | awk '{print $2}')
   if [ "${L2:-0}" -gt 0 ] && [ "${OK:-0}" -gt 0 ] && [ $((KO * 10)) -le "$OK" ]; then pass "S28 two-layer PDSCH ($L2 scheduled, DL TB ok/ko $OK/$KO)"; else fail "S28 two-layer PDSCH (layers-2 $L2, DL TB ok/ko ${OK:-0}/${KO:-0})"; fi
 fi
+# S29: CFO tracking and uplink frequency pre-compensation (only when the UE
+# ran with an emulated LO error, `UE_ARGS="--emulate-lo-ppm 1"`): the UE's
+# tracked CFO matches the injected downlink offset within 50 Hz, the gNB
+# measures the UE's uplink within 50 Hz of its carrier (mean of its `cfo=`
+# reports), and the timing model takes no steps (the sample clock is ideal).
+if grep -q "emulating a .* ppm LO error" "$UE"; then
+  WANT=$(grep -o "emulating a .* ppm LO error: DL [-+0-9]* Hz" "$UE" | head -1 | awk '{print $(NF-1)}')
+  GOT=$(grep -o "tracking: cfo [-0-9]* Hz" "$UE" | tail -1 | awk '{print $3}')
+  UL=$(grep -o "cfo=[-+][0-9.]*Hz" "$OUT/gnb.log" 2>/dev/null | sed 's/cfo=//; s/Hz//' | awk '{n++; s+=$1} END {if (n) printf "%.1f", s/n}')
+  STEPS=$(grep -o "timing_steps: [0-9]*" "$UE" | tail -1 | awk '{print $2}')
+  if [ -n "$GOT" ] && [ -n "$UL" ] && awk -v w="$WANT" -v g="$GOT" -v u="$UL" 'BEGIN {d=w-g; exit !((d<50 && d>-50) && (u<50 && u>-50))}' && [ "${STEPS:-0}" -eq 0 ]; then
+    pass "S29 CFO tracking (DL $WANT Hz tracked as $GOT Hz, gNB sees UL at $UL Hz)"
+  else
+    fail "S29 CFO tracking (DL ${WANT:-?} Hz, tracked ${GOT:-?} Hz, gNB UL ${UL:-?} Hz, steps ${STEPS:-?})"
+  fi
+fi
 # S25: connected-mode DRX (only when the gNB config has a `drx` section): the
 # UE applies the DRX-Config, spends slots outside Active Time (no C-RNTI PDCCH
 # monitoring) and still completes the ping probe.

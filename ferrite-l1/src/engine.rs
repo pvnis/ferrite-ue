@@ -18,17 +18,18 @@
 
 use crate::cell::CellGeometry;
 use crate::config::{CsiRsResource, PhyConfig};
-use crate::dl::{DlMonitor, PdschJob, PdschWorker, WorkerConfig};
+use crate::dl::{DlMonitor, PdschJob, PdschSync, PdschWorker, WorkerConfig};
 use crate::fapi::*;
 use crate::radio::{serve_uplink, DlStream, UlPacing, UlServer, UlShared};
 use crate::rt::ReadyWaveform;
 use crate::timing::SampleClock;
+use crate::track::{SyncTag, SyncTracker, TrackerConfig};
 use crate::ul::UlBuilder;
 use ferrite_common::{DuplexMode, Error, Iq, Numerology, Result, SlotPoint};
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::coreset0::{self, Coreset0Config};
 use ferrite_phy::csi;
-use ferrite_phy::sync::scan::{gscn_scan, FrameTracker, FreqShifter};
+use ferrite_phy::sync::scan::{freq_shift, gscn_scan, FrameTracker, FreqShifter};
 use ferrite_phy::sync::search::CellSearcher;
 use ferrite_phy::sync::ssb::{self, SsbCase};
 use ferrite_phy::Ofdm;
@@ -56,6 +57,9 @@ pub struct EngineParams {
     pub ul_block_len: usize,
     /// Apply CFO correction to the data path (needed over the air).
     pub cfo_correction: bool,
+    /// The radio's LO and sample clock share one reference, so the measured
+    /// CFO predicts the sampling-rate drift (see [`crate::track`]).
+    pub sro_from_cfo: bool,
     /// Maximum cell-search attempts before giving up (0 = forever).
     pub max_search_attempts: u32,
     /// Test aid: `(start_s, duration_ms)` window after engine start during
@@ -100,12 +104,20 @@ pub enum EngineEvent {
 }
 
 enum TxCmd {
-    Ul(UlTtiRequest, SampleClock, i64, std::time::Instant),
+    /// UL_TTI request, the clock to place it with, the C-RNTI, when it was
+    /// queued, and the frequency pre-compensation (Hz) to apply.
+    Ul(UlTtiRequest, SampleClock, i64, std::time::Instant, f64),
     /// Every UL request queued before this one has been issued: once they
     /// are built, the injection table is final up to the given UL index.
     Mark(i64),
     Reconfigure(Box<(CellGeometry, PhyConfig, u16)>),
     Stop,
+}
+
+/// What the PDSCH worker sends back.
+enum WorkerOut {
+    Mac(PhyToMac),
+    Sync(PdschSync),
 }
 
 enum WorkerCmd {
@@ -130,7 +142,8 @@ struct Synced {
     ssb_case: SsbCase,
     i_ssb: u8,
     half_frame: u8,
-    cfo_hz: f64,
+    /// CFO, timing and drift tracking; every anchor step goes through it.
+    track: SyncTracker,
     ssb_period_ms: u16,
     /// Where the cell is in its life: SIB1 pending, common configuration
     /// (CSS only) or dedicated (RRC connected).
@@ -208,7 +221,7 @@ pub struct Engine<'a> {
     events: crossbeam_channel::Sender<EngineEvent>,
     tx_cmd: crossbeam_channel::Sender<TxCmd>,
     wk_cmd: crossbeam_channel::Sender<WorkerCmd>,
-    wk_res: crossbeam_channel::Receiver<PhyToMac>,
+    wk_res: crossbeam_channel::Receiver<WorkerOut>,
     /// Previous slot's samples per antenna (for negative timing slews).
     prev: Vec<Vec<Iq>>,
     prev_start: i64,
@@ -232,7 +245,10 @@ pub struct EngineStats {
     pub dcis: u64,
     pub pdsch_jobs: u64,
     pub late_ul: u64,
-    pub timing_slews: u64,
+    /// One-sample anchor steps from the tracking model.
+    pub timing_steps: u64,
+    /// Coarse timing re-alignments (errors beyond a few samples).
+    pub timing_realignments: u64,
     /// Out-of-sync indications sent to RRC.
     pub out_of_sync: u64,
 }
@@ -260,11 +276,12 @@ pub fn run(
     }
     let (tx_cmd, tx_rx) = crossbeam_channel::bounded::<TxCmd>(64);
     let (wk_cmd, wk_rx) = crossbeam_channel::bounded::<WorkerCmd>(8);
-    let (wk_res_tx, wk_res) = crossbeam_channel::bounded::<PhyToMac>(64);
+    let (wk_res_tx, wk_res) = crossbeam_channel::bounded::<WorkerOut>(64);
     // TX builder thread.
     {
         let shared = shared.clone();
         let ul_center_hz = params.ul_center_hz;
+        let fs = params.fs;
         std::thread::Builder::new()
             .name("ferrite-txbuild".into())
             .spawn(move || {
@@ -277,7 +294,7 @@ pub fn run(
                             let (geom, cfg, cell_id) = *b;
                             builder = Some(UlBuilder::new(geom, cfg, ul_center_hz, cell_id));
                         }
-                        TxCmd::Ul(req, clock, c, queued) => {
+                        TxCmd::Ul(req, clock, c, queued, ul_shift_hz) => {
                             let waited = queued.elapsed();
                             if waited.as_millis() >= 5 {
                                 log::warn!("UL request for slot {} waited {:.1} ms in the build queue", req.slot, waited.as_secs_f64() * 1e3);
@@ -293,7 +310,10 @@ pub fn run(
                                     UlTtiPdu::Srs { resource_id, power_dbm } => b.srs(&clock, req.slot, *resource_id, *power_dbm),
                                 };
                                 match built {
-                                    Ok(w) => {
+                                    Ok(mut w) => {
+                                        if ul_shift_hz != 0.0 {
+                                            w.samples = freq_shift(&w.samples, ul_shift_hz, fs, w.start.max(0) as usize);
+                                        }
                                         let took = t_build.elapsed();
                                         if took.as_millis() >= 2 {
                                             log::warn!("{} build for slot {} took {:.1} ms", w.tag, req.slot, took.as_secs_f64() * 1e3);
@@ -342,7 +362,7 @@ pub fn run(
                                             c.pmi,
                                             grids.len()
                                         );
-                                        let _ = wk_res_tx.send(PhyToMac::Csi(c));
+                                        let _ = wk_res_tx.send(WorkerOut::Mac(PhyToMac::Csi(c)));
                                     }
                                 }
                             }
@@ -372,13 +392,19 @@ pub fn run(
                                         failed()
                                     } else {
                                         if let Some(c) = w.measure_csi(job.slot, &grids) {
-                                            let _ = wk_res_tx.send(PhyToMac::Csi(c));
+                                            let _ = wk_res_tx.send(WorkerOut::Mac(PhyToMac::Csi(c)));
                                         }
-                                        w.decode(&job, &grids)
+                                        let r = w.decode(&job, &grids);
+                                        // Only a PDSCH that passed its CRC is
+                                        // trusted for tracking.
+                                        if let (Some(m), true) = (w.take_sync(), r.tb.is_some()) {
+                                            let _ = wk_res_tx.send(WorkerOut::Sync(m));
+                                        }
+                                        r
                                     }
                                 }
                             };
-                            if wk_res_tx.send(PhyToMac::RxData(r)).is_err() {
+                            if wk_res_tx.send(WorkerOut::Mac(PhyToMac::RxData(r))).is_err() {
                                 break;
                             }
                         }
@@ -600,7 +626,13 @@ impl<'a> Engine<'a> {
                 ssb_case,
                 i_ssb: acq.i_ssb,
                 half_frame: acq.half_frame,
-                cfo_hz: acq.cfo_hz,
+                track: SyncTracker::new(
+                    TrackerConfig {
+                        sro_from_cfo: self.params.sro_from_cfo,
+                        ..TrackerConfig::new(self.params.fs, self.params.dl_center_hz)
+                    },
+                    acq.cfo_hz,
+                ),
                 ssb_period_ms: 20,
                 phase: CellPhase::AwaitSib1,
             };
@@ -620,6 +652,41 @@ impl<'a> Engine<'a> {
             self.configure_threads(&synced);
             return Ok(Some(synced));
         }
+    }
+
+    /// One result from the PDSCH worker: FAPI indications go to MAC, DM-RS
+    /// measurements to the tracker.
+    fn worker_out(&mut self, s: &mut Synced, m: WorkerOut, outbox: &mut Vec<MacToPhy>) {
+        match m {
+            WorkerOut::Mac(m) => {
+                if matches!(m, PhyToMac::RxData(_)) {
+                    self.outstanding_jobs = self.outstanding_jobs.saturating_sub(1);
+                }
+                self.mac.handle(m, outbox);
+            }
+            WorkerOut::Sync(m) => {
+                if let Some(d) = m.delay_samples {
+                    s.track.on_timing(m.tag, d);
+                }
+                if let Some(c) = m.cfo_residual_hz {
+                    s.track.on_cfo(m.tag, c);
+                }
+            }
+        }
+    }
+
+    /// Uplink frequency pre-compensation (Hz). The downlink arrives `cfo`
+    /// above where the UE's LO expects it, i.e. the LO (and the transmit
+    /// chain derived from the same reference) is low by `cfo / f_DL`; shifting
+    /// the uplink baseband up by `cfo · f_UL / f_DL` puts the transmission on
+    /// the network's carrier, as TS 38.101-1 §6.4.1 requires (±0.1 ppm of the
+    /// received downlink). Not applied where the data path is not corrected
+    /// either (the ZMQ transport has no LO).
+    fn ul_frequency_correction(&self, s: &Synced) -> f64 {
+        if !self.params.cfo_correction || self.params.dl_center_hz <= 0.0 {
+            return 0.0;
+        }
+        s.track.cfo_hz() * self.params.ul_center_hz / self.params.dl_center_hz
     }
 
     fn configure_threads(&mut self, s: &Synced) {
@@ -739,8 +806,41 @@ impl<'a> Engine<'a> {
             if self.stopped() {
                 return Ok(false);
             }
+            // The drift model moves the anchor in whole samples.
+            let step = s.track.advance(s.clock.dl_index(slot));
+            if slot.slot == 0 && slot.sfn == 0 {
+                let t = s.track.stats();
+                log::info!(
+                    "tracking: cfo {:.0} Hz, drift {:+.3} ppm, offset {:+.2} samples, {} steps, {} re-alignments ({} timing / {} CFO measurements)",
+                    s.track.cfo_hz(),
+                    s.track.drift_ppm(),
+                    s.track.offset(),
+                    t.steps,
+                    t.coarse,
+                    t.timing_measurements,
+                    t.cfo_measurements
+                );
+            }
+            if step != 0 {
+                if step.abs() == 1 {
+                    self.stats.timing_steps += 1;
+                } else {
+                    self.stats.timing_realignments += 1;
+                }
+                s.clock.slew(step);
+                log::debug!(
+                    "timing step {step:+} at {slot} (drift {:+.3} ppm, cfo {:.0} Hz)",
+                    s.track.drift_ppm(),
+                    s.track.cfo_hz()
+                );
+            }
             let start = s.clock.dl_index(slot);
             self.read_slot(start, sps as usize, &mut samples)?;
+            let tag = SyncTag {
+                at: start,
+                applied: s.track.applied(),
+                cfo_removed_hz: 0.0,
+            };
             if slot.slot == 0 {
                 // Keep the anchor within half an SFN cycle of the current slot
                 // (slot differences are modular over 1024 frames).
@@ -754,7 +854,8 @@ impl<'a> Engine<'a> {
             {
                 let in_slot = (ssb_off_in_frame % sps) as usize;
                 self.agc_step(&samples[0], Some(slot.index()));
-                let sh = FreqShifter::new(-s.geom.ssb_df_hz - s.cfo_hz, fs, sps as usize);
+                let ssb_cfo = s.track.cfo_hz();
+                let sh = FreqShifter::new(-s.geom.ssb_df_hz - ssb_cfo, fs, sps as usize);
                 sh.shift_into(&samples[0], start as usize, &mut shifted);
                 let cp =
                     ofdm_ssb.cp_len(ssb_first_symbol % (14 << s.ssb_case.mu()), s.ssb_case.mu());
@@ -764,12 +865,14 @@ impl<'a> Engine<'a> {
                 let mut ssb_sinr: Option<f32> = None;
                 match searcher.search_near(&shifted, (s.cell_id % 3) as u8, lo..hi) {
                     Some(r) if r.pss_metric > 0.3 && r.cell_id == s.cell_id => {
-                        let err = r.timing_index as i64 - expect as i64;
-                        if err != 0 {
-                            s.clock.slew(err);
-                            self.stats.timing_slews += 1;
-                        }
-                        s.cfo_hz = 0.9 * s.cfo_hz + 0.1 * (s.cfo_hz + r.cfo_hz);
+                        // Integer PSS position; the SSS phase slope adds the
+                        // fraction when the SSB is measurable.
+                        let mut err = r.timing_index as f64 - expect as f64;
+                        let ssb_tag = SyncTag {
+                            cfo_removed_hz: ssb_cfo,
+                            ..tag
+                        };
+                        s.track.on_cfo(ssb_tag, r.cfo_hz);
                         rlm = RlmState::InSync;
                         // Found but not measurable: treat as a strong SSB.
                         ssb_sinr = Some(f32::INFINITY);
@@ -782,6 +885,9 @@ impl<'a> Engine<'a> {
                             r.n_id_2,
                         ) {
                             ssb_sinr = Some(m.sinr_db());
+                            if m.delay_samples.abs() < 2.0 {
+                                err += f64::from(m.delay_samples);
+                            }
                             let _ = self.events.try_send(EngineEvent::Measurement {
                                 pci: s.cell_id,
                                 slot,
@@ -791,6 +897,7 @@ impl<'a> Engine<'a> {
                                 rx_gain_db: self.agc.as_ref().map_or(0.0, |a| a.gain_db() as f32),
                             });
                         }
+                        s.track.on_timing(tag, err);
                     }
                     _ => {
                         rlm = rlm.miss();
@@ -818,22 +925,19 @@ impl<'a> Engine<'a> {
                 }
             }
             // --- CFO correction for the data path (every antenna shares the LO).
-            let arc_samples: Arc<Vec<Vec<Iq>>> = if self.params.cfo_correction
-                && s.cfo_hz.abs() > 1.0
-            {
-                if shifter
-                    .as_ref()
-                    .is_none_or(|f| (f.shift_hz() + s.cfo_hz).abs() > 0.5)
-                {
-                    shifter = Some(FreqShifter::new(-s.cfo_hz, fs, sps as usize));
-                }
+            let cfo = s.track.cfo_hz();
+            let mut data_tag = tag;
+            let arc_samples: Arc<Vec<Vec<Iq>>> = if self.params.cfo_correction && cfo.abs() > 1.0 {
+                let sh = match shifter.take() {
+                    Some(f) if (f.shift_hz() + cfo).abs() <= 0.5 => f,
+                    _ => FreqShifter::new(-cfo, fs, sps as usize),
+                };
+                data_tag.cfo_removed_hz = -sh.shift_hz();
                 shifted_all.resize_with(samples.len(), Vec::new);
-                for (a, sa) in samples.iter().enumerate() {
-                    shifter
-                        .as_ref()
-                        .unwrap()
-                        .shift_into(sa, start as usize, &mut shifted_all[a]);
+                for (sa, out) in samples.iter().zip(shifted_all.iter_mut()) {
+                    sh.shift_into(sa, start as usize, out);
                 }
+                shifter = Some(sh);
                 Arc::new(shifted_all.clone())
             } else {
                 Arc::new(samples.clone())
@@ -850,12 +954,7 @@ impl<'a> Engine<'a> {
                     .wk_res
                     .recv_timeout(std::time::Duration::from_millis(20))
                 {
-                    Ok(m) => {
-                        if matches!(m, PhyToMac::RxData(_)) {
-                            self.outstanding_jobs -= 1;
-                        }
-                        self.mac.handle(m, &mut outbox);
-                    }
+                    Ok(m) => self.worker_out(s, m, &mut outbox),
                     Err(_) => {
                         log::warn!(
                             "{} PDSCH result(s) still outstanding at slot {slot}",
@@ -925,6 +1024,7 @@ impl<'a> Engine<'a> {
                     grant: g,
                     skip_decode: false,
                     queued: std::time::Instant::now(),
+                    sync: data_tag,
                 };
                 if self.wk_cmd.try_send(WorkerCmd::Job(job)).is_err() {
                     log::warn!("PDSCH worker queue full: slot {slot} dropped");
@@ -938,10 +1038,7 @@ impl<'a> Engine<'a> {
 
             // --- Worker results.
             while let Ok(m) = self.wk_res.try_recv() {
-                if matches!(m, PhyToMac::RxData(_)) {
-                    self.outstanding_jobs = self.outstanding_jobs.saturating_sub(1);
-                }
-                self.mac.handle(m, &mut outbox);
+                self.worker_out(s, m, &mut outbox);
             }
             self.drain_outbox(s, &mut outbox, slot)?;
 
@@ -1118,9 +1215,16 @@ impl<'a> Engine<'a> {
                             );
                         }
                     }
+                    let ul_shift_hz = self.ul_frequency_correction(s);
                     if self
                         .tx_cmd
-                        .try_send(TxCmd::Ul(req, clock, crnti, std::time::Instant::now()))
+                        .try_send(TxCmd::Ul(
+                            req,
+                            clock,
+                            crnti,
+                            std::time::Instant::now(),
+                            ul_shift_hz,
+                        ))
                         .is_err()
                     {
                         self.stats.late_ul += 1;

@@ -323,11 +323,14 @@ CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
       in the SSB measurement for the dBm conversion. Open: a dBm calibration
       constant per device (`--rx-power-offset-db`), and gain changes within a
       slot are not compensated in the channel estimate (the hold time covers it).
-- [ ] Connected-mode CFO and timing tracking beyond the SSB loop: the engine
-      already re-anchors timing and filters the CFO on every SSB period
-      (`slot_loop` SSB branch, ±96-sample search, 0.9/0.1 CFO IIR); open are a
-      finer estimate from PDSCH DM-RS between SSBs and a sampling-rate-offset
-      (ppm) model instead of step slews.
+- [x] CFO and timing tracking (2026-11-15): `ferrite_l1::track::SyncTracker`,
+      fractional timing from the SSS phase slope at every SSB and from the
+      PDSCH DM-RS (delay and inter-symbol CFO) of every CRC-passed PDSCH,
+      second-order timing loop with the drift (ppm) fed forward from the CFO,
+      one-sample anchor steps instead of per-measurement slews. Open: the
+      first-path vs mean-delay bias in a multipath channel (the loop centres
+      the window on the mean delay), CSI-RS/TRS as a measurement source, and
+      a Doppler-aware CFO filter for mobility.
 - [ ] Two-channel SDR receive for MIMO (`SoapyRadio::streams` opens channel 0;
       a multi-channel stream delivers all antennas in one read, so `DlStream`
       needs a fan-out source rather than one drain thread per antenna).

@@ -159,6 +159,30 @@ impl UlSink for ZmqUlSink {
     }
 }
 
+/// Test aid: a sink whose every block is shifted by a fixed frequency
+/// (phase-continuous over the UL index), standing in for a transmit LO error
+/// over an ideal transport (see `ferrite_radio::impair`).
+pub struct MixedUlSink {
+    pub inner: Box<dyn UlSink + Send>,
+    pub shift_hz: f64,
+    pub fs: f64,
+}
+
+impl UlSink for MixedUlSink {
+    fn serve_block(
+        &mut self,
+        counter: &mut u64,
+        block: &mut [Iq],
+        fill: &mut dyn FnMut(u64, &mut [Iq]),
+    ) -> Result<bool> {
+        let (shift, fs) = (self.shift_hz, self.fs);
+        self.inner.serve_block(counter, block, &mut |c, b| {
+            fill(c, b);
+            ferrite_radio::impair::mix(b, shift, fs, c);
+        })
+    }
+}
+
 /// An untimed push sink: write a full block each call; the device FIFO paces
 /// us. Only for sinks without a device time base (a file, a loopback); a real
 /// SDR uses [`TimedPushUlSink`].

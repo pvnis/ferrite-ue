@@ -51,7 +51,10 @@ fn main() {
         prach_offset: cfg.prach_offset,
         pacing: ul.pacing,
         ul_block_len: block_len,
-        cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. }),
+        // The emulated LO error impairs the frequency only, not the sample clock.
+        cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. })
+            || cfg.emulate_lo_ppm.is_some(),
+        sro_from_cfo: !cfg.independent_lo && cfg.emulate_lo_ppm.is_none(),
         max_search_attempts: 0,
         rlm_outage: cfg.rlm_outage,
     };
@@ -179,8 +182,18 @@ fn open_radio(
             let chans = tx
                 .iter()
                 .map(|ep| {
-                    ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000)
-                        .map(|src| BufferedStream::spawn(src, block_len))
+                    ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000).map(|src| {
+                        match cfg.emulate_lo_ppm {
+                            Some(ppm) => BufferedStream::spawn(
+                                ferrite_radio::impair::FrequencyOffset::new(
+                                    src,
+                                    -ppm * 1e-6 * cfg.dl_center_hz,
+                                ),
+                                block_len,
+                            ),
+                            None => BufferedStream::spawn(src, block_len),
+                        }
+                    })
                 })
                 .collect::<ferrite_common::Result<Vec<BufferedStream>>>()?;
             if chans.is_empty() {
@@ -190,10 +203,24 @@ fn open_radio(
             }
             log::info!("DL: {} receive antenna(s) {:?}", chans.len(), tx);
             let sink = ferrite_radio::zmq::ZmqSink::bind(rx, cfg.fs, block_len)?;
+            let mut ul_sink: Box<dyn ferrite_l1::radio::UlSink + Send> =
+                Box::new(ferrite_l1::radio::ZmqUlSink(sink));
+            if let Some(ppm) = cfg.emulate_lo_ppm {
+                log::warn!(
+                    "emulating a {ppm} ppm LO error: DL {:+.0} Hz, UL {:+.0} Hz",
+                    -ppm * 1e-6 * cfg.dl_center_hz,
+                    ppm * 1e-6 * cfg.ul_center_hz
+                );
+                ul_sink = Box::new(ferrite_l1::radio::MixedUlSink {
+                    inner: ul_sink,
+                    shift_hz: ppm * 1e-6 * cfg.ul_center_hz,
+                    fs: cfg.fs,
+                });
+            }
             Ok((
                 ferrite_l1::radio::DlStream::new(chans),
                 UlServer {
-                    sink: Box::new(ferrite_l1::radio::ZmqUlSink(sink)),
+                    sink: ul_sink,
                     pacing: UlPacing::Lockstep { pace_us: slot_us },
                     tx_rx_offset: cfg.tx_rx_offset,
                     block_len,

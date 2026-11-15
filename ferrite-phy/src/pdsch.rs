@@ -522,6 +522,61 @@ pub fn extract_pdsch(
     }
 }
 
+/// Mean delay of the channel relative to the FFT window, measured on the
+/// PDSCH DM-RS (type 1, CDM group `cdm_group`, every DM-RS symbol and every
+/// receive antenna of `grids[antenna][symbol]`).
+///
+/// A delay τ (in samples at FFT size `fft_size`, positive = the signal arrives
+/// later than the window assumes) rotates subcarrier k by e^{−j2πkτ/N}. The
+/// estimate correlates DM-RS REs four subcarriers apart within each RB: they
+/// carry the same frequency OCC sign, so the products are unaffected by a
+/// second port in the CDM group, and a PRB-wise precoder cancels. The range
+/// is ±N/8 samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelDelay {
+    /// Delay in samples.
+    pub samples: f32,
+    /// |Σ products| / Σ |products|, 1 for a clean single-path channel.
+    pub coherence: f32,
+}
+
+/// See [`ChannelDelay`]. `None` without DM-RS energy.
+pub fn dmrs_delay(
+    grids: &[Vec<Vec<Complex32>>],
+    sc_to_bin: impl Fn(usize) -> usize,
+    alloc: &PdschAlloc,
+    slot: u32,
+    cdm_group: usize,
+    fft_size: usize,
+) -> Option<ChannelDelay> {
+    let prb = alloc.prbs();
+    let seq_base = alloc.dmrs_seq_base();
+    let ref_len = seq_base + 6 * (prb.iter().copied().max()? + 1);
+    let mut acc = Complex32::new(0.0, 0.0);
+    let mut mag = 0f32;
+    for &l in &alloc.dmrs_symbols {
+        let full_ref =
+            pdsch_dmrs_sequence(alloc.scrambling_id, alloc.n_scid, slot, l as u32, ref_len);
+        for grid in grids.iter().filter_map(|a| a.get(l)) {
+            for &p in &prb {
+                let z: [Complex32; 6] = std::array::from_fn(|j| {
+                    grid[sc_to_bin(12 * p + 2 * j + cdm_group)]
+                        * full_ref[seq_base + 6 * p + j].conj()
+                });
+                for (a, b) in z.iter().zip(&z[2..]) {
+                    let c = b * a.conj();
+                    acc += c;
+                    mag += c.norm();
+                }
+            }
+        }
+    }
+    (mag > 0.0).then(|| ChannelDelay {
+        samples: -acc.arg() * fft_size as f32 / (4.0 * TAU),
+        coherence: acc.norm() / mag,
+    })
+}
+
 /// Invert a 2×2 complex matrix given as `[[a, b], [c, d]]` (row major).
 fn inv2(m: [[Complex32; 2]; 2]) -> Option<[[Complex32; 2]; 2]> {
     let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
@@ -805,6 +860,50 @@ pub fn descramble_llrs(llrs: &mut [f32], c_init: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A fractional delay on the DM-RS of a two-port, two-antenna PDSCH is
+    /// measured in samples, whatever the per-RB channel phase.
+    #[test]
+    fn dmrs_delay_measures_a_fractional_delay() {
+        let (cell_id, slot, n_rb, n_fft) = (42u16, 3u32, 12usize, 512usize);
+        let alloc = PdschAlloc {
+            rb_start: 0,
+            n_rb,
+            bwp_start_crb: 0,
+            dmrs_ref_crb: 0,
+            sym_start: 2,
+            n_sym: 12,
+            dmrs_symbols: vec![2, 11],
+            nof_cdm_groups_without_data: 1,
+            qm: 2,
+            vrb_to_prb: VrbToPrb::NonInterleaved,
+            n_scid: 0,
+            scrambling_id: cell_id,
+        };
+        for tau in [0.0f32, 0.4, -0.7, 3.25] {
+            let mut grids = vec![vec![vec![Complex32::new(0.0, 0.0); 12 * n_rb]; 14]; 2];
+            for &l in &alloc.dmrs_symbols {
+                let d = pdsch_dmrs_sequence(cell_id, 0, slot, l as u32, 6 * n_rb);
+                for p in 0..n_rb {
+                    // Per-RB (precoder) phase, two ports with OCC on k' = 1.
+                    let h0 = Complex32::from_polar(1.0, 0.7 * p as f32);
+                    let h1 = Complex32::from_polar(0.5, -1.1 * p as f32);
+                    for j in 0..6 {
+                        let k = 12 * p + 2 * j;
+                        let occ = if j % 2 == 1 { -1.0 } else { 1.0 };
+                        let ramp = Complex32::from_polar(1.0, -TAU * k as f32 * tau / n_fft as f32);
+                        for (a, g) in grids.iter_mut().enumerate() {
+                            let x = d[6 * p + j] * (h0 + occ * h1 * (a as f32 + 1.0));
+                            g[l][k] = x * ramp;
+                        }
+                    }
+                }
+            }
+            let m = dmrs_delay(&grids, |sc| sc, &alloc, slot, 0, n_fft).unwrap();
+            assert!((m.samples - tau).abs() < 0.01, "tau {tau}: {}", m.samples);
+            assert!(m.coherence > 0.99, "coherence {}", m.coherence);
+        }
+    }
+
     use super::*;
 
     #[test]

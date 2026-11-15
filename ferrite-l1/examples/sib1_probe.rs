@@ -114,6 +114,7 @@ fn main() {
         pacing: UlPacing::Lockstep { pace_us: slot_us },
         ul_block_len: block,
         cfo_correction: false,
+        sro_from_cfo: true,
         max_search_attempts: 10,
         rlm_outage: None,
     };

@@ -6,6 +6,7 @@ use crate::cell::CellGeometry;
 use crate::config::{CoresetConfig, PhyConfig, SearchSpaceConfig, SearchSpaceKind};
 use crate::fapi::*;
 use crate::resolve::DciResolver;
+use crate::track::SyncTag;
 use ferrite_common::{Iq, Rnti, RntiKind, SlotPoint};
 use ferrite_phy::coding::dci::{dci_decode, pdcch_descramble_llr};
 use ferrite_phy::coding::dlsch;
@@ -492,7 +493,26 @@ pub struct PdschJob {
     pub skip_decode: bool,
     /// When the engine queued the job (latency diagnostics).
     pub queued: std::time::Instant,
+    /// Sample-clock state when the slot was read (for the tracking measurement).
+    pub sync: SyncTag,
 }
+
+/// Synchronisation measurement from one PDSCH's DM-RS, for the tracker.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PdschSync {
+    pub tag: SyncTag,
+    /// Channel delay relative to the slot's anchor (samples).
+    pub delay_samples: Option<f64>,
+    /// CFO left after `tag.cfo_removed_hz` (Hz), from the phase rotation
+    /// between DM-RS symbols (needs two or more DM-RS symbols).
+    pub cfo_residual_hz: Option<f64>,
+}
+
+/// DM-RS delay estimates below this coherence are noise.
+const MIN_DELAY_COHERENCE: f32 = 0.5;
+/// Plausibility limits for one PDSCH's measurement.
+const MAX_DMRS_DELAY: f32 = 4.0;
+const MAX_DMRS_CFO_HZ: f64 = 2_000.0;
 
 /// What the worker needs from the configuration.
 #[derive(Clone)]
@@ -527,6 +547,8 @@ pub struct PdschWorker {
     comp: PhaseCompensation,
     buffers: HashMap<(RntiKind, u8), SoftBuffer>,
     pub max_iter: usize,
+    /// Tracking measurement of the last decoded PDSCH.
+    last_sync: Option<PdschSync>,
 }
 
 impl PdschWorker {
@@ -540,7 +562,13 @@ impl PdschWorker {
             cfg,
             buffers: HashMap::new(),
             max_iter: 12,
+            last_sync: None,
         }
+    }
+
+    /// The tracking measurement of the last [`Self::decode`] (taken once).
+    pub fn take_sync(&mut self) -> Option<PdschSync> {
+        self.last_sync.take()
     }
 
     pub fn reconfigure(&mut self, cfg: WorkerConfig) {
@@ -753,6 +781,26 @@ impl PdschWorker {
         } else {
             40.0
         };
+        let cdm_group = g.dmrs_ports.first().map_or(0, |p| usize::from(p / 2));
+        let delay = pdsch::dmrs_delay(
+            grids_all,
+            sc_to_bin,
+            &alloc,
+            slot_in_frame,
+            cdm_group,
+            self.ofdm.fft_size(),
+        )
+        .filter(|d| d.coherence >= MIN_DELAY_COHERENCE && d.samples.abs() < MAX_DMRS_DELAY);
+        // cfo_slope is rad per OFDM symbol; 14 · 1000 · 2^µ symbols per second.
+        let symbols_per_s = 14_000.0 * f64::from(1u32 << self.cfg.geom.numerology.mu);
+        let cfo = (alloc.dmrs_symbols.len() >= 2 && px.dmrs_metric >= 0.5)
+            .then(|| f64::from(px.cfo_slope) * symbols_per_s / std::f64::consts::TAU)
+            .filter(|c| c.abs() < MAX_DMRS_CFO_HZ);
+        self.last_sync = Some(PdschSync {
+            tag: job.sync,
+            delay_samples: delay.map(|d| f64::from(d.samples)),
+            cfo_residual_hz: cfo,
+        });
         log::debug!(
             "pdsch {:?} {} @{}: rb {}+{} (bwp {} ref {}) sym {}+{} dmrs {:?} cdm {} layers {} ports {:?} ant {} qm {} tbs {} data-re {} rm {} skipped {} of {} patterns dmrs-metric {:.2} evm {:.2} (extracted {:.2} ms after queueing)",
             g.rnti_kind, g.rnti.0, job.slot, alloc.rb_start, alloc.n_rb, bwp_start, dmrs_ref, alloc.sym_start, alloc.n_sym, alloc.dmrs_symbols, alloc.nof_cdm_groups_without_data, n_layers, g.dmrs_ports, grids_all.len(), alloc.qm, g.tbs_bits, px.llrs.len() / alloc.qm.max(1), rm_enabled, skipped.get(), patterns.len(), px.dmrs_metric, px.evm, job.queued.elapsed().as_secs_f64() * 1e3

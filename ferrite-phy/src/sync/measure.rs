@@ -31,6 +31,11 @@ pub struct SsbMeasurement {
     pub rssi: f32,
     /// SS-SINR (linear).
     pub sinr: f32,
+    /// Mean delay of the channel relative to the SSS FFT window, in samples
+    /// (positive: the signal arrives later than the window assumes), from the
+    /// phase rotation between adjacent SSS subcarriers. Unambiguous within
+    /// half an FFT length; the fractional part refines the integer PSS timing.
+    pub delay_samples: f32,
 }
 
 impl SsbMeasurement {
@@ -74,6 +79,10 @@ pub fn ssb_measure(
         h_sum += *y;
     }
     let h = h_sum / SSS_LEN as f32;
+    // A delay τ rotates subcarrier k by e^{−j2πkτ/N}: adjacent SSS REs differ
+    // by −2πτ/N.
+    let rot: Complex32 = ys.iter().zip(&ys[1..]).map(|(a, b)| b * a.conj()).sum();
+    let delay_samples = -rot.arg() * n as f32 / std::f32::consts::TAU;
     let rsrp = h.norm_sqr();
     let noise: f32 = ys.iter().map(|y| (y - h).norm_sqr()).sum::<f32>() / SSS_LEN as f32;
     let sinr = rsrp / noise.max(1e-30);
@@ -81,7 +90,12 @@ pub fn ssb_measure(
     let rssi: f32 = (0..12 * SSB_N_RB)
         .map(|k| grid[ssb_subcarrier_bin(k, n)].norm_sqr())
         .sum();
-    Some(SsbMeasurement { rsrp, rssi, sinr })
+    Some(SsbMeasurement {
+        rsrp,
+        rssi,
+        sinr,
+        delay_samples,
+    })
 }
 
 #[cfg(test)]
@@ -147,5 +161,38 @@ mod tests {
             "noisy sinr {} dB",
             m.sinr_db()
         );
+    }
+
+    /// A fractional delay of the SSS (a linear phase across the subcarriers,
+    /// i.e. a cyclic shift of the useful part) is measured in samples.
+    #[test]
+    fn measures_the_fractional_delay() {
+        let n = 256;
+        let ofdm = Ofdm::new(n);
+        let cp = ofdm.cp_len(1, 1);
+        let (n_id_1, n_id_2) = (77u16, 2u8);
+        for tau in [0.0f32, 0.3, -0.45, 1.7, -2.2] {
+            let grid: Vec<Complex32> = sss_grid(n_id_1, n_id_2, n)
+                .iter()
+                .enumerate()
+                .map(|(b, v)| {
+                    let f = if b < n / 2 {
+                        b as f32
+                    } else {
+                        b as f32 - n as f32
+                    };
+                    v * Complex32::from_polar(0.5, -std::f32::consts::TAU * f * tau / n as f32)
+                })
+                .collect();
+            let sym = ofdm.modulate_symbol(&grid, cp);
+            let mut samples = vec![Complex32::new(0.0, 0.0); 4 * (n + cp)];
+            samples[2 * (n + cp) + cp..3 * (n + cp)].copy_from_slice(&sym[cp..]);
+            let m = ssb_measure(&ofdm, &samples, cp, 1, n_id_1, n_id_2).unwrap();
+            assert!(
+                (m.delay_samples - tau).abs() < 0.01,
+                "tau {tau}: measured {}",
+                m.delay_samples
+            );
+        }
     }
 }

@@ -17,6 +17,7 @@
 use ferrite_common::{Error, Iq, Result};
 
 pub mod file;
+pub mod impair;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 pub mod time;

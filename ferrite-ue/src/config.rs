@@ -97,6 +97,17 @@ pub struct Cli {
     /// Exit as soon as the ping probe completes.
     #[arg(long)]
     pub exit_after_ping: bool,
+    /// The radio's LO is not derived from its sample clock: do not predict
+    /// the sampling-rate drift from the measured CFO (the timing loop then
+    /// learns it on its own, more slowly).
+    #[arg(long)]
+    pub independent_lo: bool,
+    /// Test aid (ZMQ only): emulate a UE local-oscillator error of this many
+    /// ppm, i.e. receive the downlink −ppm·f_DL and transmit the uplink
+    /// +ppm·f_UL off frequency. Turns on the CFO correction the ZMQ transport
+    /// normally skips; the sample clock is not impaired.
+    #[arg(long, allow_hyphen_values = true)]
+    pub emulate_lo_ppm: Option<f64>,
     /// UL slots of margin between MAC decisions and transmission.
     #[arg(long)]
     pub tx_lead: Option<u16>,
@@ -213,6 +224,10 @@ pub struct UeConfig {
     pub netns: Option<String>,
     pub timeout_s: u64,
     pub exit_after_ping: bool,
+    /// LO not locked to the sample clock (no CFO → drift feed-forward).
+    pub independent_lo: bool,
+    /// Test aid: emulated LO error (ppm) on the ZMQ transport.
+    pub emulate_lo_ppm: Option<f64>,
     pub tx_lead: u16,
     pub tx_rx_offset: i64,
     pub prach_offset: i64,
@@ -338,6 +353,8 @@ impl UeConfig {
             netns: cli.netns.clone().or(file.netns.clone()),
             timeout_s: pick!(timeout, 0),
             exit_after_ping: cli.exit_after_ping,
+            independent_lo: cli.independent_lo,
+            emulate_lo_ppm: cli.emulate_lo_ppm,
             tx_lead: pick!(tx_lead, 2),
             tx_rx_offset: pick!(tx_rx_offset, 0),
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
