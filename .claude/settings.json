@@ -19,7 +19,7 @@
     "deny": [
       "Bash(rm -rf*)"
     ]
-  }
+  },
   "hooks": {
     "PostToolUse": [
       {
