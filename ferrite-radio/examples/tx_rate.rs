@@ -1,8 +1,8 @@
 //! Measure the sustainable BladeRF TX sample rate, full-duplex (RX draining concurrently,
 //! like the live UE). Isolates the "TX underflow" question from cell search. Sweeps write
-//! block sizes. Run: cargo run -p ferrite-radio --example tx_rate --features seify -- <serial> [rate]
+//! block sizes. Run: cargo run -p ferrite-radio --example tx_rate --features soapy -- <serial> [rate]
 
-use ferrite_radio::seify::{SeifyConfig, SeifyRadio};
+use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::{SampleSink, SampleSource};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,8 +13,8 @@ fn main() {
     let serial = a.get(1).cloned().expect("usage: tx_rate <serial> [rate]");
     let fs: f64 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(30.72e6);
 
-    let radio = SeifyRadio::open(&SeifyConfig {
-        args: format!("driver=soapy,soapy_driver=bladerf,serial={serial}"),
+    let radio = SoapyRadio::open(&SoapyConfig {
+        args: format!("driver=bladerf,serial={serial}"),
         sample_rate: fs,
         frequency: 3414.99e6,
         rx_gain: 40.0,
@@ -51,9 +51,8 @@ fn main() {
         for _ in 0..20 {
             let mut o = 0;
             while o < blk {
-                match tx.write(&buf[o..]) {
-                    Ok(k) => o += k,
-                    Err(_) => {}
+                if let Ok(k) = tx.write(&buf[o..]) {
+                    o += k;
                 }
             }
         }
@@ -63,9 +62,8 @@ fn main() {
         while t0.elapsed().as_secs_f64() < 2.0 {
             let mut o = 0;
             while o < blk {
-                match tx.write(&buf[o..]) {
-                    Ok(k) => o += k,
-                    Err(_) => {}
+                if let Ok(k) = tx.write(&buf[o..]) {
+                    o += k;
                 }
             }
             written += blk as u64;

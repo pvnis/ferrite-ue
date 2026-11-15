@@ -5,14 +5,20 @@
 //! Backends live behind feature flags so the core builds without native libs:
 //!
 //! * [`file`] — read/write interleaved little-endian `f32` IQ (always available);
-//! * `soapy` (feature) — SoapySDR devices (M2SDR, BladeRF);
+//! * `soapy` (feature) — SoapySDR devices (LimeSDR, BladeRF, USRP, M2SDR);
 //! * `zmq` (feature) — a gNB exposing baseband over ZeroMQ.
+//!
+//! Time is counted in **samples** everywhere above this crate. A backend with a
+//! device time base reports the sample index of what it delivered
+//! ([`SampleSource::timestamp`]) and accepts timed bursts by sample index
+//! ([`SampleSink::write_at`]); converting to whatever unit the driver uses is
+//! the backend's business and happens once per buffer at the edge.
 
-use ferrite_common::{Iq, Result};
+use ferrite_common::{Error, Iq, Result};
 
 pub mod file;
-#[cfg(feature = "seify")]
-pub mod seify;
+#[cfg(feature = "soapy")]
+pub mod soapy;
 #[cfg(feature = "zmq")]
 pub mod zmq;
 
@@ -24,6 +30,13 @@ pub trait SampleSource {
     /// Fill `buf` with as many samples as available, returning the count
     /// written. A return of `0` indicates end-of-stream.
     fn read(&mut self, buf: &mut [Iq]) -> Result<usize>;
+
+    /// Device sample index of the first sample the last successful [`read`](Self::read)
+    /// delivered, when the backend has a device time base (an SDR). `None` for
+    /// backends without one (file, ZMQ), whose samples are simply contiguous.
+    fn timestamp(&self) -> Option<u64> {
+        None
+    }
 
     /// Read exactly `buf.len()` samples, returning `false` if the stream ended
     /// first.
@@ -47,6 +60,17 @@ pub trait SampleSink {
 
     /// Write `buf`, returning the number of samples accepted.
     fn write(&mut self, buf: &[Iq]) -> Result<usize>;
+
+    /// Write `buf` as (part of) a burst whose first sample goes on the air at device
+    /// sample index `at_sample` (the same time base as [`SampleSource::timestamp`]);
+    /// `end_burst` marks the last buffer of the burst. Backends without a device
+    /// time base do not support it.
+    fn write_at(&mut self, buf: &[Iq], at_sample: u64, end_burst: bool) -> Result<usize> {
+        let _ = (buf, at_sample, end_burst);
+        Err(Error::Radio(
+            "timed transmission is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// Serve one uplink block by pushing it to `sink`: zero `block`, let `fill` place this

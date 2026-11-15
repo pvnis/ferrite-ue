@@ -7,27 +7,26 @@ license.workspace = true
 [dependencies]
 ferrite-common.workspace = true
 num-complex.workspace = true
-seify = { version = "0.20.1", features = ["soapy", "dummy"], optional = true }
+soapysdr = { version = "0.5", optional = true }
 zmq = { version = "0.10", optional = true }
 
 [features]
 default = []
-# SoapySDR backend (LiteX-M2SDR, BladeRF, …). Requires libSoapySDR + libclang.
-soapy = []
+# SoapySDR backend (LimeSDR via LimeSuiteNG, BladeRF, USRP via UHD, M2SDR, …).
+# Requires libSoapySDR and pkg-config.
+soapy = ["dep:soapysdr"]
 # ZMQ IQ-transport backend, for a gNB exposing baseband over ZeroMQ
 # (srsRAN/OCUDU-compatible REQ/REP protocol).
 zmq = ["dep:zmq"]
-# SDR via seify (FutureSDR's HAL) over SoapySDR — BladeRF 2.0, USRP, M2SDR, …
-seify = ["dep:seify"]
 
 [[example]]
 name = "sdr_probe"
-required-features = ["seify"]
+required-features = ["soapy"]
 
 [[example]]
 name = "tx_verify"
-required-features = ["seify"]
+required-features = ["soapy"]
 
 [[example]]
 name = "tx_rate"
-required-features = ["seify"]
+required-features = ["soapy"]

@@ -3,9 +3,9 @@
 //! at the same frequency, with the tone ON vs OFF. A large ON−OFF delta ⇒ TX works (and the
 //! two antennas couple). Away from the gNB frequency so the gNB DL doesn't confound it.
 //!
-//! Run: cargo run -p ferrite-radio --example tx_verify --features seify -- <txSerial> <rxSerial> [freq_hz] [tx_gain]
+//! Run: cargo run -p ferrite-radio --example tx_verify --features soapy -- <txSerial> <rxSerial> [freq_hz] [tx_gain]
 
-use ferrite_radio::seify::{SeifyConfig, SeifyRadio};
+use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::{SampleSink, SampleSource};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +22,8 @@ fn main() {
     let tx_gain: f64 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(60.0);
     let fs = 30.72e6;
 
-    let txr = SeifyRadio::open(&SeifyConfig {
-        args: format!("driver=soapy,soapy_driver=bladerf,serial={tx_serial}"),
+    let txr = SoapyRadio::open(&SoapyConfig {
+        args: format!("driver=bladerf,serial={tx_serial}"),
         sample_rate: fs,
         frequency: freq,
         tx_gain,
@@ -31,8 +31,8 @@ fn main() {
         ..Default::default()
     })
     .expect("open TX device");
-    let rxr = SeifyRadio::open(&SeifyConfig {
-        args: format!("driver=soapy,soapy_driver=bladerf,serial={rx_serial}"),
+    let rxr = SoapyRadio::open(&SoapyConfig {
+        args: format!("driver=bladerf,serial={rx_serial}"),
         sample_rate: fs,
         frequency: freq,
         rx_gain: 50.0,
@@ -66,9 +66,8 @@ fn main() {
             }
             let mut off = 0;
             while off < block {
-                match tx.write(&buf[off..]) {
-                    Ok(k) => off += k,
-                    Err(_) => {}
+                if let Ok(k) = tx.write(&buf[off..]) {
+                    off += k;
                 }
             }
         }
@@ -76,7 +75,7 @@ fn main() {
 
     let mut rx = rxr.rx().expect("activate RX");
     // Measure RX power in a band around the tone (+1 MHz → FFT bin) with tone OFF then ON.
-    let measure = |rx: &mut ferrite_radio::seify::SeifyRx| -> f32 {
+    let measure = |rx: &mut ferrite_radio::soapy::SoapyRx| -> f32 {
         let block = 8192usize;
         let mut buf = vec![Complex32::default(); block];
         let mut sum = 0f64;

@@ -92,8 +92,14 @@ state beyond the arguments, generalised over `mu ∈ {0,1}` and any `fs`.
 ## 3. Radio transport (ferrite-radio)
 
 `SampleSource` / `SampleSink` traits; backends: ZMQ (gNB-compatible REQ/REP
-lockstep), file, SDR (seify, feature-gated). The L1 engine only sees sample
-indices; the lockstep pacing policy (`UlPacing`) is selected by the backend.
+lockstep), file, SDR (SoapySDR through the `soapysdr` crate, feature-gated).
+Time above this crate is counted in samples: a backend with a device time base
+reports the sample index of every delivered buffer (`SampleSource::timestamp`)
+and takes timed bursts by sample index (`SampleSink::write_at`); the SoapySDR
+backend converts to the library's nanoseconds once per buffer with SoapySDR's
+own algorithm and the rate the device reports, and checks at open time that
+the conversion is the identity. The L1 engine only sees sample indices; the
+lockstep pacing policy (`UlPacing`) is selected by the backend.
 
 ## 4. L1 — the slot engine (ferrite-l1)
 

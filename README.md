@@ -32,7 +32,7 @@ For 20 MHz, point the gNB at `test/gnb_zmq_20mhz.yml` and run the UE with
 | Numerology   | `mu = 1` → 30 kHz SCS, 500 µs slot                 |
 | Bandwidth    | 10 MHz (24 PRB, 15.36 MHz) or 20 MHz (51 PRB, 30.72 MHz) |
 | Transport    | ZMQ IQ (`complex<f32>` blocks), no-RF bring-up     |
-| Radio (OTA)  | LiteX-M2SDR / BladeRF via SoapySDR *(next)*         |
+| Radio (OTA)  | LimeSDR / BladeRF / USRP via SoapySDR *(next)*       |
 
 ## Quick start (ZMQ, against an OCUDU gNB + qcore)
 
@@ -201,7 +201,7 @@ so attach is TDD-pattern-agnostic — validated on `6D+S+3U` and `DDDSU` cells.
 0 % loss, repeatable.**
 
 **Milestone 4 — over the air** *(next)*
-SoapySDR backend (LiteX-M2SDR / BladeRF); the ZMQ lockstep's coordination jitter
+SoapySDR backend (LimeSDR XTRX / BladeRF); the ZMQ lockstep's coordination jitter
 goes away with a real radio clock.
 
 ## Build & test

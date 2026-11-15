@@ -297,8 +297,11 @@ CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
 
 ## Over the air (deferred until an SDR is on the bench)
 
-- [ ] Wire the SoapySDR (seify) backend into the `ferrite-ue` binary
-      (`--radio sdr`), with the free-running `UlPacing`.
+- [ ] Wire the SoapySDR backend into the `ferrite-ue` binary (`--radio sdr`),
+      with the free-running `UlPacing`, RX timestamps for overflow detection
+      and uplink bursts timed relative to the latest RX buffer. (seify was
+      dropped 2026-11-15: it exposes no RX timestamps and no Lime driver;
+      the `soapysdr` crate is used directly.)
 - [ ] UL power control: P0/alpha open loop, TPC accumulation, PRACH power
       ramping, PUCCH/PUSCH/SRS power per TS 38.213 §7.
 - [ ] Receive AGC.

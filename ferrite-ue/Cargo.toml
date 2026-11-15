@@ -6,8 +6,8 @@ license.workspace = true
 default-run = "ferrite-ue"
 
 [features]
-# Real-SDR radio backend (seify → SoapySDR). Off by default.
-sdr = ["ferrite-radio/seify"]
+# Real-SDR radio backend (SoapySDR). Off by default; needs libSoapySDR + pkg-config.
+sdr = ["ferrite-radio/soapy"]
 
 [dependencies]
 ferrite-common.workspace = true

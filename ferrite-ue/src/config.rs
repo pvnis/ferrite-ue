@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
 
-    /// Radio backend: `zmq` (gNB over ZeroMQ) or `sdr` (SoapySDR via seify).
+    /// Radio backend: `zmq` (gNB over ZeroMQ) or `sdr` (SoapySDR).
     #[arg(long)]
     pub radio: Option<String>,
     /// gNB downlink ZMQ endpoint(s), one per receive antenna, comma
@@ -23,7 +23,7 @@ pub struct Cli {
     /// gNB uplink ZMQ endpoint (the UE serves samples here).
     #[arg(long)]
     pub rx: Option<String>,
-    /// SDR device arguments (seify), e.g. `driver=soapy,soapy_driver=bladerf`.
+    /// SoapySDR device arguments, e.g. `driver=limesuiteng` or `driver=bladerf,serial=…`.
     #[arg(long)]
     pub sdr_args: Option<String>,
     #[arg(long)]
@@ -245,7 +245,7 @@ impl UeConfig {
                 rx: pick!(rx, "tcp://127.0.0.1:2101".into()),
             },
             "sdr" => RadioConfig::Sdr {
-                args: pick!(sdr_args, "driver=soapy".into()),
+                args: pick!(sdr_args, String::new()),
                 rx_gain: pick!(sdr_rx_gain, 50.0),
                 tx_gain: pick!(sdr_tx_gain, 50.0),
             },

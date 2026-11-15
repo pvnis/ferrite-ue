@@ -1,26 +1,27 @@
-//! Probe an SDR through seify: enumerate, open, configure, read a burst, report power.
+//! Probe an SDR through SoapySDR: enumerate, open, configure, stream for a while, report
+//! power, sample-index continuity (gaps = overflows) and the hardware time.
 //!
-//! De-risks the seify → SoapySDR → device path before wiring the SDR into the UE.
+//! De-risks the soapysdr → module → device path before wiring the SDR into the UE.
 //!
-//! Run (against the USRP on the LAN, for example):
-//!   cargo run -p ferrite-radio --example sdr_probe --features seify -- \
-//!       "driver=uhd,addr=128.178.122.165" 3.5e9 30.72e6 40
-//! Args: [device-args] [freq_hz] [sample_rate_hz] [rx_gain_db]  (all optional)
+//! Run (LimeSDR XTRX on PCIe, for example):
+//!   cargo run -p ferrite-radio --example sdr_probe --features soapy -- \
+//!       "driver=limesuiteng,addr=/dev/limepcie0" 3.5e9 15.36e6 40
+//! Args: [device-args] [freq_hz] [sample_rate_hz] [rx_gain_db] [record_file] [record_s]
 
-use ferrite_radio::seify::{SeifyConfig, SeifyRadio};
+use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::SampleSource;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
 
-    println!("=== seify::enumerate() ===");
-    match seify::enumerate() {
+    println!("=== SoapySDR devices ===");
+    match SoapyRadio::enumerate() {
         Ok(devs) if !devs.is_empty() => devs.iter().for_each(|d| println!("  {d}")),
         Ok(_) => println!("  (no devices found)"),
         Err(e) => println!("  enumerate error: {e}"),
     }
 
-    let cfg = SeifyConfig {
+    let cfg = SoapyConfig {
         args: a.get(1).cloned().unwrap_or_default(),
         frequency: a.get(2).and_then(|s| s.parse().ok()).unwrap_or(3.5e9),
         sample_rate: a.get(3).and_then(|s| s.parse().ok()).unwrap_or(30.72e6),
@@ -31,69 +32,84 @@ fn main() {
         "\n=== opening args={:?} freq={} Hz rate={} Hz rx_gain={} dB ===",
         cfg.args, cfg.frequency, cfg.sample_rate, cfg.rx_gain
     );
-    let radio = match SeifyRadio::open(&cfg) {
+    let radio = match SoapyRadio::open(&cfg) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("open failed: {e}");
             std::process::exit(1);
         }
     };
-    println!("opened OK; sample_rate = {} Hz", radio.sample_rate());
+    let (time_rate, source) = radio.time_rate();
+    println!(
+        "opened OK; device reports {} Hz; timestamps advance at {time_rate} Hz ({source:?}); hardware time {:?} samples",
+        radio.sample_rate(),
+        radio.hardware_time().ok()
+    );
 
-    let mut rx = radio.rx().expect("activate RX stream");
-    // Drain continuously for ~200 ms, tolerating transient overruns (the device FIFO fills
-    // while we're not reading; a single-shot read gives an unreliable few-hundred-sample power).
+    let mut rx = match radio.rx() {
+        Ok(rx) => rx,
+        Err(e) => {
+            eprintln!("RX stream failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Stream ~200 ms, checking that every buffer's sample index follows the previous one.
     let block = 8192;
     let mut blk = vec![num_complex::Complex32::default(); block];
-    let mut sum_pow = 0.0f64;
-    let mut peak = 0.0f32;
-    let mut got = 0usize;
-    let mut overruns = 0u32;
-    let want = (cfg.sample_rate * 200e-3) as usize; // ~200 ms of good samples
+    let (mut sum_pow, mut peak, mut got) = (0.0f64, 0.0f32, 0usize);
+    let (mut expected, mut gaps, mut gap_samples, mut first) = (None::<u64>, 0u32, 0u64, None);
+    let want = (radio.sample_rate() * 200e-3) as usize;
     while got < want {
-        match rx.read(&mut blk) {
+        let n = match rx.read(&mut blk) {
             Ok(0) => break,
-            Ok(n) => {
-                for c in &blk[..n] {
-                    sum_pow += c.norm_sqr() as f64;
-                    peak = peak.max(c.norm());
-                }
-                got += n;
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
             }
-            Err(_) => {
-                overruns += 1;
-                if overruns > 100000 {
-                    break;
+        };
+        if let Some(ts) = rx.timestamp() {
+            first.get_or_insert(ts);
+            if let Some(exp) = expected {
+                if ts != exp {
+                    gaps += 1;
+                    gap_samples += ts.abs_diff(exp);
                 }
             }
+            expected = Some(ts + n as u64);
         }
+        for c in &blk[..n] {
+            sum_pow += c.norm_sqr() as f64;
+            peak = peak.max(c.norm());
+        }
+        got += n;
     }
     let avg_pow = (sum_pow / got.max(1) as f64) as f32;
     println!(
-        "read {got} samples ({overruns} overruns); avg power {avg_pow:.3e} ({:.1} dBFS), peak {peak:.3}",
+        "read {got} samples; avg power {avg_pow:.3e} ({:.1} dBFS), peak {peak:.3}",
         10.0 * avg_pow.max(1e-30).log10()
     );
+    match first {
+        Some(f) => println!(
+            "timestamps: first {f}, {gaps} gaps totalling {gap_samples} samples, {} driver overflows",
+            rx.overflows()
+        ),
+        None => println!("timestamps: none (the module reports no stream time)"),
+    }
 
-    // Optional raw record: args[5]=output file, args[6]=seconds (default 1.0). Reads straight into
-    // RAM (no per-block work) so the SDR FIFO doesn't overrun, then writes once — a clean, gap-free
-    // capture for full offline cell-search + SIB1 decode. Interleaved f32 (re,im), no header.
+    // Optional raw record: args[5]=output file, args[6]=seconds (default 1.0). Reads straight
+    // into RAM so the SDR FIFO does not overrun, then writes once — a clean, gap-free capture
+    // for offline cell search + SIB1 decode. Interleaved f32 (re,im), no header.
     if let Some(out) = a.get(5) {
         use std::io::Write;
         let secs: f64 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(1.0);
-        let total = (cfg.sample_rate * secs) as usize;
+        let total = (radio.sample_rate() * secs) as usize;
         println!("recording {secs}s ({total} samples) to {out} ...");
         let mut rec: Vec<num_complex::Complex32> = Vec::with_capacity(total + block);
-        let mut ov = 0u64;
         while rec.len() < total {
             match rx.read(&mut blk) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => rec.extend_from_slice(&blk[..n]),
-                Err(_) => {
-                    ov += 1;
-                    if ov > 1_000_000 {
-                        break;
-                    }
-                }
             }
         }
         let mut bytes = Vec::with_capacity(rec.len() * 8);
@@ -101,9 +117,14 @@ fn main() {
             bytes.extend(c.re.to_le_bytes());
             bytes.extend(c.im.to_le_bytes());
         }
-        std::fs::File::create(out)
-            .and_then(|mut f| f.write_all(&bytes))
-            .expect("write recording");
-        println!("recorded {} samples ({ov} overruns) -> {out}", rec.len());
+        if let Err(e) = std::fs::File::create(out).and_then(|mut f| f.write_all(&bytes)) {
+            eprintln!("write {out}: {e}");
+            std::process::exit(1);
+        }
+        println!(
+            "recorded {} samples ({} overflows) -> {out}",
+            rec.len(),
+            rx.overflows()
+        );
     }
 }
