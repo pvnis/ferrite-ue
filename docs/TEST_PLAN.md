@@ -157,5 +157,43 @@ ta=…]`, `PUSCH: … crc=OK`).
 Same matrix with `--radio sdr --sdr-args driver=…` on the UE (binary built with `--features sdr`) and an RF gNB config.
 Additional checks: PRACH power ramping to detection, TA command > 0 applied,
 CFO tracking within ±100 Hz, AGC not saturating, sustained 10 min ping with
-< 1 % loss. The ZMQ-specific pacing/gating is not used in this mode; the radio
-clock paces the UE.
+< 1 % loss. The ZMQ-specific pacing is not used in this mode; the radio
+clock paces the UE (the commit-mark gate still bounds the uplink serve).
+
+### 6.1 Bring-up procedure (bench: LimeSDR XTRX as the UE, LimeSDR-Micro as the gNB)
+
+1. **gNB radio.** OCUDU's build carries `uhd`, `zmq` and `realtime_loopback`
+   radio plugins only. For a LimeSDR the UHD path needs the SoapySDR bridge
+   module for libuhd (`uhd-soapysdr` on Ubuntu; then `uhd_find_devices` lists
+   the Lime) and a `ru_sdr` block with `device_driver: uhd`, `device_args:
+   type=soapy,driver=limesuiteng,addr=/dev/limesdr_micro0`, `srate: 15.36`,
+   `otw_format: sc16`. Alternatively an OCUDU SoapySDR radio plugin.
+2. **UE device check.** `cargo run -p ferrite-radio --example sdr_probe
+   --features soapy --release -- "driver=limesuiteng,addr=/dev/limepcie0"
+   3.39e9 15.36e6 40`: timestamps must advance at the requested rate with no
+   gaps; note the time-rate source (the LimeSuiteNG module converts with the
+   requested rate while reporting 15 359 999 Hz).
+3. **RX→TX offset.** `cargo run -p ferrite-radio --example tx_rx_cal
+   --features soapy --release -- "driver=limesuiteng,addr=/dev/limepcie0"
+   3.39e9 15.36e6 55 55 6` (TX→RX coupling through the antennas or a padded
+   cable). Six runs must agree to the sample (XTRX: 68 samples at 15.36 MS/s);
+   pass the value as `--tx-rx-offset`. The gNB's TA command absorbs an error
+   here, but a wrong sign puts the PRACH outside the detector's window.
+4. **Gains and calibration.** Start with `--sdr-rx-gain 40` (the AGC takes
+   over: `AGC: receive gain a → b dB` in the log, settling near −22 dBFS on the
+   SSB slot) and `--sdr-tx-gain 30`. `--rx-power-offset-db` is the dBm of
+   full scale at 0 dB gain (sets the RSRP in measurement reports and the
+   pathloss); `--tx-power-offset-db` is the dBm of full scale at the TX gain
+   and enables uplink power control (debug log `UL power: PUSCH n RB → p dBm
+   (PL …, f …)`). Without it waveforms are peak-normalised to `ul_amplitude`.
+5. **Run.** `./target/release/ferrite-ue --radio sdr --sdr-args
+   "driver=limesuiteng,addr=/dev/limepcie0" --dl-arfcn 626000 --srate 15.36
+   --gscn <cell GSCN> --tx-rx-offset 68 --ping 10 --exit-after-ping --timeout
+   60`. The GSCN hint cuts a search attempt from ~1 s to tens of ms.
+6. **What to read.** UE: `uplink starts at`, no `uplink late by` lines after
+   start (raise `--sdr-tx-latency-us` if they recur), `cell found … CFO`, the
+   AGC lines, `timing_slews` in the final stats. gNB: `PRACH: … detected_preambles`
+   with `ta` ≈ the propagation delay, `PUSCH: … crc=OK`, `t_align` within a
+   few hundred ns, `TA_CMD` lines, and `epre` for the uplink level; its TPC
+   (`tpc=` in the UL grants) should settle at 1 (0 dB) once the UE's power is
+   right.

@@ -466,6 +466,13 @@ impl MacEntity {
                     power_offset_db: _,
                 } => {
                     let power_dbm = self.power.prach_dbm(self.ra.preamble_power_ramping_counter);
+                    if let Some(p) = power_dbm {
+                        log::debug!(
+                            "UL power: PRACH attempt {} → {p:.1} dBm (PL {:.1} dB)",
+                            self.ra.preamble_power_ramping_counter,
+                            self.power.pathloss_db()
+                        );
+                    }
                     phy.send(MacToPhy::UlTti(UlTtiRequest {
                         slot: occasion.slot,
                         pdus: vec![UlTtiPdu::Prach {
@@ -558,6 +565,14 @@ impl MacEntity {
             }
             self.stats.ul_tb += 1;
             let power_dbm = self.power.pusch_dbm(u32::from(p.grant.n_prb), false);
+            if let Some(pw) = power_dbm {
+                log::debug!(
+                    "UL power: PUSCH {} RB → {pw:.1} dBm (PL {:.1} dB, f {:.0} dB)",
+                    p.grant.n_prb,
+                    self.power.pathloss_db(),
+                    self.power.f_pusch_db()
+                );
+            }
             phy.send(MacToPhy::UlTti(UlTtiRequest {
                 slot: target,
                 pdus: vec![UlTtiPdu::Pusch {
