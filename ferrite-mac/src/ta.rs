@@ -102,6 +102,8 @@ mod tests {
         // Infinity: never expires.
         let mut inf = TimingAdvance::new(Numerology::KHZ30, 0);
         inf.apply_ce(31, s(0));
-        assert!(inf.aligned() && !inf.on_slot(s(100)));
+        // 100 slots later at 30 kHz (20 slots/frame) is SFN 5, slot 0.
+        let later = SlotPoint::new(Numerology::KHZ30, 5, 0);
+        assert!(inf.aligned() && !inf.on_slot(later));
     }
 }
