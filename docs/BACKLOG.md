@@ -311,8 +311,16 @@ CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
       plugin.
 - [ ] UL power control: P0/alpha open loop, TPC accumulation, PRACH power
       ramping, PUCCH/PUSCH/SRS power per TS 38.213 §7.
-- [ ] Receive AGC.
-- [ ] Connected-mode CFO and timing tracking beyond TA commands.
+- [x] Receive AGC (2026-11-15): `ferrite_radio::GainControl`, `ferrite_l1::agc`
+      on cell-search captures and SSB slots, device limits learned, gain carried
+      in the SSB measurement for the dBm conversion. Open: a dBm calibration
+      constant per device (`--rx-power-offset-db`), and gain changes within a
+      slot are not compensated in the channel estimate (the hold time covers it).
+- [ ] Connected-mode CFO and timing tracking beyond the SSB loop: the engine
+      already re-anchors timing and filters the CFO on every SSB period
+      (`slot_loop` SSB branch, ±96-sample search, 0.9/0.1 CFO IIR); open are a
+      finer estimate from PDSCH DM-RS between SSBs and a sampling-rate-offset
+      (ppm) model instead of step slews.
 - [ ] Two-channel SDR receive for MIMO (`SoapyRadio::streams` opens channel 0;
       a multi-channel stream delivers all antennas in one read, so `DlStream`
       needs a fan-out source rather than one drain thread per antenna).

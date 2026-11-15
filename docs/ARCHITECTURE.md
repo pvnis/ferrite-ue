@@ -145,6 +145,19 @@ device's write-to-air latency budget (`--sdr-tx-latency-us`) instead of handing
 it over late. The RX→TX chain latency of a device is `--tx-rx-offset`,
 measured with the `tx_rx_cal` example (loopback burst).
 
+### 4.2a Receive gain (`agc`)
+
+When the front end has a gain (`ferrite_radio::GainControl`, attached to the
+`DlStream`), the engine runs an AGC on downlink power only: every cell-search
+capture and every SSB slot (a downlink slot by definition; over TDD the uplink
+slots carry the UE's own leakage). It aims the mean slot power at −22 dBFS
+(OFDM peaks sit 10–12 dB higher), moves in whole dB outside a ±3 dB band, holds
+200 slots after a change so the tracking loops settle, and learns the device's
+real limits from what it applies (the XTRX advertises 49 dB and stops at 48).
+Every SSB measurement carries the gain in force, and the stack converts
+`dBm = dBFS − gain + rx_power_offset_db` (the dBm of full scale at 0 dB gain,
+a device constant; 0 over ZMQ).
+
 ### 4.3 L1 state
 
 ```

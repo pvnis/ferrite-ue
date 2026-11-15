@@ -74,6 +74,16 @@ pub trait SampleSink {
     }
 }
 
+/// Run-time receive gain of a device front end (an SDR); drives the L1 AGC.
+pub trait GainControl {
+    /// Receive gain range `(min, max)` in dB.
+    fn rx_gain_range(&self) -> (f64, f64);
+    /// The receive gain currently applied (dB).
+    fn rx_gain(&self) -> Result<f64>;
+    /// Apply a receive gain; returns the gain the device settled on.
+    fn set_rx_gain(&mut self, db: f64) -> Result<f64>;
+}
+
 /// Serve one uplink block by pushing it to `sink`: zero `block`, let `fill` place this
 /// block's waveforms at the absolute uplink position `*counter`, write the block, and
 /// advance `counter` by the number of samples the sink accepted.

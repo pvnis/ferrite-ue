@@ -15,6 +15,7 @@
 pub use ferrite_fapi as fapi;
 pub use ferrite_fapi::config;
 
+pub mod agc;
 pub(crate) mod cell;
 pub(crate) mod dl;
 pub mod engine;

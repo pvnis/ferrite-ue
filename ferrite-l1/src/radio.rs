@@ -24,7 +24,7 @@
 
 use ferrite_common::{Error, Iq, Result};
 use ferrite_radio::time::TimeBase;
-use ferrite_radio::SampleSink;
+use ferrite_radio::{GainControl, SampleSink};
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +38,8 @@ pub use crate::stream::BufferedStream;
 pub struct DlStream {
     chans: Vec<BufferedStream>,
     scratch: Vec<Iq>,
+    /// Receive gain of the front end, when it has one (drives the AGC).
+    gain: Option<Box<dyn GainControl + Send>>,
 }
 
 impl DlStream {
@@ -47,11 +49,22 @@ impl DlStream {
         Self {
             chans,
             scratch: Vec::new(),
+            gain: None,
         }
     }
 
     pub fn single(chan: BufferedStream) -> Self {
         Self::new(vec![chan])
+    }
+
+    /// Attach the front end's receive gain control.
+    pub fn with_gain_control(mut self, gain: Box<dyn GainControl + Send>) -> Self {
+        self.gain = Some(gain);
+        self
+    }
+
+    pub fn gain_control(&mut self) -> Option<&mut (dyn GainControl + Send + 'static)> {
+        self.gain.as_deref_mut()
     }
 
     pub fn nof_antennas(&self) -> usize {
@@ -219,7 +232,9 @@ impl<S: SampleSink> UlSink for TimedPushUlSink<S> {
         if due < earliest {
             // Jump to the first index that can still make it; the caller
             // re-checks its commit gate before the next fill.
-            let skip = earliest - due;
+            // Two blocks of slack: the receive head advances while we write,
+            // and a jump exactly to the edge makes the next block late again.
+            let skip = earliest - due + 2 * block.len() as u64;
             *counter += skip;
             if self.started {
                 self.late += 1;
@@ -431,7 +446,7 @@ mod tests {
         assert!(sink
             .serve_block(&mut counter, &mut block, &mut |_, _| {})
             .unwrap());
-        assert_eq!(counter, 600);
+        assert_eq!(counter, 616);
         assert!(sink.sink.writes.is_empty());
         // Second call: writes the block at device 10_600.. in 3-sample pieces.
         let mut seen = None;
@@ -441,12 +456,12 @@ mod tests {
                 b[2] = Iq::new(1.0, 0.0);
             })
             .unwrap());
-        assert_eq!(seen, Some(600));
-        assert_eq!(counter, 608);
+        assert_eq!(seen, Some(616));
+        assert_eq!(counter, 624);
         let w = &sink.sink.writes;
         assert_eq!(
             w.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-            vec![10_600, 10_603, 10_606]
+            vec![10_616, 10_619, 10_622]
         );
         assert_eq!(w[0].1[2], Iq::new(1.0, 0.0));
         assert_eq!(sink.late, 0);
@@ -467,8 +482,8 @@ mod tests {
         assert!(sink
             .serve_block(&mut counter, &mut block, &mut |_, _| {})
             .unwrap());
-        assert_eq!(counter, 1_050);
-        assert_eq!((sink.late, sink.skipped), (1, 150));
+        assert_eq!(counter, 1_070);
+        assert_eq!((sink.late, sink.skipped), (1, 170));
         assert_eq!(sink.sink.writes.len(), 1);
     }
 }

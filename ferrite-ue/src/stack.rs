@@ -192,19 +192,21 @@ impl Stack {
         self.mib = Some(mib);
     }
 
-    /// A serving-cell SSB measurement from the PHY (dBFS → dBm with the
-    /// configured receiver calibration) for the RRC measurement procedure.
+    /// A serving-cell SSB measurement from the PHY for the RRC measurement
+    /// procedure: dBFS at the applied receive gain → dBm with the configured
+    /// receiver calibration (the dBm of a full-scale signal at 0 dB gain).
     pub fn on_measurement(
         &mut self,
         pci: u16,
         slot: SlotPoint,
         rsrp_dbfs: f32,
+        rx_gain_db: f32,
         rsrq_db: f32,
         sinr_db: f32,
     ) {
         let m = ferrite_rrc::meas::CellMeasurement {
             pci,
-            rsrp_dbm: rsrp_dbfs + self.cfg.rx_power_offset_db,
+            rsrp_dbm: rsrp_dbfs - rx_gain_db + self.cfg.rx_power_offset_db,
             rsrq_db,
             sinr_db,
         };

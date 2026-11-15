@@ -74,8 +74,7 @@ fn main() {
     let mut stack = Stack::new(cfg.clone(), None);
     // MIB facts reach the stack through this channel (polled on the timeline thread).
     let (mib_tx, mib_rx) = crossbeam_channel::bounded::<MibInfo>(2);
-    let (meas_tx, meas_rx) =
-        crossbeam_channel::bounded::<(u16, ferrite_common::SlotPoint, f32, f32, f32)>(8);
+    let (meas_tx, meas_rx) = crossbeam_channel::bounded::<Measurement>(8);
     let reporter = {
         let ssb_scs_khz = cfg.ssb_scs_khz;
         let dl_center_hz = cfg.dl_center_hz;
@@ -113,9 +112,17 @@ fn main() {
                         rsrp_dbfs,
                         rsrq_db,
                         sinr_db,
+                        rx_gain_db,
                     } => {
-                        log::debug!("ssb measurement PCI {pci} @{slot}: rsrp {rsrp_dbfs:.1} dBFS rsrq {rsrq_db:.1} dB sinr {sinr_db:.1} dB");
-                        let _ = meas_tx.try_send((pci, slot, rsrp_dbfs, rsrq_db, sinr_db));
+                        log::debug!("ssb measurement PCI {pci} @{slot}: rsrp {rsrp_dbfs:.1} dBFS (gain {rx_gain_db} dB) rsrq {rsrq_db:.1} dB sinr {sinr_db:.1} dB");
+                        let _ = meas_tx.try_send(Measurement {
+                            pci,
+                            slot,
+                            rsrp_dbfs,
+                            rx_gain_db,
+                            rsrq_db,
+                            sinr_db,
+                        });
                     }
                     EngineEvent::SyncLost => log::warn!("sync lost"),
                     EngineEvent::Stopped => break,
@@ -231,10 +238,12 @@ fn open_radio(
             // sample, the transmit side stamps every block from it.
             let time = TimeBase::default();
             let (rx, tx) = radio.streams()?;
+            let gain = radio.rx_gain_control()?;
             let rx = Contiguous::new(rx, time.clone());
             let min_lead = (tx_latency_s * cfg.fs).round() as u64;
             Ok((
-                ferrite_l1::radio::DlStream::single(BufferedStream::spawn(rx, block_len)),
+                ferrite_l1::radio::DlStream::single(BufferedStream::spawn(rx, block_len))
+                    .with_gain_control(Box::new(gain)),
                 UlServer {
                     sink: Box::new(ferrite_l1::radio::TimedPushUlSink::new(tx, time, min_lead)),
                     pacing: UlPacing::FreeRunning,
@@ -257,6 +266,16 @@ fn ping_succeeded(stack: &Stack) -> bool {
         .is_some_and(|(_, received)| received > 0)
 }
 
+/// An SSB measurement on its way from the engine's reporter thread to the stack.
+struct Measurement {
+    pci: u16,
+    slot: ferrite_common::SlotPoint,
+    rsrp_dbfs: f32,
+    rx_gain_db: f32,
+    rsrq_db: f32,
+    sinr_db: f32,
+}
+
 /// Wraps the stack to print application events and stop the engine when done.
 struct Reporting<'a> {
     stack: &'a mut Stack,
@@ -264,7 +283,7 @@ struct Reporting<'a> {
     exit_after_ping: bool,
     done: bool,
     mib_rx: crossbeam_channel::Receiver<MibInfo>,
-    meas_rx: crossbeam_channel::Receiver<(u16, ferrite_common::SlotPoint, f32, f32, f32)>,
+    meas_rx: crossbeam_channel::Receiver<Measurement>,
     /// Set by Ctrl-C, the timeout or the ping probe: deregister, then stop.
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When the engine is stopped after the deregistration went out.
@@ -295,8 +314,15 @@ impl ferrite_fapi::MacHandler for Reporting<'_> {
                 let _ = self.cmd_tx.try_send(EngineCommand::Stop);
             }
         }
-        while let Ok((pci, slot, rsrp, rsrq, sinr)) = self.meas_rx.try_recv() {
-            self.stack.on_measurement(pci, slot, rsrp, rsrq, sinr);
+        while let Ok(m) = self.meas_rx.try_recv() {
+            self.stack.on_measurement(
+                m.pci,
+                m.slot,
+                m.rsrp_dbfs,
+                m.rx_gain_db,
+                m.rsrq_db,
+                m.sinr_db,
+            );
         }
         self.stack.handle(msg, phy);
         while let Some(ev) = self.stack.take_event() {

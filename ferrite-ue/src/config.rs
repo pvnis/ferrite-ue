@@ -114,9 +114,9 @@ pub struct Cli {
     /// PUSCH/PUCCH timing. Over the air the propagation delay does the same.
     #[arg(long, allow_hyphen_values = true)]
     pub prach_offset: Option<i64>,
-    /// Receiver power calibration: dB added to the PHY's dBFS measurements to
-    /// report dBm (SS-RSRP in measurement reports). 0 over ZMQ; the RX chain
-    /// gain (negated) over the air.
+    /// Receiver power calibration: the dBm of a full-scale (0 dBFS) signal
+    /// at 0 dB receive gain, so that SS-RSRP in dBm = dBFS − gain + this.
+    /// 0 over ZMQ (no gain); a device constant over the air.
     #[arg(long, allow_hyphen_values = true)]
     pub rx_power_offset_db: Option<f32>,
     /// Test aid: inject a radio link failure this many seconds after start

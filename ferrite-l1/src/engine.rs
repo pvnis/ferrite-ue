@@ -91,6 +91,9 @@ pub enum EngineEvent {
         rsrp_dbfs: f32,
         rsrq_db: f32,
         sinr_db: f32,
+        /// Receive gain applied at the time (dB; 0 without gain control), so the
+        /// stack can convert dBFS to dBm.
+        rx_gain_db: f32,
     },
     SyncLost,
     Stopped,
@@ -197,6 +200,8 @@ fn rlm_evaluate(ssb_sinr_db: Option<f32>) -> Option<bool> {
 pub struct Engine<'a> {
     pub params: EngineParams,
     dl: DlStream,
+    /// Receive AGC, when the front end has a gain.
+    agc: Option<crate::agc::Agc>,
     shared: Arc<UlShared>,
     mac: &'a mut dyn MacHandler,
     cmds: crossbeam_channel::Receiver<EngineCommand>,
@@ -384,6 +389,7 @@ pub fn run(
     }
     let mut eng = Engine {
         params,
+        agc: None,
         dl,
         shared,
         mac,
@@ -449,6 +455,34 @@ impl<'a> Engine<'a> {
 
     // --------------------------------------------------------------- search
 
+    /// Receive AGC on a downlink capture: measure, decide, apply.
+    fn agc_step(&mut self, samples: &[Iq], slot_index: Option<u64>) {
+        let Some(ctrl) = self.dl.gain_control() else {
+            return;
+        };
+        let agc = self.agc.get_or_insert_with(|| {
+            let initial = ctrl.rx_gain().unwrap_or(0.0);
+            crate::agc::Agc::new(ctrl.rx_gain_range(), initial)
+        });
+        let power = crate::agc::power_dbfs(samples);
+        let old = agc.gain_db();
+        if let Some(new) = agc.update(power, slot_index) {
+            match ctrl.set_rx_gain(new) {
+                Ok(actual) => {
+                    agc.applied(actual);
+                    if (actual - old).abs() >= 0.5 {
+                        log::info!("AGC: receive gain {old} → {actual} dB (power {power:.1} dBFS)");
+                    } else {
+                        log::info!(
+                            "AGC: receive gain stays {actual} dB, device limit (power {power:.1} dBFS, asked {new} dB)"
+                        );
+                    }
+                }
+                Err(e) => log::warn!("AGC: setting receive gain {new} dB failed: {e}"),
+            }
+        }
+    }
+
     fn cell_search(&mut self) -> Result<Option<Synced>> {
         self.shared.gate.store(false, Relaxed);
         let p = self.params.clone();
@@ -469,6 +503,7 @@ impl<'a> Engine<'a> {
             let mut cap = vec![Iq::default(); cap_len];
             self.dl.read_exact(&mut cap)?;
             attempts += 1;
+            self.agc_step(&cap, None);
             let Some(hit) = gscn_scan(
                 &cap,
                 p.fs,
@@ -718,6 +753,7 @@ impl<'a> Engine<'a> {
                 && slot.slot as i64 == ssb_off_in_frame / sps
             {
                 let in_slot = (ssb_off_in_frame % sps) as usize;
+                self.agc_step(&samples[0], Some(slot.index()));
                 let sh = FreqShifter::new(-s.geom.ssb_df_hz - s.cfo_hz, fs, sps as usize);
                 sh.shift_into(&samples[0], start as usize, &mut shifted);
                 let cp =
@@ -752,6 +788,7 @@ impl<'a> Engine<'a> {
                                 rsrp_dbfs: m.rsrp_db(),
                                 rsrq_db: m.rsrq_db(),
                                 sinr_db: m.sinr_db(),
+                                rx_gain_db: self.agc.as_ref().map_or(0.0, |a| a.gain_db() as f32),
                             });
                         }
                     }

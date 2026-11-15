@@ -25,7 +25,7 @@
 //! real SDR free-runs at its sample rate, so the higher layers own the timing (cell
 //! search does the acquisition; the TX side is a push, not a pull).
 
-use crate::{SampleSink, SampleSource};
+use crate::{GainControl, SampleSink, SampleSource};
 use ferrite_common::{Error, Iq, Result};
 use soapysdr::{Device, Direction, ErrorCode, RxStream, TxStream};
 use std::sync::{Arc, Mutex};
@@ -326,6 +326,43 @@ impl SoapyRadio {
                 time_rate: self.time_rate,
             },
         ))
+    }
+}
+
+impl SoapyRadio {
+    /// A handle for run-time receive gain changes (channel 0).
+    pub fn rx_gain_control(&self) -> Result<SoapyGain> {
+        let r = self
+            .device
+            .gain_range(Direction::Rx, 0)
+            .map_err(radio_err)?;
+        Ok(SoapyGain {
+            device: self.device.clone(),
+            range: (r.minimum, r.maximum),
+        })
+    }
+}
+
+/// Receive gain control of an opened device (see [`GainControl`]).
+pub struct SoapyGain {
+    device: Device,
+    range: (f64, f64),
+}
+
+impl GainControl for SoapyGain {
+    fn rx_gain_range(&self) -> (f64, f64) {
+        self.range
+    }
+
+    fn rx_gain(&self) -> Result<f64> {
+        self.device.gain(Direction::Rx, 0).map_err(radio_err)
+    }
+
+    fn set_rx_gain(&mut self, db: f64) -> Result<f64> {
+        self.device
+            .set_gain(Direction::Rx, 0, db.clamp(self.range.0, self.range.1))
+            .map_err(radio_err)?;
+        self.rx_gain()
     }
 }
 
