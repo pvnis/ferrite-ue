@@ -32,7 +32,7 @@ For 20 MHz, point the gNB at `test/gnb_zmq_20mhz.yml` and run the UE with
 | Numerology   | `mu = 1` → 30 kHz SCS, 500 µs slot                 |
 | Bandwidth    | 10 MHz (24 PRB, 15.36 MHz) or 20 MHz (51 PRB, 30.72 MHz) |
 | Transport    | ZMQ IQ (`complex<f32>` blocks), no-RF bring-up     |
-| Radio (OTA)  | LimeSDR / BladeRF / USRP via SoapySDR *(next)*       |
+| Radio (OTA)  | any SoapySDR device (`--radio sdr`, feature `sdr`); bench: LimeSDR XTRX |
 
 ## Quick start (ZMQ, against an OCUDU gNB + qcore)
 
@@ -200,16 +200,20 @@ so attach is TDD-pattern-agnostic — validated on `6D+S+3U` and `DDDSU` cells.
 **End-to-end ping through qcore's UPF, at real-time 500 µs/slot, ~12 ms RTT,
 0 % loss, repeatable.**
 
-**Milestone 4 — over the air** *(next)*
-SoapySDR backend (LimeSDR XTRX / BladeRF); the ZMQ lockstep's coordination jitter
-goes away with a real radio clock.
+**Milestone 4 — over the air** *(in progress)*
+SoapySDR backend wired into the binary (`--radio sdr --sdr-args driver=…`):
+sample-exact device time base shared by RX and TX, timed uplink blocks, overflow
+gaps zero-filled. Verified streaming on a LimeSDR XTRX; an OTA gNB, power
+control, AGC and tracking are next.
 
 ## Build & test
 
 ```sh
 cargo test --workspace                            # core (no native libs needed)
 cargo build --release -p ferrite-ue --bin ferrite-ue
-cargo build -p ferrite-radio --features soapy     # SoapySDR backend
+cargo build --release -p ferrite-ue --features sdr # with the SoapySDR backend
+./target/release/ferrite-ue --radio sdr --sdr-args "driver=limesuiteng,addr=/dev/limepcie0" \
+    --dl-arfcn 626000 --srate 15.36 --sdr-rx-gain 40 --sdr-tx-gain 30
 ```
 
 ## License

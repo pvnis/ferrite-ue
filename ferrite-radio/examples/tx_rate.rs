@@ -16,7 +16,8 @@ fn main() {
     let radio = SoapyRadio::open(&SoapyConfig {
         args: format!("driver=bladerf,serial={serial}"),
         sample_rate: fs,
-        frequency: 3414.99e6,
+        rx_frequency: 3414.99e6,
+        tx_frequency: 3414.99e6,
         rx_gain: 40.0,
         tx_gain: 50.0,
         ..Default::default()
@@ -31,9 +32,9 @@ fn main() {
     // RX drain thread (mimics the live UE: continuous RX must run alongside TX).
     let rx_on = Arc::new(AtomicBool::new(true));
     let rx_n = Arc::new(AtomicU64::new(0));
+    let (mut rx, mut tx) = radio.streams().expect("streams");
     {
         let (rx_on, rx_n) = (rx_on.clone(), rx_n.clone());
-        let mut rx = radio.rx().expect("rx");
         std::thread::spawn(move || {
             let mut buf = vec![Complex32::default(); 32768];
             while rx_on.load(Ordering::Relaxed) {
@@ -44,7 +45,6 @@ fn main() {
         });
     }
 
-    let mut tx = radio.tx().expect("tx");
     for &blk in &[1920usize, 16384, 65536, 262144] {
         let buf = vec![Complex32::new(0.1, 0.0); blk];
         // warm up

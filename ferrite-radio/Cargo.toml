@@ -30,3 +30,7 @@ required-features = ["soapy"]
 [[example]]
 name = "tx_rate"
 required-features = ["soapy"]
+
+[[example]]
+name = "tx_rx_cal"
+required-features = ["soapy"]

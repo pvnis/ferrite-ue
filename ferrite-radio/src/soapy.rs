@@ -28,6 +28,7 @@
 use crate::{SampleSink, SampleSource};
 use ferrite_common::{Error, Iq, Result};
 use soapysdr::{Device, Direction, ErrorCode, RxStream, TxStream};
+use std::sync::{Arc, Mutex};
 
 fn radio_err(e: soapysdr::Error) -> Error {
     Error::Radio(format!("{:?}: {}", e.code, e.message))
@@ -77,8 +78,10 @@ pub struct SoapyConfig {
     pub args: String,
     /// Sample rate (Hz). 30.72e6 = 20 MHz n78 at µ=1.
     pub sample_rate: f64,
-    /// Centre frequency (Hz), shared by RX and TX (a UE is monostatic on the carrier).
-    pub frequency: f64,
+    /// RX centre frequency (Hz): the downlink carrier.
+    pub rx_frequency: f64,
+    /// TX centre frequency (Hz): the uplink carrier (equal to `rx_frequency` for TDD).
+    pub tx_frequency: f64,
     /// RX front-end gain (dB).
     pub rx_gain: f64,
     /// TX front-end gain (dB).
@@ -96,7 +99,8 @@ impl Default for SoapyConfig {
         Self {
             args: String::new(),
             sample_rate: 30.72e6,
-            frequency: 3.5e9,
+            rx_frequency: 3.5e9,
+            tx_frequency: 3.5e9,
             rx_gain: 40.0,
             tx_gain: 40.0,
             bandwidth: 0.0,
@@ -214,16 +218,24 @@ impl SoapyRadio {
         } else {
             cfg.sample_rate
         };
-        for (dir, gain, ant) in [
-            (Direction::Rx, cfg.rx_gain, cfg.rx_antenna.as_deref()),
-            (Direction::Tx, cfg.tx_gain, cfg.tx_antenna.as_deref()),
+        for (dir, freq, gain, ant) in [
+            (
+                Direction::Rx,
+                cfg.rx_frequency,
+                cfg.rx_gain,
+                cfg.rx_antenna.as_deref(),
+            ),
+            (
+                Direction::Tx,
+                cfg.tx_frequency,
+                cfg.tx_gain,
+                cfg.tx_antenna.as_deref(),
+            ),
         ] {
             device
                 .set_sample_rate(dir, 0, cfg.sample_rate)
                 .map_err(radio_err)?;
-            device
-                .set_frequency(dir, 0, cfg.frequency, ())
-                .map_err(radio_err)?;
+            device.set_frequency(dir, 0, freq, ()).map_err(radio_err)?;
             device.set_gain(dir, 0, gain).map_err(radio_err)?;
             device.set_bandwidth(dir, 0, bw).map_err(radio_err)?;
             if let Some(a) = ant {
@@ -283,37 +295,66 @@ impl SoapyRadio {
         Ok(ns_to_ticks(ns, self.time_rate))
     }
 
-    /// Activate and return the RX stream (channel 0) as a [`SampleSource`]. Feeds the
-    /// same `BufferedStream` read-ahead the ZMQ DL path uses.
-    pub fn rx(&self) -> Result<SoapyRx> {
-        let mut stream = self.device.rx_stream::<Iq>(&[0]).map_err(radio_err)?;
-        stream.activate(None).map_err(radio_err)?;
-        Ok(SoapyRx {
-            stream,
-            rate: self.rate,
-            time_rate: self.time_rate,
-            timestamp: None,
-            overflows: 0,
-        })
+    /// Set up and activate both chains (channel 0) and return them as a
+    /// [`SampleSource`] / [`SampleSink`] pair sharing one device session.
+    ///
+    /// Both streams are set up before either is activated: some modules (the
+    /// LimeSuiteNG one) keep a single stream object for both directions, and
+    /// setting up the second direction after the first is running restarts it.
+    /// The pair is also torn down together, in an order every module survives
+    /// (see [`Session`]).
+    pub fn streams(&self) -> Result<(SoapyRx, SoapyTx)> {
+        let mut rx = self.device.rx_stream::<Iq>(&[0]).map_err(radio_err)?;
+        let mut tx = self.device.tx_stream::<Iq>(&[0]).map_err(radio_err)?;
+        rx.activate(None).map_err(radio_err)?;
+        tx.activate(None).map_err(radio_err)?;
+        let session = Arc::new(Session {
+            rx: Mutex::new(rx),
+            tx: Mutex::new(tx),
+        });
+        Ok((
+            SoapyRx {
+                session: session.clone(),
+                rate: self.rate,
+                time_rate: self.time_rate,
+                timestamp: None,
+                overflows: 0,
+            },
+            SoapyTx {
+                session,
+                rate: self.rate,
+                time_rate: self.time_rate,
+            },
+        ))
     }
+}
 
-    /// Activate and return the TX stream (channel 0) as a [`SampleSink`]. The device
-    /// TX FIFO back-pressures `write`, so a continuous fill→write loop paces itself to
-    /// the sample clock; timed bursts go through [`SampleSink::write_at`].
-    pub fn tx(&self) -> Result<SoapyTx> {
-        let mut stream = self.device.tx_stream::<Iq>(&[0]).map_err(radio_err)?;
-        stream.activate(None).map_err(radio_err)?;
-        Ok(SoapyTx {
-            stream,
-            rate: self.rate,
-            time_rate: self.time_rate,
-        })
+/// The two streams of one device, dropped together: the TX side is deactivated
+/// first while the RX stream still exists, then the RX stream (deactivate, close),
+/// then the TX stream (close only). Modules with one shared stream object free it
+/// on the first close and would dereference it again if the other direction were
+/// still active.
+struct Session {
+    rx: Mutex<RxStream<Iq>>,
+    tx: Mutex<TxStream<Iq>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Ok(tx) = self.tx.get_mut() {
+            let _ = tx.deactivate(None);
+        }
+        // Fields drop in declaration order: `rx` before `tx`.
     }
+}
+
+fn lock_err<T>(_: std::sync::PoisonError<T>) -> Error {
+    Error::Radio("stream lock poisoned".into())
 }
 
 /// RX half of an SDR device: a continuous baseband stream as a [`SampleSource`].
 pub struct SoapyRx {
-    stream: RxStream<Iq>,
+    session: Arc<Session>,
     rate: f64,
     time_rate: f64,
     timestamp: Option<u64>,
@@ -337,12 +378,13 @@ impl SampleSource for SoapyRx {
         // Single channel; 1 s timeout per attempt (a stall this long means the device
         // is wedged). Overflows are counted and the read retried: the stream goes on
         // and the next buffer's timestamp tells the consumer what was lost.
+        let mut stream = self.session.rx.lock().map_err(lock_err)?;
         let mut timeouts = 0u32;
         loop {
             let mut chans = [&mut *buf];
-            match self.stream.read(&mut chans, 1_000_000) {
+            match stream.read(&mut chans, 1_000_000) {
                 Ok(n) => {
-                    self.timestamp = Some(ns_to_ticks(self.stream.time_ns(), self.time_rate));
+                    self.timestamp = Some(ns_to_ticks(stream.time_ns(), self.time_rate));
                     return Ok(n);
                 }
                 Err(e) if e.code == ErrorCode::Overflow => self.overflows += 1,
@@ -359,7 +401,7 @@ impl SampleSource for SoapyRx {
 
 /// TX half of an SDR device: a continuous baseband stream exposed as a [`SampleSink`].
 pub struct SoapyTx {
-    stream: TxStream<Iq>,
+    session: Arc<Session>,
     rate: f64,
     time_rate: f64,
 }
@@ -371,14 +413,16 @@ impl SampleSink for SoapyTx {
 
     fn write(&mut self, buf: &[Iq]) -> Result<usize> {
         // Continuous stream: no timestamp, not a burst end. FIFO back-pressure paces.
-        self.stream
+        let mut stream = self.session.tx.lock().map_err(lock_err)?;
+        stream
             .write(&[buf], None, false, 1_000_000)
             .map_err(radio_err)
     }
 
     fn write_at(&mut self, buf: &[Iq], at_sample: u64, end_burst: bool) -> Result<usize> {
         let at_ns = ticks_to_ns(at_sample, self.time_rate);
-        self.stream
+        let mut stream = self.session.tx.lock().map_err(lock_err)?;
+        stream
             .write(&[buf], Some(at_ns), end_burst, 1_000_000)
             .map_err(radio_err)
     }

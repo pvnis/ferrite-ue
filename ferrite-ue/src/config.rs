@@ -26,10 +26,23 @@ pub struct Cli {
     /// SoapySDR device arguments, e.g. `driver=limesuiteng` or `driver=bladerf,serial=…`.
     #[arg(long)]
     pub sdr_args: Option<String>,
+    /// SDR receive gain (dB, device scale).
     #[arg(long)]
     pub sdr_rx_gain: Option<f64>,
+    /// SDR transmit gain (dB, device scale).
     #[arg(long)]
     pub sdr_tx_gain: Option<f64>,
+    /// SDR receive antenna port name (device default when omitted).
+    #[arg(long)]
+    pub sdr_rx_antenna: Option<String>,
+    /// SDR transmit antenna port name (device default when omitted).
+    #[arg(long)]
+    pub sdr_tx_antenna: Option<String>,
+    /// SDR write-to-air latency budget (µs): an uplink block due sooner than
+    /// this after the newest received sample is skipped instead of handed to
+    /// the device late.
+    #[arg(long)]
+    pub sdr_tx_latency_us: Option<f64>,
 
     /// Sample rate in MHz (must match the gNB: 11.52, 15.36, 23.04, 30.72, …).
     #[arg(long)]
@@ -137,6 +150,9 @@ pub struct FileConfig {
     pub sdr_args: Option<String>,
     pub sdr_rx_gain: Option<f64>,
     pub sdr_tx_gain: Option<f64>,
+    pub sdr_rx_antenna: Option<String>,
+    pub sdr_tx_antenna: Option<String>,
+    pub sdr_tx_latency_us: Option<f64>,
     pub srate: Option<f64>,
     pub dl_arfcn: Option<u32>,
     pub center_mhz: Option<f64>,
@@ -206,10 +222,15 @@ pub struct UeConfig {
 pub enum RadioConfig {
     /// One downlink endpoint per receive antenna; one uplink endpoint.
     Zmq { tx: Vec<String>, rx: String },
+    /// A SoapySDR device: both chains on channel 0.
     Sdr {
         args: String,
         rx_gain: f64,
         tx_gain: f64,
+        rx_antenna: Option<String>,
+        tx_antenna: Option<String>,
+        /// Write-to-air latency budget in seconds.
+        tx_latency_s: f64,
     },
 }
 
@@ -248,6 +269,9 @@ impl UeConfig {
                 args: pick!(sdr_args, String::new()),
                 rx_gain: pick!(sdr_rx_gain, 50.0),
                 tx_gain: pick!(sdr_tx_gain, 50.0),
+                rx_antenna: cli.sdr_rx_antenna.clone().or(file.sdr_rx_antenna.clone()),
+                tx_antenna: cli.sdr_tx_antenna.clone().or(file.sdr_tx_antenna.clone()),
+                tx_latency_s: pick!(sdr_tx_latency_us, 300.0) * 1e-6,
             },
             other => return Err(format!("unknown radio backend {other}")),
         };

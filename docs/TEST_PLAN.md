@@ -14,7 +14,7 @@ repeated after any change; the lab runner is `scripts/lab.sh`.
 | L1 vectors | codecs against captured / reference vectors | fixtures in each crate's `tests/` | byte-exact |
 | L2 loopback | PHY tx→channel→rx round trips (PDSCH/PUSCH/PUCCH/PRACH/SSB), RLC/PDCP two-entity simulations, NAS UE ↔ fake core | `cargo test` integration tests | pass at the stated SNR |
 | L3 system (ZMQ) | full attach + traffic against OCUDU + qcore, per cell configuration | `scripts/lab.sh <config>` | KPIs below |
-| L4 system (OTA) | same as L3 with a real SDR pair | manual, same runner with `--sdr` | KPIs below (looser latency) |
+| L4 system (OTA) | same as L3 with a real SDR pair | manual, same runner with `--radio sdr` | KPIs below (looser latency) |
 
 ## 2. Cell configuration matrix (L3)
 
@@ -154,7 +154,7 @@ ta=…]`, `PUSCH: … crc=OK`).
 
 ## 6. Over-the-air addendum (L4)
 
-Same matrix with `--sdr driver=soapy,...` on the UE and an RF gNB config.
+Same matrix with `--radio sdr --sdr-args driver=…` on the UE (binary built with `--features sdr`) and an RF gNB config.
 Additional checks: PRACH power ramping to detection, TA command > 0 applied,
 CFO tracking within ±100 Hz, AGC not saturating, sustained 10 min ping with
 < 1 % loss. The ZMQ-specific pacing/gating is not used in this mode; the radio

@@ -23,14 +23,15 @@ fn main() {
 
     let cfg = SoapyConfig {
         args: a.get(1).cloned().unwrap_or_default(),
-        frequency: a.get(2).and_then(|s| s.parse().ok()).unwrap_or(3.5e9),
+        rx_frequency: a.get(2).and_then(|s| s.parse().ok()).unwrap_or(3.5e9),
+        tx_frequency: a.get(2).and_then(|s| s.parse().ok()).unwrap_or(3.5e9),
         sample_rate: a.get(3).and_then(|s| s.parse().ok()).unwrap_or(30.72e6),
         rx_gain: a.get(4).and_then(|s| s.parse().ok()).unwrap_or(40.0),
         ..Default::default()
     };
     println!(
         "\n=== opening args={:?} freq={} Hz rate={} Hz rx_gain={} dB ===",
-        cfg.args, cfg.frequency, cfg.sample_rate, cfg.rx_gain
+        cfg.args, cfg.rx_frequency, cfg.sample_rate, cfg.rx_gain
     );
     let radio = match SoapyRadio::open(&cfg) {
         Ok(r) => r,
@@ -46,8 +47,8 @@ fn main() {
         radio.hardware_time().ok()
     );
 
-    let mut rx = match radio.rx() {
-        Ok(rx) => rx,
+    let mut rx = match radio.streams() {
+        Ok((rx, _tx)) => rx,
         Err(e) => {
             eprintln!("RX stream failed: {e}");
             std::process::exit(1);

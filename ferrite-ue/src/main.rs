@@ -31,33 +31,10 @@ fn main() {
     let block_len = 1920usize;
     let mu = ferrite_common::Numerology::from_scs_khz(cfg.ssb_scs_khz).map_or(1, |n| n.mu);
     let slot_us = 1000.0 / (1u32 << mu) as f64;
-    let (dl, ul): (ferrite_l1::radio::DlStream, UlServer) = match &cfg.radio {
-        RadioConfig::Zmq { tx, rx } => {
-            let chans: Vec<BufferedStream> = tx
-                .iter()
-                .map(|ep| {
-                    BufferedStream::spawn(
-                        ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000)
-                            .unwrap_or_else(|e| panic!("connect DL {ep}: {e}")),
-                        block_len,
-                    )
-                })
-                .collect();
-            log::info!("DL: {} receive antenna(s) {:?}", chans.len(), tx);
-            let sink = ferrite_radio::zmq::ZmqSink::bind(rx, cfg.fs, block_len).expect("bind UL");
-            (
-                ferrite_l1::radio::DlStream::new(chans),
-                UlServer {
-                    sink: Box::new(ferrite_l1::radio::ZmqUlSink(sink)),
-                    pacing: UlPacing::Lockstep { pace_us: slot_us },
-                    tx_rx_offset: cfg.tx_rx_offset,
-                    block_len,
-                    start_index: 0,
-                },
-            )
-        }
-        RadioConfig::Sdr { .. } => {
-            eprintln!("the SDR backend is not wired into this binary yet");
+    let (dl, ul) = match open_radio(&cfg, block_len, slot_us) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("radio: {e}");
             std::process::exit(2);
         }
     };
@@ -72,7 +49,7 @@ fn main() {
         tx_lead_slots: cfg.tx_lead,
         tx_rx_offset: cfg.tx_rx_offset,
         prach_offset: cfg.prach_offset,
-        pacing: UlPacing::Lockstep { pace_us: slot_us },
+        pacing: ul.pacing,
         ul_block_len: block_len,
         cfo_correction: !matches!(cfg.radio, RadioConfig::Zmq { .. }),
         max_search_attempts: 0,
@@ -181,6 +158,96 @@ fn main() {
             log::error!("engine failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Open the configured radio backend: the downlink stream(s) and the uplink server.
+fn open_radio(
+    cfg: &UeConfig,
+    block_len: usize,
+    slot_us: f64,
+) -> ferrite_common::Result<(ferrite_l1::radio::DlStream, UlServer)> {
+    match &cfg.radio {
+        RadioConfig::Zmq { tx, rx } => {
+            let chans = tx
+                .iter()
+                .map(|ep| {
+                    ferrite_radio::zmq::ZmqSource::connect(ep, cfg.fs, 5_000)
+                        .map(|src| BufferedStream::spawn(src, block_len))
+                })
+                .collect::<ferrite_common::Result<Vec<BufferedStream>>>()?;
+            if chans.is_empty() {
+                return Err(ferrite_common::Error::Config(
+                    "at least one downlink endpoint is needed".into(),
+                ));
+            }
+            log::info!("DL: {} receive antenna(s) {:?}", chans.len(), tx);
+            let sink = ferrite_radio::zmq::ZmqSink::bind(rx, cfg.fs, block_len)?;
+            Ok((
+                ferrite_l1::radio::DlStream::new(chans),
+                UlServer {
+                    sink: Box::new(ferrite_l1::radio::ZmqUlSink(sink)),
+                    pacing: UlPacing::Lockstep { pace_us: slot_us },
+                    tx_rx_offset: cfg.tx_rx_offset,
+                    block_len,
+                    start_index: 0,
+                },
+            ))
+        }
+        #[cfg(feature = "sdr")]
+        RadioConfig::Sdr {
+            args,
+            rx_gain,
+            tx_gain,
+            rx_antenna,
+            tx_antenna,
+            tx_latency_s,
+        } => {
+            use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
+            use ferrite_radio::time::{Contiguous, TimeBase};
+            let sc = SoapyConfig {
+                args: args.clone(),
+                sample_rate: cfg.fs,
+                rx_frequency: cfg.dl_center_hz,
+                tx_frequency: cfg.ul_center_hz,
+                rx_gain: *rx_gain,
+                tx_gain: *tx_gain,
+                bandwidth: 0.0,
+                rx_antenna: rx_antenna.clone(),
+                tx_antenna: tx_antenna.clone(),
+            };
+            let radio = SoapyRadio::open(&sc)?;
+            let (time_rate, source) = radio.time_rate();
+            log::info!(
+                "SDR {:?}: rate {} Hz (timestamps at {time_rate} Hz, {source:?}), RX {:.3} MHz gain {} dB, TX {:.3} MHz gain {} dB",
+                args,
+                radio.sample_rate(),
+                cfg.dl_center_hz / 1e6,
+                rx_gain,
+                cfg.ul_center_hz / 1e6,
+                tx_gain
+            );
+            // One time base: the receive side pins stream index 0 to a device
+            // sample, the transmit side stamps every block from it.
+            let time = TimeBase::default();
+            let (rx, tx) = radio.streams()?;
+            let rx = Contiguous::new(rx, time.clone());
+            let min_lead = (tx_latency_s * cfg.fs).round() as u64;
+            Ok((
+                ferrite_l1::radio::DlStream::single(BufferedStream::spawn(rx, block_len)),
+                UlServer {
+                    sink: Box::new(ferrite_l1::radio::TimedPushUlSink::new(tx, time, min_lead)),
+                    pacing: UlPacing::FreeRunning,
+                    tx_rx_offset: cfg.tx_rx_offset,
+                    block_len,
+                    start_index: 0,
+                },
+            ))
+        }
+        #[cfg(not(feature = "sdr"))]
+        RadioConfig::Sdr { .. } => Err(ferrite_common::Error::Config(
+            "this binary was built without the `sdr` feature (cargo build --features sdr)".into(),
+        )),
     }
 }
 

@@ -295,15 +295,26 @@ cost of hand-writing).
 Tooling: `#![warn(missing_docs)]`, a crate-level MAC↔RLC↔PDCP chain test,
 CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
 
-## Over the air (deferred until an SDR is on the bench)
+## Over the air
 
-- [ ] Wire the SoapySDR backend into the `ferrite-ue` binary (`--radio sdr`),
-      with the free-running `UlPacing`, RX timestamps for overflow detection
-      and uplink bursts timed relative to the latest RX buffer. (seify was
-      dropped 2026-11-15: it exposes no RX timestamps and no Lime driver;
-      the `soapysdr` crate is used directly.)
+- [x] Wire the SoapySDR backend into the `ferrite-ue` binary (`--radio sdr`,
+      2026-11-15): `time::Contiguous` (gap-free index, zeros for overflows,
+      shared `TimeBase`), `TimedPushUlSink` (every block stamped
+      `origin + ul_index`, late blocks skipped and counted), the commit-mark
+      gate for the free-running pacing too, both chains set up before
+      activation (LimeSuiteNG keeps one stream object). Dry run on the XTRX:
+      RX streams, TX writes timed zeros, cell search runs. (seify was dropped
+      the same day: no RX timestamps, no Lime driver.)
+- [ ] gNB side for an OTA lab: OCUDU's build has UHD/ZMQ radios only, no
+      USRP on the bench. Options: SoapyUHD's UHD module (Soapy devices appear
+      to UHD apps) in front of the LimeSDR-Micro, or an OCUDU SoapySDR radio
+      plugin.
 - [ ] UL power control: P0/alpha open loop, TPC accumulation, PRACH power
       ramping, PUCCH/PUSCH/SRS power per TS 38.213 §7.
 - [ ] Receive AGC.
 - [ ] Connected-mode CFO and timing tracking beyond TA commands.
-- [ ] TX/RX sample offset calibration per device (`--tx-rx-offset`).
+- [ ] Two-channel SDR receive for MIMO (`SoapyRadio::streams` opens channel 0;
+      a multi-channel stream delivers all antennas in one read, so `DlStream`
+      needs a fan-out source rather than one drain thread per antenna).
+- [ ] Multi-device lab: `--tx-rx-offset` per device from `tx_rx_cal`, SDR
+      run of the ZMQ matrix (TEST_PLAN L4).

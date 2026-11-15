@@ -25,7 +25,8 @@ fn main() {
     let txr = SoapyRadio::open(&SoapyConfig {
         args: format!("driver=bladerf,serial={tx_serial}"),
         sample_rate: fs,
-        frequency: freq,
+        rx_frequency: freq,
+        tx_frequency: freq,
         tx_gain,
         rx_gain: 30.0,
         ..Default::default()
@@ -34,7 +35,8 @@ fn main() {
     let rxr = SoapyRadio::open(&SoapyConfig {
         args: format!("driver=bladerf,serial={rx_serial}"),
         sample_rate: fs,
-        frequency: freq,
+        rx_frequency: freq,
+        tx_frequency: freq,
         rx_gain: 50.0,
         ..Default::default()
     })
@@ -47,8 +49,9 @@ fn main() {
     let on = Arc::new(AtomicBool::new(false));
     // TX thread: continuously push either a +1 MHz tone (when ON) or zeros (when OFF).
     let on_t = on.clone();
+    let (_tx_rx, mut tx) = txr.streams().expect("activate TX");
+    let (mut rx, _rx_tx) = rxr.streams().expect("activate RX");
     std::thread::spawn(move || {
-        let mut tx = txr.tx().expect("activate TX");
         let block = 8192usize;
         let mut n = 0u64;
         let w = std::f64::consts::TAU * 1e6 / fs; // +1 MHz tone
@@ -73,7 +76,6 @@ fn main() {
         }
     });
 
-    let mut rx = rxr.rx().expect("activate RX");
     // Measure RX power in a band around the tone (+1 MHz → FFT bin) with tone OFF then ON.
     let measure = |rx: &mut ferrite_radio::soapy::SoapyRx| -> f32 {
         let block = 8192usize;

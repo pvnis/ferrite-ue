@@ -97,9 +97,15 @@ Time above this crate is counted in samples: a backend with a device time base
 reports the sample index of every delivered buffer (`SampleSource::timestamp`)
 and takes timed bursts by sample index (`SampleSink::write_at`); the SoapySDR
 backend converts to the library's nanoseconds once per buffer with SoapySDR's
-own algorithm and the rate the device reports, and checks at open time that
-the conversion is the identity. The L1 engine only sees sample indices; the
-lockstep pacing policy (`UlPacing`) is selected by the backend.
+own algorithm and the rate its timestamps actually advance at (measured at open
+time: the LimeSuiteNG module converts with the requested rate while reporting
+the achieved one), and checks that the conversion is the identity. Both chains
+are set up before either is activated and torn down together (modules with one
+shared stream object need both). `time::Contiguous` pins a timestamped source
+to a gap-free index: stream sample `i` is device sample `origin + i`, lost
+samples (overflows) come out as zeros, and the shared `TimeBase` publishes the
+origin and the receive head to the transmit side. The L1 engine only sees
+sample indices; the pacing policy (`UlPacing`) is selected by the backend.
 
 ## 4. L1 — the slot engine (ferrite-l1)
 
@@ -131,7 +137,13 @@ the MAC's requests.
 TA command measures and cancels it). The PRACH is transmitted with `N_TA = 0`
 (`SampleClock::with_n_ta(0)`). Lockstep transports are served up to a *commit
 mark* (`ul_index(n + tx_lead + 1)` after slot `n`), never a heuristic "k slots
-behind"; a free-running SDR does not use the mark.
+behind". A free-running SDR is gated by the same mark (a block is written only
+once its uplink is final) but not paced: `TimedPushUlSink` stamps every block
+with its air time `origin + ul_index` in the device clock shared with the
+receive side, and skips (counts, logs) a block whose air time is nearer than the
+device's write-to-air latency budget (`--sdr-tx-latency-us`) instead of handing
+it over late. The RX→TX chain latency of a device is `--tx-rx-offset`,
+measured with the `tx_rx_cal` example (loopback burst).
 
 ### 4.3 L1 state
 
