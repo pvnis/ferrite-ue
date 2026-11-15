@@ -287,10 +287,10 @@ pub fn run(
                             for pdu in req.pdus {
                                 let t_build = std::time::Instant::now();
                                 let built = match &pdu {
-                                    UlTtiPdu::Prach { occasion, preamble, power_offset_db } => b.prach(&clock, occasion, *preamble, *power_offset_db),
-                                    UlTtiPdu::Pusch { grant, tb, uci } => b.pusch(&clock, grant, tb, uci),
-                                    UlTtiPdu::Pucch { resource, uci } => b.pucch(&clock, req.slot, *resource, uci, crnti),
-                                    UlTtiPdu::Srs { resource_id } => b.srs(&clock, req.slot, *resource_id),
+                                    UlTtiPdu::Prach { occasion, preamble, power_dbm } => b.prach(&clock, occasion, *preamble, *power_dbm),
+                                    UlTtiPdu::Pusch { grant, tb, uci, power_dbm } => b.pusch(&clock, grant, tb, uci, *power_dbm),
+                                    UlTtiPdu::Pucch { resource, uci, power_dbm } => b.pucch(&clock, req.slot, *resource, uci, crnti, *power_dbm),
+                                    UlTtiPdu::Srs { resource_id, power_dbm } => b.srs(&clock, req.slot, *resource_id, *power_dbm),
                                 };
                                 match built {
                                     Ok(w) => {

@@ -192,6 +192,18 @@ impl Stack {
         self.mib = Some(mib);
     }
 
+    /// The transmitter calibration turns the RRC's power-control parameters
+    /// into real powers: the PHY learns the dBm of full scale, the MAC's loops
+    /// are enabled and `P_CMAX` is bounded by what the device can radiate with
+    /// 12 dB of peak headroom (OFDM PAPR).
+    fn apply_tx_calibration(&self, phy: &mut ferrite_fapi::config::PhyConfig, mac: &mut MacConfig) {
+        phy.tx_full_scale_dbm = self.cfg.tx_full_scale_dbm;
+        if let Some(fs) = self.cfg.tx_full_scale_dbm {
+            mac.power.enabled = true;
+            mac.power.pcmax_dbm = mac.power.pcmax_dbm.min(fs - 12.0);
+        }
+    }
+
     /// A serving-cell SSB measurement from the PHY for the RRC measurement
     /// procedure: dBFS at the applied receive gain → dBm with the configured
     /// receiver calibration (the dBm of a full-scale signal at 0 dB gain).
@@ -204,13 +216,15 @@ impl Stack {
         rsrq_db: f32,
         sinr_db: f32,
     ) {
+        let rsrp_dbm = rsrp_dbfs - rx_gain_db + self.cfg.rx_power_offset_db;
         let m = ferrite_rrc::meas::CellMeasurement {
             pci,
-            rsrp_dbm: rsrp_dbfs - rx_gain_db + self.cfg.rx_power_offset_db,
+            rsrp_dbm,
             rsrq_db,
             sinr_db,
         };
         self.rrc.on_measurement(slot, &m);
+        self.mac.on_rsrp_dbm(rsrp_dbm);
     }
 
     /// Next application event, if any.
@@ -253,6 +267,8 @@ impl Stack {
                 cell_id,
             } => {
                 log::info!("SIB1: PLMN {plmn} TAC {tac} cell {cell_id:#x}");
+                let (mut p, mut m) = (p, m);
+                self.apply_tx_calibration(&mut p, &mut m);
                 self.numerology = p.numerology;
                 self.bearers.set_numerology(p.numerology);
                 phy.send(MacToPhy::Config(p));
@@ -278,6 +294,8 @@ impl Stack {
                 self.events.push_back(StackEvent::Reestablished);
             }
             RrcEvent::Reconfigure { phy: p, mac: m } => {
+                let (mut p, mut m) = (p, m);
+                self.apply_tx_calibration(&mut p, &mut m);
                 phy.send(MacToPhy::Config(p));
                 self.mac.reconfigure(*m);
                 if self.rrc.state() == RrcState::Connected {

@@ -119,6 +119,12 @@ pub struct Cli {
     /// 0 over ZMQ (no gain); a device constant over the air.
     #[arg(long, allow_hyphen_values = true)]
     pub rx_power_offset_db: Option<f32>,
+    /// Transmitter power calibration: the dBm a full-scale (0 dBFS) continuous
+    /// signal produces at the configured transmit gain. Enables uplink power
+    /// control (TS 38.213 §7): every uplink waveform is scaled to its target
+    /// power in dBm. Unset ⇒ waveforms are peak-normalised (the ZMQ case).
+    #[arg(long, allow_hyphen_values = true)]
+    pub tx_power_offset_db: Option<f32>,
     /// Test aid: inject a radio link failure this many seconds after start
     /// (while connected) to exercise RRC re-establishment. 0 = never.
     #[arg(long)]
@@ -175,6 +181,7 @@ pub struct FileConfig {
     pub tx_rx_offset: Option<i64>,
     pub prach_offset: Option<i64>,
     pub rx_power_offset_db: Option<f32>,
+    pub tx_power_offset_db: Option<f32>,
     pub rlf_at_s: Option<u64>,
     pub rlm_outage_s: Option<u64>,
     pub rlm_outage_ms: Option<u64>,
@@ -210,6 +217,8 @@ pub struct UeConfig {
     pub tx_rx_offset: i64,
     pub prach_offset: i64,
     pub rx_power_offset_db: f32,
+    /// `Some(dBm of full scale)` enables uplink power control.
+    pub tx_full_scale_dbm: Option<f32>,
     pub rlf_at_s: u64,
     /// Test aid: `(start_s, duration_ms)` radio link monitoring outage.
     pub rlm_outage: Option<(u64, u64)>,
@@ -333,6 +342,7 @@ impl UeConfig {
             tx_rx_offset: pick!(tx_rx_offset, 0),
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
             rx_power_offset_db: pick!(rx_power_offset_db, 0.0),
+            tx_full_scale_dbm: cli.tx_power_offset_db.or(file.tx_power_offset_db),
             rlf_at_s: pick!(rlf_at_s, 0),
             rlm_outage: cli
                 .rlm_outage_s

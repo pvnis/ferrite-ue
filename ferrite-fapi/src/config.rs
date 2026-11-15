@@ -655,9 +655,14 @@ pub struct PhyConfig {
     pub srs: Vec<SrsResourceConfig>,
     /// `pdsch-HARQ-ACK-Codebook` dynamic (true) / semi-static.
     pub harq_codebook_dynamic: bool,
-    /// Transmit power (full-scale fraction) for UL waveforms; the radio backend
-    /// applies the actual gain.
+    /// Transmit level (full-scale peak fraction) for UL waveforms without a
+    /// power in dBm; the radio backend applies the actual gain.
     pub ul_amplitude: f32,
+    /// Transmitter calibration: the dBm a full-scale (0 dBFS) continuous
+    /// signal produces at the configured transmit gain. With it, a PDU's
+    /// `power_dbm` sets the waveform's RMS level; without it (`None`, the ZMQ
+    /// case) every waveform is peak-normalised to `ul_amplitude`.
+    pub tx_full_scale_dbm: Option<f32>,
 }
 
 impl PhyConfig {
@@ -753,6 +758,7 @@ impl PhyConfig {
             srs: Vec::new(),
             harq_codebook_dynamic: true,
             ul_amplitude: 0.5,
+            tx_full_scale_dbm: None,
         }
     }
 }

@@ -308,7 +308,9 @@ pub enum UlTtiPdu {
     Prach {
         occasion: PrachOccasion,
         preamble: u8,
-        power_offset_db: f32,
+        /// Transmit power (dBm) before the format's `Δ_PREAMBLE`, which the
+        /// PHY adds; `None` ⇒ the PHY's default level (no calibration).
+        power_dbm: Option<f32>,
     },
     /// Transmit a PUSCH for a grant with the given MAC PDU (TX_Data.request
     /// payload) and the UCI multiplexed onto it, if any.
@@ -316,14 +318,20 @@ pub enum UlTtiPdu {
         grant: UlGrant,
         tb: Vec<u8>,
         uci: UciPayload,
+        /// Transmit power (dBm); `None` ⇒ the PHY's default level.
+        power_dbm: Option<f32>,
     },
     /// Transmit a PUCCH on `resource` with `uci`.
     Pucch {
         resource: PucchResourceRef,
         uci: UciPayload,
+        power_dbm: Option<f32>,
     },
     /// Transmit the SRS resource `resource_id` (its periodic occasion).
-    Srs { resource_id: u8 },
+    Srs {
+        resource_id: u8,
+        power_dbm: Option<f32>,
+    },
 }
 
 /// UL_TTI.request: everything MAC wants transmitted in `slot`.

@@ -309,8 +309,15 @@ CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
       USRP on the bench. Options: SoapyUHD's UHD module (Soapy devices appear
       to UHD apps) in front of the LimeSDR-Micro, or an OCUDU SoapySDR radio
       plugin.
-- [ ] UL power control: P0/alpha open loop, TPC accumulation, PRACH power
-      ramping, PUCCH/PUSCH/SRS power per TS 38.213 §7.
+- [x] UL power control (2026-11-15, `ferrite_mac::power`, TS 38.213 §7):
+      PRACH target + ramp + PL, PUSCH P0/α/`f(i)` (RAR `ΔP_rampup + δ_msg2`,
+      accumulated or absolute TPC), PUCCH `g(i)` with `Δ_F` and `Δ_TF`, SRS
+      on the PUSCH loop, Type 1 PHR from the same numbers; every UL_TTI PDU
+      carries `power_dbm`, the L1 sets the RMS level against the transmitter
+      calibration `--tx-power-offset-db` (unset ⇒ peak normalisation, the ZMQ
+      default). Open: per-device TX calibration constant (measure with a power
+      meter / the gNB's `epre`), `Δ_TF` with deltaMCS, two closed-loop states,
+      SRI-mapped P0/α sets, pathloss from CSI-RS.
 - [x] Receive AGC (2026-11-15): `ferrite_radio::GainControl`, `ferrite_l1::agc`
       on cell-search captures and SSB slots, device limits learned, gain carried
       in the SSB measurement for the dBm conversion. Open: a dBm calibration

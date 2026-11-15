@@ -14,7 +14,8 @@
 //! into MAC PDUs immediately (LCP + MAC CEs) and parked until the target slot.
 
 use crate::pdu::*;
-use crate::phr::{PhrProcedure, PowerHeadroom};
+use crate::phr::PhrProcedure;
+use crate::power::{PucchShape, UlPowerControl};
 use crate::{
     harq::*, lcp::Lcp, ra::*, rar::parse_rar_pdu, sr::SrProcedure, ta::TimingAdvance, MacConfig,
 };
@@ -89,7 +90,8 @@ pub struct MacEntity {
     ack_book: AckBook,
     bsr: crate::bsr::BsrProcedure,
     phr: PhrProcedure,
-    power: PowerHeadroom,
+    /// Uplink power control (TS 38.213 §7): loop states and the pathloss.
+    power: UlPowerControl,
     sr: Vec<SrProcedure>,
     lcp: Lcp,
     ta: TimingAdvance,
@@ -143,7 +145,7 @@ impl MacEntity {
             ack_book: AckBook::default(),
             bsr: crate::bsr::BsrProcedure::new(cfg.periodic_bsr_ms * spm, cfg.retx_bsr_ms * spm),
             phr: PhrProcedure::new(cfg.phr, spm),
-            power: PowerHeadroom::default(),
+            power: UlPowerControl::new(cfg.power.clone()),
             sr: cfg.sr.iter().map(|s| SrProcedure::new(s, spm)).collect(),
             lcp: Lcp::new(&cfg.logical_channels),
             ta: TimingAdvance::new(cfg.numerology, cfg.time_alignment_timer_ms),
@@ -182,6 +184,9 @@ impl MacEntity {
         self.bsr.periodic_slots = cfg.periodic_bsr_ms * spm;
         self.bsr.retx_slots = cfg.retx_bsr_ms * spm;
         self.ta.timer_slots = cfg.time_alignment_timer_ms * spm;
+        if cfg.power != self.cfg.power {
+            self.power.reconfigure(cfg.power.clone());
+        }
         if cfg.phr != self.cfg.phr {
             self.phr.configure(cfg.phr);
         }
@@ -231,8 +236,47 @@ impl MacEntity {
     }
 
     /// Power headroom quantities to report (from L1 power control / the stack).
-    pub fn set_power_headroom(&mut self, p: PowerHeadroom) {
-        self.power = p;
+    /// A serving-cell SS-RSRP in dBm for the pathloss estimate.
+    pub fn on_rsrp_dbm(&mut self, rsrp_dbm: f32) {
+        self.power.on_rsrp_dbm(rsrp_dbm);
+    }
+
+    /// The power-control state (for tests and reporting).
+    pub fn power_control(&self) -> &UlPowerControl {
+        &self.power
+    }
+
+    /// PUCCH shape for `Δ_TF`: dedicated resources from the configuration, the
+    /// common resource from its table row.
+    fn pucch_shape(&self, resource: PucchResourceRef, uci: &UciPayload) -> PucchShape {
+        let uci_bits = (uci.harq_ack.len() + usize::from(uci.sr.is_some()) + uci.csi1.len()) as u32;
+        match resource {
+            PucchResourceRef::Dedicated(id) => {
+                self.cfg.pucch.shapes.iter().find(|s| s.0 == id).map_or(
+                    PucchShape {
+                        format: 1,
+                        n_rb: 1,
+                        n_symbols: 14,
+                        uci_bits,
+                    },
+                    |&(_, format, n_symbols, n_rb)| PucchShape {
+                        format,
+                        n_rb: u32::from(n_rb),
+                        n_symbols: u32::from(n_symbols),
+                        uci_bits,
+                    },
+                )
+            }
+            PucchResourceRef::Common { .. } => {
+                let (format, n_symbols) = self.cfg.pucch.common_shape;
+                PucchShape {
+                    format,
+                    n_rb: 1,
+                    n_symbols: u32::from(n_symbols),
+                    uci_bits,
+                }
+            }
+        }
     }
 
     /// RRC: start a contention-based RA carrying `ccch` (RRCSetupRequest) in Msg3.
@@ -366,7 +410,7 @@ impl MacEntity {
             .collect();
         let prios: Vec<u8> = with_data.iter().map(|&(p, _)| p).collect();
         self.bsr.evaluate(now, &prios);
-        self.phr.tick(now, self.power.pathloss_db);
+        self.phr.tick(now, self.power.pathloss_db());
         if self.bsr.sr_pending && self.c_rnti.is_some() {
             if self.sr.is_empty() && !self.ra.is_running() {
                 // No SR configured: a RA with the C-RNTI (§5.4.4).
@@ -419,14 +463,15 @@ impl MacEntity {
                 RaAction::SendPreamble {
                     occasion,
                     preamble,
-                    power_offset_db,
+                    power_offset_db: _,
                 } => {
+                    let power_dbm = self.power.prach_dbm(self.ra.preamble_power_ramping_counter);
                     phy.send(MacToPhy::UlTti(UlTtiRequest {
                         slot: occasion.slot,
                         pdus: vec![UlTtiPdu::Prach {
                             occasion,
                             preamble,
-                            power_offset_db,
+                            power_dbm,
                         }],
                     }));
                 }
@@ -512,12 +557,14 @@ impl MacEntity {
                 }
             }
             self.stats.ul_tb += 1;
+            let power_dbm = self.power.pusch_dbm(u32::from(p.grant.n_prb), false);
             phy.send(MacToPhy::UlTti(UlTtiRequest {
                 slot: target,
                 pdus: vec![UlTtiPdu::Pusch {
                     grant: p.grant,
                     tb: p.tb,
                     uci,
+                    power_dbm,
                 }],
             }));
             return;
@@ -528,16 +575,20 @@ impl MacEntity {
             // outside DRX Active Time only if configured to (§5.7 says no; see
             // `MacConfig::srs_outside_active_time`).
             if self.c_rnti.is_some() && (self.drx.is_active() || self.cfg.srs_outside_active_time) {
-                if let Some(&(id, _, _)) = self
+                if let Some(&(id, _, _, n_rb)) = self
                     .cfg
                     .srs_occasions
                     .iter()
-                    .find(|(_, p, o)| target.is_occasion(u32::from(*p), u32::from(*o)))
+                    .find(|(_, p, o, _)| target.is_occasion(u32::from(*p), u32::from(*o)))
                 {
                     self.stats.srs_sent += 1;
+                    let power_dbm = self.power.srs_dbm(u32::from(n_rb));
                     phy.send(MacToPhy::UlTti(UlTtiRequest {
                         slot: target,
-                        pdus: vec![UlTtiPdu::Srs { resource_id: id }],
+                        pdus: vec![UlTtiPdu::Srs {
+                            resource_id: id,
+                            power_dbm,
+                        }],
                     }));
                 }
             }
@@ -570,9 +621,14 @@ impl MacEntity {
             self.stats.sr_sent += 1;
         }
         self.stats.pucch_sent += 1;
+        let power_dbm = self.power.pucch_dbm(self.pucch_shape(resource, &uci));
         phy.send(MacToPhy::UlTti(UlTtiRequest {
             slot: target,
-            pdus: vec![UlTtiPdu::Pucch { resource, uci }],
+            pdus: vec![UlTtiPdu::Pucch {
+                resource,
+                uci,
+                power_dbm,
+            }],
         }));
     }
 
@@ -697,6 +753,8 @@ impl MacEntity {
         if !matches!(g.rnti_kind, RntiKind::C | RntiKind::Tc) {
             return; // SI/RA/P: the PHY decodes; nothing to book.
         }
+        // The DCI's TPC steers the PUCCH loop (TS 38.213 §7.2.1).
+        self.power.on_pucch_tpc(g.tpc);
         let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
         if g.rnti_kind == RntiKind::C {
             self.drx.on_crnti_pdcch(slot);
@@ -729,6 +787,8 @@ impl MacEntity {
         upper: &mut dyn UpperLayers,
     ) {
         if g.rnti_kind == RntiKind::Tc && self.ra.msg3_pending() {
+            // The RAR grant: `f(0)` comes from the ramp and the RAR TPC, set
+            // when the RAR was parsed.
             self.send_msg3(g, phy);
             return;
         }
@@ -742,6 +802,10 @@ impl MacEntity {
         }
         let tbs_bytes = (g.tbs_bits / 8) as usize;
         let retx = self.ul_harq.is_retx(g.harq_id, g.ndi, g.tbs_bits);
+        // A UL DCI's TPC (Table 7.1.1-1) for the PUSCH loop (TS 38.213 §7.1.1).
+        if matches!(g.rnti_kind, RntiKind::C | RntiKind::Tc) {
+            self.power.on_pusch_tpc(g.tpc);
+        }
         if g.rnti_kind == RntiKind::C {
             self.drx.on_crnti_pdcch(slot);
             self.drx.on_ul_grant(g.harq_id, g.pusch_slot);
@@ -789,9 +853,11 @@ impl MacEntity {
             }
         }
         if self.phr.pending && left >= 3 {
-            push_single_phr(&mut out, self.power.ph_db, self.power.pcmax_dbm);
+            // Type 1 PH for the virtual reference PUSCH (TS 38.213 §7.7.1).
+            let ph = self.power.headroom(None);
+            push_single_phr(&mut out, ph.ph_db, ph.pcmax_dbm);
             left -= 3;
-            self.phr.on_sent(now, self.power.pathloss_db);
+            self.phr.on_sent(now, ph.pathloss_db);
             self.stats.phr_sent += 1;
         }
         // Buffer status per LCG.
@@ -889,6 +955,9 @@ impl MacEntity {
                 let Some(tb) = d.tb else { return };
                 if let Some(rar) = parse_rar_pdu(&tb) {
                     if let Some((rar, actions)) = self.ra.on_rar(&rar) {
+                        // f(0) = g(0) = ΔP_rampup + δ_msg2 (TS 38.213 §7.1.1, §7.2.1).
+                        self.power
+                            .on_rar(self.ra.preamble_power_ramping_counter, rar.grant.tpc);
                         self.apply_ra_actions(actions, phy);
                         self.ta.apply_rar(rar.ta, d.pdsch_slot);
                         phy.send(MacToPhy::TimingAdvance {
@@ -970,12 +1039,14 @@ impl MacEntity {
         self.ul_harq.store(0, 0, tbs_bits, tb.clone());
         self.ra.on_msg3_scheduled(grant.pusch_slot);
         self.stats.ul_tb += 1;
+        let power_dbm = self.power.pusch_dbm(u32::from(grant.n_prb), true);
         phy.send(MacToPhy::UlTti(UlTtiRequest {
             slot: grant.pusch_slot,
             pdus: vec![UlTtiPdu::Pusch {
                 grant,
                 tb,
                 uci: UciPayload::default(),
+                power_dbm,
             }],
         }));
     }

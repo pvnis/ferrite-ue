@@ -72,6 +72,7 @@ fn config() -> UeConfig {
         tx_rx_offset: 0,
         prach_offset: 0,
         rx_power_offset_db: 0.0,
+        tx_full_scale_dbm: None,
         rlf_at_s: 0,
         rlm_outage: None,
         t3512_s: None,

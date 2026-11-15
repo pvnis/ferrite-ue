@@ -24,6 +24,7 @@ pub(crate) mod harq;
 pub(crate) mod lcp;
 pub mod pdu;
 pub mod phr;
+pub mod power;
 pub(crate) mod ra;
 pub(crate) mod rar;
 pub(crate) mod sr;
@@ -137,6 +138,10 @@ pub struct PucchMacConfig {
     pub resources: Vec<(u8, u8, u16)>,
     /// Whether F2 resources may carry HARQ-ACK and CSI together.
     pub simultaneous_harq_ack_csi: bool,
+    /// Per resource: (id, format, symbols, RBs) — what power control needs.
+    pub shapes: Vec<(u8, u8, u8, u8)>,
+    /// The common PUCCH resource's (format, symbols) (TS 38.213 Table 9.2.1-1).
+    pub common_shape: (u8, u8),
 }
 
 /// Periodic CSI report MAC schedules: (period slots, offset slots, pucch resource id).
@@ -153,7 +158,7 @@ pub struct CsiReportMacConfig {
 }
 
 /// The MAC configuration (from RRC).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MacConfig {
     pub numerology: Numerology,
     pub rach: RachConfig,
@@ -175,8 +180,10 @@ pub struct MacConfig {
     pub csi_enabled: bool,
     /// `phr-Config` (`None` = PHR not configured / released).
     pub phr: Option<phr::PhrMacConfig>,
-    /// Periodic SRS occasions: `(resource id, period, offset)` in slots.
-    pub srs_occasions: Vec<(u8, u16, u16)>,
+    /// Uplink power control parameters (TS 38.213 §7) and the transmitter calibration.
+    pub power: power::UlPowerConfig,
+    /// Periodic SRS occasions: `(resource id, period, offset, RBs)`, period and offset in slots.
+    pub srs_occasions: Vec<(u8, u16, u16, u16)>,
     /// `drx-Config` (`None` = no DRX, always in Active Time).
     pub drx: Option<DrxMacConfig>,
     /// Keep transmitting the periodic SRS outside DRX Active Time. TS 38.321
@@ -220,6 +227,7 @@ impl MacConfig {
             tx_lead_slots,
             csi_enabled: false,
             phr: None,
+            power: power::UlPowerConfig::default(),
             srs_occasions: Vec::new(),
             drx: None,
             srs_outside_active_time: true,

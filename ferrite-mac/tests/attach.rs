@@ -332,7 +332,7 @@ fn attach_flow() {
         ) {
             if let MacToPhy::UlTti(r) = m {
                 for p in r.pdus {
-                    if let UlTtiPdu::Pucch { resource, uci } = p {
+                    if let UlTtiPdu::Pucch { resource, uci, .. } = p {
                         pucch = Some((r.slot, resource, uci));
                     }
                 }
@@ -398,7 +398,7 @@ fn attach_flow() {
         ) {
             if let MacToPhy::UlTti(r) = m {
                 for p in r.pdus {
-                    if let UlTtiPdu::Pusch { grant, tb, uci } = p {
+                    if let UlTtiPdu::Pusch { grant, tb, uci, .. } = p {
                         pusch = Some((r.slot, grant, tb, uci));
                     }
                 }

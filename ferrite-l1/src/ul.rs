@@ -58,6 +58,63 @@ pub struct UlBuilder {
     pub cell_id: u16,
 }
 
+/// `DELTA_PREAMBLE` (TS 38.321 Table 7.3-1): the format's power offset to the
+/// preamble target, `+3·µ` dB for the short formats at PRACH numerology `µ`.
+pub fn delta_preamble_db(format: pc::PreambleFormat, mu_ra: f32) -> f32 {
+    use pc::PreambleFormat as F;
+    match format {
+        F::F0 | F::F3 => 0.0,
+        F::F1 => -3.0,
+        F::F2 => -6.0,
+        F::A1 | F::B1 | F::A1B1 => 8.0 + 3.0 * mu_ra,
+        F::A2 | F::B2 | F::C2 | F::A2B2 => 5.0 + 3.0 * mu_ra,
+        F::A3 | F::B3 | F::B4 | F::A3B3 => 3.0 + 3.0 * mu_ra,
+        F::C0 => 11.0 + 3.0 * mu_ra,
+    }
+}
+
+/// Set a waveform's level. With a transmitter calibration (`full_scale_dbm`,
+/// the dBm of a 0 dBFS signal) and a power in dBm, the RMS over the
+/// transmitted (non-zero) samples is set so that the device radiates
+/// `power_dbm`, with peaks kept inside full scale; otherwise the waveform is
+/// peak-normalised to `ul_amplitude`. Returns the gain applied.
+pub fn scale_waveform(
+    w: &mut [Iq],
+    ul_amplitude: f32,
+    full_scale_dbm: Option<f32>,
+    power_dbm: Option<f32>,
+) -> f32 {
+    let pk = w.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
+    let g = match (full_scale_dbm, power_dbm) {
+        (Some(fs), Some(p)) => {
+            let (sum, n) = w
+                .iter()
+                .map(|c| c.norm_sqr())
+                .filter(|&e| e > 0.0)
+                .fold((0.0f64, 0usize), |(s, n), e| (s + f64::from(e), n + 1));
+            if n == 0 {
+                return 1.0;
+            }
+            let rms = (sum / n as f64).sqrt() as f32;
+            let g = 10f32.powf((p - fs) / 20.0) / rms.max(1e-9);
+            if g * pk > 1.0 {
+                log::debug!(
+                    "UL power {p:.1} dBm needs peak {:.2} FS: clipped to full scale",
+                    g * pk
+                );
+                1.0 / pk
+            } else {
+                g
+            }
+        }
+        _ => ul_amplitude / pk,
+    };
+    for s in w.iter_mut() {
+        *s *= g;
+    }
+    g
+}
+
 /// A built waveform and its absolute UL start index.
 pub struct Waveform {
     pub start: i64,
@@ -76,12 +133,14 @@ impl UlBuilder {
         }
     }
 
-    fn normalise(&self, w: &mut [Iq]) {
-        let pk = w.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-9);
-        let g = self.cfg.ul_amplitude / pk;
-        for s in w.iter_mut() {
-            *s *= g;
-        }
+    /// Set the waveform's level (see [`scale_waveform`]).
+    fn scale(&self, w: &mut [Iq], power_dbm: Option<f32>) {
+        scale_waveform(
+            w,
+            self.cfg.ul_amplitude,
+            self.cfg.tx_full_scale_dbm,
+            power_dbm,
+        );
     }
 
     /// PRACH preamble on `occ`.
@@ -90,7 +149,7 @@ impl UlBuilder {
         clock: &SampleClock,
         occ: &PrachOccasion,
         preamble: u8,
-        _power_offset_db: f32,
+        power_dbm: Option<f32>,
     ) -> Result<Waveform, String> {
         let p = &self.cfg.prach;
         let params = p
@@ -125,7 +184,10 @@ impl UlBuilder {
             first_sc,
         )
         .map_err(|e| format!("{e:?}"))?;
-        self.normalise(&mut w);
+        // TS 38.321 Table 7.3-1: Δ_PREAMBLE by format (+3 dB per PRACH numerology step).
+        let mu_ra = (params.delta_f_ra_hz / 15_000.0).log2().round().max(0.0) as f32;
+        let delta_preamble_db = delta_preamble_db(params.format, mu_ra);
+        self.scale(&mut w, power_dbm.map(|p| p + delta_preamble_db));
         // Occasion start: `start_tc` from the subframe start (TS 38.211 §5.3.2).
         let subframe_slot = occ.slot.sub(occ.slot.slot_in_subframe() as u64);
         // TS 38.211 §4.3.1: the PRACH is transmitted with N_TA = 0 (the
@@ -147,6 +209,7 @@ impl UlBuilder {
         grant: &UlGrant,
         tb: &[u8],
         uci: &UciPayload,
+        power_dbm: Option<f32>,
     ) -> Result<Waveform, String> {
         let mapping = if grant.time.mapping_type_a {
             MappingType::TypeA
@@ -257,7 +320,7 @@ impl UlBuilder {
             &uci.csi1,
             &csi_res,
         );
-        self.normalise(&mut w);
+        self.scale(&mut w, power_dbm);
         Ok(Waveform {
             start: clock.ul_index(slot),
             samples: w,
@@ -332,6 +395,7 @@ impl UlBuilder {
         resource: PucchResourceRef,
         uci: &UciPayload,
         crnti: u16,
+        power_dbm: Option<f32>,
     ) -> Result<Waveform, String> {
         let res = self
             .pucch_resource(resource)
@@ -466,7 +530,7 @@ impl UlBuilder {
             _ => return Err("PUCCH format 4 not supported".into()),
         };
         let mut w = w;
-        self.normalise(&mut w);
+        self.scale(&mut w, power_dbm);
         Ok(Waveform {
             start: clock.ul_index(slot),
             samples: w,
@@ -480,6 +544,7 @@ impl UlBuilder {
         clock: &SampleClock,
         slot: SlotPoint,
         resource_id: u8,
+        power_dbm: Option<f32>,
     ) -> Result<Waveform, String> {
         let r = self
             .cfg
@@ -498,11 +563,62 @@ impl UlBuilder {
             self.geom.fs,
         )
         .ok_or("unsupported SRS configuration")?;
-        self.normalise(&mut w);
+        self.scale(&mut w, power_dbm);
         Ok(Waveform {
             start: clock.ul_index(slot),
             samples: w,
             tag: "srs",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without a calibration the peak goes to `ul_amplitude`; with one the RMS of
+    /// the transmitted samples follows the power, and a power the peak cannot
+    /// carry is clipped to full scale.
+    #[test]
+    fn waveform_levels() {
+        let mut w: Vec<Iq> = (0..100)
+            .map(|i| {
+                if i < 50 {
+                    Iq::new(0.0, 0.0)
+                } else {
+                    Iq::new(0.2, 0.0)
+                }
+            })
+            .collect();
+        w[60] = Iq::new(0.4, 0.0);
+        scale_waveform(&mut w, 0.5, None, Some(10.0));
+        assert!((w[60].re - 0.5).abs() < 1e-6, "peak normalised");
+        // Calibration: 0 dBFS = 10 dBm. Target -10 dBm → RMS 0.1 over the 50 active samples.
+        let mut w: Vec<Iq> = (0..100)
+            .map(|i| {
+                if i < 50 {
+                    Iq::new(0.0, 0.0)
+                } else {
+                    Iq::new(0.2, 0.0)
+                }
+            })
+            .collect();
+        scale_waveform(&mut w, 0.5, Some(10.0), Some(-10.0));
+        let rms = (w[50..].iter().map(|c| c.norm_sqr()).sum::<f32>() / 50.0).sqrt();
+        assert!((rms - 0.1).abs() < 1e-4, "rms {rms}");
+        assert!(w[..50].iter().all(|c| *c == Iq::default()));
+        // 20 dBm would need RMS 3.16: clipped so the peak is full scale.
+        let mut w = vec![Iq::new(0.2, 0.0); 10];
+        scale_waveform(&mut w, 0.5, Some(10.0), Some(20.0));
+        assert!((w[0].re - 1.0).abs() < 1e-6);
+    }
+
+    /// TS 38.321 Table 7.3-1 spot checks.
+    #[test]
+    fn preamble_deltas() {
+        assert_eq!(delta_preamble_db(pc::PreambleFormat::F0, 0.0), 0.0);
+        assert_eq!(delta_preamble_db(pc::PreambleFormat::F1, 0.0), -3.0);
+        assert_eq!(delta_preamble_db(pc::PreambleFormat::B4, 1.0), 6.0);
+        assert_eq!(delta_preamble_db(pc::PreambleFormat::C0, 0.0), 11.0);
     }
 }

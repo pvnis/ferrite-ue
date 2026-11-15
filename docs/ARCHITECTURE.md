@@ -307,8 +307,19 @@ views. Sub-procedures and their states:
   request a switch. Every switch is a `MacEvent::BwpSwitch` that RRC answers
   with the BWP's configuration (`Reconfigure` → CONFIG.request).
 * **BSR** (§5.4.5, regular/periodic/padding, short/long), **LCP** (§5.4.3.1),
-  **PHR** (§5.4.6, Single Entry PHR from a `PowerHeadroom` input), **SRS**
-  occasions (dropped when a PUCCH/PUSCH goes out in the slot).
+  **PHR** (§5.4.6, Single Entry PHR, Type 1 from the power-control state),
+  **SRS** occasions (dropped when a PUCCH/PUSCH goes out in the slot).
+* **Uplink power control** (TS 38.213 §7, `power.rs`, `UlPowerControl`): the
+  pathloss is `ss-PBCH-BlockPower − filtered SS-RSRP (dBm)`; PRACH =
+  target + ramp + PL; PUSCH = `P_O + 10·log10(2^µ·M_RB) + α·PL + f(i)` with
+  `f(0) = ΔP_rampup + δ_msg2` from the RAR and the UL-DCI TPC accumulated (or
+  absolute); PUCCH adds `Δ_F`, `Δ_TF` (formats 0/1 by symbols, 2–4 by UCI bits
+  per RE) and `g(i)` from the DL-DCI TPC; SRS rides the PUSCH loop; all capped
+  at `P_CMAX = min(p-Max, device full scale − 12 dB)`. Every UL_TTI PDU carries
+  `power_dbm`; the L1 sets the RMS level against the transmitter calibration
+  (`PhyConfig::tx_full_scale_dbm`, from `--tx-power-offset-db`) and adds the
+  format's `Δ_PREAMBLE` to the PRACH. Without a calibration (ZMQ) powers are
+  `None` and waveforms are peak-normalised as before.
 * DL MAC PDU parsing follows TS 38.321 Table 6.2.1-1 (fixed-size CEs, SDUs
   with L fields; eLCID / reserved LCIDs stop the parse).
 

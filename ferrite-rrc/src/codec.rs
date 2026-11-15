@@ -419,6 +419,7 @@ pub fn cell_from_sib1(
         csi_reports: Vec::new(),
         harq_codebook_dynamic: true,
         ul_amplitude: 0.5,
+        tx_full_scale_dbm: None,
     };
 
     let mut mac = MacConfig::initial(
@@ -441,6 +442,32 @@ pub fn cell_from_sib1(
         tx_lead,
     );
     mac.time_alignment_timer_ms = ul.time_alignment_timer_common.0.map_or(0, u32::from);
+    // Uplink power control, cell-common part (TS 38.213 §7); the dedicated
+    // configuration refines it and the stack adds the transmitter calibration.
+    let pusch_common = ul
+        .initial_uplink_bwp
+        .pusch_config_common
+        .as_ref()
+        .and_then(|p| p.setup());
+    mac.power = ferrite_mac::power::UlPowerConfig {
+        mu,
+        ss_pbch_power_dbm: f32::from(sc.ss_pbch_block_power),
+        pcmax_dbm: f32::from(ul.frequency_info_ul.p_max.unwrap_or(23)).min(23.0),
+        preamble_target_dbm: f32::from(g.preamble_received_target_power),
+        ramping_step_db: f32::from(g.power_ramping_step_db),
+        p0_nominal_pusch_dbm: f32::from(
+            pusch_common
+                .and_then(|p| p.p0_nominal_with_grant)
+                .unwrap_or(-76),
+        ),
+        msg3_delta_preamble_db: f32::from(
+            pusch_common
+                .and_then(|p| p.msg3_delta_preamble)
+                .unwrap_or(0),
+        ),
+        p0_nominal_pucch_dbm: f32::from(pucch_common.and_then(|p| p.p0_nominal).unwrap_or(-90)),
+        ..ferrite_mac::power::UlPowerConfig::default()
+    };
 
     let plmn = s.plmn().map(|p| {
         let mut out = String::new();
@@ -858,6 +885,16 @@ pub fn apply_cell_group_bwp(
 
     // --- PUSCH.
     if let Some(p) = ul_ded.and_then(|d| d.pusch_config.as_ref()?.setup()) {
+        if let Some(pc) = p.pusch_power_control.as_ref() {
+            mac.power.tpc_accumulation = !pc.tpc_accumulation_disabled;
+            if let Some(a) = pc.msg3_alpha {
+                mac.power.msg3_alpha = a.value();
+            }
+            if let Some(set) = pc.p0_alpha_sets.first() {
+                mac.power.p0_ue_pusch_db = f32::from(set.p0.unwrap_or(0));
+                mac.power.alpha_pusch = set.alpha.map_or(1.0, |a| a.value());
+            }
+        }
         phy.pusch.dmrs_type_a = dmrs_ul(
             p.dmrs_uplink_for_pusch_mapping_type_a.as_ref(),
             phy.pusch.dmrs_type_a,
@@ -911,6 +948,19 @@ pub fn apply_cell_group_bwp(
 
     // --- PUCCH.
     if let Some(p) = ul_ded.and_then(|d| d.pucch_config.as_ref()?.setup()) {
+        if let Some(pc) = p.pucch_power_control.as_ref() {
+            mac.power.delta_f_pucch_db = [
+                pc.delta_f_pucch_f0,
+                pc.delta_f_pucch_f1,
+                pc.delta_f_pucch_f2,
+                pc.delta_f_pucch_f3,
+                pc.delta_f_pucch_f4,
+            ]
+            .map(|d| f32::from(d.unwrap_or(0)));
+            if let Some(&(_, v)) = pc.p0_set.first() {
+                mac.power.p0_ue_pucch_db = f32::from(v);
+            }
+        }
         for id in &p.resource_set_to_release_list {
             phy.pucch.resource_sets.retain(|x| x.id != *id);
         }
@@ -1055,6 +1105,10 @@ pub fn apply_cell_group_bwp(
     }
     // --- SRS: resources by id (add-mod / release); periodic occasions for MAC.
     if let Some(s) = ul_ded.and_then(|d| d.srs_config.as_ref()?.setup()) {
+        if let Some(set) = s.srs_resource_set_to_add_mod_list.first() {
+            mac.power.p0_srs_dbm = f32::from(set.p0.unwrap_or(-76));
+            mac.power.alpha_srs = set.alpha.map_or(1.0, |a| a.value());
+        }
         for id in &s.srs_resource_to_release_list {
             phy.srs.retain(|r| r.id != *id);
         }
@@ -1100,7 +1154,10 @@ pub fn apply_cell_group_bwp(
         .srs
         .iter()
         .filter(|r| r.period_slots > 0)
-        .map(|r| (r.id, r.period_slots, r.offset_slots))
+        .map(|r| {
+            let (n_rb, _) = ferrite_ran::srs::srs_bandwidth(r.params.c_srs, r.params.b_srs);
+            (r.id, r.period_slots, r.offset_slots, n_rb)
+        })
         .collect();
 
     // SR resources (PUCCH) attached to their SR configurations.
@@ -1146,6 +1203,29 @@ pub fn apply_cell_group_bwp(
             })
             .collect(),
         simultaneous_harq_ack_csi: f2.simultaneous_harq_ack_csi,
+        shapes: phy
+            .pucch
+            .resources
+            .iter()
+            .map(|r| {
+                let (fmt, n_rb) = match r.format {
+                    PucchFormat::F0 { .. } => (0, 1),
+                    PucchFormat::F1 { .. } => (1, 1),
+                    PucchFormat::F2 { n_prb, .. } => (2, n_prb),
+                    PucchFormat::F3 { n_prb, .. } => (3, n_prb),
+                    PucchFormat::F4 { .. } => (4, 1),
+                };
+                (r.id, fmt, r.n_symbols, n_rb)
+            })
+            .collect(),
+        // TS 38.213 Table 9.2.1-1: rows 0–2 are F0 over 2 symbols, 3–6 F1 over 4,
+        // 7–10 F1 over 10, 11–15 F1 over 14.
+        common_shape: match phy.pucch.resource_common.unwrap_or(11) & 15 {
+            0..=2 => (0, 2),
+            3..=6 => (1, 4),
+            7..=10 => (1, 10),
+            _ => (1, 14),
+        },
     };
     mac.csi_reports = phy
         .csi_reports
