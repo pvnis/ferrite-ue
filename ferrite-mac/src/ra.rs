@@ -204,11 +204,9 @@ impl RaProcedure {
                     self.retry(now, &mut actions);
                 }
             }
-            RaState::ContentionResolution { timer_end, .. } => {
-                if now.diff(&timer_end) >= 0 {
-                    // §5.1.5: contention resolution timer expiry.
-                    self.retry(now, &mut actions);
-                }
+            RaState::ContentionResolution { timer_end, .. } if now.diff(&timer_end) >= 0 => {
+                // §5.1.5: contention resolution timer expiry.
+                self.retry(now, &mut actions);
             }
             _ => {}
         }

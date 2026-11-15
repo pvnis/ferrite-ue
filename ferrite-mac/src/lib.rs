@@ -5,13 +5,13 @@
 //! state machines driven by PHY indications; no threads, no I/O.
 //!
 //! Sub-entities:
-//! * [`ra`] — the random-access procedure (§5.1), one state machine;
-//! * [`harq`] — DL/UL HARQ entities and the HARQ-ACK codebook (§5.3, §5.4.2, TS 38.213 §9.1);
-//! * [`bsr`], [`sr`] — buffer status reporting (§5.4.5) and scheduling requests (§5.4.4);
+//! * `ra` — the random-access procedure (§5.1), one state machine;
+//! * `harq` — DL/UL HARQ entities and the HARQ-ACK codebook (§5.3, §5.4.2, TS 38.213 §9.1);
+//! * `bsr`, `sr` — buffer status reporting (§5.4.5) and scheduling requests (§5.4.4);
 //! * [`phr`] — power headroom reporting (§5.4.6);
-//! * [`lcp`] — logical channel prioritisation (§5.4.3.1);
-//! * [`pdu`], [`rar`] — MAC PDU multiplexing/demultiplexing (§6.1) and the RAR (§6.2.3);
-//! * [`ta`] — timing advance maintenance (§5.2);
+//! * `lcp` — logical channel prioritisation (§5.4.3.1);
+//! * [`pdu`], `rar` — MAC PDU multiplexing/demultiplexing (§6.1) and the RAR (§6.2.3);
+//! * `ta` — timing advance maintenance (§5.2);
 //! * [`drx`] — discontinuous reception (§5.7): Active Time, PDCCH monitoring on/off;
 //! * [`entity`] — the [`MacEntity`] tying it together.
 

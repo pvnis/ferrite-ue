@@ -8,7 +8,7 @@
 //! * Format 2 (§6.3.2.5): RM-coded UCI (CSI) over 1–2 symbols.
 //!
 //! Structure (occ handled generally, but the common resource uses occ 0):
-//! - Base low-PAPR sequence r_{u,v}(n) = e^{jπ·φ₁₂[u][n]/4}, u = n_id mod 30, v = 0.
+//! - Base low-PAPR sequence `r_{u,v}(n) = e^{jπ·φ₁₂[u][n]/4}`, u = n_id mod 30, v = 0.
 //! - Per-symbol cyclic shift α_l = 2π·n_cs(l)/12 from a gold sequence seeded by
 //!   n_id (§6.3.2.2.2), applied as e^{jα_l·n}.
 //! - Alternating symbols: DM-RS on even, data (d·r) on odd, within each hop; the
@@ -41,7 +41,7 @@ pub const PHI_12: [[i8; 12]; 30] = [
 ];
 
 /// TS 38.211 Table 6.3.2.4.1-2: φ for the orthogonal cover code w_i(m) =
-/// exp(j·2π·φ/N_SF), indexed by [N_SF-1][i][m].
+/// exp(j·2π·φ/N_SF), indexed by `[N_SF-1][i][m]`.
 #[rustfmt::skip]
 const OCC_PHI: [[[i8; 7]; 7]; 7] = [
     [[0,0,0,0,0,0,0],[0;7],[0;7],[0;7],[0;7],[0;7],[0;7]],
@@ -73,7 +73,7 @@ pub struct PucchF1 {
     pub carrier_rb: usize,
 }
 
-/// Base sequence with cyclic shift: r^α(n) = exp(j·2π·α·n/12) · exp(jπ·φ₁₂[u][n]/4).
+/// Base sequence with cyclic shift: `r^α(n) = exp(j·2π·α·n/12) · exp(jπ·φ₁₂[u][n]/4)`.
 fn base_seq_shifted(u: usize, alpha: usize) -> [Complex32; 12] {
     let mut out = [Complex32::new(0.0, 0.0); 12];
     for (n, o) in out.iter_mut().enumerate() {

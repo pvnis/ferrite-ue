@@ -67,9 +67,9 @@ impl ZmqSource {
         self.pending.clear();
         self.pending_pos = 0;
         self.pending.reserve(bytes.len() / 8);
-        for c in bytes.chunks_exact(8) {
-            let re = f32::from_le_bytes(c[0..4].try_into().unwrap());
-            let im = f32::from_le_bytes(c[4..8].try_into().unwrap());
+        for &[r0, r1, r2, r3, i0, i1, i2, i3] in bytes.as_chunks::<8>().0 {
+            let re = f32::from_le_bytes([r0, r1, r2, r3]);
+            let im = f32::from_le_bytes([i0, i1, i2, i3]);
             self.pending.push(Complex32::new(re, im));
         }
         Ok(())

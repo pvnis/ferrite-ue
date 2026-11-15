@@ -1,5 +1,5 @@
 //! PDCP (TS 38.323) for the Ferrite 5G NR UE, plus the AS security algorithms
-//! of TS 33.501 Annex D in [`security`].
+//! of TS 33.501 Annex D in `ferrite_security`.
 //!
 //! [`PdcpEntity`] is one PDCP entity (one per radio bearer, TS 38.323 §4.2.2)
 //! modelled as a pure state machine: no I/O, no threads, time arrives as a

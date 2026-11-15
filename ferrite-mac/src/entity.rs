@@ -430,7 +430,15 @@ impl MacEntity {
             }
         }
         // SR failure (sr-TransMax) → RA + notify RRC (§5.4.4).
-        if self.sr.iter_mut().fold(false, |f, s| s.take_failed() || f) {
+        // Every configuration's flag must be consumed, so no short-circuit.
+        let sr_failed = self
+            .sr
+            .iter_mut()
+            .map(|s| s.take_failed())
+            .filter(|&f| f)
+            .count()
+            > 0;
+        if sr_failed {
             for s in &mut self.sr {
                 s.cancel();
             }

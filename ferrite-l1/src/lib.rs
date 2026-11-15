@@ -2,7 +2,7 @@
 //!
 //! * [`fapi`]: the PHY ↔ MAC interface (FAPI-style messages).
 //! * [`config`]: the PHY configuration delivered by CONFIG.request.
-//! * [`rt`], [`stream`]: real-time plumbing (queues, injection table, buffered radio stream).
+//! * `rt`, [`stream`]: real-time plumbing (queues, injection table, buffered radio stream).
 //!
 //! The engine itself (sync, PDCCH monitoring, PDSCH/HARQ receive, UL placement)
 //! lives in the remaining modules.

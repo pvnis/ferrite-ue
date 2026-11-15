@@ -4,7 +4,7 @@
 //! * a continuously drained downlink sample stream ([`DlStream`], a
 //!   [`crate::stream::BufferedStream`] over any `SampleSource`), and
 //! * an uplink server ([`UlServer`]) that is fed from the
-//!   [`crate::rt::InjectionTable`] by absolute UL sample index.
+//!   `rt::InjectionTable` by absolute UL sample index.
 //!
 //! How the uplink is paced is a property of the backend, captured in
 //! [`UlPacing`]: the ZMQ gNB pulls blocks in lockstep with the samples it
@@ -20,7 +20,7 @@
 //! the shared receive [`TimeBase`] ([`TimedPushUlSink`]), and the device FIFO
 //! back-pressures the writer. The fixed RX→TX sample offset of a
 //! backend is reported by [`UlServer::tx_rx_offset`] and consumed by
-//! [`crate::timing::SampleClock`]; nothing else about the transport is visible.
+//! `timing::SampleClock`; nothing else about the transport is visible.
 
 use ferrite_common::{Error, Iq, Result};
 use ferrite_radio::time::TimeBase;
@@ -181,7 +181,7 @@ impl<S: SampleSink> UlSink for PushUlSink<S> {
 /// stream sample 0 (published by the receive side through the shared
 /// [`TimeBase`]). The uplink index is thus tied to the downlink index by the
 /// device clock alone, exactly as over the lockstep transport, and the
-/// [`crate::timing::SampleClock`] relation `u = d − TA − tx_rx_offset + guard`
+/// `timing::SampleClock` relation `u = d − TA − tx_rx_offset + guard`
 /// holds unchanged.
 ///
 /// A block whose air time is less than `min_lead` samples after the newest

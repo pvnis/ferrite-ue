@@ -23,11 +23,10 @@ fn main() {
 
     // Parse records: 1 + 2 + 4 + 4 = 11 bytes each.
     let mut res: Vec<(u8, u16, f32, f32)> = Vec::new();
-    for r in bytes.chunks_exact(11) {
-        let l = r[0];
-        let k = u16::from_le_bytes([r[1], r[2]]);
-        let re = f32::from_le_bytes([r[3], r[4], r[5], r[6]]);
-        let im = f32::from_le_bytes([r[7], r[8], r[9], r[10]]);
+    for &[l, k0, k1, r0, r1, r2, r3, i0, i1, i2, i3] in bytes.as_chunks::<11>().0 {
+        let k = u16::from_le_bytes([k0, k1]);
+        let re = f32::from_le_bytes([r0, r1, r2, r3]);
+        let im = f32::from_le_bytes([i0, i1, i2, i3]);
         res.push((l, k, re, im));
     }
     println!("{} data REs, n_rb={n_rb}, n_cell={n_cell}", res.len());

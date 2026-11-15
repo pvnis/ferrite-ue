@@ -18,11 +18,13 @@ fn main() {
     let df: Option<f64> = a.get(5).and_then(|x| x.parse().ok());
     let bytes = std::fs::read(path).unwrap();
     let samples: Vec<Iq> = bytes
-        .chunks_exact(8)
-        .map(|c| {
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&[r0, r1, r2, r3, i0, i1, i2, i3]| {
             Iq::new(
-                f32::from_le_bytes(c[0..4].try_into().unwrap()),
-                f32::from_le_bytes(c[4..8].try_into().unwrap()),
+                f32::from_le_bytes([r0, r1, r2, r3]),
+                f32::from_le_bytes([i0, i1, i2, i3]),
             )
         })
         .collect();

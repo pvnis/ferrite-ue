@@ -1067,7 +1067,9 @@ impl RegistrationAccept {
                 0x4a => {
                     m.equivalent_plmns = ie
                         .value
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .filter_map(|c| Plmn::decode(c).ok())
                         .collect();
                 }

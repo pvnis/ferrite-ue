@@ -4,7 +4,7 @@
 //! transmits through [`SampleSink`], independent of the underlying transport.
 //! Backends live behind feature flags so the core builds without native libs:
 //!
-//! * [`file`] — read/write interleaved little-endian `f32` IQ (always available);
+//! * [`mod@file`] — read/write interleaved little-endian `f32` IQ (always available);
 //! * `soapy` (feature) — SoapySDR devices (LimeSDR, BladeRF, USRP, M2SDR);
 //! * `zmq` (feature) — a gNB exposing baseband over ZeroMQ.
 //!
