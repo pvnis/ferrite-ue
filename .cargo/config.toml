@@ -6,3 +6,13 @@
 # everything else. For a portable build, swap to: target-feature=+avx2,+fma
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# The `zmq` crate (via zmq-sys -> zeromq-src) always compiles libzmq from
+# source with the `cc` crate and does not run libzmq's configure checks.
+# Without HAVE_POSIX_MEMALIGN, libzmq's yqueue_t allocates its 64-byte-aligned
+# command chunks with plain malloc; compilers that emit aligned AVX stores for
+# the copy then fault (SIGSEGV in zmq::mailbox_t::send, seen on GitHub's
+# Ubuntu 26.04 runners).  Defining it restores the posix_memalign path that
+# every distro build of libzmq uses.
+[env]
+CXXFLAGS = "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
