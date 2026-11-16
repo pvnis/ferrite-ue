@@ -335,6 +335,71 @@ cost of hand-writing).
 Tooling: `#![warn(missing_docs)]`, a crate-level MAC↔RLC↔PDCP chain test,
 CI form of the lab matrix (clippy, unit tests and GitHub CI done 2026-11-14).
 
+## Architecture improvements (osmocom-bb review, 2026-11-16)
+
+Practices taken from OsmocomBB (`src/host/layer23`, `src/host/trxcon`,
+`src/target/trx_toolkit`), adapted to ferrite. Its C idioms (msgb, void*
+callbacks, 5–7k-line files) are not adopted; the crate split and the typed
+FAPI already improve on them.
+
+- [ ] **Explicit state machines with declared transitions** (priority).
+      Today 11 FSMs are enums changed by plain assignment: L1 `CellPhase`,
+      `RlmState`; MAC `RaState`, `SrState`, `DrxState`, `TaState`; RRC
+      `RrcState` (one `set_state` already); NAS `MmState` (with substates),
+      `CmState`, `SmState`. Implicit ones live in flags/options: HARQ
+      processes, RLC AM windows, the stack's connection-retry and
+      AS-security hand-over. Plan, after `osmo_fsm` and the MM/RR
+      (state, substate, event) → handler tables:
+      1. A small helper in `ferrite-common` (no dependency): per machine a
+         fieldless state kind and event kind, a `const` transition table
+         `(from, event) → allowed targets` annotated with the spec clause,
+         and one `transition(to, event)` entry point that checks the table
+         (a violation is an error and a counter, never a panic), logs
+         `RRC Connecting → Connected on RRCSetup [38.331 §5.3.3.4]`, and arms
+         / cancels the state's spec timers (T300, T3510, …) with the state
+         change.
+      2. Pilot on RRC and MAC RA; then NAS MM/CM/SM, MAC SR/DRX/TA, L1
+         `CellPhase`/RLM; then make the implicit machines explicit.
+      3. Generate the diagrams in ARCHITECTURE.md from the tables (Mermaid),
+         so the documentation cannot drift from the code.
+      4. Verification, in increasing cost: exhaustive tests over every
+         (state kind, event kind) pair from the table (no tooling); Kani
+         model-checking harnesses on the step functions (`#[cfg(kani)]`,
+         needs `cargo-kani` installed: no panics, only table transitions,
+         timer invariants such as "T3510 runs iff RegistrationInitiated");
+         a composed cross-layer model (NAS × RRC × MAC RA, e.g. in
+         TLA+/Quint) for deadlock and liveness ("registration attempts
+         always end"), checked against lab runs by validating the logged
+         transition traces.
+- [ ] **Protocol capture for Wireshark** (GSMTAP's role): MAC-NR PDUs (and
+      RRC / NAS) to a pcap file or UDP in Wireshark's `mac-nr` framing, as
+      srsRAN / OAI do. No new dependency.
+- [ ] **Machine-readable state** instead of log greps (`lab.sh` has 49):
+      a JSON summary at exit (counters, RRC/NAS state, tracking), later a
+      control socket (VTY's role: status, detach, re-register).
+- [ ] **RRC / NAS / user plane off the slot thread** (T0): L3 behind
+      queues, MAC (HARQ timing) stays on T0, so a slow ASN.1 decode or crypto
+      step cannot cost an uplink deadline over the air (osmocom: real-time
+      L1, non-real-time L23).
+- [ ] **Persisted subscriber state** (`gsm_subscriber`'s role): 5G-GUTI,
+      last TAI, NAS security context, forbidden PLMNs, USIM SQN (`NasUe`
+      exposes the SQN "to persist" but nothing saves it), so the UE
+      re-registers with its GUTI like a real one. Keep settings, subscriber
+      state and UE capabilities as separate structs.
+- [ ] **Runtime channel-emulator control** (`fake_trx` `FAKE_*`): change
+      SNR / ppm or drop N blocks while running, for scripted RLF →
+      re-establishment and coverage-gap tests.
+- [ ] **Named radio quirks** (`phy_quirks`): per-device workarounds (XTRX
+      68-sample offset, Lime timestamp rules) in one struct in
+      `ferrite-radio`, selected by configuration.
+- [ ] **First-class small tools** (layer23's `cell_log` / `bcch_scan`):
+      a `ferrite-scan` binary from `cell_search` / `offline_scan` that logs
+      ARFCN, PCI, RSRP, PLMN and TDD pattern (CBRS site surveys).
+- [ ] **Instance scoping and a serialisable FAPI** (lower): all state per UE
+      with a UE id in log lines; serialisable FAPI messages for FAPI-level
+      record / replay and a DSP-free virtual PHY for fast L2/L3 regression
+      (`virt_phy`'s role).
+
 ## Over the air
 
 - [x] Wire the SoapySDR backend into the `ferrite-ue` binary (`--radio sdr`,
