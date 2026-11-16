@@ -113,7 +113,7 @@ pub enum RaTrigger {
 pub struct RaMachine;
 
 const fn r(
-    from: RaPhase,
+    from: &'static [RaPhase],
     event: RaTrigger,
     to: RaPhase,
     clause: &'static str,
@@ -164,50 +164,71 @@ impl Machine for RaMachine {
         use RaPhase::*;
         use RaTrigger::*;
         &[
-            r(Idle, Start, SelectResource, "38.321 §5.1.1"),
-            r(Succeeded, Start, SelectResource, "38.321 §5.1.1"),
-            r(Failed, Start, SelectResource, "38.321 §5.1.1"),
-            r(PreambleRequested, Start, SelectResource, RESTART),
-            r(RarWindow, Start, SelectResource, RESTART),
-            r(Msg3Pending, Start, SelectResource, RESTART),
-            r(ContentionResolution, Start, SelectResource, RESTART),
             r(
+                &[Idle, Succeeded, Failed],
+                Start,
                 SelectResource,
+                "38.321 §5.1.1",
+            ),
+            r(
+                &[
+                    SelectResource,
+                    PreambleRequested,
+                    RarWindow,
+                    Msg3Pending,
+                    ContentionResolution,
+                ],
+                Start,
+                SelectResource,
+                RESTART,
+            ),
+            r(
+                &[SelectResource],
                 OccasionSelected,
                 PreambleRequested,
                 "38.321 §5.1.2, §5.1.3",
             ),
-            r(PreambleRequested, PreambleSent, RarWindow, "38.321 §5.1.4"),
-            r(RarWindow, RarReceived, Msg3Pending, "38.321 §5.1.4"),
-            r(RarWindow, RarWindowExpiry, SelectResource, RETRY),
-            r(RarWindow, RarWindowExpiry, Failed, PROBLEM),
             r(
-                Msg3Pending,
+                &[PreambleRequested],
+                PreambleSent,
+                RarWindow,
+                "38.321 §5.1.4",
+            ),
+            r(&[RarWindow], RarReceived, Msg3Pending, "38.321 §5.1.4"),
+            r(&[RarWindow], RarWindowExpiry, SelectResource, RETRY),
+            r(&[RarWindow], RarWindowExpiry, Failed, PROBLEM),
+            r(
+                &[Msg3Pending],
                 Msg3GrantTimeout,
                 SelectResource,
                 "ferrite: an unresolved RAR grant counts as no RAR (38.321 §5.1.4)",
             ),
             r(
-                Msg3Pending,
+                &[Msg3Pending],
                 Msg3GrantTimeout,
                 Failed,
                 "ferrite: an unresolved RAR grant counts as no RAR (38.321 §5.1.4)",
             ),
-            r(Msg3Pending, Msg3Sent, ContentionResolution, "38.321 §5.1.5"),
             r(
+                &[Msg3Pending],
+                Msg3Sent,
                 ContentionResolution,
+                "38.321 §5.1.5",
+            ),
+            r(
+                &[ContentionResolution],
                 ContentionResolved,
                 Succeeded,
                 "38.321 §5.1.5",
             ),
             r(
-                ContentionResolution,
+                &[ContentionResolution],
                 ContentionResolutionExpiry,
                 SelectResource,
                 "38.321 §5.1.5 (ra-ContentionResolutionTimer expiry), §5.1.4 retry",
             ),
             r(
-                ContentionResolution,
+                &[ContentionResolution],
                 ContentionResolutionExpiry,
                 Failed,
                 "38.321 §5.1.5 (ra-ContentionResolutionTimer expiry), §5.1.4 RA problem",
@@ -305,7 +326,9 @@ impl RaProcedure {
     fn go(&mut self, trigger: RaTrigger, to: RaState) -> bool {
         match self.state.transition(trigger, to) {
             Ok(t) => {
-                log::debug!("{t}");
+                if let Some(t) = t {
+                    log::debug!("{t}");
+                }
                 true
             }
             Err(v) => {
@@ -331,13 +354,10 @@ impl RaProcedure {
         self.backoff_ms = 0;
         self.msg3_ccch = ccch;
         self.crnti_ra = crnti;
-        let to = RaState::SelectResource { not_before: now };
-        if self.state.kind() == RaPhase::SelectResource {
-            // Restart before an occasion was chosen: same state, new data.
-            self.state.update(to);
-        } else {
-            self.go(RaTrigger::Start, to);
-        }
+        self.go(
+            RaTrigger::Start,
+            RaState::SelectResource { not_before: now },
+        );
     }
 
     /// Current power offset above the target (§5.1.3): (counter − 1) · step.
@@ -560,7 +580,7 @@ mod tests {
         // Every running phase can be restarted, and none is a trap.
         for k in RaMachine::KINDS {
             assert!(
-                RaMachine::RULES.iter().any(|r| r.from == *k),
+                RaMachine::RULES.iter().any(|r| r.from.contains(k)),
                 "{k:?} has no way out"
             );
         }

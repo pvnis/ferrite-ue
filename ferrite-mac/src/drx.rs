@@ -55,6 +55,110 @@ pub enum DrxState {
     Short { until: SlotPoint },
 }
 
+/// [`DrxState`] without its data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrxPhase {
+    Off,
+    Long,
+    Short,
+}
+
+/// What moves the DRX cycle state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrxTrigger {
+    /// DRX configured or released, or MAC reset.
+    Configure,
+    /// drx-InactivityTimer expiry.
+    InactivityExpiry,
+    /// drx-ShortCycleTimer expiry.
+    ShortCycleExpiry,
+    /// DRX Command MAC CE.
+    DrxCommand,
+    /// Long DRX Command MAC CE.
+    LongDrxCommand,
+}
+
+/// The DRX cycle machine.
+pub struct DrxMachine;
+
+impl ferrite_common::fsm::Machine for DrxMachine {
+    const NAME: &'static str = "DRX";
+    type State = DrxState;
+    type Kind = DrxPhase;
+    type Event = DrxTrigger;
+    const KINDS: &'static [DrxPhase] = &[DrxPhase::Off, DrxPhase::Long, DrxPhase::Short];
+    const EVENTS: &'static [DrxTrigger] = &[
+        DrxTrigger::Configure,
+        DrxTrigger::InactivityExpiry,
+        DrxTrigger::ShortCycleExpiry,
+        DrxTrigger::DrxCommand,
+        DrxTrigger::LongDrxCommand,
+    ];
+    const INITIAL: DrxPhase = DrxPhase::Off;
+    const RULES: &'static [ferrite_common::fsm::Rule<DrxPhase, DrxTrigger>] = {
+        use ferrite_common::fsm::Rule;
+        use DrxPhase::*;
+        use DrxTrigger::*;
+        &[
+            Rule {
+                from: &[Off, Short],
+                event: Configure,
+                to: Long,
+                clause: "38.321 §5.7 (DRX configured), §5.12",
+            },
+            Rule {
+                from: &[Long, Short],
+                event: Configure,
+                to: Off,
+                clause: "38.331 §5.3.5.5 (DRX released)",
+            },
+            Rule {
+                from: &[Long],
+                event: InactivityExpiry,
+                to: Short,
+                clause: "38.321 §5.7 (short cycle configured)",
+            },
+            Rule {
+                from: &[Short],
+                event: InactivityExpiry,
+                to: Long,
+                clause: "38.321 §5.7 (no short cycle)",
+            },
+            Rule {
+                from: &[Short],
+                event: ShortCycleExpiry,
+                to: Long,
+                clause: "38.321 §5.7",
+            },
+            Rule {
+                from: &[Long],
+                event: DrxCommand,
+                to: Short,
+                clause: "38.321 §5.7 (DRX Command, short cycle configured)",
+            },
+            Rule {
+                from: &[Short],
+                event: DrxCommand,
+                to: Long,
+                clause: "38.321 §5.7 (DRX Command, no short cycle)",
+            },
+            Rule {
+                from: &[Short],
+                event: LongDrxCommand,
+                to: Long,
+                clause: "38.321 §5.7 (Long DRX Command)",
+            },
+        ]
+    };
+    fn kind(s: &DrxState) -> DrxPhase {
+        match s {
+            DrxState::Off => DrxPhase::Off,
+            DrxState::Long => DrxPhase::Long,
+            DrxState::Short { .. } => DrxPhase::Short,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HarqTimers {
     /// drx-HARQ-RTT-Timer expiry (the retransmission timer starts then).
@@ -66,7 +170,7 @@ struct HarqTimers {
 /// The DRX procedure of one MAC entity.
 pub struct Drx {
     cfg: Option<DrxMacConfig>,
-    state: DrxState,
+    state: ferrite_common::fsm::Fsm<DrxMachine>,
     on_duration_until: Option<SlotPoint>,
     inactivity_until: Option<SlotPoint>,
     dl: BTreeMap<u8, HarqTimers>,
@@ -83,7 +187,7 @@ impl Drx {
     pub fn new(cfg: Option<DrxMacConfig>) -> Self {
         let mut d = Self {
             cfg: None,
-            state: DrxState::Off,
+            state: ferrite_common::fsm::Fsm::new(DrxState::Off),
             on_duration_until: None,
             inactivity_until: None,
             dl: BTreeMap::new(),
@@ -120,11 +224,12 @@ impl Drx {
 
     /// MAC reset (§5.12): every DRX timer stopped, back to the long cycle.
     pub fn reset(&mut self) {
-        self.state = if self.cfg.is_some() {
+        let to = if self.cfg.is_some() {
             DrxState::Long
         } else {
             DrxState::Off
         };
+        self.go(DrxTrigger::Configure, to);
         self.on_duration_until = None;
         self.inactivity_until = None;
         self.dl.clear();
@@ -133,7 +238,27 @@ impl Drx {
     }
 
     pub fn state(&self) -> DrxState {
-        self.state
+        *self.state.state()
+    }
+
+    /// Transitions made and refused (a refusal is a bug: see [`DrxMachine`]).
+    pub fn fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        self.state.stats()
+    }
+
+    fn go(&mut self, trigger: DrxTrigger, to: DrxState) -> bool {
+        match self.state.transition(trigger, to) {
+            Ok(t) => {
+                if let Some(t) = t {
+                    log::debug!("{t}");
+                }
+                true
+            }
+            Err(v) => {
+                log::error!("{v}");
+                false
+            }
+        }
     }
 
     pub fn configured(&self) -> bool {
@@ -167,11 +292,11 @@ impl Drx {
         if self.inactivity_until.is_some() && !running(self.inactivity_until, now) {
             self.inactivity_until = None;
             // §5.7: drx-InactivityTimer expiry → short cycle if configured.
-            self.enter_short_cycle(now);
+            self.enter_short_cycle(DrxTrigger::InactivityExpiry, now);
         }
-        if let DrxState::Short { until } = self.state {
+        if let DrxState::Short { until } = self.state() {
             if now.diff(&until) >= 0 {
-                self.state = DrxState::Long;
+                self.go(DrxTrigger::ShortCycleExpiry, DrxState::Long);
             }
         }
         for (set, is_dl) in [(&mut self.dl, true), (&mut self.ul, false)] {
@@ -200,7 +325,7 @@ impl Drx {
         }
         // --- cycle start: [(SFN × 10) + subframe] mod cycle = offset.
         let sub = u32::from(now.sfn) * 10 + u32::from(now.subframe());
-        let at_start = match self.state {
+        let at_start = match self.state() {
             DrxState::Off => false,
             DrxState::Long => {
                 sub % cfg.long_cycle_ms.max(1) == cfg.start_offset_ms % cfg.long_cycle_ms.max(1)
@@ -226,15 +351,18 @@ impl Drx {
         self.active
     }
 
-    fn enter_short_cycle(&mut self, now: SlotPoint) {
+    fn enter_short_cycle(&mut self, trigger: DrxTrigger, now: SlotPoint) {
         let Some(cfg) = self.cfg else { return };
         if let Some(s) = cfg.short {
             let spsf = u64::from(now.numerology.slots_per_subframe());
-            self.state = DrxState::Short {
-                until: now.add(u64::from(s.cycle_ms) * u64::from(s.timer_cycles) * spsf),
-            };
+            self.go(
+                trigger,
+                DrxState::Short {
+                    until: now.add(u64::from(s.cycle_ms) * u64::from(s.timer_cycles) * spsf),
+                },
+            );
         } else {
-            self.state = DrxState::Long;
+            self.go(trigger, DrxState::Long);
         }
     }
 
@@ -295,9 +423,9 @@ impl Drx {
         self.on_duration_until = None;
         self.inactivity_until = None;
         if long {
-            self.state = DrxState::Long;
+            self.go(DrxTrigger::LongDrxCommand, DrxState::Long);
         } else {
-            self.enter_short_cycle(now);
+            self.enter_short_cycle(DrxTrigger::DrxCommand, now);
         }
     }
 }
@@ -305,6 +433,11 @@ impl Drx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_is_well_formed() {
+        assert_eq!(ferrite_common::fsm::check::<DrxMachine>(), Ok(()));
+    }
     use ferrite_common::Numerology;
 
     const MU: Numerology = Numerology::KHZ30;

@@ -25,6 +25,7 @@ use crate::rt::ReadyWaveform;
 use crate::timing::SampleClock;
 use crate::track::{SyncTag, SyncTracker, TrackerConfig};
 use crate::ul::UlBuilder;
+use ferrite_common::fsm::{Fsm, Machine, Rule};
 use ferrite_common::{DuplexMode, Error, Iq, Numerology, Result, SlotPoint};
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::coreset0::{self, Coreset0Config};
@@ -146,13 +147,13 @@ struct Synced {
     track: SyncTracker,
     ssb_period_ms: u16,
     /// Where the cell is in its life: SIB1 pending, common configuration
-    /// (CSS only) or dedicated (RRC connected).
-    phase: CellPhase,
+    /// (CSS only) or dedicated (RRC connected); see [`CellPhaseMachine`].
+    phase: Fsm<CellPhaseMachine>,
 }
 
 /// Configuration phase of the synchronised cell (set by CONFIG.request).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CellPhase {
+pub enum CellPhase {
     /// Only the MIB-derived CORESET#0 / Type0 CSS: waiting for SIB1.
     AwaitSib1,
     /// SIB1 applied: common search spaces, no dedicated resources.
@@ -168,14 +169,107 @@ impl CellPhase {
     }
 }
 
+/// What moves the cell's configuration phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseTrigger {
+    /// CONFIG.request with the common (SIB1) configuration only.
+    CommonConfig,
+    /// CONFIG.request with a dedicated (RRC) configuration.
+    DedicatedConfig,
+}
+
+/// The cell-phase machine.
+pub struct CellPhaseMachine;
+
+impl Machine for CellPhaseMachine {
+    const NAME: &'static str = "PHY cell";
+    type State = CellPhase;
+    type Kind = CellPhase;
+    type Event = PhaseTrigger;
+    const KINDS: &'static [CellPhase] = &[
+        CellPhase::AwaitSib1,
+        CellPhase::Common,
+        CellPhase::Dedicated,
+    ];
+    const EVENTS: &'static [PhaseTrigger] =
+        &[PhaseTrigger::CommonConfig, PhaseTrigger::DedicatedConfig];
+    const INITIAL: CellPhase = CellPhase::AwaitSib1;
+    const RULES: &'static [Rule<CellPhase, PhaseTrigger>] = &[
+        Rule {
+            from: &[CellPhase::AwaitSib1, CellPhase::Dedicated],
+            event: PhaseTrigger::CommonConfig,
+            to: CellPhase::Common,
+            clause: "38.213 §10.1 (common search spaces from SIB1); back from dedicated on release / re-establishment (38.331 §5.3.7.4, §5.3.11)",
+        },
+        Rule {
+            from: &[CellPhase::Common],
+            event: PhaseTrigger::DedicatedConfig,
+            to: CellPhase::Dedicated,
+            clause: "38.331 §5.3.5.5 (CellGroupConfig: dedicated resources)",
+        },
+    ];
+    fn kind(s: &CellPhase) -> CellPhase {
+        *s
+    }
+}
+
 /// The engine's own hold on the cell: consecutive SSB periods without the PSS
 /// at the expected position. Independent of RRC's T310 (which gets the
 /// per-period [`SyncIndication`]s): after [`RLM_MAX_MISSED_SSB`] misses the
 /// slot timing can no longer be trusted and the engine returns to cell search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RlmState {
+pub enum RlmState {
     InSync,
     OutOfSync { misses: u32 },
+}
+
+/// What moves the engine's hold on the cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RlmTrigger {
+    /// The SSB was not found at its expected position this period.
+    SsbMissed,
+    /// The SSB was found.
+    SsbFound,
+}
+
+/// [`RlmState`] without the miss count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RlmPhase {
+    InSync,
+    OutOfSync,
+}
+
+/// The engine's radio-link machine (its own hold on the cell, below RRC).
+pub struct RlmMachine;
+
+impl Machine for RlmMachine {
+    const NAME: &'static str = "PHY RLM";
+    type State = RlmState;
+    type Kind = RlmPhase;
+    type Event = RlmTrigger;
+    const KINDS: &'static [RlmPhase] = &[RlmPhase::InSync, RlmPhase::OutOfSync];
+    const EVENTS: &'static [RlmTrigger] = &[RlmTrigger::SsbMissed, RlmTrigger::SsbFound];
+    const INITIAL: RlmPhase = RlmPhase::InSync;
+    const RULES: &'static [Rule<RlmPhase, RlmTrigger>] = &[
+        Rule {
+            from: &[RlmPhase::InSync],
+            event: RlmTrigger::SsbMissed,
+            to: RlmPhase::OutOfSync,
+            clause: "ferrite: PSS missed at the expected position (cell search after RLM_MAX_MISSED_SSB)",
+        },
+        Rule {
+            from: &[RlmPhase::OutOfSync],
+            event: RlmTrigger::SsbFound,
+            to: RlmPhase::InSync,
+            clause: "ferrite: PSS found again",
+        },
+    ];
+    fn kind(s: &RlmState) -> RlmPhase {
+        match s {
+            RlmState::InSync => RlmPhase::InSync,
+            RlmState::OutOfSync { .. } => RlmPhase::OutOfSync,
+        }
+    }
 }
 
 impl RlmState {
@@ -635,7 +729,7 @@ impl<'a> Engine<'a> {
                 )
                 .starting_at(frame_start_abs),
                 ssb_period_ms: 20,
-                phase: CellPhase::AwaitSib1,
+                phase: Fsm::new(CellPhase::AwaitSib1),
             };
             log::info!(
                 "synced PCI {} SFN {} i_ssb {} hf {} cfo {:.0} Hz ssb df {:.0} Hz mu {} CORESET0 idx {} ({} RB, {} sym) ss0 {}",
@@ -696,7 +790,7 @@ impl<'a> Engine<'a> {
             &s.cfg,
             s.cell_id,
             &s.coreset0,
-            s.phase.configured(),
+            s.phase.state().configured(),
         );
         let _ = self.wk_cmd.send(WorkerCmd::Reconfigure(Box::new(wc)));
         let _ = self.tx_cmd.send(TxCmd::Reconfigure(Box::new((
@@ -813,7 +907,7 @@ impl<'a> Engine<'a> {
             s.ssb_case.mu(),
             &ofdm_ssb,
         ) as i64;
-        let mut rlm = RlmState::InSync;
+        let mut rlm: Fsm<RlmMachine> = Fsm::new(RlmState::InSync);
         let mut outbox: Vec<MacToPhy> = Vec::new();
         loop {
             if self.stopped() {
@@ -878,7 +972,9 @@ impl<'a> Engine<'a> {
                             ..tag
                         };
                         s.track.on_cfo(ssb_tag, r.cfo_hz);
-                        rlm = RlmState::InSync;
+                        if let Err(v) = rlm.transition(RlmTrigger::SsbFound, RlmState::InSync) {
+                            log::error!("{v}");
+                        }
                         // Found but not measurable: treat as a strong SSB.
                         ssb_sinr = Some(f32::INFINITY);
                         if let Some(m) = ferrite_phy::sync::measure::ssb_measure(
@@ -905,8 +1001,11 @@ impl<'a> Engine<'a> {
                         s.track.on_timing(tag, err);
                     }
                     _ => {
-                        rlm = rlm.miss();
-                        if let RlmState::OutOfSync { misses } = rlm {
+                        let next = rlm.state().miss();
+                        if let Err(v) = rlm.transition(RlmTrigger::SsbMissed, next) {
+                            log::error!("{v}");
+                        }
+                        if let RlmState::OutOfSync { misses } = *rlm.state() {
                             if misses >= RLM_MAX_MISSED_SSB {
                                 log::warn!("SSB not found for {misses} periods: sync lost");
                                 return Ok(true);
@@ -1010,7 +1109,7 @@ impl<'a> Engine<'a> {
 
             // --- PDSCH jobs for this slot (+ CSI measurement occasions).
             let grants = self.pending_dl.remove(&slot.index()).unwrap_or_default();
-            let has_csi = s.phase.configured()
+            let has_csi = s.phase.state().configured()
                 && s.cfg.pdsch.csi_rs_rate_match.iter().any(|r| {
                     csi_rs_measured(r).is_some()
                         && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot)
@@ -1124,11 +1223,16 @@ impl<'a> Engine<'a> {
                     );
                     s.monitor.rntis = rntis;
                     s.cfg = cfg;
-                    s.phase = if dedicated {
-                        CellPhase::Dedicated
+                    let (trigger, to) = if dedicated {
+                        (PhaseTrigger::DedicatedConfig, CellPhase::Dedicated)
                     } else {
-                        CellPhase::Common
+                        (PhaseTrigger::CommonConfig, CellPhase::Common)
                     };
+                    match s.phase.transition(trigger, to) {
+                        Ok(Some(t)) => log::info!("{t}"),
+                        Ok(None) => {}
+                        Err(v) => log::error!("{v}"),
+                    }
                     self.configure_threads(s);
                     log::info!("PHY configured: dl carrier {:?} ul carrier {:?} coresets {} search spaces {} dedicated {}", s.cfg.dl_carrier, s.cfg.ul_carrier, s.cfg.coresets.len(), s.cfg.search_spaces.len(), dedicated);
                 }
@@ -1379,6 +1483,12 @@ mod tests {
         assert_eq!(rlm_evaluate(Some(RLM_Q_IN_DB)), Some(true));
         assert_eq!(rlm_evaluate(Some(30.0)), Some(true));
         assert_eq!(rlm_evaluate(Some(f32::INFINITY)), Some(true));
+    }
+
+    #[test]
+    fn tables_are_well_formed() {
+        assert_eq!(ferrite_common::fsm::check::<CellPhaseMachine>(), Ok(()));
+        assert_eq!(ferrite_common::fsm::check::<RlmMachine>(), Ok(()));
     }
 
     #[test]

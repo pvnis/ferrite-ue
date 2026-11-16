@@ -466,6 +466,7 @@ fn attach_flow() {
     assert_eq!(cs, target);
     assert_eq!(cuci.csi1, vec![0, 0, 0, 0]);
     assert_eq!(mac.ra_fsm_stats().violations, 0);
+    assert_eq!(mac.fsm_stats().violations, 0);
     assert!(mac.ra_fsm_stats().transitions >= 5);
 }
 
@@ -594,4 +595,5 @@ fn bwp_inactivity_timer_and_switch_requests() {
         }]
     );
     assert_eq!(mac.ra_fsm_stats().violations, 0);
+    assert_eq!(mac.fsm_stats().violations, 0);
 }

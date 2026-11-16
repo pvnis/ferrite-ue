@@ -428,8 +428,13 @@ impl Stack {
     /// NAS registration request → RRC connection establishment.
     fn start_connection(&mut self, now: SlotPoint) {
         self.conn.attempts += 1;
-        let nas = self.nas.start_registration();
-        self.rrc.connect(nas, now);
+        match self.nas.start_registration() {
+            Some(nas) => self.rrc.connect(nas, now),
+            None => log::warn!(
+                "registration not allowed in NAS state {:?}",
+                self.nas.state()
+            ),
+        }
     }
 
     /// Idle → connected for data: NAS SERVICE REQUEST (`service_type`: 1 =

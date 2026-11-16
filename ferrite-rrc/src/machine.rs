@@ -39,7 +39,7 @@ pub enum RrcTrigger {
 pub struct RrcMachine;
 
 const fn r(
-    from: RrcState,
+    from: &'static [RrcState],
     event: RrcTrigger,
     to: RrcState,
     clause: &'static str,
@@ -77,55 +77,55 @@ impl Machine for RrcMachine {
     const INITIAL: RrcState = Idle;
     const RULES: &'static [Rule<RrcState, RrcTrigger>] = &[
         // Connection establishment (§5.3.3).
-        r(Idle, Connect, Connecting, "38.331 §5.3.3.2"),
-        r(Connecting, RrcSetup, Connected, "38.331 §5.3.3.4"),
-        r(Connecting, RrcReject, Idle, "38.331 §5.3.15"),
-        r(Connecting, T300Expiry, Idle, "38.331 §5.3.3.7"),
+        r(&[Idle], Connect, Connecting, "38.331 §5.3.3.2"),
+        r(&[Connecting], RrcSetup, Connected, "38.331 §5.3.3.4"),
+        r(&[Connecting], RrcReject, Idle, "38.331 §5.3.15"),
+        r(&[Connecting], T300Expiry, Idle, "38.331 §5.3.3.7"),
         r(
-            Connecting,
+            &[Connecting],
             RaFailure,
             Idle,
             "ferrite: attempt ended at the MAC's RA problem (38.321 §5.1.4); 38.331 keeps T300 running",
         ),
         // Release (§5.3.8).
-        r(Connected, Release, Idle, "38.331 §5.3.8.3"),
+        r(&[Connected], Release, Idle, "38.331 §5.3.8.3"),
         // Radio link failure (§5.3.10.3): re-establish with AS security,
         // otherwise go to RRC_IDLE.
         r(
-            Connected,
+            &[Connected],
             RadioLinkFailure,
             Reestablishing,
             "38.331 §5.3.10.3, §5.3.7.2 (AS security active)",
         ),
         r(
-            Connected,
+            &[Connected],
             RadioLinkFailure,
             Idle,
             "38.331 §5.3.10.3 (AS security not active)",
         ),
         // Re-establishment (§5.3.7).
         r(
-            Reestablishing,
+            &[Reestablishing],
             ReestablishmentVerified,
             Connected,
             "38.331 §5.3.7.5",
         ),
         r(
-            Reestablishing,
+            &[Reestablishing],
             ReestablishmentFailure,
             Idle,
             "38.331 §5.3.7.5 (integrity check failed)",
         ),
-        r(Reestablishing, T301Expiry, Idle, "38.331 §5.3.7 (T301 expiry)"),
-        r(Reestablishing, RrcReject, Idle, "38.331 §5.3.15"),
+        r(&[Reestablishing], T301Expiry, Idle, "38.331 §5.3.7 (T301 expiry)"),
+        r(&[Reestablishing], RrcReject, Idle, "38.331 §5.3.15"),
         r(
-            Reestablishing,
+            &[Reestablishing],
             RrcSetupFallback,
             Idle,
             "ferrite: abort and reconnect; 38.331 §5.3.3.4 continues with the RRCSetup",
         ),
         r(
-            Reestablishing,
+            &[Reestablishing],
             RaFailure,
             Idle,
             "ferrite: attempt ended at the MAC's RA problem (38.321 §5.1.4); 38.331 keeps T301 running",
@@ -153,7 +153,7 @@ mod tests {
             assert!(
                 RrcMachine::RULES
                     .iter()
-                    .any(|r| r.from == *k && r.to == Idle),
+                    .any(|r| r.from.contains(k) && r.to == Idle),
                 "{k:?} has no way back to Idle"
             );
         }
@@ -162,6 +162,6 @@ mod tests {
     #[test]
     fn diagram_lists_every_rule() {
         let d = fsm::mermaid::<RrcMachine>();
-        assert_eq!(d.lines().count(), 2 + RrcMachine::RULES.len());
+        assert_eq!(d.lines().count(), 2 + fsm::edges::<RrcMachine>().len());
     }
 }

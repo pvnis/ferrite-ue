@@ -30,12 +30,12 @@ pub(crate) mod rar;
 pub(crate) mod sr;
 pub(crate) mod ta;
 
-pub use drx::{DrxMacConfig, DrxState, ShortDrxMacConfig};
+pub use drx::{DrxMacConfig, DrxMachine, DrxPhase, DrxState, DrxTrigger, ShortDrxMacConfig};
 pub use entity::{MacEntity, MacEvent, MacStats, UpperLayers};
 pub use ferrite_fapi as fapi;
 pub use ra::{RaMachine, RaPhase, RaState, RaTrigger};
-pub use sr::SrState;
-pub use ta::TaState;
+pub use sr::{SrMachine, SrPhase, SrState, SrTrigger};
+pub use ta::{TaMachine, TaPhase, TaState, TaTrigger};
 
 use ferrite_common::Numerology;
 

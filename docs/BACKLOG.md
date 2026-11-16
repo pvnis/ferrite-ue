@@ -353,6 +353,32 @@ FAPI already improve on them.
       RRCReestablishmentRequest aborts and reconnects (38.331 §5.3.3.4
       continues with the setup). Stray RRCRelease / RRCReject outside their
       states are now ignored (were: go to Idle).
+      2026-11-16 (second step): NAS 5GMM (state × substate), 5GMM-CM, 5GSM,
+      MAC SR / TA / DRX and L1 cell phase / RLM converted; Kani proof on SR;
+      randomised NAS entity test. Fixed on the way, each a move the tables
+      refused:
+      * SERVICE ACCEPT / SERVICE REJECT changed the 5GMM state in any state
+        (a stray one "registered" a deregistered UE); now only in
+        SERVICE-REQUEST-INITIATED. REGISTRATION REJECT likewise only during
+        a registration.
+      * A registration *update* rejected with #22 or an abnormal cause, or
+        T3520 expiring in one, deregistered locally first (PDU sessions
+        dropped, `Deregistered` emitted) and then entered
+        REGISTERED.ATTEMPTING-REGISTRATION-UPDATE; now that state directly,
+        sessions kept (24.501 §5.5.1.3.5, §5.5.1.3.7).
+      * `start_registration` (the stack's retry) registered from
+        DEREGISTERED.NO-SUPI / PLMN-SEARCH / LIMITED-SERVICE; now refused
+        (`Option`).
+      * 5GSM ESTABLISHMENT ACCEPT / REJECT applied to a session in any state
+        (a duplicate REJECT tore down an active session); now only in
+        ACTIVE-PENDING.
+      * SR: a BSR in the slot where SR_COUNTER reached sr-TransMax erased the
+        failure, so no random access was started (38.321 §5.4.4); the failure
+        now survives until the RA starts (unit test, Kani).
+      * L1: a dedicated CONFIG.request before SIB1 is refused.
+      Open: `Registered(LimitedService)` / `Registered(PlmnSearch)` are never
+      entered (dead substates); the implicit machines (HARQ, RLC AM, stack
+      retry / security hand-over); the composed NAS × RRC × MAC model.
       Today 11 FSMs are enums changed by plain assignment: L1 `CellPhase`,
       `RlmState`; MAC `RaState`, `SrState`, `DrxState`, `TaState`; RRC
       `RrcState` (one `set_state` already); NAS `MmState` (with substates),

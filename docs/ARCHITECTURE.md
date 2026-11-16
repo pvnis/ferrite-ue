@@ -499,7 +499,9 @@ its states (as a fieldless *kind* when the state carries data), its events
 and a table of rules `(from, event) → to`, each with the specification
 clause it implements; a deliberate deviation says `ferrite: …`. The entity
 keeps its state in an `Fsm`, and `Fsm::transition` is the only way to change
-it: a move the table does not allow is refused (state unchanged), counted in
+it. A rule may start from a set of kinds, and a move that keeps the kind is a
+data update that needs no rule. A guard asks `Fsm::allows` first, which is
+not a violation. Otherwise: a move the table does not allow is refused (state unchanged), counted in
 `FsmStats::violations` and logged as an error. It never panics. Every
 transition made is logged with its clause, e.g.
 `RRC Connecting → Connected on RrcSetup [38.331 §5.3.3.4]`. Leaving a state
@@ -529,34 +531,54 @@ Checks, cheapest first:
 The diagrams below are generated from the tables, and
 `ferrite-ue/tests/fsm_docs.rs` fails when they differ.
 
-Converted so far: RRC (`ferrite_rrc::machine`) and MAC random access
-(`ferrite_mac::RaMachine`). The plan is in BACKLOG ("Architecture
-improvements"): NAS MM/CM/SM, MAC SR/DRX/TA and L1 `CellPhase`/RLM next,
-then the implicit machines (HARQ, RLC AM, the stack's retry and security
-hand-over).
+Machines on tables. This is everything in BACKLOG's plan except the
+implicit machines: HARQ processes, RLC AM windows, and the stack's
+connection retry and AS-security hand-over.
 
-RRC (`RrcMachine`):
+| Layer | Machine | Kinds | Verified by |
+|---|---|---|---|
+| L1 | `ferrite_l1::engine::CellPhaseMachine` | AwaitSib1, Common, Dedicated | table check; lab |
+| L1 | `ferrite_l1::engine::RlmMachine` | InSync, OutOfSync | table check; unit test |
+| MAC | `ferrite_mac::RaMachine` | 8 | Kani (inductive, 6-input bounded); attach test |
+| MAC | `ferrite_mac::SrMachine` | Idle, Pending, Failed | Kani (inductive, 6 s); unit tests |
+| MAC | `ferrite_mac::TaMachine` | NotAligned, Aligned | table check; unit tests |
+| MAC | `ferrite_mac::DrxMachine` | Off, Long, Short | table check; unit tests |
+| RRC | `ferrite_rrc::machine::RrcMachine` | 4 | randomised entity test (every edge) |
+| NAS | `ferrite_nas::machine::MmMachine` | 15 (state × substate) | randomised entity test |
+| NAS | `ferrite_nas::machine::CmMachine` | Idle, Connected | randomised entity test |
+| NAS | `ferrite_nas::machine::SmMachine` | 4 (per PDU session) | randomised entity test |
+
+The 5GMM randomised test (150 seeds × 150 inputs, partial registrations
+with a fake core) reaches most edges. The ones it misses mostly leave
+`Registered(NonAllowedService)` or `Registered(AttemptingRegistrationUpdate)`,
+which random inputs rarely reach. `Registered(LimitedService)` and
+`Registered(PlmnSearch)` exist in the type, but no procedure enters them,
+so the table leaves them out.
+
+<details><summary>L1 cell phase (<code>CellPhaseMachine</code>)</summary>
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
-    Idle --> Connecting: Connect
-    Connecting --> Connected: RrcSetup
-    Connecting --> Idle: RrcReject
-    Connecting --> Idle: T300Expiry
-    Connecting --> Idle: RaFailure
-    Connected --> Idle: Release
-    Connected --> Reestablishing: RadioLinkFailure
-    Connected --> Idle: RadioLinkFailure
-    Reestablishing --> Connected: ReestablishmentVerified
-    Reestablishing --> Idle: ReestablishmentFailure
-    Reestablishing --> Idle: T301Expiry
-    Reestablishing --> Idle: RrcReject
-    Reestablishing --> Idle: RrcSetupFallback
-    Reestablishing --> Idle: RaFailure
+    [*] --> AwaitSib1
+    AwaitSib1 --> Common: CommonConfig
+    Dedicated --> Common: CommonConfig
+    Common --> Dedicated: DedicatedConfig
 ```
 
-MAC random access (`RaMachine`):
+</details>
+
+<details><summary>L1 radio link (<code>RlmMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> InSync
+    InSync --> OutOfSync: SsbMissed
+    OutOfSync --> InSync: SsbFound
+```
+
+</details>
+
+<details><summary>MAC random access (<code>RaMachine</code>)</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -580,3 +602,252 @@ stateDiagram-v2
     ContentionResolution --> SelectResource: ContentionResolutionExpiry
     ContentionResolution --> Failed: ContentionResolutionExpiry
 ```
+
+</details>
+
+<details><summary>MAC scheduling request (<code>SrMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Pending: Triggered
+    Pending --> Failed: TransMaxReached
+    Pending --> Idle: BsrSent
+    Failed --> Idle: RandomAccessStarted
+    Pending --> Idle: Reset
+    Failed --> Idle: Reset
+```
+
+</details>
+
+<details><summary>MAC time alignment (<code>TaMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotAligned
+    NotAligned --> Aligned: Command
+    Aligned --> NotAligned: TimerExpiry
+    Aligned --> NotAligned: Reset
+```
+
+</details>
+
+<details><summary>MAC DRX (<code>DrxMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Off
+    Off --> Long: Configure
+    Short --> Long: Configure
+    Long --> Off: Configure
+    Short --> Off: Configure
+    Long --> Short: InactivityExpiry
+    Short --> Long: InactivityExpiry
+    Short --> Long: ShortCycleExpiry
+    Long --> Short: DrxCommand
+    Short --> Long: DrxCommand
+    Short --> Long: LongDrxCommand
+```
+
+</details>
+
+<details><summary>RRC (<code>RrcMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Connecting: Connect
+    Connecting --> Connected: RrcSetup
+    Connecting --> Idle: RrcReject
+    Connecting --> Idle: T300Expiry
+    Connecting --> Idle: RaFailure
+    Connected --> Idle: Release
+    Connected --> Reestablishing: RadioLinkFailure
+    Connected --> Idle: RadioLinkFailure
+    Reestablishing --> Connected: ReestablishmentVerified
+    Reestablishing --> Idle: ReestablishmentFailure
+    Reestablishing --> Idle: T301Expiry
+    Reestablishing --> Idle: RrcReject
+    Reestablishing --> Idle: RrcSetupFallback
+    Reestablishing --> Idle: RaFailure
+```
+
+</details>
+
+<details><summary>NAS 5GMM (<code>MmMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Deregistered_InitialRegistrationNeeded
+    Deregistered_InitialRegistrationNeeded --> RegistrationInitiated: RegistrationRequested
+    Deregistered_NormalService --> RegistrationInitiated: RegistrationRequested
+    Deregistered_AttemptingRegistration --> RegistrationInitiated: RegistrationRequested
+    Registered_NormalService --> RegistrationInitiated: RegistrationRequested
+    Registered_NonAllowedService --> RegistrationInitiated: RegistrationRequested
+    Registered_AttemptingRegistrationUpdate --> RegistrationInitiated: RegistrationRequested
+    Registered_UpdateNeeded --> RegistrationInitiated: RegistrationRequested
+    Authenticating --> RegistrationInitiated: RegistrationRequested
+    SecurityMode --> RegistrationInitiated: RegistrationRequested
+    RegistrationInitiated --> Authenticating: AuthenticationCompleted
+    RegistrationInitiated --> SecurityMode: SecurityModeCompleted
+    Authenticating --> SecurityMode: SecurityModeCompleted
+    RegistrationInitiated --> Registered_NormalService: RegistrationAccepted
+    Authenticating --> Registered_NormalService: RegistrationAccepted
+    SecurityMode --> Registered_NormalService: RegistrationAccepted
+    Registered_NonAllowedService --> Registered_NormalService: RegistrationAccepted
+    Registered_AttemptingRegistrationUpdate --> Registered_NormalService: RegistrationAccepted
+    Registered_UpdateNeeded --> Registered_NormalService: RegistrationAccepted
+    RegistrationInitiated --> Deregistered_AttemptingRegistration: RegistrationFailed
+    Authenticating --> Deregistered_AttemptingRegistration: RegistrationFailed
+    SecurityMode --> Deregistered_AttemptingRegistration: RegistrationFailed
+    RegistrationInitiated --> Registered_AttemptingRegistrationUpdate: RegistrationFailed
+    Authenticating --> Registered_AttemptingRegistrationUpdate: RegistrationFailed
+    SecurityMode --> Registered_AttemptingRegistrationUpdate: RegistrationFailed
+    RegistrationInitiated --> Deregistered_NormalService: RegistrationRejected
+    Authenticating --> Deregistered_NormalService: RegistrationRejected
+    SecurityMode --> Deregistered_NormalService: RegistrationRejected
+    RegistrationInitiated --> Deregistered_LimitedService: RegistrationRejected
+    Authenticating --> Deregistered_LimitedService: RegistrationRejected
+    SecurityMode --> Deregistered_LimitedService: RegistrationRejected
+    RegistrationInitiated --> Deregistered_AttemptingRegistration: RegistrationRejected
+    Authenticating --> Deregistered_AttemptingRegistration: RegistrationRejected
+    SecurityMode --> Deregistered_AttemptingRegistration: RegistrationRejected
+    RegistrationInitiated --> Deregistered_PlmnSearch: RegistrationRejected
+    Authenticating --> Deregistered_PlmnSearch: RegistrationRejected
+    SecurityMode --> Deregistered_PlmnSearch: RegistrationRejected
+    RegistrationInitiated --> Deregistered_NoSupi: RegistrationRejected
+    Authenticating --> Deregistered_NoSupi: RegistrationRejected
+    SecurityMode --> Deregistered_NoSupi: RegistrationRejected
+    RegistrationInitiated --> Registered_AttemptingRegistrationUpdate: RegistrationRejected
+    Authenticating --> Registered_AttemptingRegistrationUpdate: RegistrationRejected
+    SecurityMode --> Registered_AttemptingRegistrationUpdate: RegistrationRejected
+    RegistrationInitiated --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    Authenticating --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    SecurityMode --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    Registered_NormalService --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    Registered_NonAllowedService --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    Registered_AttemptingRegistrationUpdate --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    Registered_UpdateNeeded --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    ServiceRequestInitiated --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    DeregistrationInitiated --> Deregistered_AttemptingRegistration: AuthenticationAborted
+    RegistrationInitiated --> Registered_AttemptingRegistrationUpdate: AuthenticationAborted
+    Authenticating --> Registered_AttemptingRegistrationUpdate: AuthenticationAborted
+    SecurityMode --> Registered_AttemptingRegistrationUpdate: AuthenticationAborted
+    RegistrationInitiated --> Deregistered_NoSupi: AuthenticationRejected
+    Authenticating --> Deregistered_NoSupi: AuthenticationRejected
+    SecurityMode --> Deregistered_NoSupi: AuthenticationRejected
+    Registered_NormalService --> Deregistered_NoSupi: AuthenticationRejected
+    Registered_NonAllowedService --> Deregistered_NoSupi: AuthenticationRejected
+    Registered_AttemptingRegistrationUpdate --> Deregistered_NoSupi: AuthenticationRejected
+    Registered_UpdateNeeded --> Deregistered_NoSupi: AuthenticationRejected
+    ServiceRequestInitiated --> Deregistered_NoSupi: AuthenticationRejected
+    DeregistrationInitiated --> Deregistered_NoSupi: AuthenticationRejected
+    Registered_NormalService --> Registered_UpdateNeeded: UpdateDue
+    Registered_NonAllowedService --> Registered_UpdateNeeded: UpdateDue
+    Registered_AttemptingRegistrationUpdate --> Registered_UpdateNeeded: UpdateDue
+    Registered_NormalService --> ServiceRequestInitiated: ServiceRequested
+    Registered_NonAllowedService --> ServiceRequestInitiated: ServiceRequested
+    Registered_AttemptingRegistrationUpdate --> ServiceRequestInitiated: ServiceRequested
+    Registered_UpdateNeeded --> ServiceRequestInitiated: ServiceRequested
+    ServiceRequestInitiated --> Registered_NormalService: ServiceAccepted
+    ServiceRequestInitiated --> Registered_NormalService: ServiceRejected
+    ServiceRequestInitiated --> Registered_NonAllowedService: ServiceRejected
+    ServiceRequestInitiated --> Deregistered_NormalService: ServiceRejected
+    ServiceRequestInitiated --> Deregistered_NoSupi: ServiceRejected
+    ServiceRequestInitiated --> Deregistered_PlmnSearch: ServiceRejected
+    ServiceRequestInitiated --> Deregistered_LimitedService: ServiceRejected
+    ServiceRequestInitiated --> Registered_NormalService: ServiceRequestAbandoned
+    Registered_NormalService --> DeregistrationInitiated: DeregistrationRequested
+    Registered_NonAllowedService --> DeregistrationInitiated: DeregistrationRequested
+    Registered_AttemptingRegistrationUpdate --> DeregistrationInitiated: DeregistrationRequested
+    Registered_UpdateNeeded --> DeregistrationInitiated: DeregistrationRequested
+    ServiceRequestInitiated --> DeregistrationInitiated: DeregistrationRequested
+    Registered_NormalService --> Deregistered_NormalService: SwitchOff
+    Registered_NonAllowedService --> Deregistered_NormalService: SwitchOff
+    Registered_AttemptingRegistrationUpdate --> Deregistered_NormalService: SwitchOff
+    Registered_UpdateNeeded --> Deregistered_NormalService: SwitchOff
+    ServiceRequestInitiated --> Deregistered_NormalService: SwitchOff
+    DeregistrationInitiated --> Deregistered_NormalService: DeregistrationAccepted
+    DeregistrationInitiated --> Deregistered_NormalService: DeregistrationAbandoned
+    RegistrationInitiated --> Deregistered_NormalService: NetworkDeregistration
+    Authenticating --> Deregistered_NormalService: NetworkDeregistration
+    SecurityMode --> Deregistered_NormalService: NetworkDeregistration
+    Registered_NormalService --> Deregistered_NormalService: NetworkDeregistration
+    Registered_NonAllowedService --> Deregistered_NormalService: NetworkDeregistration
+    Registered_AttemptingRegistrationUpdate --> Deregistered_NormalService: NetworkDeregistration
+    Registered_UpdateNeeded --> Deregistered_NormalService: NetworkDeregistration
+    ServiceRequestInitiated --> Deregistered_NormalService: NetworkDeregistration
+    DeregistrationInitiated --> Deregistered_NormalService: NetworkDeregistration
+    RegistrationInitiated --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    Authenticating --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    SecurityMode --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    Registered_NormalService --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    Registered_NonAllowedService --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    Registered_AttemptingRegistrationUpdate --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    Registered_UpdateNeeded --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    ServiceRequestInitiated --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    DeregistrationInitiated --> Deregistered_AttemptingRegistration: NetworkDeregistration
+    RegistrationInitiated --> Deregistered_LimitedService: NetworkDeregistration
+    Authenticating --> Deregistered_LimitedService: NetworkDeregistration
+    SecurityMode --> Deregistered_LimitedService: NetworkDeregistration
+    Registered_NormalService --> Deregistered_LimitedService: NetworkDeregistration
+    Registered_NonAllowedService --> Deregistered_LimitedService: NetworkDeregistration
+    Registered_AttemptingRegistrationUpdate --> Deregistered_LimitedService: NetworkDeregistration
+    Registered_UpdateNeeded --> Deregistered_LimitedService: NetworkDeregistration
+    ServiceRequestInitiated --> Deregistered_LimitedService: NetworkDeregistration
+    DeregistrationInitiated --> Deregistered_LimitedService: NetworkDeregistration
+    RegistrationInitiated --> Deregistered_PlmnSearch: NetworkDeregistration
+    Authenticating --> Deregistered_PlmnSearch: NetworkDeregistration
+    SecurityMode --> Deregistered_PlmnSearch: NetworkDeregistration
+    Registered_NormalService --> Deregistered_PlmnSearch: NetworkDeregistration
+    Registered_NonAllowedService --> Deregistered_PlmnSearch: NetworkDeregistration
+    Registered_AttemptingRegistrationUpdate --> Deregistered_PlmnSearch: NetworkDeregistration
+    Registered_UpdateNeeded --> Deregistered_PlmnSearch: NetworkDeregistration
+    ServiceRequestInitiated --> Deregistered_PlmnSearch: NetworkDeregistration
+    DeregistrationInitiated --> Deregistered_PlmnSearch: NetworkDeregistration
+    RegistrationInitiated --> Deregistered_NoSupi: NetworkDeregistration
+    Authenticating --> Deregistered_NoSupi: NetworkDeregistration
+    SecurityMode --> Deregistered_NoSupi: NetworkDeregistration
+    Registered_NormalService --> Deregistered_NoSupi: NetworkDeregistration
+    Registered_NonAllowedService --> Deregistered_NoSupi: NetworkDeregistration
+    Registered_AttemptingRegistrationUpdate --> Deregistered_NoSupi: NetworkDeregistration
+    Registered_UpdateNeeded --> Deregistered_NoSupi: NetworkDeregistration
+    ServiceRequestInitiated --> Deregistered_NoSupi: NetworkDeregistration
+    DeregistrationInitiated --> Deregistered_NoSupi: NetworkDeregistration
+```
+
+</details>
+
+<details><summary>NAS 5GMM-IDLE / CONNECTED (<code>CmMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Connected: ConnectionEstablished
+    Connected --> Idle: ConnectionReleased
+```
+
+</details>
+
+<details><summary>NAS 5GSM, per PDU session (<code>SmMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Inactive
+    Inactive --> ActivePending: EstablishmentRequested
+    ActivePending --> Active: EstablishmentAccepted
+    ActivePending --> Inactive: EstablishmentRejected
+    ActivePending --> Inactive: EstablishmentAbandoned
+    Active --> InactivePending: ReleaseRequested
+    InactivePending --> Active: ReleaseRejected
+    InactivePending --> Inactive: ReleaseAbandoned
+    ActivePending --> Inactive: NetworkRelease
+    Active --> Inactive: NetworkRelease
+    InactivePending --> Inactive: NetworkRelease
+    Active --> Inactive: StatusSync
+    ActivePending --> Inactive: LocalRelease
+    Active --> Inactive: LocalRelease
+    InactivePending --> Inactive: LocalRelease
+```
+
+</details>

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ie;
+pub mod machine;
 /// MILENAGE and the 5G key hierarchy, provided by `ferrite-security`.
 pub mod milenage {
     pub use ferrite_security::kdf::*;

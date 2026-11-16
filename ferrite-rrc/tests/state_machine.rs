@@ -644,13 +644,8 @@ fn random_inputs_stay_inside_the_table() {
         transitions > 2000,
         "too few transitions exercised: {transitions}"
     );
-    use ferrite_common::fsm::Machine;
-    for r in ferrite_rrc::machine::RrcMachine::RULES {
-        let pair = format!("{:?}->{:?}", r.from, r.to);
-        assert!(
-            seen.contains(&pair),
-            "never exercised: {pair} ({:?})",
-            r.event
-        );
+    for (from, event, to) in ferrite_common::fsm::edges::<ferrite_rrc::machine::RrcMachine>() {
+        let pair = format!("{from:?}->{to:?}");
+        assert!(seen.contains(&pair), "never exercised: {pair} ({event:?})");
     }
 }

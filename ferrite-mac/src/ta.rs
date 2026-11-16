@@ -5,6 +5,7 @@
 //! expires). On expiry the entity flushes its HARQ buffers, drops PUCCH/SRS
 //! and only transmits PRACH until the next random access (§5.2).
 
+use ferrite_common::fsm::{Fsm, FsmStats, Machine, Rule};
 use ferrite_common::{slot::ta, Numerology, SlotPoint};
 
 /// Uplink time-alignment state of the (primary) timing advance group.
@@ -16,12 +17,70 @@ pub enum TaState {
     Aligned { expiry: Option<SlotPoint> },
 }
 
+/// [`TaState`] without its data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaPhase {
+    NotAligned,
+    Aligned,
+}
+
+/// What moves the time-alignment state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaTrigger {
+    /// Timing Advance in a RAR or a TA Command MAC CE: timeAlignmentTimer
+    /// (re)started.
+    Command,
+    TimerExpiry,
+    /// MAC reset.
+    Reset,
+}
+
+/// The time-alignment machine.
+pub struct TaMachine;
+
+impl Machine for TaMachine {
+    const NAME: &'static str = "TA";
+    type State = TaState;
+    type Kind = TaPhase;
+    type Event = TaTrigger;
+    const KINDS: &'static [TaPhase] = &[TaPhase::NotAligned, TaPhase::Aligned];
+    const EVENTS: &'static [TaTrigger] =
+        &[TaTrigger::Command, TaTrigger::TimerExpiry, TaTrigger::Reset];
+    const INITIAL: TaPhase = TaPhase::NotAligned;
+    const RULES: &'static [Rule<TaPhase, TaTrigger>] = &[
+        Rule {
+            from: &[TaPhase::NotAligned],
+            event: TaTrigger::Command,
+            to: TaPhase::Aligned,
+            clause: "38.321 §5.2 (TA command: start timeAlignmentTimer)",
+        },
+        Rule {
+            from: &[TaPhase::Aligned],
+            event: TaTrigger::TimerExpiry,
+            to: TaPhase::NotAligned,
+            clause: "38.321 §5.2 (timeAlignmentTimer expiry)",
+        },
+        Rule {
+            from: &[TaPhase::Aligned],
+            event: TaTrigger::Reset,
+            to: TaPhase::NotAligned,
+            clause: "38.321 §5.12 (MAC reset)",
+        },
+    ];
+    fn kind(s: &TaState) -> TaPhase {
+        match s {
+            TaState::NotAligned => TaPhase::NotAligned,
+            TaState::Aligned { .. } => TaPhase::Aligned,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TimingAdvance {
     /// Absolute N_TA in T_c units.
     pub n_ta_tc: i64,
     pub timer_slots: u32,
-    state: TaState,
+    state: Fsm<TaMachine>,
     numerology: Numerology,
 }
 
@@ -30,13 +89,33 @@ impl TimingAdvance {
         Self {
             n_ta_tc: 0,
             timer_slots: timer_ms.saturating_mul(numerology.slots_per_subframe()),
-            state: TaState::NotAligned,
+            state: Fsm::new(TaState::NotAligned),
             numerology,
         }
     }
 
     pub fn state(&self) -> TaState {
-        self.state
+        *self.state.state()
+    }
+
+    /// Transitions made and refused (a refusal is a bug: see [`TaMachine`]).
+    pub fn fsm_stats(&self) -> FsmStats {
+        self.state.stats()
+    }
+
+    fn go(&mut self, trigger: TaTrigger, to: TaState) -> bool {
+        match self.state.transition(trigger, to) {
+            Ok(t) => {
+                if let Some(t) = t {
+                    log::debug!("{t}");
+                }
+                true
+            }
+            Err(v) => {
+                log::error!("{v}");
+                false
+            }
+        }
     }
 
     /// Apply the RAR 12-bit TA command (absolute).
@@ -57,17 +136,19 @@ impl TimingAdvance {
     }
 
     fn restart(&mut self, now: SlotPoint) {
-        self.state = TaState::Aligned {
-            expiry: (self.timer_slots > 0).then(|| now.add(self.timer_slots as u64)),
-        };
+        self.go(
+            TaTrigger::Command,
+            TaState::Aligned {
+                expiry: (self.timer_slots > 0).then(|| now.add(self.timer_slots as u64)),
+            },
+        );
     }
 
     /// Per-slot step: `true` exactly once when the timeAlignmentTimer expires.
     pub fn on_slot(&mut self, now: SlotPoint) -> bool {
-        if let TaState::Aligned { expiry: Some(t) } = self.state {
+        if let TaState::Aligned { expiry: Some(t) } = self.state() {
             if now.diff(&t) >= 0 {
-                self.state = TaState::NotAligned;
-                return true;
+                return self.go(TaTrigger::TimerExpiry, TaState::NotAligned);
             }
         }
         false
@@ -75,18 +156,25 @@ impl TimingAdvance {
 
     /// True while the uplink is time-aligned.
     pub fn aligned(&self) -> bool {
-        matches!(self.state, TaState::Aligned { .. })
+        matches!(self.state(), TaState::Aligned { .. })
     }
 
     pub fn reset(&mut self) {
         self.n_ta_tc = 0;
-        self.state = TaState::NotAligned;
+        if self.aligned() {
+            self.go(TaTrigger::Reset, TaState::NotAligned);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_is_well_formed() {
+        assert_eq!(ferrite_common::fsm::check::<TaMachine>(), Ok(()));
+    }
 
     #[test]
     fn timer_expiry_drops_alignment() {

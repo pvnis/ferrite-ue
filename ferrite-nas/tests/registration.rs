@@ -319,7 +319,7 @@ fn full_flow(ea: u8, ia: u8) -> (NasUe, FakeCore) {
     });
     let mut core = FakeCore::new(ea, ia);
     u.tick(1_000);
-    let rr = u.start_registration();
+    let rr = u.start_registration().expect("registration allowed");
     assert_eq!(
         rr,
         ferrite_nas::msgs::registration_request(IMSI),
@@ -352,7 +352,7 @@ fn full_flow(ea: u8, ia: u8) -> (NasUe, FakeCore) {
     assert_eq!(u.ul_nas_count_at_activation(), Some(0));
     // SMComplete = count 0, RegistrationComplete = 1, UL NAS Transport = 2.
     assert_eq!(u.security_context().unwrap().next_ul_count(), 3);
-    assert_eq!(u.sessions()[0].state, SmState::Active);
+    assert_eq!(u.sessions()[0].state(), SmState::Active);
     assert_eq!(u.sqn_ms(), Some(0x20));
     (u, core)
 }
@@ -435,7 +435,7 @@ fn configuration_update_identity_and_network_deregistration() {
         vec![NasEvent::PduSessionDown { psi: 5 }, NasEvent::Deregistered]
     );
     // The context survives (no cause): re-registration goes out with the GUTI, SHT 1.
-    let rr = u.start_registration();
+    let rr = u.start_registration().expect("registration allowed");
     assert_eq!(rr[1], 1);
     let plain = core.rx(&rr);
     let rr = RegistrationRequest::decode(&plain).unwrap();
@@ -449,7 +449,7 @@ fn ue_deregistration_and_session_release() {
     let rel = u.release_pdu_session(5).expect("release");
     pump(&mut u, &mut core, vec![rel]);
     assert_eq!(u.events(), vec![NasEvent::PduSessionDown { psi: 5 }]);
-    assert_eq!(u.sessions()[0].state, SmState::Inactive);
+    assert_eq!(u.sessions()[0].state(), SmState::Inactive);
     // Re-establish on demand.
     let req = u.request_pdu_session(5).expect("re-request");
     pump(&mut u, &mut core, vec![req]);
@@ -487,7 +487,7 @@ fn sqn_resynchronisation() {
         ..Default::default()
     });
     let mut core = FakeCore::new(0, 2);
-    let rr = u.start_registration();
+    let rr = u.start_registration().expect("registration allowed");
     pump(&mut u, &mut core, vec![rr]);
     assert!(u.is_registered(), "{:?}", u.state());
     assert_eq!(
@@ -603,7 +603,7 @@ fn pdu_session_reject_and_t3580_retry() {
         ..Default::default()
     });
     let mut core = FakeCore::new(0, 2);
-    let rr = u.start_registration();
+    let rr = u.start_registration().expect("registration allowed");
     pump(&mut u, &mut core, vec![rr]);
     assert!(u.is_registered(), "{:?}", u.state());
     let _ = u.events();
@@ -637,7 +637,7 @@ fn pdu_session_reject_and_t3580_retry() {
         u.events(),
         vec![NasEvent::PduSessionRejected { psi: 3, cause: 27 }]
     );
-    assert_eq!(u.sessions()[0].state, SmState::Inactive);
+    assert_eq!(u.sessions()[0].state(), SmState::Inactive);
     // DL NAS TRANSPORT with a 5GMM cause (payload not forwarded).
     let req = u.request_pdu_session(3).expect("request again");
     let _ = core.rx(&req);
@@ -963,7 +963,7 @@ mod oracle {
     #[test]
     fn initial_registration_request() {
         let mut u = ue(NasConfig::default());
-        let rr = u.start_registration();
+        let rr = u.start_registration().expect("registration allowed");
         let m = decode(&rr);
         let Message::Gmm(_, GmmMessage::RegistrationRequest(r)) = &m else {
             panic!("{m}")
@@ -1069,4 +1069,201 @@ mod oracle {
             "{inner}"
         );
     }
+}
+
+/// Like [`pump`], but only `rounds` UL → DL exchanges: leaves the UE in
+/// the middle of a procedure (authentication, security mode).
+fn partial_pump(ue: &mut NasUe, core: &mut FakeCore, mut ul: Vec<Vec<u8>>, rounds: usize) {
+    for _ in 0..rounds {
+        let mut next = Vec::new();
+        for pdu in ul {
+            for dl in core.on_ul(&pdu) {
+                next.extend(ue.on_dl_nas(&dl).unwrap_or_default());
+            }
+        }
+        ul = next;
+    }
+}
+
+/// The NAS entity, driven by long pseudo-random sequences of procedure
+/// calls, timer expiries, connection changes and network messages (from a
+/// registered UE with a PDU session, or a fresh one), never makes a move
+/// outside its 5GMM, 5GMM-CM and 5GSM transition tables.
+#[test]
+fn random_inputs_stay_inside_the_tables() {
+    use ferrite_common::fsm::edges;
+    use ferrite_nas::machine::MmMachine;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut transitions = 0;
+    for seed in 1..=150u64 {
+        let (mut u, mut core) = if seed % 2 == 0 {
+            full_flow(0, 2)
+        } else {
+            (
+                ue(NasConfig {
+                    imeisv: Some("3534900698735912".into()),
+                    ..Default::default()
+                }),
+                FakeCore::new(0, 2),
+            )
+        };
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut now = 2_000u64;
+        let mut rand = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for step in 0..150 {
+            let before = u.state();
+            let r = rand();
+            let pick = |xs: &[u8]| xs[(r >> 8) as usize % xs.len()];
+            let dl: Option<Vec<u8>> = match r % 22 {
+                0 => {
+                    // With no security context the request goes out plain and
+                    // a fresh core can run the procedure, part of the way.
+                    let fresh = u.security_context().is_none();
+                    if let (Some(rr), true) = (u.start_registration(), fresh) {
+                        core = FakeCore::new(0, 2);
+                        partial_pump(&mut u, &mut core, vec![rr], 1 + (r >> 8) as usize % 4);
+                    }
+                    None
+                }
+                1 => {
+                    let _ = u.service_request(1);
+                    None
+                }
+                2 => {
+                    let _ = u.deregister();
+                    None
+                }
+                3 => {
+                    let _ = u.deregister_with(true);
+                    None
+                }
+                4 => {
+                    let _ = u.request_pdu_session(5);
+                    None
+                }
+                5 => {
+                    let _ = u.release_pdu_session(5);
+                    None
+                }
+                6 => {
+                    u.on_connection_established();
+                    None
+                }
+                7 => {
+                    u.on_connection_released();
+                    None
+                }
+                8 => {
+                    now += 1_000;
+                    None
+                }
+                9 => {
+                    // Long enough for any NAS timer.
+                    now += 13 * 60_000;
+                    None
+                }
+                10 => Some(
+                    RegistrationReject {
+                        cause: pick(&[3, 9, 11, 12, 22, 111]),
+                        t3346: (r & 0x10000 != 0).then_some(mm::GprsTimer2 { unit: 0, value: 1 }),
+                        t3502: None,
+                        eap_message: None,
+                        rejected_nssai: None,
+                    }
+                    .encode(),
+                ),
+                11 => Some(
+                    mm::ServiceReject {
+                        cause: pick(&[3, 9, 22, 28, 111]),
+                        pdu_session_status: None,
+                        t3346: None,
+                    }
+                    .encode(),
+                ),
+                12 => Some(mm::authentication_reject()),
+                13 => Some(
+                    core.tx(
+                        mm::ServiceAccept {
+                            pdu_session_status: (r & 0x10000 != 0).then_some(0),
+                            pdu_session_reactivation_result: None,
+                            t3448: None,
+                        }
+                        .encode(),
+                        SecurityHeaderType::IntegrityCiphered,
+                    ),
+                ),
+                14 => Some(core.tx(
+                    mm::deregistration_accept(false),
+                    SecurityHeaderType::IntegrityCiphered,
+                )),
+                15 => Some(
+                    core.tx(
+                        DeregistrationRequestUeTerminated {
+                            dereg_type: DeregistrationType {
+                                access_type: 1,
+                                reregistration_required: r & 0x10000 != 0,
+                                switch_off: false,
+                            },
+                            cause: (r & 0x20000 != 0).then(|| pick(&[3, 11, 12, 22])),
+                            t3346: None,
+                        }
+                        .encode(),
+                        SecurityHeaderType::IntegrityCiphered,
+                    ),
+                ),
+                16 => Some(
+                    core.tx(
+                        RegistrationAccept {
+                            result: 1,
+                            guti: Some(guti()),
+                            tai_list: vec![Tai {
+                                plmn: plmn(),
+                                tac: 1,
+                            }],
+                            allowed_nssai: vec![Snssai { sst: 1, sd: None }],
+                            ..Default::default()
+                        }
+                        .encode(),
+                        SecurityHeaderType::IntegrityCiphered,
+                    ),
+                ),
+                _ => None,
+            };
+            if let Some(pdu) = dl {
+                let _ = u.on_dl_nas(&pdu);
+            }
+            seen.insert(format!("{before:?}->{:?}", u.state()));
+            let before = u.state();
+            let _ = u.tick(now);
+            seen.insert(format!("{before:?}->{:?}", u.state()));
+            let _ = u.events();
+            let _ = u.take_pending_initial_message();
+            assert_eq!(
+                u.fsm_stats().violations,
+                0,
+                "seed {seed} step {step}: {before:?} → {:?}",
+                u.state()
+            );
+        }
+        transitions += u.fsm_stats().transitions;
+    }
+    let missing: Vec<String> = edges::<MmMachine>()
+        .into_iter()
+        .map(|(f, _, t)| format!("{f:?}->{t:?}"))
+        .filter(|p| !seen.contains(p))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    eprintln!("5GMM edges not exercised ({}): {missing:?}", missing.len());
+    assert!(transitions > 2500, "too few transitions: {transitions}");
+    assert!(
+        missing.len() < 40,
+        "5GMM coverage dropped: {} edges never taken",
+        missing.len()
+    );
 }

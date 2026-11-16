@@ -16,16 +16,18 @@
 //! along its table.
 //!
 //! A state may carry data (a deadline, an RNTI); the table is written over its
-//! fieldless [`Machine::kind`], so the rules stay finite and enumerable.
+//! fieldless [`Machine::kind`], so the rules stay finite and enumerable. A
+//! rule may start from a set of kinds ("any registered substate"); a move
+//! that keeps the kind is a data update, allowed without a rule.
 
 use core::fmt;
 
-/// One allowed transition: on `event` in `from`, the machine may enter `to`.
-/// Several rules may share `(from, event)` when a guard in the entity picks
-/// the target (e.g. RLF with or without AS security).
+/// One allowed transition: on `event` in any kind of `from`, the machine may
+/// enter `to`. Several rules may share `(from, event)` when a guard in the
+/// entity picks the target (e.g. RLF with or without AS security).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rule<K, E> {
-    pub from: K,
+pub struct Rule<K: 'static, E> {
+    pub from: &'static [K],
     pub event: E,
     pub to: K,
     /// Where the transition comes from, e.g. `"38.331 §5.3.3.4"`; a
@@ -62,7 +64,7 @@ pub fn rule<M: Machine>(
 ) -> Option<&'static Rule<M::Kind, M::Event>> {
     M::RULES
         .iter()
-        .find(|r| r.from == from && r.event == event && r.to == to)
+        .find(|r| r.from.contains(&from) && r.event == event && r.to == to)
 }
 
 /// A transition that was made.
@@ -202,24 +204,36 @@ impl<M: Machine> Fsm<M> {
         self.stats
     }
 
-    /// Enter `to` on `event` if the table allows it.
+    /// Whether [`Fsm::transition`] to `to` on `event` would be allowed (a
+    /// guard's question; asking is not a violation).
+    pub fn allows(&self, event: M::Event, to: &M::State) -> bool {
+        let (from, to) = (M::kind(&self.state), M::kind(to));
+        from == to || rule::<M>(from, event, to).is_some()
+    }
+
+    /// Enter `to` on `event` if the table allows it. `Ok(None)`: `to` has
+    /// the current kind (a data update, no transition).
     pub fn transition(
         &mut self,
         event: M::Event,
         to: M::State,
-    ) -> Result<Transition<M>, Violation<M>> {
+    ) -> Result<Option<Transition<M>>, Violation<M>> {
         let from = M::kind(&self.state);
         let to_kind = M::kind(&to);
+        if from == to_kind {
+            self.state = to;
+            return Ok(None);
+        }
         match rule::<M>(from, event, to_kind) {
             Some(r) => {
                 self.state = to;
                 self.stats.transitions += 1;
-                Ok(Transition {
+                Ok(Some(Transition {
                     from,
                     event,
                     to: to_kind,
                     clause: r.clause,
-                })
+                }))
             }
             None => {
                 self.stats.violations += 1;
@@ -250,7 +264,7 @@ pub fn reachable<M: Machine>() -> Vec<M::Kind> {
     let mut seen = vec![M::INITIAL];
     let mut i = 0;
     while let Some(&k) = seen.get(i) {
-        for r in M::RULES.iter().filter(|r| r.from == k) {
+        for r in M::RULES.iter().filter(|r| r.from.contains(&k)) {
             if !seen.contains(&r.to) {
                 seen.push(r.to);
             }
@@ -260,33 +274,53 @@ pub fn reachable<M: Machine>() -> Vec<M::Kind> {
     seen
 }
 
+/// Every `(from, event, to)` the table allows, one `from` kind at a time
+/// (a kind's move to itself, a data update, left out).
+pub fn edges<M: Machine>() -> Vec<(M::Kind, M::Event, M::Kind)> {
+    let mut out: Vec<(M::Kind, M::Event, M::Kind)> = Vec::new();
+    for r in M::RULES {
+        for &f in r.from {
+            let e = (f, r.event, r.to);
+            if f != r.to && !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
 /// Well-formedness of a machine's table: every rule uses listed kinds and
-/// events, no rule is a self-loop or a duplicate, every rule names its
-/// clause, every event is used, and every kind is reachable from the
-/// initial one. Returns every problem found.
+/// events, starts from at least one kind, is not a single-kind self-loop,
+/// allows something no earlier rule does, and names its clause; every event
+/// is used, and every kind is reachable from the initial one. Returns every
+/// problem found.
 pub fn check<M: Machine>() -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
     if !M::KINDS.contains(&M::INITIAL) {
         problems.push(format!("initial {:?} not listed", M::INITIAL));
     }
     for (i, r) in M::RULES.iter().enumerate() {
-        if !M::KINDS.contains(&r.from) || !M::KINDS.contains(&r.to) {
+        if r.from.iter().any(|k| !M::KINDS.contains(k)) || !M::KINDS.contains(&r.to) {
             problems.push(format!("rule {i} uses an unlisted kind: {r:?}"));
         }
         if !M::EVENTS.contains(&r.event) {
             problems.push(format!("rule {i} uses an unlisted event: {r:?}"));
         }
-        if r.from == r.to {
+        if r.from.is_empty() {
+            problems.push(format!("rule {i} starts from no kind: {r:?}"));
+        }
+        if r.from == [r.to] {
             problems.push(format!("rule {i} is a self-loop: {r:?}"));
+        } else if !r.from.iter().any(|&f| {
+            f != r.to
+                && !M::RULES[..i]
+                    .iter()
+                    .any(|p| p.from.contains(&f) && p.event == r.event && p.to == r.to)
+        }) {
+            problems.push(format!("rule {i} duplicates earlier ones: {r:?}"));
         }
         if r.clause.is_empty() {
             problems.push(format!("rule {i} has no clause: {r:?}"));
-        }
-        if M::RULES[..i]
-            .iter()
-            .any(|p| p.from == r.from && p.event == r.event && p.to == r.to)
-        {
-            problems.push(format!("rule {i} duplicates an earlier one: {r:?}"));
         }
     }
     for e in M::EVENTS {
@@ -307,11 +341,28 @@ pub fn check<M: Machine>() -> Result<(), Vec<String>> {
     }
 }
 
-/// The table as a Mermaid state diagram.
+/// A kind's name as a Mermaid state id (`Registered(NormalService)` →
+/// `Registered_NormalService`).
+fn mermaid_id<K: fmt::Debug>(k: &K) -> String {
+    format!("{k:?}")
+        .chars()
+        .filter_map(|c| match c {
+            '(' | ',' => Some('_'),
+            ')' | ' ' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// The table as a Mermaid state diagram (one line per edge of [`edges`]).
 pub fn mermaid<M: Machine>() -> String {
-    let mut out = format!("stateDiagram-v2\n    [*] --> {:?}\n", M::INITIAL);
-    for r in M::RULES {
-        out.push_str(&format!("    {:?} --> {:?}: {:?}\n", r.from, r.to, r.event));
+    let mut out = format!("stateDiagram-v2\n    [*] --> {}\n", mermaid_id(&M::INITIAL));
+    for (f, e, t) in edges::<M>() {
+        out.push_str(&format!(
+            "    {} --> {}: {e:?}\n",
+            mermaid_id(&f),
+            mermaid_id(&t)
+        ));
     }
     out
 }
@@ -342,19 +393,19 @@ mod tests {
         const INITIAL: Light = Light::Off;
         const RULES: &'static [Rule<Light, Ev>] = &[
             Rule {
-                from: Light::Off,
+                from: &[Light::Off],
                 event: Ev::Switch,
                 to: Light::On,
                 clause: "a",
             },
             Rule {
-                from: Light::On,
+                from: &[Light::On],
                 event: Ev::Switch,
                 to: Light::Off,
                 clause: "b",
             },
             Rule {
-                from: Light::On,
+                from: &[Light::On],
                 event: Ev::Fail,
                 to: Light::Broken,
                 clause: "c",
@@ -369,8 +420,10 @@ mod tests {
     fn transitions_follow_the_table() {
         assert_eq!(check::<Lamp>(), Ok(()));
         let mut f = Fsm::<Lamp>::new((Light::Off, 0));
-        let t = f.transition(Ev::Switch, (Light::On, 1)).unwrap();
+        let t = f.transition(Ev::Switch, (Light::On, 1)).unwrap().unwrap();
         assert_eq!(t.to_string(), "LAMP Off → On on Switch [a]");
+        // Same kind: a data update, no rule needed.
+        assert!(f.transition(Ev::Fail, (Light::On, 1)).unwrap().is_none());
         // Not in the table: refused, state kept, counted.
         let v = f.transition(Ev::Switch, (Light::Broken, 2)).unwrap_err();
         assert_eq!(v.from, Light::On);
@@ -398,19 +451,19 @@ mod tests {
         const INITIAL: Light = Light::Off;
         const RULES: &'static [Rule<Light, Ev>] = &[
             Rule {
-                from: Light::Off,
+                from: &[Light::Off],
                 event: Ev::Switch,
                 to: Light::Off,
                 clause: "",
             },
             Rule {
-                from: Light::Off,
+                from: &[Light::Off],
                 event: Ev::Switch,
                 to: Light::On,
                 clause: "x",
             },
             Rule {
-                from: Light::Off,
+                from: &[Light::Off],
                 event: Ev::Switch,
                 to: Light::On,
                 clause: "x",

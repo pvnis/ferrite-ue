@@ -15,8 +15,16 @@ fn architecture_diagrams_match_the_tables() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/ARCHITECTURE.md");
     let doc = std::fs::read_to_string(path).unwrap_or_default();
     let stale: Vec<String> = [
-        check::<ferrite_rrc::machine::RrcMachine>(&doc),
+        check::<ferrite_l1::engine::CellPhaseMachine>(&doc),
+        check::<ferrite_l1::engine::RlmMachine>(&doc),
         check::<ferrite_mac::RaMachine>(&doc),
+        check::<ferrite_mac::SrMachine>(&doc),
+        check::<ferrite_mac::TaMachine>(&doc),
+        check::<ferrite_mac::DrxMachine>(&doc),
+        check::<ferrite_rrc::machine::RrcMachine>(&doc),
+        check::<ferrite_nas::machine::MmMachine>(&doc),
+        check::<ferrite_nas::machine::CmMachine>(&doc),
+        check::<ferrite_nas::machine::SmMachine>(&doc),
     ]
     .into_iter()
     .flatten()

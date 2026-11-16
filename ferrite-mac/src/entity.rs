@@ -225,6 +225,24 @@ impl MacEntity {
         self.ra.fsm_stats()
     }
 
+    /// Transitions made and refused across the MAC machines (RA, SR, TA,
+    /// DRX): a refusal is a bug in the entity or a table.
+    pub fn fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        let mut t = ferrite_common::fsm::FsmStats::default();
+        let parts = [
+            self.ra.fsm_stats(),
+            self.ta.fsm_stats(),
+            self.drx.fsm_stats(),
+        ]
+        .into_iter()
+        .chain(self.sr.iter().map(|s| s.fsm_stats()));
+        for p in parts {
+            t.transitions += p.transitions;
+            t.violations += p.violations;
+        }
+        t
+    }
+
     /// Time-alignment state (diagnostics).
     pub fn ta_state(&self) -> crate::ta::TaState {
         self.ta.state()
@@ -313,7 +331,7 @@ impl MacEntity {
         self.bsr.cancel();
         self.phr.reset();
         for s in &mut self.sr {
-            s.cancel();
+            s.reset();
         }
         self.ta.reset();
         self.drx.reset();

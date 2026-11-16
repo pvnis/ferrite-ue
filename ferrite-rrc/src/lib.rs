@@ -400,7 +400,9 @@ impl RrcUe {
     fn go(&mut self, trigger: RrcTrigger, to: RrcState) -> bool {
         match self.state.transition(trigger, to) {
             Ok(t) => {
-                log::info!("{t}");
+                if let Some(t) = t {
+                    log::info!("{t}");
+                }
                 if to != RrcState::Connecting {
                     self.t300_expiry = None;
                 }
