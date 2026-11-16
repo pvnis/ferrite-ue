@@ -47,6 +47,40 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 - [ ] Double-symbol DM-RS (`maxLength = 2`), DL and UL.
 - [ ] PUSCH frequency hopping (intra-slot); MAC currently refuses the grant.
 - [ ] PT-RS (DL reception, UL insertion) when configured.
+- [x] 2026-11-16 UCI on PUSCH rewritten after OCUDU's `get_ulsch_information`
+      / `ulsch_demultiplex` (`pusch::uci_pusch_layout`): ΣK_r = C·K (it used
+      TBS + CRC), α (`uci-OnPUSCH.scaling`) on the ACK count, β_offset index
+      by payload size (ACK 1–2 / 3–11 / >11, CSI ≤11 / >11; OCUDU sets index 1
+      = 20 and index 2 = 6.25), the UL-SCH rate-matched around 3–11 ACK bits
+      (it was punctured), CSI part 1 placed around the reserved ACK REs (also
+      with no ACK: OCUDU reserves for two bits) and with Q'_CSI reduced by
+      them. Found by the n48 / 10-slot TDD configs: with more DL slots per
+      UL slot, two-bit ACKs on PUSCH failed 14 of 15 times and one-bit ACKs
+      were read as NACK (DL retransmissions); now C1 / C2 / T1 / T7 run with
+      0 UL CRC failures on the ZMQ channel.
+- [x] 2026-11-16 PDCCH presence gate robust to timing offsets and fading:
+      the gate before the blind decode used `|mean h|² / mean |h|²` over a
+      candidate's REGs, which are interleaved across the CORESET, so a DL
+      timing error of a few samples (a linear phase over the band) or
+      frequency-selective fading scored a real PDCCH near zero and skipped it.
+      It now correlates neighbouring REGs (next RB / next symbol). Under the
+      emulator's `cell-edge` channel on C1 (TDL-A 100 ns, 5 dB) the UE decoded
+      78 % of the UL grants before, 89 % after; the UL went from 3/1142 to
+      49/43 PUSCH CRC ok/ko and the attach now completes.
+- [x] 2026-11-16 Drift over the cell-search gap and SFN aliasing: the timing
+      tracker now starts counting at the acquisition (a dropped search backlog
+      of seconds is 129 samples at 1 ppm and 30.72 MHz: the SSB was lost
+      after the drop), and the slot clock is re-anchored at the slot-loop
+      start (slot ↔ index is modular over the SFN cycle; a backlog over
+      5.12 s aliased to the wrong cycle: "timing slew of 314572101 samples").
+      The `tracking:` summary is also logged when the engine stops.
+- [x] 2026-11-16 Periodic CSI on every configured occasion: the MAC dropped
+      a report when the latest measurement predated the current report period
+      (a CSI-RS a few slots before the occasion is often still in flight when
+      the slot is built), so the gNB decoded nothing on PUCCH and failed the
+      PUSCH that should have carried it — on C2 that cost SRB1 and declared an
+      RLF. The report now uses the latest measurement (CQI 0 before the
+      first).
 - [x] 2026-11-13 SRS transmission, periodic resources (comb 2/4, cyclic
       shift, C_SRS/B_SRS table, no hopping): OCUDU detects the sounding
       (EPRE +1.5 dB, t_align 0.2 µs, ~55 dB SINR, S20). Aperiodic /
@@ -249,8 +283,8 @@ TCI, rate-match groups, CBG, two codewords…); RA type 0; `ra-SearchSpace` /
 B/C; single-layer / port-0 only (no ports 1001+, n_SCID, DM-RS type 2 /
 maxLength 2, PT-RS, TB2); PDSCH rate matching around the SSB / rateMatchPatterns
 / CSI-RS rows other than 1/2/3/4; LBRM; multi-CB soft combining; CBG;
-`dataScramblingIdentityPDSCH/PUSCH`; UCI ≥3 ACK bits puncture instead of
-rate-matching the UL-SCH; CSI part 2 / polar UCI; PUCCH F4, F2/F3 intra-slot
+`dataScramblingIdentityPDSCH/PUSCH`; CSI part 2 / polar UCI (more than 11
+bits; UCI on PUSCH refuses them); PUCCH F4, F2/F3 intra-slot
 hopping and group hopping; PRACH restricted sets, FR2 table, MsgA;
 aperiodic/semi-persistent SRS; RI/PMI/CSI-IM/L1-RSRP reports; TRS not used
 for tracking; PDCCH precoder granularity allContiguousRBs; neighbour cell

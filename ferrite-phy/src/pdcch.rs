@@ -557,27 +557,39 @@ pub fn equalize_candidate(
     out
 }
 
-/// Cheap PDCCH presence metric for a candidate: the coherence of the per-REG
-/// channel estimate across its REGs, `|mean(h)|² / mean(|h|²)`. A real PDCCH
-/// (same precoder across its REG bundles) scores ≈1; noise-only REGs give
-/// random estimates, ≈1/N. Gating the blind decode on it (≈0.3–0.5) skips the
-/// equalize + polar decode for the many empty candidates, at no extra reads.
+/// Cheap PDCCH presence metric for a candidate: the normalised correlation of
+/// the channel estimates of neighbouring REGs (next RB in the same symbol, next
+/// symbol in the same RB), `|Σ h_a·h_b*| / Σ (|h_a|² + |h_b|²)/2`. A real PDCCH
+/// scores ≈1 — and keeps doing so under a timing offset (a linear phase across
+/// frequency rotates every pair alike) or frequency-selective fading (which
+/// changes little over one RB), both of which can drive a whole-candidate
+/// `|mean h|²`-style coherence to zero across the interleaved REG bundles.
+/// Noise-only estimates score ≈ 1/√pairs. Gating the blind decode on it skips
+/// the equalize + polar decode for most empty candidates.
 pub fn candidate_coherence(est: &CoresetEstimate, coreset: &Coreset, cand: &Candidate) -> f32 {
-    let mut sum = Complex32::new(0.0, 0.0);
+    let regs: std::collections::HashSet<(usize, usize)> = cand
+        .cces
+        .iter()
+        .flat_map(|&cce| coreset.cce_regs(cce))
+        .collect();
+    let mut corr = Complex32::new(0.0, 0.0);
     let mut power = 0.0f32;
-    let mut n = 0u32;
-    for &cce in &cand.cces {
-        for (l, rb) in coreset.cce_regs(cce) {
-            let h = est.get(l, rb);
-            sum += h;
-            power += h.norm_sqr();
-            n += 1;
+    for &(l, rb) in &regs {
+        let a = est.get(l, rb);
+        let next_rb = (rb + 1 < coreset.rbs.len() && coreset.rbs[rb + 1] == coreset.rbs[rb] + 1)
+            .then_some((l, rb + 1));
+        for nb in [next_rb, Some((l + 1, rb))].into_iter().flatten() {
+            if regs.contains(&nb) {
+                let b = est.get(nb.0, nb.1);
+                corr += a * b.conj();
+                power += 0.5 * (a.norm_sqr() + b.norm_sqr());
+            }
         }
     }
-    if n == 0 || power <= 1e-12 {
+    if power <= 1e-12 {
         return 0.0;
     }
-    (sum / n as f32).norm_sqr() / (power / n as f32)
+    corr.norm() / power
 }
 
 #[cfg(test)]
@@ -684,6 +696,34 @@ mod tests {
             candidate_coherence(&noise, &coreset, &cand) < 0.5,
             "noise low"
         );
+    }
+
+    /// A timing offset puts a linear phase across the CORESET (4 samples at
+    /// 15.36 MHz: 0.59 rad per RB, ~14 rad over 24 RB); the presence metric
+    /// must still pass the candidate, since its REG bundles are interleaved
+    /// across the whole band.
+    #[test]
+    fn candidate_coherence_survives_a_timing_offset() {
+        let coreset = coreset1(24, 2, 1);
+        let n_rb = coreset.n_rb();
+        let theta = 2.0 * std::f32::consts::PI * 12.0 * 30e3 * 4.0 / 15.36e6;
+        let est = CoresetEstimate {
+            n_rb,
+            h: (0..coreset.n_reg())
+                .map(|i| {
+                    let rb = i % n_rb;
+                    Complex32::from_polar(0.8, theta * coreset.rbs[rb] as f32)
+                })
+                .collect(),
+        };
+        for al in [1usize, 2, 4, 8] {
+            let cand = Candidate {
+                agg_level: al,
+                cces: (0..al).collect(),
+            };
+            let c = candidate_coherence(&est, &coreset, &cand);
+            assert!(c > 0.8, "AL{al}: {c}");
+        }
     }
 
     /// Exhaustive candidates cover every CCE-aligned position, in particular AL1

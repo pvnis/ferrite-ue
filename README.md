@@ -6,137 +6,130 @@ code from srsRAN, OpenAirInterface, or OCUDU — those serve only as behavioral
 references and as a network-side gNB to test against. (Extracting normative
 constant tables / reference vectors from the specs is the only thing lifted.)
 
-**Status: end-to-end works, in real time.** Ferrite performs the full SA
-attach over a ZMQ IQ transport against an OCUDU/qcore network — cell search →
-PRACH/RACH → 5G-AKA → NAS + AS security → registration → PDU session → DRB — and
-carries live IP traffic (ping through qcore's UPF) at the **real-time μ=1 slot
-rate (500 µs/slot, 2000 slots/s), 0 % packet loss**. Active-traffic round-trip
-is **~12 ms**.
+**Status: end-to-end over ZMQ on 11 cell configurations; over-the-air
+bring-up in progress.** Ferrite performs the full SA attach against an
+OCUDU gNB and the qcore core — cell search → PRACH → RRC setup → 5G-AKA →
+NAS + AS security → registration → PDU session → DRB — and carries IP
+traffic through the UPF in real time (500 µs slots at 30 kHz). Ping RTT
+medians in the lab are 15–19 ms on the TDD cells and ~29 ms on FDD n3.
 
-The cell configuration is **decoded live, not transcribed**: the TDD UL/DL
-pattern and timing tables come from SIB1, and the dedicated radio-bearer config
-(k1 list, DCI field widths, PUCCH/SR/CSI resources, CSI-RS layout, CORESET#1
-geometry) from the RRCSetup `masterCellGroup`. Ferrite attaches against
-different TDD patterns and channel bandwidths without code changes — validated
-on 5 ms `6D+S+3U` and 2.5 ms `DDDSU` cells, and at both **10 MHz and 20 MHz**
-(the wider BWP's DCI/PUCCH/CORESET widths all derive from the parsed config).
-For 20 MHz, point the gNB at `test/gnb_zmq_20mhz.yml` and run the UE with
-`--srate 30.72e6`; end-to-end ping works the same as 10 MHz.
+The cell configuration is **decoded live, not transcribed**: band and duplex
+follow from the ARFCN, the TDD pattern (including `pattern2`) and timing
+tables come from SIB1, and the dedicated configuration (k1/k2 lists, DCI field
+widths, PUCCH/SR/CSI resources, CSI-RS, CORESET#1, DRX, BWPs, power control,
+UCI-on-PUSCH offsets) from the RRC messages. The UE needs only the radio
+endpoint, sample rate and carrier frequency.
 
-## Target configuration
+## Supported and lab-validated cells
 
-| Parameter    | Value                                              |
-|--------------|----------------------------------------------------|
-| Mode         | 5G SA (standalone)                                 |
-| Frequency    | FR1, band **n78**, TDD (pattern read live from SIB1) |
-| Numerology   | `mu = 1` → 30 kHz SCS, 500 µs slot                 |
-| Bandwidth    | 10 MHz (24 PRB, 15.36 MHz) or 20 MHz (51 PRB, 30.72 MHz) |
-| Transport    | ZMQ IQ (`complex<f32>` blocks), no-RF bring-up     |
-| Radio (OTA)  | any SoapySDR device (`--radio sdr`, feature `sdr`); bench: LimeSDR XTRX |
+Every configuration below attaches and pings against OCUDU over ZMQ
+(`scripts/lab.sh <id>`; configs in `test/`, details in
+`docs/TEST_PLAN.md` §2):
+
+| Id | Band | Duplex / SCS | Bandwidth | TDD period | Exercises |
+|---|---|---|---|---|---|
+| T1 | n78 | TDD 30 kHz | 10 MHz | 5 ms: 6D + S + 3U | baseline: SRS, SIB2, measurement reports, inactivity release / paging |
+| T2 | n78 | TDD 30 kHz | 10 MHz | 2.5 ms: DDDSU | short period, PUCCH format 3 |
+| T3 | n78 | TDD 30 kHz | 20 MHz | 5 ms | wide BWP, DFT-s-OFDM uplink |
+| T4 | n78 | TDD 30 kHz | 10 MHz | 5 ms | connected-mode DRX |
+| T5 | n78 | TDD 30 kHz | 10 MHz | 5 ms | 2x2 downlink MIMO, two layers, RI/PMI reporting |
+| T6 | n78 | TDD 30 kHz | 10 MHz | 5 ms: DDSUUUUUUU | uplink-heavy |
+| T7 | n78 | TDD 30 kHz | 10 MHz | 5 ms: DDDDDDDDSU | downlink-heavy, multi-bit HARQ-ACK |
+| C1 | **n48 (US CBRS)** | TDD 30 kHz | 10 MHz at 3600 MHz | 5 ms: DDDDDDDSUU | UL symbols in the special slot |
+| C2 | **n48 (US CBRS)** | TDD 30 kHz | 20 MHz at 3600 MHz | 5 ms: DDDSU + DDSUU | two-pattern TDD (`pattern2`), full-width PUCCH |
+| F1 | n3 | FDD 15 kHz | 10 MHz | – | FDD, long PRACH format, NEA2/NIA2 ciphering |
+| F2 | n3 | FDD 15 kHz | 20 MHz | – | FDD wide BWP |
+
+The band table (`ferrite-common/src/band.rs`) also knows n1, n2, n5, n7, n8,
+n20, n28, n38, n40, n41, n66, n71 and n79 (duplex mode, ARFCN ranges, SSB
+SCS); those are untested in the lab. On the n78 cells the UE takes the first
+matching band, n77, which overlaps n78 at 3390 MHz. Sample rates in the lab configs:
+15.36 / 30.72 MSps for TDD 10 / 20 MHz, 11.52 / 23.04 MSps for FDD 10 / 20 MHz.
+
+**Channel emulator.** `ferrite-chanem` sits between the gNB and the UE on
+the ZMQ link and applies 3GPP fading (TDL-A/B/C, EPA/EVA/ETU), propagation
+delay, a UE oscillator error and noise. `scripts/lab.sh <id> --scenario
+<name>` runs a cell through one of the named channels (`ideal`, `static`,
+`indoor`, `pedestrian`, `urban`, `vehicular`, `dispersive`, `cell-edge`), and
+`scripts/matrix.sh` runs every cell × scenario into one results table
+(`docs/TEST_PLAN.md` §5.2).
 
 ## Quick start (ZMQ, against an OCUDU gNB + qcore)
 
-**1. Bring up the network side.** Start qcore, then the gNB with the bundled
-config (band n78, 10 MHz, ZMQ on tcp ports 2100 DL / 2101 UL):
+The lab runner does everything (core, gNB, UE, log collection, pass/fail per
+test stage):
 
 ```sh
-# from your ocudu-pavo build dir
-./apps/gnb/gnb -c /path/to/ferrite/test/gnb_zmq_ferrite.yml
+scripts/lab.sh T1 --ping 20                       # one cell, direct ZMQ
+scripts/lab.sh C1 --ping 20 --scenario pedestrian # CBRS cell through a fading channel
+scripts/matrix.sh -c "T1 C1 C2" -s "ideal vehicular"
 ```
 
-**2. Build and run the UE.** The default binary is `ferrite-ue`:
+By hand: start qcore, then the gNB with one of the bundled configs (ZMQ on
+tcp ports 2100 DL / 2101 UL), then the UE with the matching carrier and
+sample rate:
 
 ```sh
-cargo build --release -p ferrite-ue --bin ferrite-ue
+./apps/gnb/gnb -c /path/to/ferrite/test/gnb_zmq_tdd_n48_10mhz.yml   # from the ocudu build dir
+cargo build --release -p ferrite-ue
+./target/release/ferrite-ue --dl-arfcn 640000 --srate 15.36 --ping 20
 ```
 
-*Built-in ping* (no privileges — sends ICMP over the DRB internally, using the
-IP the network assigns in the PDU Session Accept). Doubles as an RTT probe: it
-sends 20 echoes at 1 Hz and prints each round-trip time:
+The built-in ping needs no privileges: it sends ICMP over the DRB to
+`--ping-target` and prints each round trip. To carry host traffic instead,
+create a TUN interface (needs root):
 
 ```sh
-./target/release/ferrite-ue
-# 🏓 seq=0 time=12.4 ms
-```
-
-To attach against a different TDD pattern, point the gNB at the bundled DDDSU
-config (`test/gnb_zmq_dddsu.yml`) instead; the UE needs no flags to follow it.
-
-*Real TUN interface* (host traffic over the air; needs root for the interface).
-Ferrite creates the TUN, extracts its assigned IP, and configures it — then any
-tool can send through it:
-
-```sh
-sudo ./target/release/ferrite-ue --tun ferrite0 --netns ferritens
-# then, in another shell:
+sudo ./target/release/ferrite-ue --dl-arfcn 626000 --tun ferrite0 --netns ferritens
 sudo ip netns exec ferritens ping 10.255.0.1
 ```
 
-The UE prints its progress through each attach stage; `TUN ferrite0 up` (or the
-built-in `ICMP echo/reply`) means the full stack is live.
-
 ## Command-line options
 
-All have working defaults; override only what your setup needs.
+All options can also come from a TOML file (`--config`; flags override it).
+`ferrite-ue --help` lists everything; the main ones:
 
-| Flag             | Default                              | Meaning |
-|------------------|--------------------------------------|---------|
-| `--tx`           | `tcp://127.0.0.1:2100`               | gNB **downlink** ZMQ endpoint (UE reads) |
-| `--rx`           | `tcp://127.0.0.1:2101`               | gNB **uplink** ZMQ endpoint (UE writes) |
-| `--srate`        | `15.36e6`                            | Sample rate (Hz) — must match the gNB |
-| `--center-mhz`   | `3390.0`                             | Carrier centre frequency (MHz) |
-| `--tun`          | *(off)*                              | Create this TUN interface and carry host IP over the DRB (needs root) |
-| `--netns`        | *(none)*                             | Move the TUN into this network namespace |
-| `--tun-mtu`      | `1400`                               | TUN MTU |
-| `--ping-target`  | `10.255.0.1`                         | ICMP echo target (built-in ping mode) |
-| `--ue-ip`        | *(auto)*                             | Override the UE IP instead of taking it from the PDU Session Accept |
-| `--imsi`         | `001010167891203`                    | Subscriber IMSI (SUCI) |
-| `--ki`           | `51222502…45fc0`                     | 5G-AKA Milenage key K (32 hex) |
-| `--opc`          | `981d464c…d0bcf`                     | 5G-AKA Milenage OPc (32 hex) |
-| `--snn`          | `5G:mnc001.mcc001.3gppnetwork.org`   | Serving-network name |
-| `--preamble`     | `0`                                  | PRACH preamble index |
-| `--amp`          | `0.5`                                | UL transmit peak amplitude |
-| `--sweep`        | `384`                                | PRACH occasion offset sweep step (samples) |
-| `--msg3-delay`   | `7`                                  | RAR→Msg3 slot delay |
-| `--fshift`       | `0`                                  | Extra frequency shift applied to the UL |
-| `--toff-lo` / `--toff-hi` / `--toff-step` | `-2800` / `-600` / `25` | Msg3 timing-offset search window (samples) |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--radio` | `zmq` | `zmq` (gNB over ZeroMQ) or `sdr` (SoapySDR, feature `sdr`) |
+| `--tx` | `tcp://127.0.0.1:2100` | gNB downlink endpoint(s), one per receive antenna (`a,b` for 2x2) |
+| `--rx` | `tcp://127.0.0.1:2101` | gNB uplink endpoint (the UE serves samples here) |
+| `--srate` | `15.36` | Sample rate in MHz (must match the gNB) |
+| `--dl-arfcn` / `--center-mhz` | `626000` | Downlink carrier centre |
+| `--band`, `--ssb-scs`, `--gscn` | derived | Overrides / hints for the cell search |
+| `--imsi`, `--ki`, `--opc`, `--dnn` | lab SIM, `internet` | Subscriber credentials |
+| `--ping`, `--ping-target`, `--ping-interval-ms` | `20`, `10.255.0.1`, `1000` | Built-in ICMP probe (0 disables) |
+| `--tun`, `--netns` | off | Carry host IP over the DRB through a TUN |
+| `--timeout`, `--exit-after-ping` | run forever | Stop conditions |
+| `--sdr-args`, `--sdr-rx-gain`, `--sdr-tx-gain`, `--sdr-*-antenna` | – | SoapySDR device and gains |
+| `--rx-power-offset-db`, `--tx-power-offset-db` | 0 / unset | dBm calibration of the radio (enables uplink power control) |
+| `--independent-lo` | off | The radio's LO is not locked to its sample clock (don't predict timing drift from the CFO) |
+| `--emulate-lo-ppm`, `--rlf-at-s`, `--rlm-outage-s`, `--t3512-s` | off | Test aids (oscillator error, radio link failure, RLM outage, periodic registration) |
+| `--log` | `info` | Log level (`RUST_LOG`-style filters also work) |
 
-## Runtime tuning (environment variables)
-
-Off by default; useful for measurement and for pushing the real-time envelope.
-
-| Var                | Default | Effect |
-|--------------------|---------|--------|
-| `FERRITE_PERF`     | off     | Per-slot performance reports on stderr: timeline (`[perf-ue-t0]`), RX-PHY worker (`[perf-ue-rxphy]`), HARQ-ACK lag/lateness + job drops (`[perf-ue-ack]`) |
-| `FERRITE_PACE_US`  | `500`   | Wall-clock µs/slot the radio thread paces the gNB to (real time). Larger = slower/looser |
-| `FERRITE_LEAD`     | `-2`    | Slots the UL serve may run ahead of T0's DL consumption. Each slot of lead eats the k1 HARQ-ACK budget; negative gates the serve *behind* T0, adding ACK margin (the lockstep gNB absorbs the trail) |
-| `FERRITE_FB`       | off     | Re-enable the no-DCI brute-force PDSCH fallback (off by default: it can't be HARQ-ACKed and its worst case triggers retx storms) |
-| `FERRITE_RT`       | off     | Pin the timeline / RX-PHY / radio threads to SCHED_FIFO cores (needs `CAP_SYS_NICE` / root) |
-| `FERRITE_DRIFT`    | off     | Diagnostic: log T0-vs-serving drift and each late-ACK's position |
-| `FERRITE_PAD_US`   | `0`     | Pad the slot period (study pace vs. the lockstep) |
-| `FERRITE_DUMP_FSH` | off     | Dump one granted-slot's frequency-shifted samples to `/tmp/ferrite_fsh.bin` for offline decode timing |
+Diagnostic environment variables: `FERRITE_PERF` (radio-read overrun
+reports), `FERRITE_DRIFT` (uplink waveform overlap audit), and
+`FERRITE_PRACH_SWEEP` / `FERRITE_PUSCH_SWEEP` (cycle the uplink timing per
+attempt for calibration, TEST_PLAN §5.1).
 
 ## Architecture
 
-`ferrite-ue` runs a staged, real-time pipeline (OCUDU's task-executor pattern) so
-the DL-decode→HARQ-ACK path beats the 500 µs slot deadline:
+The L1 (`ferrite-l1`) runs a small set of threads around one slot clock
+(`docs/ARCHITECTURE.md` §4):
 
-- **T0 — timeline** (hard real-time): owns the sample clock; reads DL via a
-  read-ahead `BufferedStream`, hands each slot to the RX-PHY worker, and runs the
-  protocol stack + HARQ-ACK/SR build.
-- **Radio thread**: serves the UL from a position-keyed injection table, **paced**
-  to real time and **gated** to T0's DL consumption (so the gNB can't out-run its
-  own scheduler and the DL buffer can't grow unbounded).
-- **RX-PHY worker (T1)**: OFDM demod, PDCCH blind decode, PDSCH LDPC decode + HARQ
-  soft-combining, on a small dedicated `rayon` pool (candidates + layouts in
-  parallel).
-- **TX-build thread**: PUSCH / CSI modulation, off the timeline thread.
+- **radio-rx** drains the radio into a buffered stream, one per receive antenna;
+- **timeline (T0)** owns the slot clock: per slot it tracks timing and CFO,
+  monitors the PDCCH, hands PDSCH jobs to the worker, and runs the
+  MAC / RLC / PDCP / RRC / NAS stack synchronously;
+- **PDSCH worker** does channel estimation, MMSE demapping and LDPC decoding
+  with HARQ soft combining;
+- **tx-build** turns the MAC's UL_TTI requests (PUSCH with UCI, PUCCH F0–F3,
+  PRACH, SRS) into samples at absolute positions;
+- **UL serve** hands those samples to the radio: on the ZMQ request in
+  lockstep with the gNB, on an SDR as timed bursts on the device clock.
 
-See `ferrite-l1/src/rt.rs` for the queue/stage plumbing. Two lessons that
-made 500 µs work: the decode→ACK pipeline lag is bounded by the worker **queue
-depth** (kept shallow so bursts drop instead of stalling), and the PDSCH
-time-domain shape must come from the **DCI's TDRA bit**, not the slot index
-(HARQ retransmissions of a short-slot TB keep the short shape in normal slots).
+The PHY talks to the MAC only through FAPI-style messages (`ferrite-fapi`), and
+nothing above `ferrite-radio` knows which transport is in use.
 
 ### Protocol stack (L2 / L3)
 
@@ -179,43 +172,33 @@ ferrite-ue        the binary: config, engine wiring, stack glue, bearers, user p
 ```
 
 See `docs/ARCHITECTURE.md` for the layer contracts and state machines and
-`docs/TEST_PLAN.md` for the lab matrix (`scripts/lab.sh`; `CHANEM="…"` runs
-it through the channel emulator, TEST_PLAN §5.2).
+`docs/TEST_PLAN.md` for the lab matrix, test stages and channel scenarios.
 
 ## Roadmap
 
-**Milestone 1 — downlink cell search & sync** ✅
-PSS/SSS correlation → PCI, CFO estimation, PBCH DMRS + SCL polar decode → MIB.
-Cross-validated: Ferrite's emitted SSB decodes in srsRAN's independent receiver
-with `crc=OK` and every MIB field correct.
-
-**Milestone 2 — live gNB decode** ✅
-ZMQ backend; GSCN scan → SSB lock; continuous sync tracking; PDCCH/CORESET#0 DCI
-blind decode; SIB1 PDSCH LDPC decode (CRC OK) — all live against an OCUDU SA gNB.
-
-**Milestone 3 — full SA attach & data plane** ✅
-PRACH/RACH → RAR → Msg3/Msg4 contention resolution → RRC setup → 5G-AKA
-(Milenage) → NAS + AS security → registration → PDU session → DRB. Uplink PUSCH,
-PUCCH (HARQ-ACK / SR / CSI) and UCI-on-PUSCH (HARQ-ACK + CSI part 1), HARQ
-soft-combining both directions. Cell config decoded live (SIB1 + masterCellGroup),
-so attach is TDD-pattern-agnostic — validated on `6D+S+3U` and `DDDSU` cells.
-**End-to-end ping through qcore's UPF, at real-time 500 µs/slot, ~12 ms RTT,
-0 % loss, repeatable.**
-
-**Milestone 4 — over the air** *(in progress)*
-SoapySDR backend wired into the binary (`--radio sdr --sdr-args driver=…`):
-sample-exact device time base shared by RX and TX, timed uplink blocks, overflow
-gaps zero-filled. Verified streaming on a LimeSDR XTRX; an OTA gNB, power
-control, AGC and tracking are next.
+- **Done (ZMQ):** SA attach and data plane; TDD patterns incl. `pattern2`,
+  FDD, 10 / 20 MHz; 2x2 DL MIMO with RI/PMI; DRX, BWP switching, RLF and
+  re-establishment, paging and service request, periodic registration;
+  UCI on PUSCH (HARQ-ACK up to 11 bits, CSI part 1); fine timing / CFO
+  tracking with UL frequency pre-compensation; uplink power control and
+  receive AGC; the fading channel emulator.
+- **Over the air (in progress):** the SoapySDR backend is wired in
+  (`--radio sdr`) with a sample-exact device time base and timed uplink
+  bursts, verified streaming on a LimeSDR XTRX; an over-the-air gNB is the
+  missing piece.
+- **Open:** 3–4 layers, polar-coded UCI (>11 bits) and CSI part 2, CDL /
+  ray-traced channels, neighbour cells and mobility. The full list is in
+  `docs/BACKLOG.md`.
 
 ## Build & test
 
 ```sh
-cargo test --workspace                            # core (no native libs needed)
-cargo build --release -p ferrite-ue --bin ferrite-ue
-cargo build --release -p ferrite-ue --features sdr # with the SoapySDR backend
+cargo test --workspace                               # no native libs needed
+cargo build --release -p ferrite-ue                  # ZMQ backend
+cargo build --release -p ferrite-ue --features sdr   # with SoapySDR
+cargo build --release -p ferrite-radio --features zmq --bin ferrite-chanem
 ./target/release/ferrite-ue --radio sdr --sdr-args "driver=limesuiteng,addr=/dev/limepcie0" \
-    --dl-arfcn 626000 --srate 15.36 --sdr-rx-gain 40 --sdr-tx-gain 30
+    --dl-arfcn 640000 --srate 15.36 --sdr-rx-gain 40 --sdr-tx-gain 30
 ```
 
 ## License

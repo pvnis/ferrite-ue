@@ -632,7 +632,8 @@ impl<'a> Engine<'a> {
                         ..TrackerConfig::new(self.params.fs, self.params.dl_center_hz)
                     },
                     acq.cfo_hz,
-                ),
+                )
+                .starting_at(frame_start_abs),
                 ssb_period_ms: 20,
                 phase: CellPhase::AwaitSib1,
             };
@@ -765,6 +766,18 @@ impl<'a> Engine<'a> {
             self.dl.skip(backlog as usize)?;
             self.prev.iter_mut().for_each(Vec::clear);
         }
+        // Apply the drift accumulated since acquisition (over the dropped
+        // backlog too), then re-anchor the clock here: slot ↔ index mapping is
+        // modular over the SFN cycle, and a backlog of more than half a cycle
+        // (5.12 s) would otherwise alias to the wrong one.
+        let pos = self.dl.position() as i64;
+        let step = s.track.advance(pos);
+        if step != 0 {
+            log::info!("timing: {step:+} samples of drift since acquisition");
+            s.clock.slew(step);
+        }
+        let (anchor, anchor_off) = s.clock.slot_at(pos);
+        s.clock.set_anchor(anchor, pos - anchor_off);
         // Start at the first whole slot at/after the current stream position.
         let (mut slot, off) = s.clock.slot_at(self.dl.position() as i64);
         if off != 0 {
@@ -804,23 +817,14 @@ impl<'a> Engine<'a> {
         let mut outbox: Vec<MacToPhy> = Vec::new();
         loop {
             if self.stopped() {
+                // A final summary: short runs may never reach an SFN 0.
+                log::info!("tracking: {}", s.track.summary());
                 return Ok(false);
             }
             // The drift model moves the anchor in whole samples.
             let step = s.track.advance(s.clock.dl_index(slot));
             if slot.slot == 0 && slot.sfn == 0 {
-                let t = s.track.stats();
-                log::info!(
-                    "tracking: cfo {:.0} Hz, drift {:+.3} ppm, offset {:+.2} samples, {} steps, {} re-alignments, {} outliers ({} timing / {} CFO measurements)",
-                    s.track.cfo_hz(),
-                    s.track.drift_ppm(),
-                    s.track.offset(),
-                    t.steps,
-                    t.coarse,
-                    t.outliers,
-                    t.timing_measurements,
-                    t.cfo_measurements
-                );
+                log::info!("tracking: {}", s.track.summary());
             }
             if step != 0 {
                 if step.abs() == 1 {

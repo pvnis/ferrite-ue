@@ -272,35 +272,40 @@ impl UlBuilder {
                 bits.len()
             ));
         }
-        let beta_ack = self
-            .cfg
-            .pusch
-            .beta_offsets
-            .map_or(20.0, |b| beta_offset_harq(b.ack_index1));
-        let beta_csi = self
-            .cfg
-            .pusch
-            .beta_offsets
-            .map_or(6.25, |b| pusch::beta_offset_csi(b.csi1_index1));
+        // β_offset indices by payload size (TS 38.213 §9.3): ACK 1-2 / 3-11 / >11
+        // bits, CSI part 1 up to 11 / above.
+        let betas = self.cfg.pusch.beta_offsets;
+        let o_ack = uci.harq_ack.len();
+        let beta_ack = betas.map_or(20.0, |b| {
+            beta_offset_harq(match o_ack {
+                0..=2 => b.ack_index1,
+                3..=11 => b.ack_index2,
+                _ => b.ack_index3,
+            })
+        });
+        let beta_csi = betas.map_or(6.25, |b| {
+            pusch::beta_offset_csi(if uci.csi1.len() <= 11 {
+                b.csi1_index1
+            } else {
+                b.csi1_index2
+            })
+        });
         let alpha = [0.5, 0.65, 0.8, 1.0][self.cfg.pusch.uci_scaling as usize & 3];
-        let mut e = pusch::pusch_e_len(&alloc);
-        let csi_res: Vec<(usize, usize)> = if uci.csi1.is_empty() {
-            Vec::new()
-        } else {
-            let sp = seg_params(tbs_bits, r);
-            pusch::csi1_pusch_res(
-                &alloc.dmrs_symbols,
-                (alloc.sym_start, alloc.n_sym),
-                alloc.n_rb,
-                uci.csi1.len(),
-                beta_csi,
+        let sp = seg_params(tbs_bits, r);
+        let layout = pusch::uci_pusch_layout(
+            &alloc,
+            &pusch::UciSizes {
+                o_ack,
+                o_csi1: uci.csi1.len(),
+                beta_ack,
+                beta_csi1: beta_csi,
                 alpha,
-                sp.c * sp.k,
-            )
-        };
-        e = e
-            .checked_sub(alloc.qm * csi_res.len())
-            .ok_or("CSI part 1 does not fit the PUSCH")?;
+                sum_kr: sp.c * sp.k,
+            },
+        )?;
+        let e = layout
+            .ulsch_e(&alloc)
+            .ok_or("the UCI does not fit the PUSCH")?;
         let ulsch = dlsch_encode(&bits, e, r, alloc.qm, grant.rv);
         let slot = grant.pusch_slot;
         let mut w = pusch::pusch_modulate_slot_uci_csi(
@@ -315,10 +320,8 @@ impl UlBuilder {
             self.ul_center_hz,
             self.geom.fs,
             &uci.harq_ack,
-            beta_ack,
-            tbs_bits,
             &uci.csi1,
-            &csi_res,
+            &layout,
         );
         self.scale(&mut w, power_dbm);
         Ok(Waveform {

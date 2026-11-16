@@ -134,6 +134,15 @@ impl SyncTracker {
         }
     }
 
+    /// Count the drift from DL stream index `at` (the acquisition): the first
+    /// [`advance`](Self::advance) then applies it over however long the gap
+    /// to the first tracked slot is (a dropped cell-search backlog can be
+    /// seconds — 129 samples at 1 ppm and 30.72 MHz over 4.2 s).
+    pub fn starting_at(mut self, at: i64) -> Self {
+        self.last_advance = Some(at);
+        self
+    }
+
     /// Current CFO estimate (Hz; positive = the signal is above nominal).
     pub fn cfo_hz(&self) -> f64 {
         self.cfo_hz
@@ -157,6 +166,22 @@ impl SyncTracker {
     /// Total anchor shift handed out so far (samples).
     pub fn applied(&self) -> i64 {
         self.applied
+    }
+
+    /// One-line state and counters, as the engine logs them (`tracking: …`).
+    pub fn summary(&self) -> String {
+        let t = self.stats();
+        format!(
+            "cfo {:.0} Hz, drift {:+.3} ppm, offset {:+.2} samples, {} steps, {} re-alignments, {} outliers ({} timing / {} CFO measurements)",
+            self.cfo_hz(),
+            self.drift_ppm(),
+            self.offset(),
+            t.steps,
+            t.coarse,
+            t.outliers,
+            t.timing_measurements,
+            t.cfo_measurements
+        )
     }
 
     pub fn stats(&self) -> TrackStats {
@@ -396,6 +421,22 @@ mod tests {
 
     /// A lone outlier (a DM-RS measurement in a fade) moves nothing, and a
     /// good measurement in between cancels the pending one.
+    /// Started at the acquisition index, the first advance after a long gap
+    /// (a dropped search backlog) hands out the whole drift over it: 1 ppm
+    /// (CFO −ppm·f_c, fed forward) for 4.2 s at 30.72 MHz is 129 samples.
+    /// Without the start index the gap would be lost.
+    #[test]
+    fn drift_over_the_acquisition_gap_is_applied() {
+        let fs = 30.72e6;
+        let cfg = TrackerConfig::new(fs, FC);
+        let gap = (4.2 * fs) as i64;
+        let mut t = SyncTracker::new(cfg.clone(), -1e-6 * FC).starting_at(0);
+        let step = t.advance(gap);
+        assert!((step - 129).abs() <= 1, "step {step}");
+        let mut late = SyncTracker::new(cfg, -1e-6 * FC);
+        assert_eq!(late.advance(gap), 0);
+    }
+
     #[test]
     fn lone_outliers_are_dropped() {
         let mut t = SyncTracker::new(TrackerConfig::new(FS, FC), 0.0);

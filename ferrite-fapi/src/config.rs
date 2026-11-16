@@ -74,10 +74,9 @@ impl TddConfig {
         let p1 = self.pattern1.period_slots as u64 * scale;
         let total = p1 + self.pattern2.map_or(0, |p| p.period_slots as u64 * scale);
         let s = slot_index % total;
-        let (pat, s) = if s < p1 {
-            (self.pattern1, s)
-        } else {
-            (self.pattern2.unwrap(), s - p1)
+        let (pat, s) = match self.pattern2 {
+            Some(p2) if s >= p1 => (p2, s - p1),
+            _ => (self.pattern1, s),
         };
         let dl_full = pat.dl_slots as u64 * scale;
         let ul_full = pat.ul_slots as u64 * scale;

@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # Lab runner for the system tests in docs/TEST_PLAN.md (ZMQ transport).
 #
-#   scripts/lab.sh <config-id> [--duration S] [--ping N] [--no-core]
+#   scripts/lab.sh <config-id> [--duration S] [--ping N] [--no-core] [--scenario NAME]
 #
 # config-id ∈ T1 (tdd_n78_10mhz) T2 (tdd_n78_10mhz_dddsu) T3 (tdd_n78_20mhz)
 #             T4 (tdd_n78_10mhz_drx) T5 (tdd_n78_10mhz_2x2, two DL antennas)
+#             T6 (tdd_n78_10mhz_ulheavy, DDSUUUUUUU)
+#             T7 (tdd_n78_10mhz_dlheavy, DDDDDDDDSU)
+#             C1 (tdd_n48_10mhz, CBRS, DDDDDDDSUU)
+#             C2 (tdd_n48_20mhz, CBRS, DDDSU+DDSUU)
 #             F1 (fdd_n3_10mhz) F2 (fdd_n3_20mhz)
+#
+# --scenario NAME (or SCENARIO=NAME) runs the cell through the channel
+# emulator with a named channel; see `scenario_args` below and
+# docs/TEST_PLAN.md §5.2. `--scenario list` prints them.
 #
 # Starts qcore (sudo) and the OCUDU gNB with the matching config, then the UE
 # with the matching ARFCN / sample rate, waits for the ping probe to finish (or
@@ -25,6 +33,7 @@ while [ $# -gt 0 ]; do
     --duration) DURATION=$2; shift 2;;
     --ping) PING=$2; shift 2;;
     --no-core) CORE=0; shift;;
+    --scenario) SCENARIO=$2; shift 2;;
     *) echo "unknown arg $1"; exit 2;;
   esac
 done
@@ -34,11 +43,46 @@ case "$ID" in
   T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72; DLF=3390; ULF=3390;;
   T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
   T5) CFG=gnb_zmq_tdd_n78_10mhz_2x2;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102";;
+  T6) CFG=gnb_zmq_tdd_n78_10mhz_ulheavy; ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
+  T7) CFG=gnb_zmq_tdd_n78_10mhz_dlheavy; ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
+  C1) CFG=gnb_zmq_tdd_n48_10mhz;       ARFCN=640000; SRATE=15.36; DLF=3600; ULF=3600;;
+  C2) CFG=gnb_zmq_tdd_n48_20mhz;       ARFCN=640000; SRATE=30.72; DLF=3600; ULF=3600;;
   F1) CFG=gnb_zmq_fdd_n3_10mhz;        ARFCN=368500; SRATE=11.52; DLF=1842.5; ULF=1747.5;;
   F2) CFG=gnb_zmq_fdd_n3_20mhz;        ARFCN=368500; SRATE=23.04; DLF=1842.5; ULF=1747.5;;
   *) echo "unknown config id $ID"; exit 2;;
 esac
-OUT="$ROOT/test/results/$ID-$(date +%Y%m%d-%H%M%S)"
+
+# Named channel scenarios for the emulator: model, delay spread (ns, TDL
+# only), UE speed (km/h; the Doppler follows from this cell's DL carrier),
+# UE oscillator error (ppm), one-way propagation delay (ns), SNR (dB, both
+# directions; measured over the whole sample bandwidth).
+#   name        model  ds   km/h ppm  delay snr  what it stands for
+SCENARIOS="
+ideal       none   -    0    0    0     -    emulator in the path, channel off
+static      none   -    0    1    500   30   no fading: clock error, 150 m, noise
+indoor      tdla   30   1    0.5  100   30   indoor small cell (CBRS), walking slowly
+pedestrian  epa    -    3    1    500   20   outdoor pedestrian
+urban       tdlc   100  15   1    1000  20   urban macro, slow vehicle
+vehicular   eva    -    60   1    1000  20   vehicle at 60 km/h
+dispersive  tdlc   300  3    1    500   25   long delay spread (taps beyond the CP)
+cell-edge   tdla   100  3    2    3000  5    900 m, low SNR
+"
+scenario_args() {
+  echo "$SCENARIOS" | awk -v n="$1" -v f="$DLF" '$1 == n {
+    a = ($2 == "none") ? "" : "--model " $2 " ";
+    if ($3 != "-") a = a "--ds-ns " $3 " ";
+    if ($4 > 0) a = a sprintf("--doppler-hz %.0f ", $4 / 3.6 * f * 1e6 / 3e8);
+    a = a "--ppm " $5 " --delay-ns " $6;
+    if ($7 != "-") a = a " --dl-snr-db " $7 " --ul-snr-db " $7;
+    print a; found = 1 } END { exit !found }'
+}
+if [ -n "${SCENARIO:-}" ]; then
+  [ "$SCENARIO" = list ] && { echo "$SCENARIOS"; exit 0; }
+  [ -n "${CHANEM:-}" ] && { echo "set SCENARIO or CHANEM, not both"; exit 2; }
+  CHANEM=$(scenario_args "$SCENARIO") || { echo "unknown scenario $SCENARIO (--scenario list)"; exit 2; }
+  echo "   scenario $SCENARIO: $CHANEM"
+fi
+OUT="$ROOT/test/results/$ID${SCENARIO:+-$SCENARIO}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 echo "== $ID: $CFG → $OUT"
 

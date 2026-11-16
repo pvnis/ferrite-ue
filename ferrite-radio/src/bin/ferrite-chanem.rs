@@ -321,15 +321,14 @@ fn fetch_loop(
     // transmitter replies with whatever it has buffered for that port, so the
     // ports' reply lengths can differ; only their common length is processed
     // and the rest carried over, which keeps the antennas sample-aligned.
+    // Every port is requested every round (as a direct reader would): a
+    // transmitter produces all its ports together, so skipping the port that
+    // is ahead can leave it blocked on that port's full buffer while we wait
+    // for another.
     let mut pending: Vec<Vec<Complex32>> = vec![Vec::new(); ups.len()];
     loop {
         let t0 = Instant::now();
-        // Request only the ports that are behind (all of them when even).
-        let behind = pending.iter().map(Vec::len).min().unwrap_or(0);
         for (u, buf) in ups.iter().zip(pending.iter_mut()) {
-            if buf.len() > behind {
-                continue;
-            }
             loop {
                 u.send(&[0u8][..], 0).map_err(zerr("upstream request"))?;
                 match u.recv_bytes(0) {

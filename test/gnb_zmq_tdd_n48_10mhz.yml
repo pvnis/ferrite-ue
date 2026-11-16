@@ -1,0 +1,127 @@
+# OCUDU gNB config for Ferrite UE over ZMQ — band n48 (US CBRS, 3550-3700 MHz),
+# 10 MHz at 3600 MHz, 30 kHz SCS, 5 ms TDD period DDDDDDDSUU with UL symbols in
+# the special slot (6 DL, 4 UL, 4 guard).
+# Same as gnb_zmq_tdd_n78_10mhz.yml (T1: ZMQ ports 2100/2101, NGAP/GTP bind
+# 127.0.0.20, gnb_id 333, shared qcore AMF, SRS, SIB2, measurement reports)
+# except for the band and TDD pattern below.
+#
+# Run:   /home/dmd/ocudu-pavo/build/apps/gnb/gnb -c /home/dmd/ferrite-ue/test/gnb_zmq_tdd_n48_10mhz.yml
+
+gnb_id: 333
+
+cu_cp:
+  # Measurement reporting (the UE must decode measConfig and send
+  # MeasurementReport): a periodical report of the serving cell.
+  mobility:
+    trigger_handover_from_measurements: false
+    cells:
+      - nr_cell_id: 0x534000
+        periodic_report_cfg_id: 1
+    report_configs:
+      - report_cfg_id: 1
+        report_type: periodical
+        report_interval_ms: 1024
+  # Release the UE to idle after 5 s without traffic (exercises RRC release,
+  # service request and paging; the ping rounds in the lab are spaced wider).
+  inactivity_timer: 5
+  amf:
+    # For SIB1-only bring-up without the core, set `no_core: true` (the cell
+    # then broadcasts SSB/SIB1 without NGAP). For UE attach, leave it pointed at
+    # the shared qcore AMF below and make sure qcore is running.
+    # no_core: true          # standalone (RACH/Msg3 PHY test); commented → qcore
+    addr: 127.0.0.1          # shared qcore AMF
+    bind_addr: 127.0.0.20    # unique local bind (NGAP + GTP-U 127.0.0.20:2152)
+    supported_tracking_areas:
+      -
+        tac: 7               # must match qcore (TAC 7)
+        plmn_list:
+          -
+            plmn: "00101"
+            tai_slice_support_list:
+              -
+                sst: 1
+                sd: 0
+
+ru_sdr:
+ device_driver: zmq
+ device_args: tx_port=tcp://127.0.0.1:2100,rx_port=tcp://127.0.0.1:2101,base_srate=15.36e6
+ srate: 15.36
+ tx_gain: 0
+ rx_gain: 0
+
+cell_cfg:
+ dl_arfcn: 640000
+ band: 48
+ channel_bandwidth_MHz: 10
+ common_scs: 30
+ plmn: "00101"
+ tac: 7                       # must match qcore (TAC 7)
+ slicing:
+ - sst: 1
+   sd: 0
+ pci: 1
+ tdd_ul_dl_cfg:
+  # DDDDDDDSUU: 7 DL slots, special slot 6 DL / 4 UL symbols, 2 UL slots.
+  dl_ul_tx_period: 10
+  nof_dl_slots: 7
+  nof_dl_symbols: 6
+  nof_ul_slots: 2
+  nof_ul_symbols: 4
+ nof_antennas_ul: 1
+ nof_antennas_dl: 1
+ pdsch:
+  # Cap DL/UL to QPSK on the qam64 table: the lossless ZMQ channel reports
+  # infinite SINR so link adaptation would otherwise pick 64/256-QAM, which the
+  # Ferrite UE's QPSK-tested modem can't yet produce/consume. MCS ≤ 9 = QPSK, and
+  # matches the UE's qam64 mcs_params so brute-forced DL decode + UL grants align.
+  mcs_table: qam64
+ pusch:
+  mcs_table: qam64
+ # PUCCH: replicate the values the gNB would auto-reduce to for this narrow (10 MHz TDD)
+ # BWP — the auto-reduction only fires when the whole pucch section is left default
+ # (du_high_config_translators.cpp ~line 797), and setting sr_period_ms alone would
+ # otherwise switch the cell to the full-width PUCCH layout. sr_period_ms 5 (10 slots)
+ # cuts the SR wait from 20 ms to 5 ms — the dominant term in the idle-UE ping RTT.
+ pucch:
+  sr_period_ms: 5
+  resource_set_size: 7
+  nof_cell_res_set_configs: 1
+  nof_cell_sr_res: 7
+  nof_cell_csi_res: 7
+  f1_enable_occ: true
+ prach:
+  prach_config_index: 159
+ # Periodic SRS for every UE (the UE sounds on its configured occasions).
+ srs:
+  type_enabled: periodic
+  period_ms: 20
+ # Broadcast SIB2 in one SI message every 32 frames (the UE acquires other SI
+ # from the si-SchedulingInfo windows).
+ sib:
+  si_window_length: 20
+  si_sched_info:
+   - si_period: 32
+     sib_mapping: [2]
+  sib2:
+   q_hyst: 3
+   thresh_serving_low_p: 0
+   cell_reselection_priority: 6
+   q_rx_lev_min: -140
+   s_intra_search_p: 62
+   t_reselection_nr: 1
+
+log:
+ filename: /tmp/ferrite_gnb_zmq.log
+ rrc_level: debug
+ all_level: info
+ lib_level: info
+ fapi_level: debug
+ mac_level: debug
+ ngap_level: debug
+ f1ap_level: debug
+ phy_level: debug
+ broadcast_enabled: true
+ hex_max_size: 1024
+
+metrics:
+ autostart_stdout_metrics: 1

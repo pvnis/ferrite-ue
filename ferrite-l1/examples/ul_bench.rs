@@ -35,23 +35,7 @@ fn main() {
     let tb = vec![0u8; 11];
     let t = std::time::Instant::now();
     for _ in 0..10 {
-        let w = pusch::pusch_modulate_slot_uci_csi(
-            &ofdm,
-            &tb,
-            &alloc,
-            1,
-            9,
-            1,
-            1,
-            0x4601,
-            3390e6,
-            15.36e6,
-            &[],
-            20.0,
-            88,
-            &[],
-            &[],
-        );
+        let w = pusch::pusch_modulate_slot(&ofdm, &tb, &alloc, 1, 9, 1, 1, 0x4601, 3390e6, 15.36e6);
         assert!(!w.is_empty());
     }
     println!(
@@ -72,23 +56,7 @@ fn main() {
         };
         let tb = vec![0x5au8; tbs_bytes];
         let t = std::time::Instant::now();
-        let w = pusch::pusch_modulate_slot_uci_csi(
-            &ofdm,
-            &tb,
-            &alloc,
-            1,
-            9,
-            1,
-            1,
-            0x4601,
-            3390e6,
-            15.36e6,
-            &[],
-            20.0,
-            tbs_bytes * 8,
-            &[],
-            &[],
-        );
+        let w = pusch::pusch_modulate_slot(&ofdm, &tb, &alloc, 1, 9, 1, 1, 0x4601, 3390e6, 15.36e6);
         assert!(!w.is_empty());
         println!(
             "pusch {n_rb} RB, {tbs_bytes} B: {:.2} ms",

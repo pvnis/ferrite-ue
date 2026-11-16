@@ -83,7 +83,7 @@ state beyond the arguments, generalised over `mu ∈ {0,1}` and any `fs`.
 | `coding::dci` | polar DCI, field layouts and sizes for 0_0/1_0/0_1/1_1 from the RRC configuration | 38.212 §7.3.1 |
 | `coding::{crc,polar,ldpc,ratematch,dlsch}` | channel coding (structured LDPC encoder, AVX2 decoder) | 38.212 §5 |
 | `pdsch` | RE extraction in §7.3.1.5 order, VRB→PRB, rate matching around CSI-RS, demapping | 38.211 §7.3.1, 38.214 §5.1 |
-| `pusch` | CP-OFDM and DFT-s-OFDM PUSCH (transform precoding, low-PAPR DM-RS, π/2-BPSK), UCI multiplexing | 38.211 §6.3.1, 38.212 §6.2.7 |
+| `pusch` | CP-OFDM and DFT-s-OFDM PUSCH (transform precoding, low-PAPR DM-RS, π/2-BPSK), UCI multiplexing (`uci_pusch_layout`: HARQ-ACK / CSI part 1 counts and RE map as OCUDU's demultiplexer reads them) | 38.211 §6.3.1, 38.212 §6.2.7, §6.3.2.4 |
 | `pucch` | formats 0, 1, 2, 3 | 38.211 §6.3.2 |
 | `prach` | preamble formats 0–3 and A1–C2, waveform at any `fs` | 38.211 §6.3.3 |
 | `srs` | low-PAPR sequences, SRS modulation | 38.211 §6.4.1.4 |

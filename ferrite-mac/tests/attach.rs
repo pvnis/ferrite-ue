@@ -415,6 +415,56 @@ fn attach_flow() {
         .any(|x| matches!(x, ferrite_mac::pdu::DlSubPdu::Sdu { lcid: 1, sdu } if sdu.len() == 40)));
     assert!(uci.harq_ack.is_empty()); // T-DAI 3 with nothing booked → no ACK bits
     assert_eq!(mac.stats().ul_tb, 2);
+
+    // A periodic CSI report occasion that falls on a PUSCH before any CSI
+    // measurement still carries a report (CQI 0, "out of range"): the gNB
+    // decodes one there whatever the UE does, and a PUSCH without it fails.
+    let target = s.add(6);
+    let mut c = config();
+    c.csi_enabled = true;
+    c.csi_reports = vec![CsiReportMacConfig {
+        period_slots: 40,
+        offset_slots: (target.index() % 40) as u16,
+        pucch_resource: 8,
+        quantity: ferrite_fapi::config::CsiReportQuantity::Cqi,
+        nof_ports: 1,
+        allowed_ranks: vec![1],
+    }];
+    mac.reconfigure(c);
+    let ul2 = UlGrant {
+        pusch_slot: target,
+        harq_id: 2,
+        dai: None,
+        ..ul.clone()
+    };
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: s,
+            dci: Dci::Ul(ul2),
+        }),
+    );
+    let mut csi_pusch = None;
+    for _ in 0..8 {
+        s = s.add(1);
+        for m in step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: s }),
+        ) {
+            if let MacToPhy::UlTti(r) = m {
+                for p in r.pdus {
+                    if let UlTtiPdu::Pusch { uci, .. } = p {
+                        csi_pusch = Some((r.slot, uci));
+                    }
+                }
+            }
+        }
+    }
+    let (cs, cuci) = csi_pusch.expect("PUSCH on the CSI occasion");
+    assert_eq!(cs, target);
+    assert_eq!(cuci.csi1, vec![0, 0, 0, 0]);
 }
 
 /// TS 38.321 §5.15: on a non-default BWP the bwp-InactivityTimer runs,

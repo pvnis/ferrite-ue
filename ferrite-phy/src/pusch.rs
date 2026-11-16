@@ -167,46 +167,6 @@ pub fn pusch_modulate_slot(
     center_freq_hz: f64,
     fs: f64,
 ) -> Vec<Complex32> {
-    pusch_modulate_slot_uci(
-        ofdm,
-        ulsch,
-        alloc,
-        cell_id,
-        slot_in_frame,
-        slot_in_subframe,
-        mu,
-        tc_rnti,
-        center_freq_hz,
-        fs,
-        &[],
-        0.0,
-        0,
-    )
-}
-
-/// As `pusch_modulate_slot`, but multiplex up to 2 HARQ-ACK bits onto the PUSCH
-/// (UCI-on-PUSCH, TS 38.212 §6.2.7 / 38.213 §9.3): the gNB moves the DL HARQ-ACK
-/// onto a scheduled PUSCH instead of the PUCCH. For ≤2 bits the ACK PUNCTURES the
-/// UL-SCH (the UL-SCH rate-match is unchanged; the ACK REs overwrite data REs), so
-/// only the ACK RE placement + encoding differ. `beta_harq` = beta_offset_harq_ack
-/// value, `tb_bits` = UL-SCH transport-block size (bits) for Q'_ACK. `harq_ack`
-/// empty ⇒ identical to `pusch_modulate_slot`.
-#[allow(clippy::too_many_arguments)]
-pub fn pusch_modulate_slot_uci(
-    ofdm: &Ofdm,
-    ulsch: &[u8],
-    alloc: &PuschAlloc,
-    cell_id: u16,
-    slot_in_frame: u32,
-    slot_in_subframe: usize,
-    mu: u8,
-    tc_rnti: u16,
-    center_freq_hz: f64,
-    fs: f64,
-    harq_ack: &[u8],
-    beta_harq: f32,
-    tb_bits: usize,
-) -> Vec<Complex32> {
     pusch_modulate_slot_uci_csi(
         ofdm,
         ulsch,
@@ -218,20 +178,20 @@ pub fn pusch_modulate_slot_uci(
         tc_rnti,
         center_freq_hz,
         fs,
-        harq_ack,
-        beta_harq,
-        tb_bits,
         &[],
         &[],
+        &UciLayout::default(),
     )
 }
 
-/// As `pusch_modulate_slot_uci`, additionally multiplexing a CSI part 1 report
-/// (TS 38.212 §6.2.7): the CSI REs (see `csi1_pusch_res`, β = `beta_csi`, α = 1) carry
-/// the RM(32,O)-coded report, and the UL-SCH data is RATE-MATCHED around them — the
-/// caller must have encoded `ulsch` to `E − 2·Q'_CSI` bits. Scrambling is indexed by
-/// RE position (the gNB descrambles the multiplexed stream in mapping order), which
-/// reduces to the plain stream scrambling when no CSI is present.
+/// As `pusch_modulate_slot`, multiplexing UCI (TS 38.212 §6.2.7): HARQ-ACK
+/// bits `harq_ack` and a CSI part 1 report `csi1` on the REs `layout` gives
+/// (from [`uci_pusch_layout`] with the same payload sizes). The UL-SCH `ulsch`
+/// must be rate-matched to [`UciLayout::ulsch_e`] bits: it is mapped around the
+/// CSI REs and, with more than two ACK bits, around the ACK REs; one or two ACK
+/// bits puncture it instead. Scrambling is indexed by RE position (the gNB
+/// descrambles the multiplexed stream in mapping order), which reduces to the
+/// plain stream scrambling without UCI.
 #[allow(clippy::too_many_arguments)]
 pub fn pusch_modulate_slot_uci_csi(
     ofdm: &Ofdm,
@@ -245,43 +205,84 @@ pub fn pusch_modulate_slot_uci_csi(
     center_freq_hz: f64,
     fs: f64,
     harq_ack: &[u8],
-    beta_harq: f32,
-    tb_bits: usize,
     csi1: &[u8],
-    csi_res: &[(usize, usize)],
+    layout: &UciLayout,
 ) -> Vec<Complex32> {
     let n = ofdm.fft_size();
     let center = alloc.carrier_rb * 6; // DC subcarrier index of the UL carrier
     let bin = |sc: usize| (sc as i32 - center as i32).rem_euclid(n as i32) as usize;
 
-    let dmrs_set: std::collections::HashSet<usize> = alloc.dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (alloc.sym_start..alloc.sym_start + alloc.n_sym)
-        .filter(|l| !dmrs_set.contains(l))
-        .collect();
+    let data_syms = data_symbols(alloc);
     let n_sc = 12 * alloc.n_rb;
     let n_re = data_syms.len() * n_sc;
     let qm = alloc.qm;
-
-    // CSI part 1 REs by map index (k'-first-then-l order) → coded-bit-pair index.
-    let mut csi_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let rm_csi = if !csi1.is_empty() {
-        for (ci, &(l, sc_a)) in csi_res.iter().enumerate() {
-            let sym_pos = data_syms.iter().position(|&x| x == l).unwrap();
-            csi_at.insert(sym_pos * n_sc + sc_a, ci);
-        }
-        rm_encode(csi1, csi_res.len() * qm)
+    // Map index (k'-first, then l) of an RE given as (symbol, subcarrier).
+    let map_index = |&(l, sc): &(usize, usize)| {
+        data_syms
+            .iter()
+            .position(|&x| x == l)
+            .map(|p| p * n_sc + sc)
+    };
+    let csi_at: std::collections::HashMap<usize, usize> = layout
+        .csi1
+        .iter()
+        .enumerate()
+        .filter_map(|(i, re)| map_index(re).map(|di| (di, i)))
+        .collect();
+    let ack_at: std::collections::HashMap<usize, usize> = layout
+        .ack
+        .iter()
+        .enumerate()
+        .filter_map(|(i, re)| map_index(re).map(|di| (di, i)))
+        .collect();
+    let rm_csi = if csi1.is_empty() {
+        Vec::new()
+    } else {
+        rm_encode(csi1, layout.csi1.len() * qm)
+    };
+    let rm_ack = if harq_ack.len() >= 3 {
+        rm_encode(harq_ack, layout.ack.len() * qm)
     } else {
         Vec::new()
     };
 
     // Scramble (§6.3.1.1): c_init = n_RNTI·2^15 + n_ID (n_RNTI = TC-RNTI, n_ID = PCI).
-    // Indexed by RE position over the whole mapping (identical to the plain stream
-    // scrambling when the data occupies every RE).
     let c = gold_sequence(pdsch_scramble_c_init(tc_rnti, cell_id), qm * n_re);
 
+    // The scrambled bits of HARQ-ACK RE `i` at map index `di`. One or two bits
+    // use the small-block code with placeholders (TS 38.212 §5.3.3.1, scrambled
+    // per TS 38.211 §6.3.1.1: `x` → 1, `y` → the previous scrambled bit):
+    // 1 bit → [c0, y, x, …]; 2 bits → [c0, c1, x, …], [c2, c0, x, …], [c1, c2, x, …]
+    // with c2 = c0 ⊕ c1. Three to eleven bits are Reed-Muller (32, O) coded.
+    let ack_bits = |i: usize, di: usize, out: &mut [u8]| {
+        let m = &c[qm * di..qm * di + qm];
+        out.iter_mut().for_each(|b| *b = 1);
+        match harq_ack {
+            [b0] => {
+                out[0] = b0 ^ m[0];
+                if qm > 1 {
+                    out[1] = out[0];
+                }
+            }
+            [b0, b1] => {
+                let seq = [*b0, *b1, b0 ^ b1];
+                if qm == 1 {
+                    out[0] = seq[i % 3] ^ m[0];
+                } else {
+                    out[0] = seq[(2 * i) % 3] ^ m[0];
+                    out[1] = seq[(2 * i + 1) % 3] ^ m[1];
+                }
+            }
+            _ => {
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = rm_ack.get(qm * i + k).copied().unwrap_or(0) ^ m[k];
+                }
+            }
+        }
+    };
+
     let mut grids = vec![vec![Complex32::new(0.0, 0.0); n]; 14];
-    // Data in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l,
-    // skipping the CSI REs (the UL-SCH is rate-matched around them).
+    // Map in §6.3.1.6 order: increasing k' (subcarrier over RBs) first, then l.
     let mut src = 0usize; // next UL-SCH bit
     let mut re_bits = vec![0u8; qm];
     for (di, (&l, kp)) in data_syms
@@ -290,17 +291,31 @@ pub fn pusch_modulate_slot_uci_csi(
         .enumerate()
     {
         let sc = 12 * alloc.rb_start + kp;
-        if let Some(&ci) = csi_at.get(&di) {
-            for i in 0..qm {
-                re_bits[i] = rm_csi[qm * ci + i] ^ c[qm * di + i];
+        let ack = ack_at.get(&di).copied();
+        let filled = if let Some(&ci) = csi_at.get(&di) {
+            for (i, b) in re_bits.iter_mut().enumerate() {
+                *b = rm_csi.get(qm * ci + i).copied().unwrap_or(0) ^ c[qm * di + i];
             }
-            grids[l][bin(sc)] = modulate_re(&re_bits, di);
-        } else if src + qm <= ulsch.len() {
-            for i in 0..qm {
-                re_bits[i] = ulsch[src + i] ^ c[qm * di + i];
+            true
+        } else if let (Some(i), true) = (ack, layout.ack_rate_matched) {
+            ack_bits(i, di, &mut re_bits);
+            true
+        } else {
+            let data = src + qm <= ulsch.len();
+            if data {
+                for (i, b) in re_bits.iter_mut().enumerate() {
+                    *b = ulsch[src + i] ^ c[qm * di + i];
+                }
+                src += qm;
             }
+            // One or two ACK bits puncture the UL-SCH.
+            if let Some(i) = ack {
+                ack_bits(i, di, &mut re_bits);
+            }
+            data || ack.is_some()
+        };
+        if filled {
             grids[l][bin(sc)] = modulate_re(&re_bits, di);
-            src += qm;
         }
     }
     // DM-RS (config type 1, CDM group 0: even subcarriers). The DM-RS symbols
@@ -332,65 +347,6 @@ pub fn pusch_modulate_slot_uci_csi(
                 grids[l][bin(sc)] =
                     refs[6 * (alloc.crb_offset + alloc.rb_start + rb) + j] * dmrs_boost;
             }
-        }
-    }
-
-    // UCI-on-PUSCH: overwrite (puncture) the selected data REs with the HARQ-ACK
-    // symbols. Each ACK RE is at data index `di` in the k'-first, then-l map; the
-    // scrambling bits are c[Qm·di ..] (same sequence as the data).
-    //   1-2 bits: small-block "placeholder" code (TS 38.212 Table 5.3.3.1-1/2):
-    //     1 bit → [c0, y, x, …], 2 bits → [c0, c1, x, …], [c2, c0, x, …], [c1, c2, x, …];
-    //     scrambling (§6.3.1.1) maps x → 1 and y → the previous scrambled bit.
-    //   3-11 bits: Reed-Muller (32,O) coded, rate-matched to Q'_ACK·Qm bits, scrambled.
-    // (For ≥3 bits the gNB actually rate-matches the UL-SCH around the ACK REs; we
-    // still puncture, so that PUSCH's own UL data fails CRC and retransmits — but the
-    // gNB reads the ACK from these REs regardless, which frees the DL HARQ.)
-    if !harq_ack.is_empty() && harq_ack.len() <= 11 {
-        let o_ack = harq_ack.len();
-        let n_sc = 12 * alloc.n_rb;
-        let res = harq_ack_pusch_res(
-            &alloc.dmrs_symbols,
-            (alloc.sym_start, alloc.n_sym),
-            alloc.n_rb,
-            o_ack,
-            beta_harq,
-            tb_bits,
-        );
-        // Coded bit `k` of the UCI (per RE-pair): ≤2 use the small-block form, ≥3 RM.
-        let rm = if o_ack >= 3 {
-            rm_encode(harq_ack, res.len() * qm)
-        } else {
-            Vec::new()
-        };
-        for (i, &(l, sc_a)) in res.iter().enumerate() {
-            let di = data_syms.iter().position(|&x| x == l).unwrap() * n_sc + sc_a;
-            let m = &c[qm * di..qm * di + qm];
-            // Placeholders (`x`) scramble to 1 whatever the sequence.
-            re_bits.iter_mut().for_each(|b| *b = 1);
-            match o_ack {
-                1 => {
-                    let b = harq_ack[0] ^ m[0];
-                    re_bits[0] = b;
-                    if qm > 1 {
-                        re_bits[1] = b; // y: repeat the previous scrambled bit
-                    }
-                }
-                2 => {
-                    let seq = [harq_ack[0], harq_ack[1], harq_ack[0] ^ harq_ack[1]];
-                    if qm == 1 {
-                        re_bits[0] = seq[i % 3] ^ m[0];
-                    } else {
-                        re_bits[0] = seq[(2 * i) % 3] ^ m[0];
-                        re_bits[1] = seq[(2 * i + 1) % 3] ^ m[1];
-                    }
-                }
-                _ => {
-                    for k in 0..qm {
-                        re_bits[k] = rm[qm * i + k] ^ m[k];
-                    }
-                }
-            }
-            grids[l][bin(12 * alloc.rb_start + sc_a)] = modulate_re(&re_bits, di);
         }
     }
 
@@ -497,105 +453,6 @@ pub(crate) fn rm_encode(bits: &[u8], e: usize) -> Vec<u8> {
     (0..e).map(|k| d[k % 32]).collect()
 }
 
-/// HARQ-ACK-on-PUSCH RE placement for 1-2 ACK bits (QPSK), matching OCUDU's
-/// `ulsch_demultiplex` (TS 38.212 §6.2.7): reserve Q'_rvd REs across the non-DM-RS
-/// symbols starting after the first DM-RS symbol (strided so each symbol carries a
-/// fair share), then place the actual Q'_ACK REs on a strided subset of the reserved
-/// ones. Returns each ACK RE as `(symbol, subcarrier-within-alloc)`, in gNB order.
-fn harq_ack_pusch_res(
-    dmrs_symbols: &[usize],
-    sym_range: (usize, usize),
-    n_rb: usize,
-    o_ack: usize,
-    beta: f32,
-    tb_bits: usize,
-) -> Vec<(usize, usize)> {
-    let n_sc = 12 * n_rb;
-    let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1)
-        .filter(|l| !dmrs.contains(l))
-        .collect();
-    let first_dmrs = *dmrs_symbols.iter().min().unwrap();
-    let l1 = match data_syms.iter().find(|&&l| l > first_dmrs) {
-        Some(&l) => l,
-        None => return Vec::new(),
-    };
-    let nof_re_uci = data_syms.len() * n_sc;
-    let nof_re_uci_l0 = data_syms.iter().filter(|&&l| l > first_dmrs).count() * n_sc;
-    let crc = if tb_bits <= 3824 { 16 } else { 24 };
-    let sum_cb = (tb_bits + crc) as f32;
-    // Q'_ACK = min(ceil(O_ACK·β·M_uci / ΣK), ceil(α·M_uci_l0)), α = 1.
-    let q_of = |oa: usize| -> usize {
-        let left = ((oa as f32) * beta * nof_re_uci as f32 / sum_cb).ceil() as usize;
-        left.min(nof_re_uci_l0)
-    };
-    let q_ack = q_of(o_ack).max(1);
-    // >2 ACK bits: select Q'_ACK REs DIRECTLY (Step 2, no reserved set), strided per
-    // symbol across the non-DM-RS symbols from l1 (the UL-SCH is rate-matched around
-    // them — here punctured, since we don't reduce the UL-SCH E).
-    if o_ack >= 3 {
-        let mut res = Vec::new();
-        let mut placed = 0usize;
-        for &l in data_syms.iter().filter(|&&l| l >= l1) {
-            let rem = q_ack - placed;
-            if rem > 0 {
-                let (d, cnt) = if rem < n_sc {
-                    (n_sc / rem, rem)
-                } else {
-                    (1, n_sc)
-                };
-                for i in 0..cnt {
-                    res.push((l, i * d));
-                }
-                placed += cnt;
-            }
-            if placed >= q_ack {
-                break;
-            }
-        }
-        return res;
-    }
-    // For <2 ACK bits the reserved count is computed as if there were 2.
-    let q_rvd = if o_ack < 2 { q_of(2).max(q_ack) } else { q_ack };
-
-    let mut res = Vec::new();
-    let (mut rvd_placed, mut ack_placed) = (0usize, 0usize);
-    for &l in data_syms.iter().filter(|&&l| l >= l1) {
-        let m_uci = n_sc;
-        // Step 1: reserve REs in this symbol (strided across all subcarriers).
-        let rem_rvd = q_rvd - rvd_placed;
-        let reserved: Vec<usize> = if rem_rvd > 0 {
-            let (d, cnt) = if rem_rvd < m_uci {
-                (m_uci / rem_rvd, rem_rvd)
-            } else {
-                (1, m_uci)
-            };
-            rvd_placed += cnt;
-            (0..cnt).map(|i| i * d).collect()
-        } else {
-            Vec::new()
-        };
-        // Step 5: place the actual HARQ-ACK on a strided subset of the reserved REs.
-        let rem_ack = q_ack - ack_placed;
-        if !reserved.is_empty() && rem_ack > 0 {
-            let m_rvd = reserved.len();
-            let (d2, cnt2) = if rem_ack < m_rvd {
-                (m_rvd / rem_ack, rem_ack)
-            } else {
-                (1, m_rvd)
-            };
-            for i in 0..cnt2 {
-                res.push((l, reserved[i * d2]));
-            }
-            ack_placed += cnt2;
-        }
-        if ack_placed >= q_ack {
-            break;
-        }
-    }
-    res
-}
-
 /// β_offset for CSI part 1/2 on PUSCH by betaOffsetCSI-Part-Index (TS 38.213
 /// Table 9.3-2; normative constants).
 pub fn beta_offset_csi(index: u8) -> f32 {
@@ -606,53 +463,156 @@ pub fn beta_offset_csi(index: u8) -> f32 {
     *T.get(index as usize).unwrap_or(&6.25)
 }
 
-/// CSI-part-1-on-PUSCH RE placement (TS 38.212 §6.3.2.4.1.2 count, §6.2.7 mapping,
-/// matching OCUDU's `ulsch_demultiplex`): Q'_CSI = min(⌈O·β·M_uci/ΣK_r⌉, ⌈α·M_uci⌉),
-/// placed strided per symbol over ALL non-DM-RS symbols from the slot start (unlike
-/// HARQ-ACK, which starts after the first DM-RS). `sum_kr` is the UL-SCH's ΣK_r —
-/// the LDPC code-block sizes INCLUDING filler (C·K from `seg_params`), NOT TBS+CRC
-/// (one RE of difference shifts the whole data map). The UL-SCH is RATE-MATCHED
-/// around these REs — the caller must shrink its data E by 2·len() and the mapper
-/// must skip them. Returns each CSI RE as `(symbol, subcarrier-within-alloc)`.
-pub fn csi1_pusch_res(
-    dmrs_symbols: &[usize],
-    sym_range: (usize, usize),
-    n_rb: usize,
-    o_csi: usize,
-    beta: f32,
-    alpha: f32,
-    sum_kr: usize,
-) -> Vec<(usize, usize)> {
-    let n_sc = 12 * n_rb;
-    let dmrs: std::collections::HashSet<usize> = dmrs_symbols.iter().copied().collect();
-    let data_syms: Vec<usize> = (sym_range.0..sym_range.0 + sym_range.1)
-        .filter(|l| !dmrs.contains(l))
-        .collect();
-    let nof_re_uci = data_syms.len() * n_sc;
-    let sum_cb = sum_kr as f32;
-    let q_csi = (((o_csi as f32) * beta * nof_re_uci as f32 / sum_cb).ceil() as usize)
-        .min((alpha * nof_re_uci as f32).ceil() as usize)
-        .max(1);
-    let mut res = Vec::new();
-    let mut placed = 0usize;
-    for &l in &data_syms {
-        let rem = q_csi - placed;
-        if rem > 0 {
-            let (d, cnt) = if rem < n_sc {
-                (n_sc / rem, rem)
+/// The non-DM-RS symbols of an allocation (two DM-RS CDM groups without data:
+/// the DM-RS symbols carry no data or UCI).
+fn data_symbols(alloc: &PuschAlloc) -> Vec<usize> {
+    (alloc.sym_start..alloc.sym_start + alloc.n_sym)
+        .filter(|l| !alloc.dmrs_symbols.contains(l))
+        .collect()
+}
+
+/// UCI payload sizes and coding parameters for [`uci_pusch_layout`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UciSizes {
+    /// HARQ-ACK bits (0-11).
+    pub o_ack: usize,
+    /// CSI part 1 bits (0-11).
+    pub o_csi1: usize,
+    /// β_offset for the HARQ-ACK (the index matching `o_ack`, TS 38.213 §9.3).
+    pub beta_ack: f32,
+    /// β_offset for CSI part 1.
+    pub beta_csi1: f32,
+    /// `uci-OnPUSCH.scaling` α.
+    pub alpha: f32,
+    /// ΣK_r: the UL-SCH LDPC code-block sizes INCLUDING filler bits (C·K), not
+    /// TBS + CRC: one RE of difference shifts the whole map.
+    pub sum_kr: usize,
+}
+
+/// Where UCI goes on a PUSCH: each HARQ-ACK and CSI part 1 RE as `(symbol,
+/// subcarrier within the allocation)`, in coded-bit order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UciLayout {
+    pub ack: Vec<(usize, usize)>,
+    pub csi1: Vec<(usize, usize)>,
+    /// More than two ACK bits: the UL-SCH is rate-matched around the ACK REs
+    /// (one or two puncture it).
+    pub ack_rate_matched: bool,
+}
+
+impl UciLayout {
+    /// The UL-SCH rate-matching length E for `alloc` with this UCI, or `None`
+    /// if the UCI leaves no room.
+    pub fn ulsch_e(&self, alloc: &PuschAlloc) -> Option<usize> {
+        let uci_re = self.csi1.len()
+            + if self.ack_rate_matched {
+                self.ack.len()
             } else {
-                (1, n_sc)
+                0
             };
-            for i in 0..cnt {
-                res.push((l, i * d));
-            }
-            placed += cnt;
+        pusch_e_len(alloc).checked_sub(alloc.qm * uci_re)
+    }
+}
+
+/// UCI-on-PUSCH resource counts (TS 38.212 §6.3.2.4.1.1-2) and RE mapping
+/// (§6.2.7), with UL-SCH, exactly as OCUDU's `get_ulsch_information` and
+/// `ulsch_demultiplex` compute them:
+///
+/// * Q'_ACK = min(⌈O_ACK·β·M_UCI / ΣK_r⌉, ⌈α·M_UCI(l₀)⌉), M_UCI(l₀) counting
+///   the symbols from the first DM-RS on;
+/// * with fewer than two ACK bits (none included) Q'_rvd is Q'_ACK for two
+///   bits, with two it is Q'_ACK, with more there is no reserved set;
+/// * Q'_CSI1 = min(⌈O_CSI·β·M_UCI / ΣK_r⌉, ⌈α·M_UCI⌉ − Q'_ACK,rvd), where the
+///   subtrahend is Q'_rvd for up to two ACK bits and Q'_ACK above;
+/// * per symbol: reserved REs (from the first symbol after the first DM-RS,
+///   strided), then more-than-two ACK REs (same rule), then CSI REs (from the
+///   first symbol, strided over the REs not reserved and not ACK), then one or
+///   two ACK bits on a strided subset of the reserved REs.
+///
+/// Payloads above 11 bits need a CRC and polar coding, not implemented: `Err`.
+pub fn uci_pusch_layout(alloc: &PuschAlloc, u: &UciSizes) -> Result<UciLayout, String> {
+    if u.o_ack > 11 || u.o_csi1 > 11 {
+        return Err(format!(
+            "UCI on PUSCH with {} HARQ-ACK / {} CSI bits (more than 11 needs polar coding)",
+            u.o_ack, u.o_csi1
+        ));
+    }
+    let n_sc = 12 * alloc.n_rb;
+    let data_syms = data_symbols(alloc);
+    let Some(&first_dmrs) = alloc.dmrs_symbols.iter().min() else {
+        return Ok(UciLayout::default());
+    };
+    let m_uci = data_syms.len() * n_sc;
+    let m_uci_l0 = data_syms.iter().filter(|&&l| l > first_dmrs).count() * n_sc;
+    let q = |o: usize, beta: f32| -> usize {
+        (o as f32 * beta * m_uci as f32 / u.sum_kr.max(1) as f32).ceil() as usize
+    };
+    let q_ack_of = |o: usize| -> usize {
+        if o == 0 {
+            0
+        } else {
+            q(o, u.beta_ack).min((u.alpha * m_uci_l0 as f32).ceil() as usize)
         }
-        if placed >= q_csi {
-            break;
+    };
+    let q_ack = q_ack_of(u.o_ack);
+    let q_rvd = match u.o_ack {
+        0 | 1 => q_ack_of(2),
+        2 => q_ack,
+        _ => 0,
+    };
+    let q_csi = if u.o_csi1 == 0 {
+        0
+    } else {
+        let ack_for_csi = if u.o_ack <= 2 { q_rvd } else { q_ack };
+        q(u.o_csi1, u.beta_csi1)
+            .min(((u.alpha * m_uci as f32).ceil() as usize).saturating_sub(ack_for_csi))
+    };
+    // Every `d`-th of the first `d·count` entries of `set`, where (d, count) =
+    // (M / remaining, remaining) if remaining < M, else (1, M).
+    let select = |set: &[usize], remaining: usize| -> Vec<usize> {
+        let m = set.len();
+        let (d, count) = if remaining < m {
+            (m / remaining, remaining)
+        } else {
+            (1, m)
+        };
+        set.iter().step_by(d).take(count).copied().collect()
+    };
+    let mut out = UciLayout {
+        ack_rate_matched: u.o_ack > 2,
+        ..UciLayout::default()
+    };
+    let (mut rvd_done, mut ack_done, mut csi_done) = (0usize, 0usize, 0usize);
+    for &l in &data_syms {
+        let after_dmrs = l > first_dmrs;
+        let mut uci: Vec<usize> = (0..n_sc).collect();
+        let rvd = if after_dmrs && rvd_done < q_rvd {
+            let r = select(&uci, q_rvd - rvd_done);
+            rvd_done += r.len();
+            r
+        } else {
+            Vec::new()
+        };
+        let ack_left = q_ack - ack_done;
+        if after_dmrs && u.o_ack > 2 && ack_left > 0 {
+            let a = select(&uci, ack_left);
+            ack_done += a.len();
+            uci.retain(|k| !a.contains(k));
+            out.ack.extend(a.iter().map(|&k| (l, k)));
+        }
+        if uci.len() > rvd.len() && csi_done < q_csi {
+            let free: Vec<usize> = uci.iter().copied().filter(|k| !rvd.contains(k)).collect();
+            let c = select(&free, q_csi - csi_done);
+            csi_done += c.len();
+            out.csi1.extend(c.iter().map(|&k| (l, k)));
+        }
+        if !rvd.is_empty() && u.o_ack <= 2 && ack_left > 0 {
+            let a = select(&rvd, ack_left);
+            ack_done += a.len();
+            out.ack.extend(a.iter().map(|&k| (l, k)));
         }
     }
-    res
+    Ok(out)
 }
 
 /// Number of PUSCH data REs and rate-match length `E = N_RE·Qm` for an
@@ -668,15 +628,88 @@ mod tests {
     use crate::coding::dlsch::{dlsch_decode_single, dlsch_encode_single};
     use crate::pdsch::descramble_llrs;
 
-    /// HARQ-ACK-on-PUSCH RE placement for 1 bit: dmrs [2,7,11], β=20, TB 1600 bits,
-    /// 20 RB → Q'_ACK = ceil(20·2640/1616) = 33 REs, all in symbol 3 (the first
-    /// symbol after the first DM-RS), strided at subcarriers 0,6,12,…
+    fn uci_alloc(n_rb: usize, qm: usize) -> PuschAlloc {
+        PuschAlloc {
+            rb_start: 0,
+            n_rb,
+            sym_start: 0,
+            n_sym: 14,
+            dmrs_symbols: vec![2, 7, 11],
+            qm,
+            carrier_rb: 24,
+            crb_offset: 0,
+            transform_precoding: None,
+        }
+    }
+
+    fn sizes(o_ack: usize, o_csi1: usize, sum_kr: usize) -> UciSizes {
+        UciSizes {
+            o_ack,
+            o_csi1,
+            beta_ack: 20.0,
+            beta_csi1: 6.25,
+            alpha: 1.0,
+            sum_kr,
+        }
+    }
+
+    /// One ACK bit, 20 RB, ΣK 1616: Q'_rvd (two bits) = ⌈2·20·2640/1616⌉ = 66
+    /// REs reserved in symbol 3 (stride 3), Q'_ACK = 33 on every other one —
+    /// subcarriers 0, 6, 12, …; the UL-SCH keeps its full length (punctured).
     #[test]
-    fn harq_ack_pusch_re_placement() {
-        let res = harq_ack_pusch_res(&[2, 7, 11], (0, 14), 20, 1, 20.0, 1600);
-        assert_eq!(res.len(), 33);
-        assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
-        assert_eq!(&res[..3], &[(3, 0), (3, 6), (3, 12)]);
+    fn uci_layout_one_ack_bit() {
+        let alloc = uci_alloc(20, 2);
+        let l = uci_pusch_layout(&alloc, &sizes(1, 0, 1616)).unwrap();
+        assert_eq!(l.ack.len(), 33);
+        assert!(l.ack.iter().all(|&(s, _)| s == 3));
+        assert_eq!(&l.ack[..3], &[(3, 0), (3, 6), (3, 12)]);
+        assert!(!l.ack_rate_matched);
+        assert_eq!(l.ulsch_e(&alloc), Some(pusch_e_len(&alloc)));
+    }
+
+    /// Two ACK bits use the whole reserved set (66 REs, stride 3).
+    #[test]
+    fn uci_layout_two_ack_bits() {
+        let l = uci_pusch_layout(&uci_alloc(20, 2), &sizes(2, 0, 1616)).unwrap();
+        assert_eq!(l.ack.len(), 66);
+        assert_eq!(&l.ack[..3], &[(3, 0), (3, 3), (3, 6)]);
+    }
+
+    /// Three ACK bits: Q'_ACK = 99 REs placed directly (stride 2) and the
+    /// UL-SCH rate-matched around them.
+    #[test]
+    fn uci_layout_three_ack_bits_rate_match() {
+        let alloc = uci_alloc(20, 2);
+        let l = uci_pusch_layout(&alloc, &sizes(3, 0, 1616)).unwrap();
+        assert_eq!(l.ack.len(), 99);
+        assert_eq!(&l.ack[..3], &[(3, 0), (3, 2), (3, 4)]);
+        assert!(l.ack_rate_matched);
+        assert_eq!(l.ulsch_e(&alloc), Some(pusch_e_len(&alloc) - 2 * 99));
+    }
+
+    /// CSI without HARQ-ACK still avoids the REs reserved for two ACK bits
+    /// (as OCUDU's demultiplexer does). 1 RB, ΣK 100: Q'_CSI = ⌈4·6.25·132/100⌉
+    /// = 33, Q'_rvd = ⌈2·20·132/100⌉ = 53 (symbols 3-6 whole, 5 REs of symbol 8).
+    /// CSI fills symbols 0-1 (24), skips 3-6, takes the 7 free REs of symbol 8
+    /// and two more (stride 6) in symbol 9.
+    #[test]
+    fn uci_layout_csi_avoids_reserved_ack_res() {
+        let l = uci_pusch_layout(&uci_alloc(1, 2), &sizes(0, 4, 100)).unwrap();
+        assert!(l.ack.is_empty());
+        assert_eq!(l.csi1.len(), 33);
+        let on = |sym: usize| -> Vec<usize> {
+            l.csi1.iter().filter(|r| r.0 == sym).map(|r| r.1).collect()
+        };
+        assert_eq!(on(0).len() + on(1).len(), 24);
+        assert!((3..=6).all(|s| on(s).is_empty()));
+        assert_eq!(on(8), vec![1, 3, 5, 7, 9, 10, 11]);
+        assert_eq!(on(9), vec![0, 6]);
+    }
+
+    /// Payloads above 11 bits are refused rather than silently dropped.
+    #[test]
+    fn uci_layout_refuses_polar_sized_payloads() {
+        assert!(uci_pusch_layout(&uci_alloc(20, 2), &sizes(12, 0, 1616)).is_err());
     }
 
     /// Reed-Muller (32,O): input bit i selects basis row i; all-zero → all-zero.
@@ -688,16 +721,6 @@ mod tests {
         // input [1,1,0] = row0 XOR row1.
         let expect: Vec<u8> = (0..32).map(|j| RM_BASIS[0][j] ^ RM_BASIS[1][j]).collect();
         assert_eq!(rm_encode(&[1, 1, 0], 32), expect);
-    }
-
-    /// 3-bit HARQ-ACK RE placement (direct, not reserved): Q'_ACK=ceil(3·20·2640/1616)
-    /// = 99 REs in symbol 3, strided at subcarriers 0,2,4,…
-    #[test]
-    fn harq_ack_pusch_re_placement_3bit() {
-        let res = harq_ack_pusch_res(&[2, 7, 11], (0, 14), 20, 3, 20.0, 1600);
-        assert_eq!(res.len(), 99);
-        assert!(res.iter().all(|&(l, sc)| l == 3 && sc < 240));
-        assert_eq!(&res[..3], &[(3, 0), (3, 2), (3, 4)]);
     }
 
     /// Modulate a Msg3-sized PUSCH, demodulate it, equalise trivially (no

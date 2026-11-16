@@ -104,7 +104,7 @@ pub struct MacEntity {
     tc_rnti: Option<Rnti>,
     pending_pusch: BTreeMap<u64, PendingPusch>,
     /// Latest CSI measurement and the slot it was taken in.
-    pending_csi: Option<(CsiValues, SlotPoint)>,
+    latest_csi: Option<(CsiValues, SlotPoint)>,
     /// Rank and PMI from the latest multi-port CSI-RS measurement; a
     /// single-port (TRS) measurement updates the CQI but keeps these.
     csi_rank: Option<(u8, u8)>,
@@ -156,7 +156,7 @@ impl MacEntity {
             c_rnti: None,
             tc_rnti: None,
             pending_pusch: BTreeMap::new(),
-            pending_csi: None,
+            latest_csi: None,
             csi_rank: None,
             crnti_ce_pending: false,
             events: Vec::new(),
@@ -303,7 +303,7 @@ impl MacEntity {
         self.ul_harq.reset();
         self.ack_book = AckBook::default();
         self.pending_pusch.clear();
-        self.pending_csi = None;
+        self.latest_csi = None;
         self.csi_rank = None;
         self.bsr.cancel();
         self.phr.reset();
@@ -533,17 +533,26 @@ impl MacEntity {
             }
         }
         // CSI report occasion? Not outside DRX Active Time (§5.7).
+        // Every configured occasion carries a report (the gNB decodes one there
+        // whatever we do; leaving it out of a PUSCH breaks that PUSCH's data):
+        // the latest measurement, which by the time the slot is built may be
+        // older than the CSI-RS just before it (the CSI reference resource is
+        // ≥ 4·2^μ slots before the report anyway, TS 38.214 §5.2.2.5), or
+        // CQI 0 ("out of range") before the first one.
         let csi: Option<(Vec<u8>, u8)> = if self.cfg.csi_enabled && self.drx.is_active() {
+            let v = self.latest_csi.map_or(
+                CsiValues {
+                    cqi: 0,
+                    ri: 1,
+                    pmi: 0,
+                },
+                |(v, _)| v,
+            );
             self.cfg
                 .csi_reports
                 .iter()
                 .find(|c| target.is_occasion(c.period_slots as u32, c.offset_slots as u32))
-                .and_then(|c| {
-                    let (v, when) = self.pending_csi?;
-                    // Only report a measurement from the current report period.
-                    (target.diff(&when) >= 0 && target.diff(&when) < c.period_slots as i64)
-                        .then(|| (csi_report_bits(c, v), c.pucch_resource))
-                })
+                .map(|c| (csi_report_bits(c, v), c.pucch_resource))
         } else {
             None
         };
@@ -556,9 +565,6 @@ impl MacEntity {
                 Vec::new()
             };
             let csi1 = csi.map(|c| c.0).unwrap_or_default();
-            if !csi1.is_empty() {
-                self.pending_csi = None;
-            }
             p.tb.truncate(p.tb.len());
             let uci = UciPayload {
                 harq_ack: ack,
@@ -675,7 +681,6 @@ impl MacEntity {
         };
         if let (0, false, Some(&(_, r))) = (n_ack, sr_positive, csi.as_ref()) {
             // CSI only → the report's resource (F2).
-            self.pending_csi = None;
             return (
                 PucchResourceRef::Dedicated(r),
                 UciPayload {
@@ -685,10 +690,10 @@ impl MacEntity {
                 },
             );
         }
-        if n_ack == 0 && sr_positive {
+        if let (0, true, Some(r)) = (n_ack, sr_positive, sr_res) {
             // SR only → the SR resource.
             return (
-                PucchResourceRef::Dedicated(sr_res.unwrap()),
+                PucchResourceRef::Dedicated(r),
                 UciPayload {
                     harq_ack: Vec::new(),
                     sr: Some(true),
@@ -699,9 +704,9 @@ impl MacEntity {
         if n_ack <= 2 && csi.is_none() {
             // ≤2 HARQ-ACK bits: set 0 by PRI; with a positive SR, use the SR's F1
             // resource instead (§9.2.5.1) — the resource choice conveys the SR.
-            if sr_positive {
+            if let (true, Some(r)) = (sr_positive, sr_res) {
                 return (
-                    PucchResourceRef::Dedicated(sr_res.unwrap()),
+                    PucchResourceRef::Dedicated(r),
                     UciPayload {
                         harq_ack: ack,
                         sr: Some(true),
@@ -728,9 +733,6 @@ impl MacEntity {
         } else {
             Vec::new()
         };
-        if !csi1.is_empty() {
-            self.pending_csi = None;
-        }
         let bits = n_ack + usize::from(sr_res.is_some()) + csi1.len();
         let res = set_for(bits.max(3))
             .and_then(|(_, ids, _)| ids.get(pri as usize).or(ids.last()).copied())
@@ -1167,7 +1169,7 @@ impl MacEntity {
             PhyToMac::RxData(d) => self.on_rx_data(d, phy, upper),
             PhyToMac::Csi(c) => {
                 let v = merge_csi(&mut self.csi_rank, &c);
-                self.pending_csi = Some((v, c.slot));
+                self.latest_csi = Some((v, c.slot));
             }
             PhyToMac::Rach(r) => {
                 let acts = self.ra.on_prach_sent(r.slot);

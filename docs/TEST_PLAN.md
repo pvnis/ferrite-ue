@@ -27,6 +27,10 @@ Configs live in `test/` and point at qcore (AMF 127.0.0.1, PLMN 001/01, TAC 7).
 | T3 | `gnb_zmq_tdd_n78_20mhz.yml` | TDD | n78 | 30 kHz | 20 MHz | 30.72 | 5 ms | idx 159 |
 | T5 | `gnb_zmq_tdd_n78_10mhz_2x2.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 5 ms | idx 159; T1 with `nof_antennas_dl: 2`, `pdsch.max_rank: 2`, one ZMQ TX port per antenna (2100/2102) wired to the UE's two RX ports (`--tx a,b`): the 2x2 MIMO cell, identity channel |
 | T4 | `gnb_zmq_tdd_n78_10mhz_drx.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 5 ms | idx 159; T1 plus connected-mode DRX (`cell_cfg.drx`: 80 ms long cycle, 10 ms on-duration / inactivity, 8-slot retx timers) |
+| T6 | `gnb_zmq_tdd_n78_10mhz_ulheavy.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 5 ms: DDSUUUUUUU (S 10D/2U) | idx 159; uplink-heavy |
+| T7 | `gnb_zmq_tdd_n78_10mhz_dlheavy.yml` | TDD | n78 | 30 kHz | 10 MHz | 15.36 | 5 ms: DDDDDDDDSU (S 10D/2U) | idx 159; downlink-heavy: up to eight DL slots acknowledged in one UL slot (multi-bit HARQ-ACK on PUCCH / PUSCH) |
+| C1 | `gnb_zmq_tdd_n48_10mhz.yml` | TDD | n48 (CBRS) | 30 kHz | 10 MHz at 3600 MHz | 15.36 | 5 ms: DDDDDDDSUU (S 6D/4U) | idx 159; UL symbols in the special slot |
+| C2 | `gnb_zmq_tdd_n48_20mhz.yml` | TDD | n48 (CBRS) | 30 kHz | 20 MHz at 3600 MHz | 30.72 | 5 ms in two patterns: DDDSU (S 6D/4U) + DDSUU (S 8D/2U) | idx 159; `pattern2`, full-width PUCCH |
 | F1 | `gnb_zmq_fdd_n3_10mhz.yml` | FDD | n3 | 15 kHz | 10 MHz | 11.52 | – | OCUDU default (idx 16, long format 0) Full AS security (`cu_cp.security`: NEA2 ciphering + NIA2 integrity on SRBs and DRBs). |
 | F2 | `gnb_zmq_fdd_n3_20mhz.yml` | FDD | n3 | 15 kHz | 20 MHz | 23.04 | – | default |
 | F3 (stretch) | `gnb_zmq_fdd_n3_20mhz_30khz.yml` | FDD | n3 | 30 kHz (SSB 15) | 20 MHz | 30.72 | – | default |
@@ -180,9 +184,34 @@ in/out, signal power, pace against real time, and the share of time spent
 waiting upstream / processing / waiting downstream). The emulator processes up
 to six blocks ahead of the downstream requests, per direction; the ZMQ
 transport aligns by sample count, so the added wall-clock latency does not
-move the radio timing. Lockstep ZMQ runs at whatever pace the slowest stage
+move the radio timing. The emulator requests every upstream port every round (a transmitter produces its ports together; skipping one deadlocks it on that port's full buffer) and carries over unequal reply lengths. Lockstep ZMQ runs at whatever pace the slowest stage
 allows: a 2x2 fading link is the emulator's heaviest case and slows the whole
 system to ~0.3× real time, which the gNB and UE tolerate.
+
+**Named scenarios.** `scripts/lab.sh <config> --scenario NAME` (or
+`SCENARIO=NAME`) picks a channel from a table in `lab.sh`
+(`--scenario list` prints it); the Doppler follows from the UE speed and the
+cell's downlink carrier (f_D = v·f/c), so a scenario means the same motion on
+every band:
+
+| Scenario | Model | Delay spread | Speed | Clock error | Delay | SNR | Stands for |
+|---|---|---|---|---|---|---|---|
+| ideal | none | – | 0 | 0 | 0 | – | emulator in the path, channel off |
+| static | none | – | 0 | 1 ppm | 500 ns | 30 dB | no fading: clock error, 150 m, noise |
+| indoor | TDL-A | 30 ns | 1 km/h | 0.5 ppm | 100 ns | 30 dB | indoor small cell (CBRS) |
+| pedestrian | EPA | (43 ns) | 3 km/h | 1 ppm | 500 ns | 20 dB | outdoor pedestrian |
+| urban | TDL-C | 100 ns | 15 km/h | 1 ppm | 1 µs | 20 dB | urban macro, slow vehicle |
+| vehicular | EVA | (357 ns) | 60 km/h | 1 ppm | 1 µs | 20 dB | vehicle |
+| dispersive | TDL-C | 300 ns | 3 km/h | 1 ppm | 500 ns | 25 dB | taps beyond the cyclic prefix |
+| cell-edge | TDL-A | 100 ns | 3 km/h | 2 ppm | 3 µs | 5 dB | 900 m, low SNR |
+
+`scripts/matrix.sh [-c "T1 C1 …"] [-s "ideal pedestrian …"] [--ping N]`
+runs configurations × scenarios (default: all of both; `-s direct` runs
+without the emulator) and writes one summary table (result, ping, UE DL
+TB ok/ko, gNB PUSCH CRC ok/ko, UE drift, pace, failed stages) to
+`test/results/matrix-<timestamp>.md`. The gNB PUSCH count includes the
+grants it still issues after the UE has stopped at the end of a run (a few
+KO with SINR = inf).
 
 Results 2026-11-15 (1 ppm, 500 ns, 25 dB SNR both ways, unless noted):
 
