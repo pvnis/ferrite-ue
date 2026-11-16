@@ -1,6 +1,9 @@
 //! Offline PRACH sanity check for the n78 TDD cell (idx 159 = B4, 30 kHz):
 //! occasion timing within the subframe, the frequency placement, and the
 //! new generator against the legacy single-symbol path that OCUDU detected.
+
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use ferrite_common::{DuplexMode, Numerology, SlotPoint};
 use ferrite_phy::prach::{self, PrachScs, PrachSeqLen, RestrictedSet};
 use ferrite_phy::prach_config as pc;

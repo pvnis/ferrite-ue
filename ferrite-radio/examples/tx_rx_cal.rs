@@ -12,6 +12,9 @@
 //!       "driver=limesuiteng,addr=/dev/limepcie0" 3.5e9 15.36e6 40 30 [repeats]
 //! Args: [device-args] [freq_hz] [sample_rate_hz] [rx_gain_db] [tx_gain_db] [repeats]
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::{SampleSink, SampleSource};
 use num_complex::Complex32;

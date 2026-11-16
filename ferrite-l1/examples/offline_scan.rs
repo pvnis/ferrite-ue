@@ -4,6 +4,9 @@
 //! printing PSS/SSS metrics and the MIB; also measures the MIB false-pass rate
 //! on noise.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::Iq;
 use ferrite_phy::sync::scan::{freq_shift, gscn_scan};
 use ferrite_phy::sync::search::CellSearcher;

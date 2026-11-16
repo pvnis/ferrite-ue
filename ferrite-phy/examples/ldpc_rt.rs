@@ -1,3 +1,5 @@
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // Round-trip the exact NAS-phase mcs=2 rb[0,2) size that fails live:
 // tbs=88 bits (11 B) → B=104 → BG2 Kb=6 Zc=18 (lifting set 4), 76 filler bits.
 fn main() {

@@ -1419,11 +1419,13 @@ pub fn cell_group_bwps(cell: &CellInfo, c: &cg::CellGroupConfig) -> BwpConfigs {
         .and_then(|s| s.first_active_downlink_bwp_id)
         .filter(|id| by_id.contains_key(id))
         .unwrap_or(cell.phy.dl_bwp.id);
+    // BWP 0 is always inserted above; the current configuration is the last
+    // resort.
     let active = by_id
         .get(&active_id)
         .or_else(|| by_id.get(&0))
         .cloned()
-        .expect("BWP 0 is always present");
+        .unwrap_or_else(|| (cell.phy.clone(), cell.mac.clone()));
     BwpConfigs {
         by_id,
         active_id,

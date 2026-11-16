@@ -2,6 +2,9 @@
 //! PBCH) is synthesized, distorted by a flat channel, CFO, and noise, and the
 //! receiver must blindly recover cell ID, SSB index, and the exact MIB.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::sync::cfo::correct_cfo;
 use ferrite_phy::sync::pbch::{pbch_dmrs_index, L_MAX_FR1_ABOVE_3GHZ, L_MAX_FR1_BELOW_3GHZ};

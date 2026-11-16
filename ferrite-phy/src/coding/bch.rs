@@ -279,7 +279,7 @@ pub fn bch_decode(llrs: &[f32], cell_id: u16, i_ssb: u8) -> Option<Mib> {
     if c.iter().all(|&b| b == 0) {
         return None;
     }
-    let a_scr: [u8; PBCH_A] = c[..PBCH_A].try_into().unwrap();
+    let a_scr: [u8; PBCH_A] = *c.first_chunk::<PBCH_A>()?;
 
     // The SFN 2nd/3rd LSBs are unscrambled, so v is readable directly from the
     // received bits: they sit at interleaved positions G(8) and G(7).

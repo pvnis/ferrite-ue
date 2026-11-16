@@ -5,6 +5,9 @@
 //!
 //!   cargo run -p ferrite-l1 --example sib1_probe -- <dl-arfcn> <srate-MHz> [band] [ssb-scs-kHz]
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::{arfcn_to_hz, BandInfo, RntiKind};
 use ferrite_l1::engine::{self, EngineCommand, EngineEvent, EngineParams};
 use ferrite_l1::fapi::*;

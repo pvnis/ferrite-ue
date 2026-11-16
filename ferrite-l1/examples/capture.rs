@@ -4,6 +4,9 @@
 //!
 //!   cargo run -p ferrite-l1 --example capture -- <out.iq> <srate-MHz> <ms>
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::Iq;
 use ferrite_l1::radio::{serve_uplink, UlPacing, UlServer, UlShared, ZmqUlSink};
 use ferrite_l1::stream::BufferedStream;

@@ -228,6 +228,22 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 
 ## Tooling / hygiene
 
+- [x] 2026-11-16 No `unwrap` / `expect` / `panic!` in non-test code (the
+      CLAUDE.md rule), now enforced: `[workspace.lints.clippy]` warns on
+      `unwrap_used` / `expect_used` / `panic` (errors in CI), `clippy.toml`
+      exempts tests, examples / benches / integration-test helpers opt out
+      at their crate root. 20 sites removed; reachable from outside were
+      the polar list decoder's path sort (`partial_cmp().unwrap()` panicked
+      on NaN LLRs; now `total_cmp`, regression test), PBCH RE extraction,
+      the IMSI parser (a non-digit wrapped around; the configuration now
+      rejects anything but 6–15 digits), the CCCH SDU length, and four
+      PDSCH asserts on network-configured values (bundle size, DM-RS
+      reference CRB, Qm, slot index).
+- [ ] About 25 `assert!` remain in the DSP crates (`ferrite-phy`: polar,
+      LDPC, OFDM, rate matching, PSS / SSS, cell search) on internal shape
+      invariants (lengths the same module computed). Not reachable from the
+      network as far as reviewed; converting them means `Result`s through
+      the DSP API.
 - [x] 2026-11-13 Removed the `max_ue_mcs` caps from the TDD test configs
       (whole matrix runs with link adaptation; 64-QAM both ways).
 - [x] 2026-11-13 `lab.sh`: `UE_LOG` filter honoured, S14/S16/S17 stages,

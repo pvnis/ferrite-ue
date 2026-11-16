@@ -36,8 +36,9 @@ impl SampleSource for FileSource {
         for (i, slot) in buf.iter_mut().enumerate() {
             match self.reader.read_exact(&mut bytes) {
                 Ok(()) => {
-                    let re = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-                    let im = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    let [r0, r1, r2, r3, i0, i1, i2, i3] = bytes;
+                    let re = f32::from_le_bytes([r0, r1, r2, r3]);
+                    let im = f32::from_le_bytes([i0, i1, i2, i3]);
                     *slot = Complex32::new(re, im);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {

@@ -321,6 +321,10 @@ impl UeConfig {
         let ssb_scs_khz = pick!(ssb_scs, info.ssb_scs_khz[0]);
         let ul_center_hz = arfcn_to_hz(info.ul_arfcn_for_dl(dl_arfcn));
         let imsi = pick!(imsi, "001010167891203".into());
+        // TS 23.003 §2.2: at most 15 digits (MCC 3 + MNC 2-3 + MSIN).
+        if !(6..=15).contains(&imsi.len()) || !imsi.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("IMSI {imsi:?}: expected 6 to 15 decimal digits"));
+        }
         let ki = hex16(&pick!(ki, "5122250214c33e723a5dd523fc145fc0".into()), "ki")?;
         let opc = hex16(
             &pick!(opc, "981d464c7c52eb6e5036234984ad0bcf".into()),

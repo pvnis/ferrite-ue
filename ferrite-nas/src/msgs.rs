@@ -12,8 +12,14 @@ fn bcd(lo: u8, hi: u8) -> u8 {
 /// routing indicator (2), protection scheme (1), home-net key id (1), then the
 /// MSIN BCD (scheme output for the null scheme).
 pub fn suci_from_imsi(imsi: &str) -> Vec<u8> {
-    let d: Vec<u8> = imsi.bytes().map(|b| b - b'0').collect();
-    assert!(d.len() == 15, "expect a 15-digit IMSI (2-digit MNC)");
+    // Digits only, padded / cut to 15 (this legacy helper serves the
+    // 15-digit, 2-digit-MNC test identities).
+    let mut d: Vec<u8> = imsi
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    d.resize(15, 0);
     let (mcc, mnc, msin) = (&d[0..3], &d[3..5], &d[5..]);
     let mut v = vec![
         // Identity type octet: SUPI format = IMSI (0), type of identity = SUCI (001).
@@ -140,13 +146,11 @@ pub fn auth_response(res_star: &[u8; 16]) -> Vec<u8> {
 /// plain message (SHT nibble 0) returns `(0, [0;4], 0, whole message)`. A
 /// protected message is [EPD 0x7e | SHT | MAC(4) | SEQ | inner].
 pub fn strip_security_header(nas: &[u8]) -> (u8, [u8; 4], u8, &[u8]) {
-    if nas.len() >= 7 && nas[0] == 0x7e && (nas[1] & 0x0f) != 0 {
-        (
-            nas[1] & 0x0f,
-            nas[2..6].try_into().unwrap(),
-            nas[6],
-            &nas[7..],
-        )
+    if let [0x7e, sht, m0, m1, m2, m3, sqn, rest @ ..] = nas {
+        if sht & 0x0f == 0 {
+            return (0, [0; 4], 0, nas);
+        }
+        (sht & 0x0f, [*m0, *m1, *m2, *m3], *sqn, rest)
     } else {
         (0, [0; 4], 0, nas)
     }

@@ -4,6 +4,9 @@
 //!
 //! Usage: cargo run -p ferrite-phy --example pdcch_analyze -- <file.rec> [n_rb] [n_cell]
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_phy::coding::dci::dci_decode;
 use ferrite_phy::sequence::gold_sequence;
 

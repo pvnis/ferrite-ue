@@ -8,6 +8,9 @@
 //! sample rate `fft_size * 30 kHz` (default 256 → 7.68 MHz), padded with
 //! silence before and after.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::sync::pbch::L_MAX_FR1_ABOVE_3GHZ;
 use ferrite_phy::sync::ssb::{build_ssb_waveform, ssb_sample_offset_in_frame, SsbCase};

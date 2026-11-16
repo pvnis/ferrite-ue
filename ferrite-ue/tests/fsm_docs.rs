@@ -2,6 +2,9 @@
 //! transition tables (`ferrite_common::fsm::mermaid`); this test fails when
 //! a table changes without its diagram, and prints the block to paste.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::fsm::{mermaid, Machine};
 
 fn check<M: Machine>(doc: &str) -> Option<String> {

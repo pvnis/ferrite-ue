@@ -85,7 +85,9 @@ pub fn seg_params(a: usize, r: f64) -> SegParams {
         .flat_map(|s| s.iter().copied())
         .filter(|&z| kb as usize * z as usize >= k_prime)
         .min()
-        .expect("no lifting size fits") as usize;
+        // Segmentation bounds K' by K_cb = kb · 384, so the largest lifting
+        // size always fits.
+        .unwrap_or(384) as usize;
     let k_full = match bg {
         BaseGraph::Bg1 => 22,
         BaseGraph::Bg2 => 10,
@@ -196,7 +198,10 @@ fn encode_cb(cb_bits: &[u8], p: &SegParams, e_r: usize, rv: u8, qm: usize) -> Ve
     // code block: cb_bits then filler (NULL modeled as 0 here; excluded via mask)
     let mut cb = vec![0u8; p.k];
     cb[..cb_bits.len()].copy_from_slice(cb_bits);
-    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    // seg_params only picks lifting sizes of the 38.212 table.
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return vec![0u8; e_r];
+    };
     let code = g.encode(&cb); // full 52·Zc (or 68·Zc) codeword
                               // d = codeword minus first 2·Zc punctured systematic bits.
     let d = &code[2 * p.zc..];
@@ -349,7 +354,10 @@ pub fn dlsch_decode_single_bits(
         return dlsch_decode_multi(f, tbs, qm, rv, max_iter, &p);
     }
     let b_len = tbs + tb_crc(tbs).width();
-    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    // seg_params only picks lifting sizes of the 38.212 table.
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return (vec![0u8; tbs], false, false);
+    };
     let ncb = g.n() - 2 * p.zc;
     let mut filler = vec![false; ncb];
     let fstart = b_len.saturating_sub(2 * p.zc);
@@ -382,7 +390,10 @@ fn dlsch_decode_multi(
     let g_by = f.len() / qm;
     let base = g_by / p.c;
     let rem = g_by % p.c;
-    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    // seg_params only picks lifting sizes of the 38.212 table.
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return (vec![0u8; tbs], false, false);
+    };
     let ncb = g.n() - 2 * p.zc;
     let k_prime = p.k_info + p.l; // K' = info + CB-CRC (24)
     let mut filler = vec![false; ncb];
@@ -471,7 +482,10 @@ pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<
         return (vec![0u8; tbs], false, false);
     }
     let b_len = tbs + tb_crc(tbs).width();
-    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    // seg_params only picks lifting sizes of the 38.212 table.
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return (vec![0u8; tbs], false, false);
+    };
     let ncb = g.n() - 2 * p.zc;
     let mut cbf = cb.to_vec();
     cbf.resize(ncb, 0.0);
@@ -496,7 +510,10 @@ pub fn dlsch_decode_cb(cb: &[f32], tbs: usize, r: f64, max_iter: usize) -> (Vec<
 /// transport block + CRC + filler. For interface debugging.
 pub fn de_rate_match_full(f: &[f32], tbs: usize, r: f64, qm: usize, rv: u8) -> (Vec<f32>, usize) {
     let p = seg_params(tbs, r);
-    let g = LdpcGraph::new(p.bg, p.zc as u16).unwrap();
+    // seg_params only picks lifting sizes of the 38.212 table.
+    let Some(g) = LdpcGraph::new(p.bg, p.zc as u16) else {
+        return (Vec::new(), 0);
+    };
     let ncb = g.n() - 2 * p.zc;
     let b_len = tbs + tb_crc(tbs).width();
     let mut filler = vec![false; ncb];

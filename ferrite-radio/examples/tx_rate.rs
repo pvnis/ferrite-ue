@@ -2,6 +2,9 @@
 //! like the live UE). Isolates the "TX underflow" question from cell search. Sweeps write
 //! block sizes. Run: cargo run -p ferrite-radio --example tx_rate --features soapy -- <serial> [rate]
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::{SampleSink, SampleSource};
 use num_complex::Complex32;

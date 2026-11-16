@@ -17,6 +17,9 @@
 //!   /home/dmd/ocudu-pavo/build2/tests/benchmarks/phy/upper/channel_coding/ldpc/\
 //!   ldpc_decoder_benchmark -R 1000 -I 6
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_phy::coding::ldpc::{BaseGraph, LdpcGraph};
 use ferrite_phy::coding::ldpc_tables::LIFTING_SETS;
 use std::time::Instant;

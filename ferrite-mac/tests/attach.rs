@@ -2,6 +2,9 @@
 //! resolution → UL grant → PUSCH with a MAC SDU, plus a DL assignment whose
 //! HARQ-ACK goes out on a PUCCH at n + k1.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::{Numerology, Rnti, RntiKind, SlotPoint};
 use ferrite_fapi::config::PrachConfig;
 use ferrite_fapi::*;

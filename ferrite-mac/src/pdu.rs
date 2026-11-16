@@ -48,8 +48,10 @@ pub fn parse_dl_pdu(pdu: &[u8]) -> Vec<DlSubPdu> {
                 i += 1;
             }
             LCID_DL_CON_RES => {
-                let Some(p) = pdu.get(i..i + 6) else { break };
-                out.push(DlSubPdu::ContentionResolution(p.try_into().unwrap()));
+                let Some(p) = pdu.get(i..).and_then(|r| r.first_chunk::<6>()) else {
+                    break;
+                };
+                out.push(DlSubPdu::ContentionResolution(*p));
                 i += 6;
             }
             LCID_DRX => out.push(DlSubPdu::DrxCommand),
@@ -247,13 +249,15 @@ pub fn push_crnti_ce(out: &mut Vec<u8>, crnti: u16) {
 }
 
 /// Build the Msg3 CCCH subPDU: 48- or 64-bit CCCH SDU, no length field.
-pub fn push_ccch(out: &mut Vec<u8>, ccch: &[u8]) {
+/// Any other length is not a CCCH SDU: nothing is written, `false`.
+pub fn push_ccch(out: &mut Vec<u8>, ccch: &[u8]) -> bool {
     match ccch.len() {
         6 => out.push(LCID_UL_CCCH48),
         8 => out.push(LCID_UL_CCCH64),
-        n => panic!("CCCH SDU must be 6 or 8 octets, got {n}"),
+        _ => return false,
     }
     out.extend_from_slice(ccch);
+    true
 }
 
 /// A decoded TB is a plausible DL-SCH MAC PDU (every subheader understood and

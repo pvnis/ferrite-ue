@@ -2,6 +2,9 @@
 //! network side of 5G-AKA from the same K/OPc, verifies every uplink MAC and
 //! deciphers with the negotiated algorithms.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_nas::milenage::k_gnb;
 use ferrite_nas::mm::{
     self, decode_mm, AuthenticationRequest, ConfigurationUpdateCommand,

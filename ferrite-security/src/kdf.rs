@@ -2,8 +2,9 @@
 //! RES* (A.4), K_AUSF (A.2), K_SEAF (A.6), K_AMF (A.7), the NAS / RRC / UP
 //! algorithm keys (A.8), K_gNB (A.9) and the horizontal K_NG-RAN* (A.11).
 
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,8 +20,16 @@ pub mod algo_type {
 
 /// KDF as HMAC-SHA256(key, S) (TS 33.220 §B.2). Returns the 32-byte output.
 pub fn kdf(key: &[u8], s: &[u8]) -> [u8; 32] {
-    // HMAC accepts any key length, so `new_from_slice` cannot fail here.
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    // RFC 2104: a key is zero-padded to the block size (64 octets), or
+    // hashed first if longer, so the fixed-size (infallible) constructor
+    // gives the same MAC as the variable-length one.
+    let mut block = [0u8; 64];
+    if key.len() > block.len() {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut mac = <HmacSha256 as KeyInit>::new(&block.into());
     mac.update(s);
     mac.finalize().into_bytes().into()
 }
@@ -123,6 +132,31 @@ pub fn k_ng_ran_star(k_gnb: &[u8; 32], pci: u16, arfcn: u32) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    /// RFC 4231 HMAC-SHA256 test cases 2 (short key) and 6 (a key longer
+    /// than the block, hashed first): the fixed-block construction matches.
+    #[test]
+    fn hmac_sha256_rfc4231() {
+        assert_eq!(
+            kdf(b"Jefe", b"what do ya want for nothing?").to_vec(),
+            hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        );
+        assert_eq!(
+            kdf(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )
+            .to_vec(),
+            hex("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+        );
+    }
 
     /// A.8 keys differ per type distinguisher and algorithm id; UP keys use
     /// the UP distinguishers (0x05 / 0x06), not the NAS ones.

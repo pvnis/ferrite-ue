@@ -214,16 +214,15 @@ pub fn extract_pbch(
     }
 
     let layout = PbchLayout::new(cell_id);
-    let dmrs = layout
-        .dmrs_re
-        .iter()
-        .map(|&(l, k)| grids[l as usize].as_ref().unwrap()[ssb_subcarrier_bin(k as usize, n)])
-        .collect();
-    let data = layout
-        .data_re
-        .iter()
-        .map(|&(l, k)| grids[l as usize].as_ref().unwrap()[ssb_subcarrier_bin(k as usize, n)])
-        .collect();
+    let re = |&(l, k): &(u8, u16)| {
+        grids
+            .get(l as usize)?
+            .as_ref()?
+            .get(ssb_subcarrier_bin(k as usize, n))
+            .copied()
+    };
+    let dmrs = layout.dmrs_re.iter().map(re).collect::<Option<Vec<_>>>()?;
+    let data = layout.data_re.iter().map(re).collect::<Option<Vec<_>>>()?;
     Some((dmrs, data, layout))
 }
 

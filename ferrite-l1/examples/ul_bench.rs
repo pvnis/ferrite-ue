@@ -1,4 +1,7 @@
 //! Micro-benchmark of the UL waveform builders (PUCCH F1 / PUSCH) at 15.36 MHz.
+
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use ferrite_phy::{pucch, pusch, Ofdm};
 fn main() {
     let ofdm = Ofdm::new(512);

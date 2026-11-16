@@ -1075,6 +1075,7 @@ impl MacEntity {
         let tbs = (tbs_bits / 8) as usize;
         let mut tb = Vec::with_capacity(tbs);
         if let Some(ccch) = self.ra.msg3_ccch {
+            // A 48-bit SDU by type: always a valid CCCH length.
             push_ccch(&mut tb, &ccch);
         } else if let Some(c) = self.c_rnti {
             push_crnti_ce(&mut tb, c.0);

@@ -127,17 +127,15 @@ pub fn polar_transform(u: &mut [u8]) {
     }
 }
 
-/// Encode `info` bits (length = number of set bits in `mask`) into `n` coded bits.
+/// Encode `info` bits (length = number of set bits in `mask`; callers build
+/// the mask from that length) into `n` coded bits. On a mismatch the bits
+/// that fit are encoded.
 pub fn polar_encode(info: &[u8], mask: &[bool]) -> Vec<u8> {
-    let n = mask.len();
-    let mut u = vec![0u8; n];
-    let mut it = info.iter();
-    for (i, &is_info) in mask.iter().enumerate() {
-        if is_info {
-            u[i] = *it.next().expect("info length must match mask");
-        }
+    let mut u = vec![0u8; mask.len()];
+    let info_positions = u.iter_mut().zip(mask).filter(|(_, &m)| m).map(|(b, _)| b);
+    for (slot, &bit) in info_positions.zip(info) {
+        *slot = bit;
     }
-    assert!(it.next().is_none(), "info length must match mask");
     polar_transform(&mut u);
     u
 }
@@ -271,13 +269,15 @@ pub fn scl_decode(
             }
         }
         if next.len() > list_size {
-            next.sort_by(|a, b| a.metric.partial_cmp(&b.metric).unwrap());
+            // total_cmp: a NaN metric (NaN LLRs from a bad block) sorts last
+            // instead of panicking.
+            next.sort_by(|a, b| a.metric.total_cmp(&b.metric));
             next.truncate(list_size);
         }
         paths = next;
     }
 
-    paths.sort_by(|a, b| a.metric.partial_cmp(&b.metric).unwrap());
+    paths.sort_by(|a, b| a.metric.total_cmp(&b.metric));
     let extract = |p: &Path| -> Vec<u8> {
         mask.iter()
             .zip(&p.u)
@@ -296,6 +296,18 @@ pub fn scl_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NaN LLRs (a broken block from the radio) must not panic the list
+    /// decoder's path sort.
+    #[test]
+    fn nan_llrs_do_not_panic() {
+        let mask = info_mask(64, 20);
+        let mut llr = vec![1.0f32; 64];
+        llr[3] = f32::NAN;
+        llr[40] = f32::NAN;
+        let (_, ok) = scl_decode(&llr, &mask, 8, |_| false);
+        assert!(!ok);
+    }
     use crate::coding::crc::CRC24C;
 
     struct Rng(u64);

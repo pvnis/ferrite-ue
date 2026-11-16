@@ -95,8 +95,18 @@ impl UeIdentity {
     }
 
     fn parse_plmn(&mut self) {
-        let d: Vec<u16> = self.imsi.bytes().map(|b| (b - b'0') as u16).collect();
-        let num = |s: &[u16]| s.iter().fold(0u16, |a, &x| a * 10 + x);
+        // Digits only (the configuration validates the IMSI; anything else
+        // is skipped rather than wrapped around).
+        let d: Vec<u16> = self
+            .imsi
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .map(|b| u16::from(b - b'0'))
+            .collect();
+        let num = |s: &[u16]| {
+            s.iter()
+                .fold(0u16, |a, &x| a.wrapping_mul(10).wrapping_add(x))
+        };
         self.mcc = num(d.get(0..3).unwrap_or(&[]));
         self.mnc = num(d.get(3..3 + self.mnc_digits as usize).unwrap_or(&[]));
     }

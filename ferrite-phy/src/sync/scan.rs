@@ -106,7 +106,9 @@ pub fn gscn_scan(
             .collect();
         handles
             .into_iter()
-            .flat_map(|h| h.join().expect("scan thread panicked"))
+            // A scan thread that panicked contributes no hits (its GSCNs are
+            // simply not found) instead of taking the UE down.
+            .flat_map(|h| h.join().unwrap_or_default())
             .collect()
     });
     // Strongest PSS peak first; a decodable MIB beats any metric.

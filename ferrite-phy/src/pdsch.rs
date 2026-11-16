@@ -71,7 +71,8 @@ impl VrbToPrb {
 /// the rest `L`. VRB bundle `j = cR + r` (`R = 2`, `C = ⌊N_bundle/R⌋`) maps to
 /// PRB bundle `f(j) = rC + c`; the last bundle maps to itself.
 pub fn interleaved_vrb_to_prb(n_bwp_size: usize, n_bwp_start: usize, l: usize) -> Vec<usize> {
-    assert!(l == 2 || l == 4, "RB bundle size is 2 or 4");
+    // vrb-ToPRB-Interleaver bundle size: n2 or n4 (anything else as n2).
+    let l = if l == 4 { 4 } else { 2 };
     let head = n_bwp_start % l;
     let n_bundle = (n_bwp_size + head).div_ceil(l);
     let first = l - head;
@@ -191,11 +192,9 @@ impl PdschAlloc {
 
     /// DM-RS sequence index of the first DM-RS RE of the BWP's first RB.
     pub fn dmrs_seq_base(&self) -> usize {
-        assert!(
-            self.bwp_start_crb >= self.dmrs_ref_crb,
-            "DM-RS reference CRB must not exceed the BWP start"
-        );
-        6 * (self.bwp_start_crb - self.dmrs_ref_crb)
+        // The reference CRB never exceeds the BWP start in a valid
+        // configuration; a broken one gives index 0, not a panic.
+        6 * self.bwp_start_crb.saturating_sub(self.dmrs_ref_crb)
     }
 }
 
@@ -243,10 +242,9 @@ pub fn demod_slot(
     mu: u8,
     comp: Option<&PhaseCompensation>,
 ) -> Option<Vec<Vec<Complex32>>> {
-    assert!(
-        slot_in_subframe < (1usize << mu),
-        "slot_in_subframe out of range for mu={mu}"
-    );
+    if slot_in_subframe >= (1usize << mu) {
+        return None;
+    }
     let n = ofdm.fft_size();
     let mut grids = Vec::with_capacity(14);
     let mut off = slot_start;
@@ -281,10 +279,9 @@ pub(crate) struct Demapper {
 
 impl Demapper {
     pub(crate) fn new(qm: usize) -> Self {
-        assert!(
-            matches!(qm, 2 | 4 | 6 | 8),
-            "unsupported modulation order {qm}"
-        );
+        // Qm from the MCS tables: 2, 4, 6 or 8 (anything else as QPSK, which
+        // fails the CRC instead of panicking).
+        let qm = if matches!(qm, 2 | 4 | 6 | 8) { qm } else { 2 };
         let m = qm / 2;
         let scale = [2.0f32, 10.0, 42.0, 170.0][m - 1].sqrt();
         let mut levels = [0f32; 16];

@@ -4,6 +4,9 @@
 //! to the PHY, NAS registration → RRC connection → MAC random access, and the
 //! retry policy after a failed attempt.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::{DuplexMode, Numerology, Rnti, RntiKind, SlotPoint};
 use ferrite_fapi::*;
 use ferrite_rrc::derive::MibInfo;

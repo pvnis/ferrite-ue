@@ -1,6 +1,9 @@
 //! Codec bindings against the live OCUDU captures (n78 TDD 10 MHz cell):
 //! SIB1 → common configuration, RRCSetup → dedicated configuration + bearers.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_common::DuplexMode;
 use ferrite_fapi::config::{PucchFormat, SearchSpaceKind};
 use ferrite_rrc::derive::{cell_from_sib1, decode_dl_ccch, DlCcch, RadioInfo};

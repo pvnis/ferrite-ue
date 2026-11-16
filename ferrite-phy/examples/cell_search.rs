@@ -5,6 +5,9 @@
 //!
 //! Run with: `cargo run -p ferrite-phy --example cell_search`
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_phy::coding::bch::Mib;
 use ferrite_phy::sync::cfo::correct_cfo;
 use ferrite_phy::sync::pbch::L_MAX_FR1_ABOVE_3GHZ;

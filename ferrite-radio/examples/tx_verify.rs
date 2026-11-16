@@ -5,6 +5,9 @@
 //!
 //! Run: cargo run -p ferrite-radio --example tx_verify --features soapy -- <txSerial> <rxSerial> [freq_hz] [tx_gain]
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use ferrite_radio::soapy::{SoapyConfig, SoapyRadio};
 use ferrite_radio::{SampleSink, SampleSource};
 use num_complex::Complex32;

@@ -3,6 +3,9 @@
 //! UPER DL-DCCH and PCCH messages. No MAC, PDCP or NAS involved — the test
 //! plays the stack and checks the events RRC asks it to carry out.
 
+// Test / development tool: panicking on a broken setup is the point.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod common;
 
 use common::{hex, mib, radio, Bits, RRC_SETUP_HEX, SIB1_HEX};

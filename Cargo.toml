@@ -63,3 +63,11 @@ opt-level = 3
 # `cfg(kani)`: model-checking harnesses (`cargo kani`), see ferrite_common::fsm.
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# CLAUDE.md: no unwrap / expect / panic in non-test code (tests are exempt
+# through clippy.toml; examples, benches and integration-test helpers opt
+# out at their crate root).
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
