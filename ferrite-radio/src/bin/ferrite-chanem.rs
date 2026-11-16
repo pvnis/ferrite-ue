@@ -25,6 +25,7 @@
 use ferrite_radio::channel::{profile, Link, LinkConfig};
 use num_complex::Complex32;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -181,13 +182,15 @@ const PIPELINE: usize = 6;
 /// would then deadlock: the fetcher blocked on a full queue that the reader
 /// will not touch until another, empty, queue delivers.
 struct Depth {
+    name: &'static str,
     queued: Mutex<Vec<usize>>,
     changed: Condvar,
 }
 
 impl Depth {
-    fn new(ports: usize) -> Self {
+    fn new(name: &'static str, ports: usize) -> Self {
         Self {
+            name,
             queued: Mutex::new(vec![0; ports]),
             changed: Condvar::new(),
         }
@@ -196,10 +199,19 @@ impl Depth {
     /// Wait until some queue is below [`PIPELINE`], then count one more block
     /// on every port.
     fn push(&self) -> Result<(), String> {
-        let poisoned = |_| "queue lock poisoned".to_string();
+        fn poisoned<T>(_: T) -> String {
+            "queue lock poisoned".to_string()
+        }
         let mut q = self.queued.lock().map_err(poisoned)?;
         while q.iter().all(|&d| d >= PIPELINE) {
-            q = self.changed.wait(q).map_err(poisoned)?;
+            let (g, t) = self
+                .changed
+                .wait_timeout(q, std::time::Duration::from_secs(2))
+                .map_err(poisoned)?;
+            q = g;
+            if t.timed_out() {
+                eprintln!("{}: downstream idle for 2 s, queues {:?}", self.name, *q);
+            }
         }
         q.iter_mut().for_each(|d| *d += 1);
         Ok(())
@@ -219,6 +231,53 @@ impl Depth {
     }
 }
 
+/// Couples the two directions: uplink samples are delivered to the gNB at
+/// most [`Coupling::margin`] ahead of the downlink samples taken from it.
+///
+/// A ZMQ gNB (OCUDU) consumes uplink only while it can transmit, and polls
+/// both directions from one I/O thread. If the uplink gets ahead by more
+/// than its receive buffer (614 400 samples) — e.g. the UE keeps answering
+/// uplink requests while it is not reading downlink — that thread blocks
+/// pushing uplink, the transmit side is never drained, and the gNB
+/// deadlocks. A direct UE↔gNB link cannot get that far ahead; the emulator's
+/// queues can.
+struct Coupling {
+    /// Downlink samples received from the gNB (first antenna).
+    dl_in: AtomicU64,
+    /// Uplink samples delivered to the gNB.
+    ul_out: AtomicU64,
+    margin: u64,
+}
+
+impl Coupling {
+    /// Wait until `len` more uplink samples stay within the margin.
+    fn admit_ul(&self, len: usize) {
+        let len = len as u64;
+        let since = Instant::now();
+        let mut warned = 0;
+        while self.ul_out.load(Relaxed) + len > self.dl_in.load(Relaxed) + self.margin {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            let s = since.elapsed().as_secs();
+            if s >= 2 * (warned + 1) {
+                warned += 1;
+                eprintln!(
+                    "UL: held {s} s: {} uplink samples delivered, {} downlink received",
+                    self.ul_out.load(Relaxed),
+                    self.dl_in.load(Relaxed)
+                );
+            }
+        }
+        self.ul_out.fetch_add(len, Relaxed);
+    }
+}
+
+/// Which direction a [`serve`] call carries (for the [`Coupling`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Dir {
+    Dl,
+    Ul,
+}
+
 /// Serve one direction until an error: a fetcher thread pulls upstream
 /// blocks, runs them through the channel and queues the outputs (see
 /// [`Depth`] for how far ahead); a server thread per downstream port answers each request with
@@ -227,6 +286,8 @@ impl Depth {
 /// by sample count, so the extra wall-clock latency does not move any timing.
 fn serve(
     name: &'static str,
+    dir: Dir,
+    coupling: &Arc<Coupling>,
     ctx: &zmq::Context,
     up: &[String],
     bind: &[String],
@@ -258,12 +319,14 @@ fn serve(
     eprintln!("{name}: {up:?} → {bind:?}");
     let (txs, rxs): (Vec<Sender<Block>>, Vec<Receiver<Block>>) =
         (0..downs.len()).map(|_| std::sync::mpsc::channel()).unzip();
-    let depth = Arc::new(Depth::new(downs.len()));
+    let depth = Arc::new(Depth::new(name, downs.len()));
     let fetch_depth = Arc::clone(&depth);
+    let fetch_coupling = (dir == Dir::Dl).then(|| Arc::clone(coupling));
     std::thread::Builder::new()
         .name(format!("chanem-{name}-fetch"))
         .spawn(move || {
-            if let Err(e) = fetch_loop(name, &ups, link, &txs, &fetch_depth) {
+            let counted = fetch_coupling.as_deref();
+            if let Err(e) = fetch_loop(name, &ups, link, &txs, &fetch_depth, counted) {
                 eprintln!("{name}: fetcher stopped: {e}");
             }
         })
@@ -275,10 +338,13 @@ fn serve(
     for (a, (down, rx)) in downs.into_iter().zip(rxs).enumerate() {
         let depth = Arc::clone(&depth);
         let err_tx = err_tx.clone();
+        let gate = (dir == Dir::Ul).then(|| Arc::clone(coupling));
         std::thread::Builder::new()
             .name(format!("chanem-{name}-{a}"))
             .spawn(move || {
-                let e = serve_port(&down, &rx, &depth, a).err().unwrap_or_default();
+                let e = serve_port(&down, &rx, &depth, a, gate.as_deref())
+                    .err()
+                    .unwrap_or_default();
                 let _ = err_tx.send(format!("{name} port {a}: {e}"));
             })
             .map_err(|e| format!("thread: {e}"))?;
@@ -289,17 +355,22 @@ fn serve(
         .unwrap_or_else(|_| format!("{name}: servers gone")))
 }
 
-/// Answer each request on `down` with the next block queued for port `a`.
+/// Answer each request on `down` with the next block queued for port `a`
+/// (uplink: once the [`Coupling`] admits it).
 fn serve_port(
     down: &zmq::Socket,
     rx: &Receiver<Block>,
     depth: &Depth,
     a: usize,
+    gate: Option<&Coupling>,
 ) -> Result<(), String> {
     loop {
         down.recv_msg(0).map_err(zerr("request"))?;
         let block = rx.recv().map_err(|_| "fetcher gone".to_string())?;
         depth.pop(a)?;
+        if let Some(g) = gate {
+            g.admit_ul(block.len());
+        }
         down.send(to_bytes(&block), 0).map_err(zerr("reply"))?;
     }
 }
@@ -311,6 +382,7 @@ fn fetch_loop(
     mut link: Link,
     txs: &[Sender<Block>],
     depth: &Depth,
+    counted: Option<&Coupling>,
 ) -> Result<(), String> {
     let mut report = Instant::now();
     let mut last_in = 0i64;
@@ -328,15 +400,23 @@ fn fetch_loop(
     let mut pending: Vec<Vec<Complex32>> = vec![Vec::new(); ups.len()];
     loop {
         let t0 = Instant::now();
-        for (u, buf) in ups.iter().zip(pending.iter_mut()) {
+        for (p, (u, buf)) in ups.iter().zip(pending.iter_mut()).enumerate() {
             loop {
                 u.send(&[0u8][..], 0).map_err(zerr("upstream request"))?;
                 match u.recv_bytes(0) {
                     Ok(b) => {
-                        buf.extend(to_samples(&b));
+                        let samples = to_samples(&b);
+                        if let (0, Some(c)) = (p, counted) {
+                            c.dl_in.fetch_add(samples.len() as u64, Relaxed);
+                        }
+                        buf.extend(samples);
                         break;
                     }
-                    Err(zmq::Error::EAGAIN) => continue,
+                    Err(zmq::Error::EAGAIN) => {
+                        // 2 s receive timeout: report a stalled upstream.
+                        eprintln!("{name}: upstream port {p} silent for 2 s");
+                        continue;
+                    }
                     Err(e) => return Err(format!("upstream: {e}")),
                 }
             }
@@ -432,15 +512,31 @@ fn run() -> Result<(), String> {
         a.model, a.ds_s * 1e9, a.doppler_hz, a.delay_s * 1e9, a.ppm, dl.cfo_hz, ul.cfo_hz, a.dl_snr_db, a.ul_snr_db
     );
     let ctx = zmq::Context::new();
+    let coupling = Arc::new(Coupling {
+        dl_in: AtomicU64::new(0),
+        ul_out: AtomicU64::new(0),
+        // 5 ms: well inside the gNB's receive buffer, well beyond its
+        // transmit advance and the uplink pipeline.
+        margin: (a.srate_hz * 5e-3) as u64,
+    });
     let ul_thread = {
         let ctx = ctx.clone();
+        let coupling = Arc::clone(&coupling);
         let (up, bind) = (a.ul_up.clone(), a.ul_bind.clone());
         std::thread::Builder::new()
             .name("chanem-ul".into())
-            .spawn(move || serve("UL", &ctx, &up, &bind, Link::new(ul)))
+            .spawn(move || serve("UL", Dir::Ul, &coupling, &ctx, &up, &bind, Link::new(ul)))
             .map_err(|e| format!("thread: {e}"))?
     };
-    let dl_result = serve("DL", &ctx, &a.dl_up, &a.dl_bind, Link::new(dl));
+    let dl_result = serve(
+        "DL",
+        Dir::Dl,
+        &coupling,
+        &ctx,
+        &a.dl_up,
+        &a.dl_bind,
+        Link::new(dl),
+    );
     // The DL loop only returns on an error; report it (and the UL one).
     let ul_result = if ul_thread.is_finished() {
         ul_thread

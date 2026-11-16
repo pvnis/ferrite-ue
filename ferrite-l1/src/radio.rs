@@ -366,7 +366,10 @@ pub fn serve_uplink(mut server: UlServer, shared: Arc<UlShared>, samples_per_slo
                 .sink
                 .serve_block(&mut counter, &mut block, &mut |c, b| {
                     b.iter_mut().for_each(|s| *s = Iq::default());
-                    table.lock().unwrap().fill(c as i64, b);
+                    table
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .fill(c as i64, b);
                 })
         };
         match ok {

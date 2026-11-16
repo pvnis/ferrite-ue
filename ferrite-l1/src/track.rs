@@ -94,6 +94,8 @@ const FIRST_DT_S: f64 = 0.02;
 const STEP_THRESHOLD: f64 = 0.75;
 /// Plausibility limit on the loop's own rate state (ppm).
 const MAX_RATE_PPM: f64 = 50.0;
+/// Scale of the rate-state gain while the CFO feed-forward is active.
+const RESIDUAL_RATE_GAIN: f64 = 0.05;
 /// Two coarse errors confirm each other within this (samples).
 const COARSE_AGREEMENT: f64 = 1.5;
 
@@ -188,8 +190,12 @@ impl SyncTracker {
         self.stats
     }
 
+    fn feed_forward_active(&self) -> bool {
+        self.cfg.sro_from_cfo && self.cfg.carrier_hz > 0.0
+    }
+
     fn feed_forward(&self) -> f64 {
-        if self.cfg.sro_from_cfo && self.cfg.carrier_hz > 0.0 {
+        if self.feed_forward_active() {
             -self.cfo_hz / self.cfg.carrier_hz * self.cfg.fs
         } else {
             0.0
@@ -234,7 +240,20 @@ impl SyncTracker {
         self.pending_coarse = None;
         let wn = std::f64::consts::TAU * self.cfg.timing_bandwidth_hz;
         let k1 = (2.0 * std::f64::consts::FRAC_1_SQRT_2 * wn * dt).min(0.5);
-        let k2 = wn * wn * dt;
+        // With the feed-forward the CFO already carries the clock drift, and
+        // the rate state only absorbs a residual; at full gain it integrates
+        // the timing wander of a fading multipath channel (path powers
+        // trading places move the measured arrival by fractions of the delay
+        // spread) into a false drift — 0.3–0.6 ppm under TDL-C 300 ns or
+        // EVA 60 km/h, with the CFO itself within 1 %.
+        let k2 = wn
+            * wn
+            * dt
+            * if self.feed_forward_active() {
+                RESIDUAL_RATE_GAIN
+            } else {
+                1.0
+            };
         self.offset += k1 * e;
         let max_rate = MAX_RATE_PPM * 1e-6 * self.cfg.fs;
         self.rate = (self.rate + k2 * e).clamp(-max_rate, max_rate);
@@ -343,6 +362,35 @@ mod tests {
             }
         }
         (worst, t)
+    }
+
+    /// Fading multipath moves the measured arrival around (the strongest
+    /// path changes); with the CFO feed-forward that wander must not turn
+    /// into a drift estimate.
+    #[test]
+    fn multipath_timing_wander_is_not_drift() {
+        let ppm = 1.0;
+        let eps = ppm * 1e-6;
+        let true_cfo = -eps * FC;
+        let mut t = SyncTracker::new(TrackerConfig::new(FS, FC), true_cfo);
+        let mut worst = 0f64;
+        for n in 0..(30 * 2000) {
+            let at = n * SLOT;
+            t.advance(at);
+            let s = at as f64 / FS;
+            let wander = 1.5 * (std::f64::consts::TAU * 0.3 * s).sin()
+                + 0.8 * (std::f64::consts::TAU * 0.11 * s + 1.0).sin();
+            let truth = eps * at as f64 - t.applied() as f64;
+            let tg = tag(&t, at);
+            if n % 3 == 0 {
+                t.on_timing(tg, truth + wander);
+                t.on_cfo(tg, true_cfo - tg.cfo_removed_hz);
+            }
+            if n > 10 * 2000 {
+                worst = worst.max((t.drift_ppm() - ppm).abs());
+            }
+        }
+        assert!(worst < 0.05, "drift error up to {worst:.3} ppm");
     }
 
     #[test]

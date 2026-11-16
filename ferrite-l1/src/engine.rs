@@ -323,7 +323,7 @@ pub fn run(
                                             log::warn!("{} for slot {} is late by {} samples", w.tag, req.slot, now - w.start);
                                         }
                                         log::debug!("ul {} slot {}: start {} len {} (served {}, margin {} samples)", w.tag, req.slot, w.start, w.samples.len(), now, w.start - now);
-                                        shared.table.lock().unwrap().push(ReadyWaveform { pos: w.start, samples: w.samples, tag: w.tag }, now);
+                                        shared.table.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ReadyWaveform { pos: w.start, samples: w.samples, tag: w.tag }, now);
                                     }
                                     Err(e) => log::warn!("UL build failed for slot {}: {e}", req.slot),
                                 }

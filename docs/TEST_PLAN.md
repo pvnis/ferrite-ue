@@ -66,7 +66,7 @@ PRACH, timing tables and PUCCH resources must all be learned over the air.
 | S27 | Periodic registration update | `UE_ARGS="--t3512-s 8 --ping-rounds 2 --ping-round-gap-s 25"` on a config with the gNB's inactivity release (T1): after the release the UE is in 5GMM-IDLE, T3512 expires, the UE connects (mo-Signalling) with REGISTRATION REQUEST (periodic) and the core accepts (`registration update complete`); the second ping round, after the next release, still goes through a service request (S14) |
 | S28 | Two-layer PDSCH (2x2) | gNB with `nof_antennas_dl: 2` / `max_rank: 2` (T5), the UE's two RX ports wired to the two TX ports: the UE measures the two-port CSI-RS and reports RI 2 (`CSI: … ri=2` in the gNB log; the UE's `CSI <slot>: … ri 2` debug line), the gNB schedules two-layer PDSCHs (`nof_layers=2`) and the UE decodes them with its MMSE demapper (DL TB failures < 10 %); ping 10/10 |
 | S29 | CFO tracking, UL frequency pre-compensation | `UE_ARGS="--emulate-lo-ppm 1"` (any config; the ZMQ source and sink mix in the frequency error of a UE oscillator 1 ppm high: DL −ppm·f_DL, UL +ppm·f_UL, sample clock ideal): the UE's `tracking:` CFO equals the injected DL offset within 50 Hz, the gNB's mean `cfo=` over the UE's uplink is within 50 Hz (without the pre-compensation it would be +ppm·f_UL), and no timing step is taken. Verified 2026-11-15 on T1 at +1 and −3 ppm and F1 at +2 ppm (FDD, UL scaled by f_UL/f_DL): gNB UL CFO mean 0 Hz, spread ±4 Hz |
-| S30 | Channel emulator | `CHANEM="<ferrite-chanem options>"` (any config; §5.2): the attach, ping and the configuration's other stages pass through the emulated channel, the emulator reports traffic in both directions, and with `--ppm` the UE's `tracking:` drift matches the emulated clock error within 0.1 ppm. Results 2026-11-15 in §5.2 |
+| S30 | Channel emulator | `CHANEM="<ferrite-chanem options>"` (any config; §5.2): the attach, ping and the configuration's other stages pass through the emulated channel, the emulator reports traffic in both directions, and with `--ppm` the UE's `tracking:` drift and CFO (as ppm of the DL carrier) each match the emulated clock error within 0.1 ppm. Results in §5.2 |
 | S25 | Connected-mode DRX | gNB with `cell_cfg.drx` (T4): the UE applies the DRX-Config (`DRX configured`), stops monitoring the C-RNTI PDCCH and sending periodic CSI outside Active Time (`drx_sleep_slots > 0` in the final MAC stats) and the ping probe still completes through the on-duration / SR wake-ups. Note: the periodic SRS is kept during sleep (`MacConfig::srs_outside_active_time`): OCUDU feeds the timing-advance estimate of every SRS occasion to its TA manager, detected or not, and empty occasions produce a −1 TA command per DRX cycle until the uplink leaves the cyclic prefix (observed: UL dead after ~8 cycles, RLF) |
 | S20 | SRS | gNB with `cell_cfg.srs.type_enabled: periodic`: the UE transmits its periodic SRS resource; the gNB PHY log shows `SRS:` detections with a sane SINR/EPRE for the UE's C-RNTI |
 | S22 | Transform-precoded PUSCH | gNB with `pusch.enable_transform_precoding: true` (T3): Msg3, fallback-DCI and DCI 0_1 PUSCHs are DFT-s-OFDM with the low-PAPR DM-RS and the Table 6.1.4.1-1 MCS mapping; ≥90 % of the gNB's PUSCH CRCs pass |
@@ -227,6 +227,20 @@ TDL-C at 300 ns reaches 2.6 µs, beyond the 2.3 µs cyclic prefix at 30 kHz:
 the late taps' inter-symbol interference shows in the uplink. The fading
 two-layer case misses S28's 10 % TB-failure limit (set for the clean channel)
 by a little; link adaptation, not the receiver, sets that rate.
+
+Full matrix 2026-11-16 (`matrix.sh --ping 10 --duration 180`, 11 configs ×
+8 scenarios, `test/results/matrix-20261116-032033.md`): 88 runs, 82 attached
+and pinged, 806 of 820 pings answered (72 runs 10/10). Every config passes
+`ideal` and `static`, with zero DL TB failures; UL CRC KOs on clean runs are
+the post-exit grants noted above. Failures by cause, and their fixes:
+
+| Seen | Cause | Status |
+|---|---|---|
+| 6 runs hung after sync (T5 under 5 fading scenarios, T1 once) | The emulator let uplink run ahead of the gNB's downlink while the UE was not reading downlink; OCUDU then blocks its one ZMQ I/O thread pushing into a full receive buffer and never drains its transmit side | Fixed: the emulator delivers uplink at most 5 ms ahead of the downlink it has taken from the gNB (`Coupling`). T5 under all five failing scenarios attaches since. One single-antenna hang after a 735 ms search backlog seen once since, not reproduced in three tries; the emulator now logs which side it is waiting on after 2 s |
+| 18 S30 failures (vehicular, dispersive, some cell-edge): UE drift 0.2–0.7 ppm off | Not the CFO (within 1 % in every run): the timing loop's rate integrator turned the timing wander of fading multipath into drift, on top of the CFO feed-forward that already carries it | Fixed: rate gain × 0.05 while the feed-forward is on (test `multipath_timing_wander_is_not_drift`); reruns of T1/C1/F1/T6 × vehicular/dispersive all within 0.02 ppm. S30 now also checks the CFO, as ppm of the DL carrier, within 0.1 ppm |
+| 10 runs lost 1–3 pings | Mostly cell-edge (5 dB) and 2x2 fading at 0.17–0.3× emulator pace | Open: link margin and the slow emulator path |
+| 4 S22 failures (T3 urban, vehicular, dispersive, cell-edge) | S22 asks for ≥ 90 % gNB PUSCH CRC OK, a clean-channel limit; under fading the CP-OFDM configs show the same UL failure rates (T1 urban 54/25), so this is the gNB's decoding and link adaptation, not the UE's DFT-s-OFDM | By design: read S22 on `ideal` / `static` |
+| T5 S28 under fading (after the hang fix: indoor 62/33, vehicular 87/22 DL TB ok/ko) | Two-layer PDSCH BLER above the 10 % limit, which is set for the clean channel; indoor at 30 dB should not fail a third of its TBs | Open: rank-2 decoding under fading (rank / PMI reporting vs MMSE) |
 
 ## 6. Over-the-air addendum (L4)
 

@@ -121,7 +121,9 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       S30): T5 keeps two layers through 2x2 TDL-A. Open: three/four layers,
       the SDR two-channel receive path, CDL / Sionna RT ray-traced channels
       (spatially correlated antennas), and a faster 2x2 fading path (the
-      emulator runs 2x2 TDL at ~0.3–0.6× real time).
+      emulator runs 2x2 TDL at ~0.3–0.6× real time); two-layer PDSCH BLER
+      under fading (T5 indoor 62/33 DL TB ok/ko, 2026-11-16 matrix, TEST_PLAN
+      §5.2).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC

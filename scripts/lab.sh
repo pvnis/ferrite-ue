@@ -242,18 +242,23 @@ fi
 # S30: channel emulator (only with `CHANEM`): the emulator carried both
 # directions (its 10 s report lines; the last DL pace is shown), and when it
 # emulates a UE clock error (`--ppm`) the UE's sample-clock tracking converges
-# on it (drift within 0.1 ppm, from the UE's last `tracking:` line).
+# on it: drift and CFO (as ppm of the DL carrier) each within 0.1 ppm, from
+# the UE's last `tracking:` line.
 if [ -n "${CHANEM:-}" ]; then
   PACE=$(grep "^DL:.*pace" "$OUT/chanem.log" 2>/dev/null | tail -1 | grep -o "pace [0-9.]*" | awk '{print $2}')
   ULOK=$(grep -c "^UL:.*pace" "$OUT/chanem.log" 2>/dev/null)
   PPM=$(echo " $CHANEM " | grep -o -- " --ppm [-+0-9.e]*" | awk '{print $2}')
   DRIFT=$(grep -o "drift [-+0-9.]* ppm" "$UE" | tail -1 | awk '{print $2}')
+  CFO=$(grep "tracking:" "$UE" | tail -1 | grep -o "cfo [-+0-9]* Hz" | awk '{print $2}')
+  CFOPPM=$(awk -v c="${CFO:-nan}" -v f="$DLF" 'BEGIN {printf "%+.3f", -c / f}')
   if [ -z "$PACE" ] || [ "${ULOK:-0}" -eq 0 ]; then
     fail "S30 channel emulator (no traffic report in chanem.log)"
   elif [ -n "$PPM" ] && ! awk -v w="$PPM" -v g="${DRIFT:-nan}" 'BEGIN {d=w-g; exit !(w==0 || (d<0.1 && d>-0.1))}'; then
     fail "S30 channel emulator (clock error $PPM ppm, UE tracked ${DRIFT:-?} ppm)"
+  elif [ -n "$PPM" ] && ! awk -v w="$PPM" -v g="${CFOPPM:-nan}" 'BEGIN {d=w-g; exit !(w==0 || (d<0.1 && d>-0.1))}'; then
+    fail "S30 channel emulator (clock error $PPM ppm, UE CFO ${CFO:-?} Hz = $CFOPPM ppm)"
   else
-    pass "S30 channel emulator ($CHANEM; pace ${PACE}x real time${DRIFT:+, UE drift $DRIFT ppm})"
+    pass "S30 channel emulator ($CHANEM; pace ${PACE}x real time${DRIFT:+, UE drift $DRIFT ppm}${CFO:+, CFO $CFO Hz})"
   fi
 fi
 # S25: connected-mode DRX (only when the gNB config has a `drx` section): the
