@@ -465,6 +465,8 @@ fn attach_flow() {
     let (cs, cuci) = csi_pusch.expect("PUSCH on the CSI occasion");
     assert_eq!(cs, target);
     assert_eq!(cuci.csi1, vec![0, 0, 0, 0]);
+    assert_eq!(mac.ra_fsm_stats().violations, 0);
+    assert!(mac.ra_fsm_stats().transitions >= 5);
 }
 
 /// TS 38.321 §5.15: on a non-default BWP the bwp-InactivityTimer runs,
@@ -591,4 +593,5 @@ fn bwp_inactivity_timer_and_switch_requests() {
             ul_bwp: Some(0)
         }]
     );
+    assert_eq!(mac.ra_fsm_stats().violations, 0);
 }

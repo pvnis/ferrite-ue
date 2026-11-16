@@ -491,3 +491,92 @@ tests with the independent `oxirush-nas` decoder (`validate()` clean).
 * No PUCCH/CSI resource constants: from `PUCCH-Config` / `CSI-MeasConfig`.
 * No mapping-order / CDM / TBS sweeps: spec order, DCI antenna-port field,
   38.214 §5.1.3.2.
+
+## 13. Declared state machines (`ferrite_common::fsm`)
+
+A protocol state machine states its transitions as data: a `Machine` lists
+its states (as a fieldless *kind* when the state carries data), its events
+and a table of rules `(from, event) → to`, each with the specification
+clause it implements; a deliberate deviation says `ferrite: …`. The entity
+keeps its state in an `Fsm`, and `Fsm::transition` is the only way to change
+it: a move the table does not allow is refused (state unchanged), counted in
+`FsmStats::violations` and logged as an error. It never panics. Every
+transition made is logged with its clause, e.g.
+`RRC Connecting → Connected on RrcSetup [38.331 §5.3.3.4]`. Leaving a state
+stops the timers that belong to it.
+
+Checks, cheapest first:
+
+1. `fsm::check` per machine (unit test): rules use listed kinds and events,
+   no self-loops or duplicates, every rule names a clause, every event is
+   used, every kind is reachable from the initial one.
+2. Scenario and randomised tests drive the real entity and assert no
+   violation. RRC: `random_inputs_stay_inside_the_table`, 200 seeds × 120
+   inputs, every table edge exercised, T300 only in Connecting, T301 only in
+   Reestablishing, T310 only in Connected.
+3. Kani proofs (`#[cfg(kani)]`, `cargo kani -p <crate>`) on the real code.
+   RA: `ra_step_preserves_the_invariant` is an inductive proof. From *any*
+   state with any data satisfying the invariant, one arbitrary input keeps
+   the invariant, causes no violation, and does not panic or overflow. The
+   invariant is: counter within 1..=preambleTransMax+1; Failed exactly when
+   it is preambleTransMax+1; ramping counter ≤ transmission counter. Cover
+   checks show that the failure, success and RAR paths are reachable, so
+   the proof is not vacuous. `ra_moves_only_along_its_table` replays every
+   6-input sequence from a fresh procedure. About 30 s and 10 min.
+4. Planned: a composed NAS × RRC × MAC RA model for deadlock and liveness,
+   validated against the transition logs of lab runs.
+
+The diagrams below are generated from the tables, and
+`ferrite-ue/tests/fsm_docs.rs` fails when they differ.
+
+Converted so far: RRC (`ferrite_rrc::machine`) and MAC random access
+(`ferrite_mac::RaMachine`). The plan is in BACKLOG ("Architecture
+improvements"): NAS MM/CM/SM, MAC SR/DRX/TA and L1 `CellPhase`/RLM next,
+then the implicit machines (HARQ, RLC AM, the stack's retry and security
+hand-over).
+
+RRC (`RrcMachine`):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Connecting: Connect
+    Connecting --> Connected: RrcSetup
+    Connecting --> Idle: RrcReject
+    Connecting --> Idle: T300Expiry
+    Connecting --> Idle: RaFailure
+    Connected --> Idle: Release
+    Connected --> Reestablishing: RadioLinkFailure
+    Connected --> Idle: RadioLinkFailure
+    Reestablishing --> Connected: ReestablishmentVerified
+    Reestablishing --> Idle: ReestablishmentFailure
+    Reestablishing --> Idle: T301Expiry
+    Reestablishing --> Idle: RrcReject
+    Reestablishing --> Idle: RrcSetupFallback
+    Reestablishing --> Idle: RaFailure
+```
+
+MAC random access (`RaMachine`):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> SelectResource: Start
+    Succeeded --> SelectResource: Start
+    Failed --> SelectResource: Start
+    PreambleRequested --> SelectResource: Start
+    RarWindow --> SelectResource: Start
+    Msg3Pending --> SelectResource: Start
+    ContentionResolution --> SelectResource: Start
+    SelectResource --> PreambleRequested: OccasionSelected
+    PreambleRequested --> RarWindow: PreambleSent
+    RarWindow --> Msg3Pending: RarReceived
+    RarWindow --> SelectResource: RarWindowExpiry
+    RarWindow --> Failed: RarWindowExpiry
+    Msg3Pending --> SelectResource: Msg3GrantTimeout
+    Msg3Pending --> Failed: Msg3GrantTimeout
+    Msg3Pending --> ContentionResolution: Msg3Sent
+    ContentionResolution --> Succeeded: ContentionResolved
+    ContentionResolution --> SelectResource: ContentionResolutionExpiry
+    ContentionResolution --> Failed: ContentionResolutionExpiry
+```

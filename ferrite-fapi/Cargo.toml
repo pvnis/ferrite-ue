@@ -8,3 +8,6 @@ description = "PHY <-> MAC interface (FAPI-style messages) and PHY configuration
 [dependencies]
 ferrite-common.workspace = true
 ferrite-ran.workspace = true
+
+[lints]
+workspace = true

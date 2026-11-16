@@ -1,8 +1,8 @@
 //! Ferrite RRC (TS 38.331) — the UE RRC entity.
 //!
 //! The state machine is [`RrcState`] (Idle / Connecting / Connected /
-//! Reestablishing, transitions in its documentation, every change logged by
-//! `set_state`). Timers: T300 (connection establishment), T301
+//! Reestablishing); its transitions are the table in [`machine`], and every
+//! change goes through that table (checked, logged with its clause). Timers: T300 (connection establishment), T301
 //! (re-establishment) and T310 (radio link failure detection from the PHY's
 //! in-sync / out-of-sync indications, N310 / N311) run on the slot clock
 //! passed to [`RrcUe::tick`].
@@ -18,12 +18,15 @@
 
 pub mod codec;
 pub mod derive;
+pub mod machine;
 pub mod meas;
 
+use ferrite_common::fsm::Fsm;
 use ferrite_common::SlotPoint;
 use ferrite_fapi::config::PhyConfig;
 use ferrite_mac::MacConfig;
 pub use ferrite_security::{CipherAlg, IntegrityAlg};
+use machine::{RrcMachine, RrcTrigger};
 
 /// RRC states (§4.2.1).
 /// RRC state (TS 38.331 §4.2.1 `RRC_IDLE` / `RRC_CONNECTED`, with the two
@@ -254,7 +257,7 @@ impl Default for RrcConfig {
 /// The UE RRC entity.
 pub struct RrcUe {
     pub cfg: RrcConfig,
-    state: RrcState,
+    state: Fsm<RrcMachine>,
     /// Slot clock of the last `tick` (the RRC timers run on it).
     now: Option<SlotPoint>,
     events: Vec<RrcEvent>,
@@ -303,7 +306,7 @@ impl RrcUe {
     pub fn new(cfg: RrcConfig) -> Self {
         Self {
             cfg,
-            state: RrcState::Idle,
+            state: Fsm::new(RrcState::Idle),
             now: None,
             events: Vec::new(),
             cell: None,
@@ -383,22 +386,52 @@ impl RrcUe {
 
     /// Current RRC state (TS 38.331 §4.2.1 plus the two procedure sub-states).
     pub fn state(&self) -> RrcState {
-        self.state
+        *self.state.state()
     }
 
-    fn set_state(&mut self, to: RrcState) {
-        if self.state != to {
-            log::info!("RRC: {:?} → {:?}", self.state, to);
-            self.state = to;
-            // Radio link monitoring only runs in RRC_CONNECTED (§5.3.10.1);
-            // T310 stops on any state change (release, RLF, re-establishment).
-            self.stop_t310();
+    /// Transitions made and refused (a refusal is a bug: see [`machine`]).
+    pub fn fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        self.state.stats()
+    }
+
+    /// Enter `to` on `trigger` if the table in [`machine`] allows it; `false`
+    /// (logged as an error, state unchanged) if it does not. Leaving a state
+    /// stops its timers.
+    fn go(&mut self, trigger: RrcTrigger, to: RrcState) -> bool {
+        match self.state.transition(trigger, to) {
+            Ok(t) => {
+                log::info!("{t}");
+                if to != RrcState::Connecting {
+                    self.t300_expiry = None;
+                }
+                if to != RrcState::Reestablishing {
+                    self.t301_expiry = None;
+                }
+                // Radio link monitoring only runs in RRC_CONNECTED (§5.3.10.1);
+                // T310 stops on any state change (release, RLF, re-establishment).
+                self.stop_t310();
+                true
+            }
+            Err(v) => {
+                log::error!("{v}");
+                false
+            }
         }
     }
 
     /// Whether T310 is running (N310 out-of-sync indications received, RLF pending).
     pub fn t310_running(&self) -> bool {
         self.t310_expiry.is_some()
+    }
+
+    /// Whether T300 is running (connection establishment pending).
+    pub fn t300_running(&self) -> bool {
+        self.t300_expiry.is_some()
+    }
+
+    /// Whether T301 is running (re-establishment pending).
+    pub fn t301_running(&self) -> bool {
+        self.t301_expiry.is_some()
     }
 
     fn stop_t310(&mut self) {
@@ -410,7 +443,7 @@ impl RrcUe {
     /// §5.3.10.1 / §5.3.10.2: N310 consecutive out-of-sync indications start
     /// T310; N311 consecutive in-sync indications while it runs stop it.
     fn on_sync_indication(&mut self, in_sync: bool) {
-        if self.state != RrcState::Connected {
+        if self.state() != RrcState::Connected {
             return;
         }
         let Some(cell) = self.cell.as_ref() else {
@@ -468,7 +501,7 @@ impl RrcUe {
     /// request: mo-Data = 4, mt-Access = 2). Uses the 5G-S-TMSI as the UE
     /// identity when it is known.
     pub fn connect_for(&mut self, nas_pdu: Vec<u8>, now: SlotPoint, cause: u8) {
-        if self.state != RrcState::Idle || self.cell.is_none() {
+        if self.state() != RrcState::Idle || self.cell.is_none() {
             return;
         }
         let id = self.cfg.ue_random_id.unwrap_or_else(|| {
@@ -481,8 +514,10 @@ impl RrcUe {
         self.setup_used_s_tmsi = self.s_tmsi.is_some();
         let ccch = derive::encode_setup_request(id, self.s_tmsi, cause);
         self.setup_request = Some(ccch);
+        if !self.go(RrcTrigger::Connect, RrcState::Connecting) {
+            return;
+        }
         self.pending_nas = Some(nas_pdu);
-        self.set_state(RrcState::Connecting);
         let t300 = self.cell.as_ref().map_or(self.cfg.t300_ms, |c| c.t300_ms);
         let slots = t300 * now.numerology.slots_per_subframe();
         self.t300_expiry = Some(now.add(slots as u64));
@@ -492,14 +527,16 @@ impl RrcUe {
     pub fn on_mac(&mut self, n: MacNotification) {
         match n {
             MacNotification::RaSucceeded { c_rnti } => self.c_rnti = Some(c_rnti),
-            MacNotification::RaFailed => match self.state {
+            MacNotification::RaFailed => match self.state() {
                 RrcState::Connecting => {
-                    self.set_state(RrcState::Idle);
-                    self.events.push(RrcEvent::Failed("random access failed"));
+                    if self.go(RrcTrigger::RaFailure, RrcState::Idle) {
+                        self.events.push(RrcEvent::Failed("random access failed"));
+                    }
                 }
-                RrcState::Reestablishing => {
-                    self.abort_reestablishment("random access failed during re-establishment")
-                }
+                RrcState::Reestablishing => self.abort_reestablishment(
+                    RrcTrigger::RaFailure,
+                    "random access failed during re-establishment",
+                ),
                 // §5.3.10.3: a random access problem while connected is an RLF.
                 RrcState::Connected => self.start_reestablishment(),
                 RrcState::Idle => {}
@@ -507,7 +544,7 @@ impl RrcUe {
             MacNotification::SrFailure => log::info!("SR failure: MAC runs a C-RNTI random access"),
             MacNotification::TimeAlignmentExpired => log::warn!("uplink time alignment lost"),
             MacNotification::RlcMaxRetx { .. } | MacNotification::RadioLinkFailure => {
-                if self.state == RrcState::Connected {
+                if self.state() == RrcState::Connected {
                     self.start_reestablishment();
                 }
             }
@@ -520,7 +557,7 @@ impl RrcUe {
     /// indicator, the DL BWP paired with `ul_bwp`); unknown ids are ignored.
     pub fn switch_bwp(&mut self, dl_bwp: Option<u8>, ul_bwp: Option<u8>) {
         let Some(id) = dl_bwp.or(ul_bwp) else { return };
-        if self.state != RrcState::Connected {
+        if self.state() != RrcState::Connected {
             return;
         }
         let Some(cell) = self.cell.as_mut() else {
@@ -561,10 +598,11 @@ impl RrcUe {
             (self.security, self.c_rnti, self.cell.as_ref())
         else {
             // §5.3.7.2: without AS security the UE goes to RRC_IDLE instead.
-            self.meas.clear();
-            self.security = None;
-            self.set_state(RrcState::Idle);
-            self.events.push(RrcEvent::Failed("radio link failure"));
+            if self.go(RrcTrigger::RadioLinkFailure, RrcState::Idle) {
+                self.meas.clear();
+                self.security = None;
+                self.events.push(RrcEvent::Failed("radio link failure"));
+            }
             return;
         };
         let pci = cell.phy.ssb.pci;
@@ -578,8 +616,10 @@ impl RrcUe {
         let ccch = derive::encode_reestablishment_request(c_rnti, pci, smac, 2);
         let (common_phy, common_mac) = (cell.common_phy.clone(), cell.common_mac.clone());
         log::info!("radio link failure: RRC re-establishment (C-RNTI {c_rnti:#x}, PCI {pci}, shortMAC-I {smac:#06x})");
+        if !self.go(RrcTrigger::RadioLinkFailure, RrcState::Reestablishing) {
+            return;
+        }
         self.stats.reestablishments += 1;
-        self.set_state(RrcState::Reestablishing);
         self.pending_reest = None;
         self.t301_expiry = None;
         // §5.3.7.4: back to the default L1/MAC (common) configuration — the
@@ -609,9 +649,10 @@ impl RrcUe {
         self.t301_expiry = Some(now.add(u64::from(t301 * now.numerology.slots_per_subframe())));
     }
 
-    fn abort_reestablishment(&mut self, why: &'static str) {
-        self.set_state(RrcState::Idle);
-        self.t301_expiry = None;
+    fn abort_reestablishment(&mut self, trigger: RrcTrigger, why: &'static str) {
+        if !self.go(trigger, RrcState::Idle) {
+            return;
+        }
         self.pending_reest = None;
         self.security = None;
         self.meas.clear();
@@ -624,11 +665,15 @@ impl RrcUe {
             return;
         };
         if !ok {
-            self.abort_reestablishment("RRCReestablishment integrity check failed");
+            self.abort_reestablishment(
+                RrcTrigger::ReestablishmentFailure,
+                "RRCReestablishment integrity check failed",
+            );
             return;
         }
-        self.set_state(RrcState::Connected);
-        self.t301_expiry = None;
+        if !self.go(RrcTrigger::ReestablishmentVerified, RrcState::Connected) {
+            return;
+        }
         self.events.push(RrcEvent::TxSrb {
             srb: 1,
             pdu: derive::encode_reestablishment_complete(tid),
@@ -640,13 +685,14 @@ impl RrcUe {
     pub fn tick(&mut self, now: SlotPoint) {
         self.now = Some(now);
         if let Some(t) = self.t300_expiry {
-            if self.state == RrcState::Connecting && now.diff(&t) >= 0 {
-                self.t300_expiry = None;
-                self.set_state(RrcState::Idle);
+            if self.state() == RrcState::Connecting
+                && now.diff(&t) >= 0
+                && self.go(RrcTrigger::T300Expiry, RrcState::Idle)
+            {
                 self.events.push(RrcEvent::Failed("T300 expired"));
             }
         }
-        if self.state == RrcState::Connected {
+        if self.state() == RrcState::Connected {
             self.meas.tick(now);
             self.send_measurement_reports();
             if self.t310_expiry.is_some_and(|t| now.diff(&t) >= 0) {
@@ -654,15 +700,15 @@ impl RrcUe {
             }
         }
         if let Some(t) = self.t301_expiry {
-            if self.state == RrcState::Reestablishing && now.diff(&t) >= 0 {
-                self.abort_reestablishment("T301 expired");
+            if self.state() == RrcState::Reestablishing && now.diff(&t) >= 0 {
+                self.abort_reestablishment(RrcTrigger::T301Expiry, "T301 expired");
             }
         }
     }
 
     /// A serving-cell SSB measurement from the PHY (§5.5.3).
     pub fn on_measurement(&mut self, now: SlotPoint, m: &meas::CellMeasurement) {
-        if self.state != RrcState::Connected {
+        if self.state() != RrcState::Connected {
             return;
         }
         self.meas.on_serving_measurement(now, m);
@@ -690,16 +736,19 @@ impl RrcUe {
             return;
         };
         match derive::decode_dl_ccch(pdu, cell, self.cfg.tx_lead_slots) {
-            Ok(derive::DlCcch::Setup { .. }) if self.state == RrcState::Reestablishing => {
+            Ok(derive::DlCcch::Setup { .. }) if self.state() == RrcState::Reestablishing => {
                 log::warn!(
                     "RRCSetup instead of RRCReestablishment: the network fell back; reconnecting"
                 );
-                self.abort_reestablishment("re-establishment fallback to RRCSetup");
+                self.abort_reestablishment(
+                    RrcTrigger::RrcSetupFallback,
+                    "re-establishment fallback to RRCSetup",
+                );
             }
-            Ok(derive::DlCcch::Setup { .. }) if self.state != RrcState::Connecting => {
+            Ok(derive::DlCcch::Setup { .. }) if self.state() != RrcState::Connecting => {
                 log::warn!(
                     "RRCSetup received in state {:?} without a pending request: ignored",
-                    self.state
+                    self.state()
                 );
             }
             Ok(derive::DlCcch::Setup {
@@ -709,8 +758,9 @@ impl RrcUe {
                 bearers,
                 bwps,
             }) => {
-                self.t300_expiry = None;
-                self.set_state(RrcState::Connected);
+                if !self.go(RrcTrigger::RrcSetup, RrcState::Connected) {
+                    return;
+                }
                 // The dedicated configuration becomes the baseline later
                 // reconfigurations are applied on top of.
                 if let Some(c) = self.cell.as_mut() {
@@ -738,10 +788,17 @@ impl RrcUe {
                 self.events.push(RrcEvent::TxSrb { srb: 1, pdu });
                 self.events.push(RrcEvent::Connected);
             }
-            Ok(derive::DlCcch::Reject) => {
-                self.set_state(RrcState::Idle);
-                self.events.push(RrcEvent::Failed("RRCReject"));
-            }
+            Ok(derive::DlCcch::Reject) => match self.state() {
+                RrcState::Connecting => {
+                    if self.go(RrcTrigger::RrcReject, RrcState::Idle) {
+                        self.events.push(RrcEvent::Failed("RRCReject"));
+                    }
+                }
+                RrcState::Reestablishing => {
+                    self.abort_reestablishment(RrcTrigger::RrcReject, "RRCReject")
+                }
+                s => log::warn!("RRCReject in state {s:?} without a pending request: ignored"),
+            },
             Err(e) => log::warn!("DL-CCCH decode failed: {e}"),
         }
     }
@@ -869,14 +926,17 @@ impl RrcUe {
                 }
             }
             derive::DlDcch::Reestablishment { tid, ncc } => {
-                if self.state != RrcState::Reestablishing {
-                    log::warn!("RRCReestablishment while {:?}: ignored", self.state);
+                if self.state() != RrcState::Reestablishing {
+                    log::warn!("RRCReestablishment while {:?}: ignored", self.state());
                     return;
                 }
                 let (Some(k), Some(old), Some(cell)) =
                     (self.k_gnb, self.security, self.cell.as_ref())
                 else {
-                    self.abort_reestablishment("RRCReestablishment without a security context");
+                    self.abort_reestablishment(
+                        RrcTrigger::ReestablishmentFailure,
+                        "RRCReestablishment without a security context",
+                    );
                     return;
                 };
                 if ncc != 0 {
@@ -892,10 +952,13 @@ impl RrcUe {
                 self.events.push(RrcEvent::VerifyReestablishment(sec));
             }
             derive::DlDcch::Release => {
-                self.set_state(RrcState::Idle);
-                self.security = None;
-                self.meas.clear();
-                self.events.push(RrcEvent::Released);
+                if self.state() != RrcState::Connected {
+                    log::warn!("RRCRelease in state {:?}: ignored", self.state());
+                } else if self.go(RrcTrigger::Release, RrcState::Idle) {
+                    self.security = None;
+                    self.meas.clear();
+                    self.events.push(RrcEvent::Released);
+                }
             }
             derive::DlDcch::Other(name) => log::info!("DL-DCCH {name} ignored"),
         }
@@ -903,7 +966,7 @@ impl RrcUe {
 
     /// A PCCH PDU (Paging) decoded with the P-RNTI (§5.3.2.3).
     pub fn on_pcch(&mut self, pdu: &[u8]) {
-        if self.state != RrcState::Idle {
+        if self.state() != RrcState::Idle {
             return;
         }
         match ferrite_asn1::rrc::PagingMessage::decode(pdu) {
@@ -940,7 +1003,7 @@ impl RrcUe {
 
     /// NAS wants to send a PDU (ULInformationTransfer, §5.7.2).
     pub fn send_nas(&mut self, nas: &[u8]) {
-        if self.state != RrcState::Connected {
+        if self.state() != RrcState::Connected {
             log::warn!("NAS PDU dropped: not connected");
             return;
         }

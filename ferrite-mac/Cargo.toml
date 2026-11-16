@@ -9,3 +9,6 @@ ferrite-common.workspace = true
 ferrite-fapi.workspace = true
 ferrite-ran.workspace = true
 log.workspace = true
+
+[lints]
+workspace = true

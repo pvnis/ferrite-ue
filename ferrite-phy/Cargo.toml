@@ -16,3 +16,6 @@ ferrite-radio.workspace = true
 [[bench]]
 name = "ldpc_decode"
 harness = false
+
+[lints]
+workspace = true

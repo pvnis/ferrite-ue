@@ -15,3 +15,6 @@ ferrite-security.workspace = true
 
 [dev-dependencies]
 ferrite-phy.workspace = true
+
+[lints]
+workspace = true

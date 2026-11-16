@@ -39,3 +39,6 @@ required-features = ["soapy"]
 [[bin]]
 name = "ferrite-chanem"
 required-features = ["zmq"]
+
+[lints]
+workspace = true

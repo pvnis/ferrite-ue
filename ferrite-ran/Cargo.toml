@@ -7,3 +7,6 @@ description = "3GPP TS 38.21x parameter tables and arithmetic shared by the Ferr
 
 [dependencies]
 ferrite-common.workspace = true
+
+[lints]
+workspace = true

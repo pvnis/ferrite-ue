@@ -217,7 +217,12 @@ impl MacEntity {
 
     /// Random-access procedure state (diagnostics).
     pub fn ra_state(&self) -> &RaState {
-        &self.ra.state
+        self.ra.state()
+    }
+
+    /// RA transitions made and refused (see [`crate::ra::RaMachine`]).
+    pub fn ra_fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        self.ra.fsm_stats()
     }
 
     /// Time-alignment state (diagnostics).

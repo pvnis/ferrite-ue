@@ -549,3 +549,108 @@ fn bwp_switch_to_an_unknown_bwp_is_ignored() {
     });
     assert!(ue.take_events().is_empty());
 }
+
+/// RRCReject (DL-CCCH c1 index 0) without a wait time.
+fn reject() -> Vec<u8> {
+    let mut b = Bits::new();
+    b.put(0, 1).put(0, 2).put(0, 1); // c1 / rrcReject / criticalExtensions rrcReject
+    b.put(0, 3); // RRCReject-IEs: waitTime, late / nonCritical extension absent
+    b.bytes()
+}
+
+/// RRCReestablishment (DL-DCCH c1 index 3), nextHopChainingCount 0.
+fn reestablishment(tid: u64) -> Vec<u8> {
+    let mut b = Bits::new();
+    b.put(0, 1).put(3, 4).put(tid, 2).put(0, 1);
+    b.put(0, 2).put(0, 3); // two absent OPTIONALs, nextHopChainingCount
+    b.bytes()
+}
+
+#[test]
+fn reject_and_reestablishment_messages_decode() {
+    let mut ue = camped();
+    ue.tick(slot(0));
+    ue.connect(vec![0x7e], slot(0));
+    ue.on_dl_ccch(&reject());
+    assert_eq!(ue.state(), RrcState::Idle);
+    let mut ue = secured();
+    ue.tick(slot(0));
+    ue.on_mac(MacNotification::RadioLinkFailure);
+    ue.on_dl_dcch(1, &reestablishment(0));
+    ue.reestablishment_verified(true);
+    assert_eq!(ue.state(), RrcState::Connected);
+}
+
+/// The entity, driven by long pseudo-random sequences of everything the
+/// network, MAC and clock can hand it, never makes a move outside the
+/// transition table, and its timers only run in their states (T300 in
+/// Connecting, T301 in Reestablishing, T310 in Connected).
+#[test]
+fn random_inputs_stay_inside_the_table() {
+    let mut transitions = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 1..=200u64 {
+        let mut ue = camped();
+        let mut rng = seed;
+        let mut now = 0u64;
+        ue.set_k_gnb([7u8; 32]);
+        for step in 0..120 {
+            let before = ue.state();
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            match rng % 17 {
+                0 | 1 => ue.connect(vec![0x7e, 0x00, 0x41], slot(now)),
+                2 => ue.on_mac(MacNotification::RaSucceeded { c_rnti: 0x4601 }),
+                3 => ue.on_dl_ccch(&hex(RRC_SETUP_HEX)),
+                4 => ue.on_dl_ccch(&reject()),
+                5 => ue.on_mac(MacNotification::RaFailed),
+                6 => ue.on_mac(MacNotification::RadioLinkFailure),
+                7 => ue.on_mac(MacNotification::RlcMaxRetx { lcid: 1 }),
+                8 => ue.on_dl_dcch(1, &smc(1, 2, 2)),
+                9 => ue.security_verified(rng & 0x100 != 0),
+                10 => ue.on_dl_dcch(1, &reestablishment(0)),
+                11 => ue.reestablishment_verified(rng & 0x100 != 0),
+                12 => ue.on_dl_dcch(1, &release(0)),
+                13 => ue.on_mac(MacNotification::SyncIndication {
+                    in_sync: rng & 0x100 != 0,
+                }),
+                14 => ue.on_dl_dcch(1, &dl_info_transfer(0, &[0x7e])),
+                // Time: a slot, or far enough for any timer to expire.
+                15 => now += 1,
+                _ => now += ms(3000),
+            }
+            seen.insert(format!("{before:?}->{:?}", ue.state()));
+            let before = ue.state();
+            ue.tick(slot(now));
+            seen.insert(format!("{before:?}->{:?}", ue.state()));
+            ue.take_events();
+            let s = ue.state();
+            let ctx = format!("seed {seed} step {step}: {s:?}");
+            assert_eq!(ue.fsm_stats().violations, 0, "{ctx}");
+            assert!(
+                !ue.t300_running() || s == RrcState::Connecting,
+                "T300 {ctx}"
+            );
+            assert!(
+                !ue.t301_running() || s == RrcState::Reestablishing,
+                "T301 {ctx}"
+            );
+            assert!(!ue.t310_running() || s == RrcState::Connected, "T310 {ctx}");
+        }
+        transitions += ue.fsm_stats().transitions;
+    }
+    assert!(
+        transitions > 2000,
+        "too few transitions exercised: {transitions}"
+    );
+    use ferrite_common::fsm::Machine;
+    for r in ferrite_rrc::machine::RrcMachine::RULES {
+        let pair = format!("{:?}->{:?}", r.from, r.to);
+        assert!(
+            seen.contains(&pair),
+            "never exercised: {pair} ({:?})",
+            r.event
+        );
+    }
+}

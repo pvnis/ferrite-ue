@@ -342,7 +342,17 @@ Practices taken from OsmocomBB (`src/host/layer23`, `src/host/trxcon`,
 callbacks, 5–7k-line files) are not adopted; the crate split and the typed
 FAPI already improve on them.
 
-- [ ] **Explicit state machines with declared transitions** (priority).
+- [~] **Explicit state machines with declared transitions** (priority).
+      2026-11-16: helper `ferrite_common::fsm` done; RRC and MAC RA
+      converted, with a randomised RRC entity test and two Kani proofs on RA
+      (inductive invariant, bounded 6-step), diagrams generated into
+      ARCHITECTURE §13. Writing the RRC table exposed three deliberate
+      deviations, now visible as `ferrite:` rules: an RA problem ends a
+      connection / re-establishment attempt at once (38.331 keeps T300 /
+      T301 running and lets MAC retry), and RRCSetup in response to
+      RRCReestablishmentRequest aborts and reconnects (38.331 §5.3.3.4
+      continues with the setup). Stray RRCRelease / RRCReject outside their
+      states are now ignored (were: go to Idle).
       Today 11 FSMs are enums changed by plain assignment: L1 `CellPhase`,
       `RlmState`; MAC `RaState`, `SrState`, `DrxState`, `TaState`; RRC
       `RrcState` (one `set_state` already); NAS `MmState` (with substates),

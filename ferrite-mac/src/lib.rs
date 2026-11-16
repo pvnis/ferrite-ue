@@ -33,7 +33,7 @@ pub(crate) mod ta;
 pub use drx::{DrxMacConfig, DrxState, ShortDrxMacConfig};
 pub use entity::{MacEntity, MacEvent, MacStats, UpperLayers};
 pub use ferrite_fapi as fapi;
-pub use ra::RaState;
+pub use ra::{RaMachine, RaPhase, RaState, RaTrigger};
 pub use sr::SrState;
 pub use ta::TaState;
 

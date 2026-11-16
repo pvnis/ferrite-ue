@@ -12,3 +12,6 @@ ferrite-security.workspace = true
 [dev-dependencies]
 oxirush-nas = { version = "0.7", features = ["security"] }
 oxirush-security = "0.4"
+
+[lints]
+workspace = true

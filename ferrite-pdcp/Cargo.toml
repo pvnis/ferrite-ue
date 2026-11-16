@@ -8,3 +8,6 @@ license.workspace = true
 ferrite-common.workspace = true
 log.workspace = true
 ferrite-security.workspace = true
+
+[lints]
+workspace = true

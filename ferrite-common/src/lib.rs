@@ -8,6 +8,7 @@
 use num_complex::Complex32;
 
 pub mod band;
+pub mod fsm;
 pub mod slot;
 
 pub use band::{
