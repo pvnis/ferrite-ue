@@ -285,7 +285,7 @@ impl RlmState {
 /// and searches again: long enough (≥ 2.5 s at the 10 ms SSB period) for RRC's
 /// N310 / T310 to declare the radio link failure first with the network's
 /// values (T310 ≤ 2 s).
-const RLM_MAX_MISSED_SSB: u32 = 250;
+pub const RLM_MAX_MISSED_SSB: u32 = 250;
 
 /// Radio link monitoring thresholds (TS 38.133 §8.1.1): Q_out is the SSB SINR
 /// at which the hypothetical PDCCH BLER is 10 %, Q_in where it is 2 %.
