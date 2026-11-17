@@ -112,6 +112,7 @@ fn main() {
         band,
         gscn_hint,
         tx_lead_slots: 2,
+        ul_stream_lead_slots: 0,
         tx_rx_offset: 0,
         prach_offset: 0,
         pacing: UlPacing::Lockstep { pace_us: slot_us },

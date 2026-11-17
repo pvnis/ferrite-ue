@@ -468,6 +468,38 @@ fn attach_flow() {
     let (cs, cuci) = csi_pusch.expect("PUSCH on the CSI occasion");
     assert_eq!(cs, target);
     assert_eq!(cuci.csi1, vec![0, 0, 0, 0]);
+    assert_eq!(mac.stats().grant_late, 0);
+
+    // K2 equal to the tx lead (3): slot s + 3 was assembled at the
+    // SLOT.indication of s, before this DCI; the grant is counted as late and
+    // no PUSCH goes out for it.
+    let late = UlGrant {
+        pusch_slot: s.add(3),
+        harq_id: 3,
+        dai: None,
+        ..ul.clone()
+    };
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::Dci(DciIndication {
+            slot: s,
+            dci: Dci::Ul(late),
+        }),
+    );
+    assert_eq!(mac.stats().grant_late, 1);
+    for _ in 0..4 {
+        s = s.add(1);
+        for m in step(
+            &mut mac,
+            &mut up,
+            PhyToMac::Slot(SlotIndication { slot: s }),
+        ) {
+            if let MacToPhy::UlTti(r) = m {
+                assert!(!r.pdus.iter().any(|p| matches!(p, UlTtiPdu::Pusch { .. })));
+            }
+        }
+    }
     assert_eq!(mac.ra_fsm_stats().violations, 0);
     assert_eq!(mac.fsm_stats().violations, 0);
     assert!(mac.ra_fsm_stats().transitions >= 5);

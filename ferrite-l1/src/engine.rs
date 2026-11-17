@@ -50,6 +50,11 @@ pub struct EngineParams {
     pub gscn_hint: Option<u32>,
     /// How many slots ahead MAC must issue UL_TTI requests.
     pub tx_lead_slots: u16,
+    /// Lead (slots) the served uplink must keep over the delivered downlink
+    /// on a lockstep transport; 0 = no requirement. The caller sizes
+    /// `tx_lead_slots` for it ([`crate::radio::tx_lead_for_ul_stream_lead`]);
+    /// the engine reports when the timing advance outgrows that sizing.
+    pub ul_stream_lead_slots: u16,
     /// Backend TX/RX calibration (samples, positive = transmit earlier).
     pub tx_rx_offset: i64,
     /// PRACH-only timing calibration (samples, positive = earlier).
@@ -909,6 +914,7 @@ impl<'a> Engine<'a> {
         ) as i64;
         let mut rlm: Fsm<RlmMachine> = Fsm::new(RlmState::InSync);
         let mut outbox: Vec<MacToPhy> = Vec::new();
+        let mut lead_short = false;
         loop {
             if self.stopped() {
                 // A final summary: short runs may never reach an SFN 0.
@@ -1153,10 +1159,40 @@ impl<'a> Engine<'a> {
             if self.tx_cmd.try_send(TxCmd::Mark(mark)).is_err() {
                 log::warn!("TX build queue full at slot {slot}: commit mark delayed");
             }
+            self.check_ul_stream_lead(s, slot, &mut lead_short);
 
             slot = slot.add(1);
             let _ = numerology;
         }
+    }
+
+    /// With a required uplink stream lead, report when the timing advance
+    /// (TS 38.211 clause 4.3.1) has grown past what the decision horizon was
+    /// sized for: a lockstep peer then waits for uplink it requested before
+    /// delivering the downlink that would release it.
+    fn check_ul_stream_lead(&self, s: &Synced, slot: SlotPoint, short: &mut bool) {
+        let k = self.params.ul_stream_lead_slots;
+        if k == 0 {
+            return;
+        }
+        let sps = s.clock.samples_per_slot();
+        let advance = s.clock.ta_samples() + s.clock.tx_rx_offset - s.clock.ul_guard;
+        let floor = crate::radio::ul_stream_lead_floor(
+            self.params.tx_lead_slots,
+            sps,
+            self.params.ul_block_len,
+            advance,
+        );
+        let now_short = floor < i64::from(k) * sps;
+        if now_short && !*short {
+            log::warn!(
+                "uplink stream lead at {slot}: {floor} samples < {k} slot(s) with an uplink advance of {advance} samples; a lockstep peer stalls (tx lead {} slots)",
+                self.params.tx_lead_slots
+            );
+        } else if !now_short && *short {
+            log::info!("uplink stream lead at {slot}: {floor} samples, {k} slot(s) met again");
+        }
+        *short = now_short;
     }
 
     /// UL index up to which the uplink is final when every request for slots

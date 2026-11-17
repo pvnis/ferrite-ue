@@ -155,6 +155,21 @@ device's write-to-air latency budget (`--sdr-tx-latency-us`) instead of handing
 it over late. The RX→TX chain latency of a device is `--tx-rx-offset`,
 measured with the `tx_rx_cal` example (loopback burst).
 
+A lockstep peer that pulls uplink block `t` before it delivers downlink block
+`t` (a block-wise channel emulator) needs the commit mark to lead the
+*delivered* downlink by a whole block. The mark leads the *processed*
+downlink by `tx_lead` slots less the uplink advance, the engine processes
+whole slots only (up to a slot of delivered samples waits), and the serve
+hands out whole blocks, so the guaranteed lead is
+`tx_lead·sps − (sps − 1) − advance − (block − 1)`
+(`radio::ul_stream_lead_floor`): below one slot at the default `tx_lead` of
+2 whenever the slot grid lags the block grid. `--ul-stream-lead-slots K`
+raises `tx_lead` to the smallest horizon whose floor is `K` slots, with the
+largest `N_TA,offset` assumed, and the engine warns if the timing advance
+later outgrows it. The horizon must stay below the network's smallest K1/K2:
+the MAC assembles slot `n + tx_lead` before the PDCCH of slot `n` is decoded,
+and counts (`grant_late`) and reports any grant inside the horizon.
+
 ### 4.2b Synchronisation tracking (`track`)
 
 `SyncTracker` owns the CFO estimate and every move of the sample clock's
