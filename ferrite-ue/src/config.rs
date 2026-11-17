@@ -111,6 +111,14 @@ pub struct Cli {
     /// UL slots of margin between MAC decisions and transmission.
     #[arg(long)]
     pub tx_lead: Option<u16>,
+    /// Lockstep transports (ZMQ): keep the uplink the UE can serve at least
+    /// this many slots ahead of the downlink it has received, zeros where
+    /// nothing is scheduled, for a peer (a block-wise channel emulator) that
+    /// pulls uplink block t before it delivers downlink block t. Raises
+    /// `--tx-lead` to the decision horizon this needs, which must stay below
+    /// the network's smallest K1/K2. 0 (default) = no requirement.
+    #[arg(long)]
+    pub ul_stream_lead_slots: Option<u16>,
     /// Radio backend TX/RX timing calibration in samples: how much earlier
     /// than the nominal uplink timing the backend must be fed (positive =
     /// earlier). 0 for the ZMQ lockstep transport.
@@ -197,6 +205,7 @@ pub struct FileConfig {
     pub netns: Option<String>,
     pub timeout: Option<u64>,
     pub tx_lead: Option<u16>,
+    pub ul_stream_lead_slots: Option<u16>,
     pub tx_rx_offset: Option<i64>,
     pub prach_offset: Option<i64>,
     pub rx_power_offset_db: Option<f32>,
@@ -238,6 +247,8 @@ pub struct UeConfig {
     /// Test aid: emulated LO error (ppm) on the ZMQ transport.
     pub emulate_lo_ppm: Option<f64>,
     pub tx_lead: u16,
+    /// Required uplink stream lead over the received downlink (slots).
+    pub ul_stream_lead_slots: u16,
     pub tx_rx_offset: i64,
     pub prach_offset: i64,
     pub rx_power_offset_db: f32,
@@ -372,6 +383,7 @@ impl UeConfig {
             independent_lo: cli.independent_lo,
             emulate_lo_ppm: cli.emulate_lo_ppm,
             tx_lead: pick!(tx_lead, 2),
+            ul_stream_lead_slots: pick!(ul_stream_lead_slots, 0),
             tx_rx_offset: pick!(tx_rx_offset, 0),
             prach_offset: pick!(prach_offset, -(fs * 1e-6).round() as i64),
             rx_power_offset_db: pick!(rx_power_offset_db, 0.0),

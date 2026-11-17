@@ -74,6 +74,7 @@ fn config() -> UeConfig {
         independent_lo: false,
         emulate_lo_ppm: None,
         tx_lead: 2,
+        ul_stream_lead_slots: 0,
         tx_rx_offset: 0,
         prach_offset: 0,
         rx_power_offset_db: 0.0,

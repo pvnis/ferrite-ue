@@ -129,6 +129,9 @@ pub struct MacStats {
     pub pucch_sent: u64,
     pub sr_sent: u64,
     pub ack_late: u64,
+    /// Grants whose PUSCH or HARQ-ACK slot was already built when the DCI
+    /// arrived (K2 or K1 not above the tx lead): never transmitted.
+    pub grant_late: u64,
     pub phr_sent: u64,
     pub srs_sent: u64,
     /// Slots outside DRX Active Time (no C-RNTI PDCCH monitoring).
@@ -797,6 +800,24 @@ impl MacEntity {
         }
     }
 
+    /// The uplink of slot `n + tx_lead` is assembled at the SLOT.indication of
+    /// slot `n`, before the PDCCH of slot `n` is decoded; a DCI received in
+    /// `slot` whose uplink falls at or before `slot + tx_lead` (K1 of TS
+    /// 38.213 clause 9.2.3 or K2 of TS 38.214 clause 6.1.2.1 not above the
+    /// lead) therefore misses its slot. Counted and reported, since the
+    /// network sees a DTX.
+    fn check_grant_horizon(&mut self, slot: SlotPoint, target: SlotPoint, what: &str) {
+        let k = target.diff(&slot);
+        let lead = i64::from(self.cfg.tx_lead_slots);
+        if k <= lead {
+            self.stats.grant_late += 1;
+            log::warn!(
+                "{what} for slot {target} granted at {slot} (K = {k}) is inside the tx lead of {lead} slots: not transmitted ({} late grants)",
+                self.stats.grant_late
+            );
+        }
+    }
+
     fn on_dl_grant(&mut self, slot: SlotPoint, g: DlGrant) {
         if !matches!(g.rnti_kind, RntiKind::C | RntiKind::Tc) {
             return; // SI/RA/P: the PHY decodes; nothing to book.
@@ -812,6 +833,7 @@ impl MacEntity {
             }
         }
         if let Some(ack_slot) = g.ack_slot {
+            self.check_grant_horizon(slot, ack_slot, "HARQ-ACK");
             self.ack_book_common_r = Some(g.r_pucch_common);
             self.ack_book.book(
                 ack_slot,
@@ -868,6 +890,7 @@ impl MacEntity {
             self.ul_harq.store(g.harq_id, g.ndi, g.tbs_bits, tb.clone());
             (tb, inc, trunc)
         };
+        self.check_grant_horizon(slot, g.pusch_slot, "PUSCH");
         let key = g.pusch_slot.index();
         self.pending_pusch.insert(
             key,

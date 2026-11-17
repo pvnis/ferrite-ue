@@ -9,7 +9,7 @@ use ferrite_ue::config::{RadioConfig, UeConfig};
 use ferrite_ue::stack::{Stack, StackEvent};
 
 fn main() {
-    let cfg = match UeConfig::load() {
+    let mut cfg = match UeConfig::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("configuration error: {e}");
@@ -31,6 +31,7 @@ fn main() {
     let block_len = 1920usize;
     let mu = ferrite_common::Numerology::from_scs_khz(cfg.ssb_scs_khz).map_or(1, |n| n.mu);
     let slot_us = 1000.0 / (1u32 << mu) as f64;
+    raise_tx_lead_for_ul_stream(&mut cfg, block_len);
     let (dl, ul) = match open_radio(&cfg, block_len, slot_us) {
         Ok(r) => r,
         Err(e) => {
@@ -47,6 +48,7 @@ fn main() {
         band: cfg.band,
         gscn_hint: cfg.gscn_hint,
         tx_lead_slots: cfg.tx_lead,
+        ul_stream_lead_slots: cfg.ul_stream_lead_slots,
         tx_rx_offset: cfg.tx_rx_offset,
         prach_offset: cfg.prach_offset,
         pacing: ul.pacing,
@@ -287,6 +289,43 @@ fn open_radio(
         RadioConfig::Sdr { .. } => Err(ferrite_common::Error::Config(
             "this binary was built without the `sdr` feature (cargo build --features sdr)".into(),
         )),
+    }
+}
+
+/// Size the decision horizon for `--ul-stream-lead-slots` before the stack
+/// and the engine take it. The uplink advance is not known before SIB1 and
+/// the RAR, so the sizing assumes the largest `N_TA,offset` (39936 T_c,
+/// TS 38.133 Table 7.1.2-2) with `N_TA = 0`; the engine warns if the timing
+/// advance later outgrows it.
+fn raise_tx_lead_for_ul_stream(cfg: &mut UeConfig, block_len: usize) {
+    if cfg.ul_stream_lead_slots == 0 {
+        return;
+    }
+    let sps = ferrite_common::Numerology::from_scs_khz(cfg.ssb_scs_khz)
+        .map_or(1, |n| n.samples_per_slot(cfg.fs)) as i64;
+    // `--prach-offset` is the negated uplink guard (positive = earlier).
+    let advance = ferrite_common::slot::ta::tc_to_samples(39936, cfg.fs)
+        + cfg.tx_rx_offset
+        + cfg.prach_offset;
+    let need = ferrite_l1::radio::tx_lead_for_ul_stream_lead(
+        cfg.ul_stream_lead_slots,
+        sps,
+        block_len,
+        advance,
+    );
+    if need > cfg.tx_lead {
+        log::info!(
+            "uplink stream lead of {} slot(s): tx lead raised from {} to {need} slots (needs K1, K2 > {need})",
+            cfg.ul_stream_lead_slots,
+            cfg.tx_lead
+        );
+        cfg.tx_lead = need;
+    } else {
+        log::info!(
+            "uplink stream lead of {} slot(s) met by the tx lead of {} slots",
+            cfg.ul_stream_lead_slots,
+            cfg.tx_lead
+        );
     }
 }
 

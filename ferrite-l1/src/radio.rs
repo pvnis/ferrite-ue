@@ -298,6 +298,49 @@ impl<S: SampleSink> UlSink for TimedPushUlSink<S> {
     }
 }
 
+/// Worst-case lead, in samples, of the uplink a lockstep transport can be
+/// served over the downlink it has delivered, with the decision horizon at
+/// `tx_lead_slots`.
+///
+/// After DL slot `n` is processed the commit mark is `ul_index(n + tx_lead +
+/// 1)`, so the mark leads the end of the processed downlink by `tx_lead`
+/// slots less `ul_advance`, the uplink advance of TS 38.211 clause 4.3.1
+/// (`(N_TA + N_TA,offset)·T_c` in samples) plus the backend `tx_rx_offset`
+/// minus the uplink guard. Two more terms eat into it: the engine processes
+/// whole slots, so up to `sps − 1` delivered samples belong to a slot it
+/// cannot process yet; and the serve hands out whole blocks, so up to
+/// `block_len − 1` committed samples wait for the next mark. A lockstep peer
+/// that requests uplink block `t` before it delivers downlink block `t` of
+/// `N` samples needs this floor to be at least `N`.
+pub fn ul_stream_lead_floor(
+    tx_lead_slots: u16,
+    sps: i64,
+    block_len: usize,
+    ul_advance: i64,
+) -> i64 {
+    i64::from(tx_lead_slots) * sps - (sps - 1) - ul_advance - (block_len as i64 - 1)
+}
+
+/// The smallest decision horizon (slots) whose [`ul_stream_lead_floor`] is at
+/// least `lead_slots` whole slots.
+///
+/// The MAC builds the uplink of slot `n + tx_lead` at the SLOT.indication of
+/// slot `n`, before the PDCCH of slot `n` is decoded, so a grant whose `K1`
+/// (TS 38.213 clause 9.2.3) or `K2` (TS 38.214 clause 6.1.2.1) is not above
+/// the horizon arrives too late for its slot: the horizon this returns must
+/// stay below the smallest `K1`/`K2` the network schedules with.
+pub fn tx_lead_for_ul_stream_lead(
+    lead_slots: u16,
+    sps: i64,
+    block_len: usize,
+    ul_advance: i64,
+) -> u16 {
+    let sps = sps.max(1);
+    let need = i64::from(lead_slots) * sps + (sps - 1) + ul_advance + (block_len as i64 - 1);
+    let slots = (need.max(0) + sps - 1) / sps;
+    u16::try_from(slots).unwrap_or(u16::MAX)
+}
+
 /// Shared state between the engine and the UL serve thread.
 pub struct UlShared {
     /// UL index the serve thread has reached (behind the engine).
@@ -512,5 +555,213 @@ mod tests {
         assert_eq!(counter, 1_070);
         assert_eq!((sink.late, sink.skipped), (1, 170));
         assert_eq!(sink.sink.writes.len(), 1);
+    }
+
+    // ---- Lockstep uplink lead (a channel emulator that pulls uplink block t
+    // before it delivers downlink block t).
+
+    use crate::rt::ReadyWaveform;
+    use crate::timing::SampleClock;
+    use ferrite_common::{Numerology, SlotPoint};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// 3.84 Msps at 30 kHz: 1920 samples per slot, served in blocks of 320.
+    const FS: f64 = 3.84e6;
+    const SPS: i64 = 1920;
+    const BLOCK: usize = 320;
+    const NUM: Numerology = Numerology::KHZ30;
+
+    /// A clock whose slot boundaries lag the stream origin by `dl_delay`
+    /// samples (the propagation delay of the emulated channel), with the
+    /// default `N_TA,offset` and an uplink guard.
+    fn clock(dl_delay: i64, n_ta_tc: i64, guard: i64) -> SampleClock {
+        let mut c = SampleClock::new(FS, NUM, SlotPoint::new(NUM, 0, 0), dl_delay);
+        c.n_ta_tc = n_ta_tc;
+        c.ul_guard = guard;
+        c
+    }
+
+    fn advance(c: &SampleClock) -> i64 {
+        c.ta_samples() + c.tx_rx_offset - c.ul_guard
+    }
+
+    /// Served lead over the delivered downlink, with the commit mark and the
+    /// whole-block gate as the engine and the serve thread apply them.
+    fn served_lead(c: &SampleClock, lead: u16, received: i64) -> i64 {
+        // Every whole slot delivered is processed; the one holding the
+        // sample at `received` is not.
+        let (open, _) = c.slot_at(received);
+        let committed = c.ul_index(open.add(u64::from(lead)));
+        committed.div_euclid(BLOCK as i64) * BLOCK as i64 - received
+    }
+
+    /// The floor is the minimum of the served lead over every phase of the
+    /// slot grid against the block grid, and some phase reaches it.
+    #[test]
+    fn lead_floor_is_the_minimum_over_every_phase() {
+        for lead in 1..=4u16 {
+            let mut reached = false;
+            for dl_delay in 0..SPS {
+                let c = clock(dl_delay, 64 * 16, 4);
+                let floor = ul_stream_lead_floor(lead, SPS, BLOCK, advance(&c));
+                // The block phase of the mark repeats every BLOCK of delay;
+                // within it, every delivered sample of one slot.
+                let step = if dl_delay < BLOCK as i64 {
+                    1
+                } else {
+                    BLOCK / 4
+                };
+                for received in (SPS * 4..SPS * 5).step_by(step) {
+                    let l = served_lead(&c, lead, received);
+                    assert!(l >= floor, "lead {lead} delay {dl_delay}: {l} < {floor}");
+                    reached |= l == floor;
+                }
+            }
+            assert!(reached, "lead {lead}: floor never reached");
+        }
+    }
+
+    #[test]
+    fn horizon_for_a_stream_lead() {
+        // 23.04 Msps at 30 kHz, ZMQ blocks of 1920, N_TA,offset = 39936 T_c.
+        let adv = ferrite_common::slot::ta::tc_to_samples(39936, 23.04e6);
+        assert_eq!(tx_lead_for_ul_stream_lead(0, 11520, 1920, adv), 2);
+        assert_eq!(tx_lead_for_ul_stream_lead(1, 11520, 1920, adv), 3);
+        assert_eq!(tx_lead_for_ul_stream_lead(2, 11520, 1920, adv), 4);
+        for k in 0..4u16 {
+            let l = tx_lead_for_ul_stream_lead(k, SPS, BLOCK, 60);
+            assert!(ul_stream_lead_floor(l, SPS, BLOCK, 60) >= i64::from(k) * SPS);
+            assert!(ul_stream_lead_floor(l - 1, SPS, BLOCK, 60) < i64::from(k) * SPS);
+        }
+    }
+
+    /// Stands in for the emulator's REQ client: answers every serve at once
+    /// and records the served stream.
+    struct Recorded(Arc<Mutex<Vec<Iq>>>);
+    impl UlSink for Recorded {
+        fn serve_block(
+            &mut self,
+            counter: &mut u64,
+            block: &mut [Iq],
+            fill: &mut dyn FnMut(u64, &mut [Iq]),
+        ) -> Result<bool> {
+            fill(*counter, block);
+            self.0.lock().unwrap().extend_from_slice(block);
+            *counter += block.len() as u64;
+            Ok(true)
+        }
+    }
+
+    /// Outcome of a lockstep run.
+    struct Run {
+        /// Block whose uplink request the UE could not answer.
+        stalled_at: Option<i64>,
+        stream: Vec<Iq>,
+        /// UL index of the burst.
+        burst_at: i64,
+        late: bool,
+    }
+
+    const BURST: [Iq; 3] = [Iq::new(1.0, 0.0), Iq::new(0.0, 1.0), Iq::new(-1.0, 0.0)];
+
+    /// Drive the real serve thread against an emulated lockstep peer with
+    /// downlink blocks of one slot: for each block `t` the peer first waits
+    /// for uplink block `t`, then delivers downlink block `t`, upon which the
+    /// test plays the engine: every slot now whole is processed, the MAC
+    /// builds slot `n + lead` (one burst, in slot 6 + lead), and the commit
+    /// mark moves to `ul_index(n + lead + 1)`. The bounded wait for a block
+    /// stands in for the peer's request timeout; the outcome does not depend
+    /// on thread timing.
+    fn lockstep(lead: u16, c: &SampleClock, blocks: i64) -> Run {
+        let stream = Arc::new(Mutex::new(Vec::new()));
+        let shared = UlShared::new(0);
+        let mut open = SlotPoint::new(NUM, 0, 0);
+        let lead64 = u64::from(lead);
+        shared
+            .committed
+            .store(c.ul_index(open.add(lead64)), Relaxed);
+        shared.gate.store(true, Relaxed);
+        let server = UlServer {
+            sink: Box::new(Recorded(stream.clone())),
+            pacing: UlPacing::FreeRunning,
+            tx_rx_offset: 0,
+            block_len: BLOCK,
+            start_index: 0,
+        };
+        let th = {
+            let shared = shared.clone();
+            std::thread::spawn(move || serve_uplink(server, shared, SPS, FS))
+        };
+        let burst_slot = SlotPoint::new(NUM, 0, 6).add(lead64);
+        let burst_at = c.ul_index(burst_slot) + 100;
+        let mut late = false;
+        let mut stalled_at = None;
+        'blocks: for t in 0..blocks {
+            let t0 = std::time::Instant::now();
+            while shared.served.load(Relaxed) < (t + 1) * SPS {
+                if t0.elapsed() > std::time::Duration::from_millis(300) {
+                    stalled_at = Some(t);
+                    break 'blocks;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            let received = (t + 1) * SPS;
+            while c.dl_index(open.add(1)) <= received {
+                if open.add(lead64) == burst_slot {
+                    let now = shared.served.load(Relaxed);
+                    late |= burst_at < now;
+                    let wf = ReadyWaveform {
+                        pos: burst_at,
+                        samples: BURST.to_vec(),
+                        tag: "test",
+                    };
+                    shared.table.lock().unwrap().push(wf, now);
+                }
+                open = open.add(1);
+                shared
+                    .committed
+                    .store(c.ul_index(open.add(lead64)), Relaxed);
+            }
+        }
+        shared.stop.store(true, Relaxed);
+        th.join().unwrap();
+        let stream = stream.lock().unwrap().clone();
+        Run {
+            stalled_at,
+            stream,
+            burst_at,
+            late,
+        }
+    }
+
+    /// With the horizon a one-slot stream lead asks for, a one-slot lockstep
+    /// block is always answered from what is delivered, and the uplink still
+    /// lands at its TS 38.211 clause 4.3.1 position with zeros around it.
+    #[test]
+    fn one_slot_blocks_run_with_a_one_slot_stream_lead() {
+        for dl_delay in [0, 7, 500, SPS - 1] {
+            let c = clock(dl_delay, 64 * 16, 4);
+            let lead = tx_lead_for_ul_stream_lead(1, SPS, BLOCK, advance(&c));
+            assert_eq!(lead, 3);
+            let r = lockstep(lead, &c, 16);
+            assert_eq!(r.stalled_at, None, "delay {dl_delay}");
+            assert!(!r.late);
+            assert!(r.stream.len() >= 16 * SPS as usize);
+            let at = r.burst_at as usize;
+            assert_eq!(&r.stream[at..at + BURST.len()], &BURST);
+            let nonzero = r.stream.iter().filter(|s| **s != Iq::default()).count();
+            assert_eq!(nonzero, BURST.len());
+        }
+    }
+
+    /// The default horizon of 2 slots leaves less than a slot of lead once
+    /// the slot grid lags the block grid: the peer's request for the next
+    /// block cannot be answered until it delivers that very block.
+    #[test]
+    fn one_slot_blocks_stall_at_the_default_horizon() {
+        let c = clock(7, 64 * 16, 4);
+        assert!(ul_stream_lead_floor(2, SPS, BLOCK, advance(&c)) < SPS);
+        let r = lockstep(2, &c, 16);
+        assert!(r.stalled_at.is_some());
     }
 }

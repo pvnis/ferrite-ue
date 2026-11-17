@@ -104,6 +104,7 @@ All options can also come from a TOML file (`--config`; flags override it).
 | `--timeout`, `--exit-after-ping` | run forever | Stop conditions |
 | `--sdr-args`, `--sdr-rx-gain`, `--sdr-tx-gain`, `--sdr-*-antenna` | – | SoapySDR device and gains |
 | `--rx-power-offset-db`, `--tx-power-offset-db` | 0 / unset | dBm calibration of the radio (enables uplink power control) |
+| `--tx-lead`, `--ul-stream-lead-slots` | `2`, `0` | MAC decision horizon (slots); uplink lead over the received downlink a block-wise lockstep peer needs (raises `--tx-lead`, which must stay below the gNB's smallest K1/K2) |
 | `--independent-lo` | off | The radio's LO is not locked to its sample clock (don't predict timing drift from the CFO) |
 | `--emulate-lo-ppm`, `--rlf-at-s`, `--rlm-outage-s`, `--t3512-s` | off | Test aids (oscillator error, radio link failure, RLM outage, periodic registration) |
 | `--log` | `info` | Log level (`RUST_LOG`-style filters also work) |
