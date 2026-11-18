@@ -33,6 +33,7 @@ Every configuration below attaches and pings against OCUDU over ZMQ
 | T3 | n78 | TDD 30 kHz | 20 MHz | 5 ms | wide BWP, DFT-s-OFDM uplink |
 | T4 | n78 | TDD 30 kHz | 10 MHz | 5 ms | connected-mode DRX |
 | T5 | n78 | TDD 30 kHz | 10 MHz | 5 ms | 2x2 downlink MIMO, two layers, RI/PMI reporting |
+| T8 | n78 | TDD 30 kHz | 10 MHz | 5 ms | **4 gNB antennas** into the UE's 2: 4-port CSI-RS, Type I single-panel codebook (N1,N2 = 2,1), ranks 1–4 allowed (through the channel emulator) |
 | T6 | n78 | TDD 30 kHz | 10 MHz | 5 ms: DDSUUUUUUU | uplink-heavy |
 | T7 | n78 | TDD 30 kHz | 10 MHz | 5 ms: DDDDDDDDSU | downlink-heavy, multi-bit HARQ-ACK |
 | C1 | **n48 (US CBRS)** | TDD 30 kHz | 10 MHz at 3600 MHz | 5 ms: DDDDDDDSUU | UL symbols in the special slot |
@@ -179,7 +180,7 @@ See `docs/ARCHITECTURE.md` for the layer contracts and state machines and
 ## Roadmap
 
 - **Done (ZMQ):** SA attach and data plane; TDD patterns incl. `pattern2`,
-  FDD, 10 / 20 MHz; 2x2 DL MIMO with RI/PMI; DRX, BWP switching, RLF and
+  FDD, 10 / 20 MHz; 2x2 DL MIMO with RI/PMI (2- and 4-port CSI-RS); DRX, BWP switching, RLF and
   re-establishment, paging and service request, periodic registration;
   UCI on PUSCH (HARQ-ACK up to 11 bits, CSI part 1); fine timing / CFO
   tracking with UL frequency pre-compensation; uplink power control and

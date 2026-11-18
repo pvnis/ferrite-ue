@@ -551,8 +551,9 @@ pub struct CsiReportConfig {
     pub cqi_table: u8,
     /// `reportQuantity`.
     pub quantity: CsiReportQuantity,
-    /// CSI-RS antenna ports of the PMI codebook (1 without a `codebookConfig`).
-    pub nof_ports: u8,
+    /// The PMI codebook (its CSI-RS ports and Type I single-panel shape);
+    /// `OnePort` without a `codebookConfig`.
+    pub codebook: ferrite_ran::codebook::Codebook,
     /// `typeI-SinglePanel-ri-Restriction` (TS 38.214 §5.2.2.2.1: bit `i`,
     /// r0 = LSB, allows rank `i + 1`); `0x01` without a codebook.
     pub ri_restriction: u8,
@@ -793,7 +794,7 @@ mod tests {
             pucch_resource: 0,
             cqi_table: 0,
             quantity: CsiReportQuantity::RiPmiCqi,
-            nof_ports: 2,
+            codebook: ferrite_ran::codebook::Codebook::TwoPort,
             ri_restriction: r,
         };
         assert_eq!(c(0b0000_0011).allowed_ranks(), vec![1, 2]);

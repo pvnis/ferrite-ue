@@ -107,7 +107,7 @@ pub struct MacEntity {
     latest_csi: Option<(CsiValues, SlotPoint)>,
     /// Rank and PMI from the latest multi-port CSI-RS measurement; a
     /// single-port (TRS) measurement updates the CQI but keeps these.
-    csi_rank: Option<(u8, u8)>,
+    csi_rank: Option<(u8, Pmi)>,
     /// Pending C-RNTI MAC CE for the next UL PDU (C-RNTI-based RA).
     crnti_ce_pending: bool,
     events: Vec<MacEvent>,
@@ -567,7 +567,7 @@ impl MacEntity {
                 CsiValues {
                     cqi: 0,
                     ri: 1,
-                    pmi: 0,
+                    pmi: Pmi::default(),
                 },
                 |(v, _)| v,
             );
@@ -1109,11 +1109,11 @@ impl MacEntity {
 /// Fold a CSI indication into the report values: a multi-port measurement
 /// sets the rank / PMI (remembered in `rank`), a single-port one carries the
 /// CQI only and keeps the last multi-port rank / PMI (rank 1 if none yet).
-fn merge_csi(rank: &mut Option<(u8, u8)>, c: &CsiIndication) -> CsiValues {
+fn merge_csi(rank: &mut Option<(u8, Pmi)>, c: &CsiIndication) -> CsiValues {
     if c.nof_ports >= 2 {
         *rank = Some((c.ri.max(1), c.pmi));
     }
-    let (ri, pmi) = rank.unwrap_or((1, 0));
+    let (ri, pmi) = rank.unwrap_or((1, Pmi::default()));
     CsiValues {
         cqi: c.cqi,
         ri,
@@ -1127,24 +1127,13 @@ pub struct CsiValues {
     pub cqi: u8,
     /// Rank indicator, 1-based.
     pub ri: u8,
-    /// Type I single-panel PMI (`i2`).
-    pub pmi: u8,
+    /// Type I single-panel PMI.
+    pub pmi: Pmi,
 }
 
 fn push_bits(out: &mut Vec<u8>, v: u32, n: usize) {
     for i in (0..n).rev() {
         out.push(((v >> i) & 1) as u8);
-    }
-}
-
-/// PMI field width of the Type I single-panel codebook (TS 38.212 Table
-/// 6.3.1.1.2-2 for two ports: `i2` only, 2 bits at rank 1, 1 bit at rank 2;
-/// nothing for one port). Codebooks with more ports are not reported yet.
-fn pmi_bits(nof_ports: u8, rank: u8) -> usize {
-    match (nof_ports, rank) {
-        (2, 1) => 2,
-        (2, _) => 1,
-        _ => 0,
     }
 }
 
@@ -1157,6 +1146,7 @@ fn csi_report_bits(cfg: &crate::CsiReportMacConfig, v: CsiValues) -> Vec<u8> {
     use ferrite_fapi::config::CsiReportQuantity as Q;
     let mut out = Vec::new();
     let ranks = &cfg.allowed_ranks;
+    let cb = cfg.codebook;
     let with_ri = matches!(cfg.quantity, Q::RiCqi | Q::RiPmiCqi) && ranks.len() > 1;
     let with_pmi = cfg.quantity == Q::RiPmiCqi;
     let ri = if ranks.contains(&v.ri) {
@@ -1165,19 +1155,23 @@ fn csi_report_bits(cfg: &crate::CsiReportMacConfig, v: CsiValues) -> Vec<u8> {
         ranks[0]
     };
     if with_ri {
-        let bits = (usize::BITS - (ranks.len() - 1).leading_zeros()) as usize;
         let idx = ranks.iter().position(|&r| r == ri).unwrap_or(0) as u32;
-        push_bits(&mut out, idx, bits);
+        push_bits(&mut out, idx, cb.ri_bits(ranks.len()));
     }
     if with_pmi {
+        // TS 38.212 Table 6.3.1.1.2-1 fields i1,1 | i1,2 | i1,3 | i2, padded
+        // in front to the widest PMI of the allowed ranks.
         let widest = ranks
             .iter()
-            .map(|&r| pmi_bits(cfg.nof_ports, r))
+            .map(|&r| cb.pmi_sizes(r).total())
             .max()
             .unwrap_or(0);
-        let mine = pmi_bits(cfg.nof_ports, ri);
-        push_bits(&mut out, 0, widest - mine);
-        push_bits(&mut out, u32::from(v.pmi), mine);
+        let s = cb.pmi_sizes(ri);
+        push_bits(&mut out, 0, widest - s.total());
+        push_bits(&mut out, u32::from(v.pmi.i11), s.i11);
+        push_bits(&mut out, u32::from(v.pmi.i12), s.i12);
+        push_bits(&mut out, u32::from(v.pmi.i13), s.i13);
+        push_bits(&mut out, u32::from(v.pmi.i2), s.i2);
     }
     push_bits(&mut out, u32::from(v.cqi & 0xf), 4);
     out
@@ -1221,6 +1215,14 @@ mod csi_report_tests {
     use super::*;
     use ferrite_fapi::config::CsiReportQuantity as Q;
 
+    /// A two-port PMI (`i2` only).
+    fn p(i2: u8) -> Pmi {
+        Pmi {
+            i2,
+            ..Pmi::default()
+        }
+    }
+
     /// A single-port TRS measurement after a two-port one keeps the rank and
     /// PMI the two-port measurement recommended, and only refreshes the CQI.
     #[test]
@@ -1235,14 +1237,14 @@ mod csi_report_tests {
             rsrp_dbfs: -20.0,
         };
         let mut rank = None;
-        let v = merge_csi(&mut rank, &ind(12, 1, 0, 1));
-        assert_eq!((v.cqi, v.ri, v.pmi), (12, 1, 0));
-        let v = merge_csi(&mut rank, &ind(15, 2, 1, 2));
-        assert_eq!((v.cqi, v.ri, v.pmi), (15, 2, 1));
-        let v = merge_csi(&mut rank, &ind(13, 1, 0, 1));
-        assert_eq!((v.cqi, v.ri, v.pmi), (13, 2, 1));
-        let v = merge_csi(&mut rank, &ind(14, 1, 3, 2));
-        assert_eq!((v.cqi, v.ri, v.pmi), (14, 1, 3));
+        let v = merge_csi(&mut rank, &ind(12, 1, p(0), 1));
+        assert_eq!((v.cqi, v.ri, v.pmi), (12, 1, p(0)));
+        let v = merge_csi(&mut rank, &ind(15, 2, p(1), 2));
+        assert_eq!((v.cqi, v.ri, v.pmi), (15, 2, p(1)));
+        let v = merge_csi(&mut rank, &ind(13, 1, p(0), 1));
+        assert_eq!((v.cqi, v.ri, v.pmi), (13, 2, p(1)));
+        let v = merge_csi(&mut rank, &ind(14, 1, p(3), 2));
+        assert_eq!((v.cqi, v.ri, v.pmi), (14, 1, p(3)));
     }
 
     fn cfg(q: Q, ports: u8, ranks: &[u8]) -> crate::CsiReportMacConfig {
@@ -1251,7 +1253,14 @@ mod csi_report_tests {
             offset_slots: 0,
             pucch_resource: 8,
             quantity: q,
-            nof_ports: ports,
+            codebook: match ports {
+                1 => Codebook::OnePort,
+                2 => Codebook::TwoPort,
+                _ => Codebook::SinglePanel {
+                    n1: ports / 2,
+                    n2: 1,
+                },
+            },
             allowed_ranks: ranks.to_vec(),
         }
     }
@@ -1263,7 +1272,7 @@ mod csi_report_tests {
             CsiValues {
                 cqi: 9,
                 ri: 1,
-                pmi: 0,
+                pmi: p(0),
             },
         );
         assert_eq!(b, vec![1, 0, 0, 1]);
@@ -1273,7 +1282,7 @@ mod csi_report_tests {
                 CsiValues {
                     cqi: 15,
                     ri: 2,
-                    pmi: 1
+                    pmi: p(1)
                 }
             ),
             vec![1, 1, 1, 1]
@@ -1288,7 +1297,7 @@ mod csi_report_tests {
             CsiValues {
                 cqi: 8,
                 ri: 1,
-                pmi: 3,
+                pmi: p(3),
             },
         );
         assert_eq!(b, vec![0, 1, 1, 1, 0, 0, 0]);
@@ -1298,7 +1307,7 @@ mod csi_report_tests {
             CsiValues {
                 cqi: 8,
                 ri: 2,
-                pmi: 1,
+                pmi: p(1),
             },
         );
         assert_eq!(b, vec![1, 0, 1, 1, 0, 0, 0]);
@@ -1308,7 +1317,7 @@ mod csi_report_tests {
             CsiValues {
                 cqi: 8,
                 ri: 2,
-                pmi: 1,
+                pmi: p(1),
             },
         );
         assert_eq!(
@@ -1323,10 +1332,55 @@ mod csi_report_tests {
                 CsiValues {
                     cqi: 1,
                     ri: 2,
-                    pmi: 0
+                    pmi: p(0)
                 }
             ),
             vec![1, 0, 0, 0, 1]
+        );
+    }
+
+    /// Four ports (N1 = 2, N2 = 1) with every rank allowed (OCUDU's 4T
+    /// default): RI 2 bits, then the PMI padded to the widest (5 bits at
+    /// rank 1 and 2, 4 at ranks 3 / 4), then the CQI — 11 bits whatever the
+    /// rank, as the gNB sizes the report.
+    #[test]
+    fn four_port_report_layout() {
+        let c = cfg(Q::RiPmiCqi, 4, &[1, 2, 3, 4]);
+        let v = |ri, pmi| CsiValues { cqi: 9, ri, pmi };
+        // Rank 1: RI 00, i1,1 = 5 (101), i2 = 2 (10), CQI 1001.
+        let b = csi_report_bits(
+            &c,
+            v(
+                1,
+                Pmi {
+                    i11: 5,
+                    i2: 2,
+                    ..Pmi::default()
+                },
+            ),
+        );
+        assert_eq!(b, vec![0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1]);
+        // Rank 2: RI 01, i1,1 = 3 (011), i1,3 = 1, i2 = 1.
+        let b = csi_report_bits(
+            &c,
+            v(
+                2,
+                Pmi {
+                    i11: 3,
+                    i13: 1,
+                    i2: 1,
+                    ..Pmi::default()
+                },
+            ),
+        );
+        assert_eq!(b, vec![0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1]);
+        // Rank 3: RI 10, one padding bit, i1,1 = 0 (000), i2 = 0.
+        let b = csi_report_bits(&c, v(3, Pmi::default()));
+        assert_eq!(b, vec![1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]);
+        // Ranks 1–2 only (a gNB configured for two layers): RI 1 bit.
+        assert_eq!(
+            csi_report_bits(&cfg(Q::RiPmiCqi, 4, &[1, 2]), v(1, Pmi::default())).len(),
+            10
         );
     }
 }

@@ -32,6 +32,10 @@
 
 pub mod config;
 
+/// The PMI codebook description and value carried in CONFIG.request and
+/// CSI.indication.
+pub use ferrite_ran::codebook::{Codebook, Pmi};
+
 use ferrite_common::{Rnti, RntiKind, SlotPoint};
 
 /// Modulation order and target code rate of a transport block.
@@ -208,10 +212,10 @@ pub struct CsiIndication {
     pub slot: SlotPoint,
     pub sinr_db: f32,
     pub cqi: u8,
-    /// Rank indicator (1-based) and the Type I single-panel PMI (`i2`) the
-    /// PHY recommends; 1 / 0 from a single-port measurement.
+    /// Rank indicator (1-based) and the Type I single-panel PMI the PHY
+    /// recommends; rank 1 / PMI 0 from a single-port measurement.
     pub ri: u8,
-    pub pmi: u8,
+    pub pmi: ferrite_ran::codebook::Pmi,
     /// Number of CSI-RS ports measured: only a multi-port measurement
     /// carries a rank / PMI recommendation, a single-port one only the CQI.
     pub nof_ports: u8,

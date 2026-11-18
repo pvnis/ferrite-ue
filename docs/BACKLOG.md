@@ -12,33 +12,40 @@ transport (see `ARCHITECTURE.md`, radio backend section).
 
 ## Top priority
 
-- [ ] **4-port CSI** (a gNB with four DL antenna ports, e.g. 4T4R over the
-      air). Today `pmi_bits` (`ferrite-mac/src/entity.rs`) knows one and two
-      ports only and gives 0 PMI bits otherwise, and the PHY measures the
-      two-port row 3 and the single-port TRS only (a 4-port resource is
-      rate-matched around, not measured). A gNB that configures a 4-port
-      NZP-CSI-RS (Type I single panel, N1 = 2, N2 = 1) would get CSI
-      reports shorter than it expects: on PUCCH the CSI shares one coded
-      payload with HARQ-ACK and SR, so those are lost too; on PUSCH the CSI
-      part 1 size changes the UCI RE count and corrupts the UL-SCH. PDSCH
-      itself is unaffected (DM-RS ports follow the layers, at most two with
-      two receive antennas). In order:
-      1. Correctly sized reports for any configured port count (TS 38.212
-         Table 6.3.1.1.2-1: i1,1 / i1,2 / i1,3 / i2 per rank and codebook
-         mode, RI under the `ri-Restriction`), with default values where
-         nothing is measured. On its own this keeps HARQ-ACK and the UL-SCH
-         intact on a 4T cell.
-      2. 4-port measurement: the CSI-RS rows OCUDU configures for four
-         ports (Table 7.4.1.5.3-1 rows 4 / 5), channel per port pair, Type I
-         single-panel codebook search (TS 38.214 §5.2.2.2.1, O1 = 4) for
-         ranks 1 and 2, CQI at the chosen rank.
-      3. UE capability that says what the UE does: `featureSets` with
-         `codebookParameters` (type I single panel, maximum ports per
-         resource) and `maxNumberMIMO-LayersPDSCH` = 2, so a gNB that
-         honours capabilities configures within them. Check what OCUDU
-         does with the port count (antennas vs capability).
-      4. A 4-antenna lab cell (T5 with `nof_antennas_dl: 4`, four ZMQ ports
-         through the emulator to the UE's two) and a stage like S28.
+- [~] **4-port CSI** (a gNB with four DL antenna ports, e.g. 4T4R over the
+      air). OCUDU sets the CSI-RS port count from the cell's antennas
+      (`csi_params.nof_ports = dl_carrier.nof_ant`), not from the UE, so a
+      4T cell configures a 4-port NZP-CSI-RS (row 4), the Type I
+      single-panel codebook N1,N2 = 2,1 (mode 1) and an ri-Restriction of
+      `max_rank` (or all four ranks) for every UE.
+      1. [x] 2026-11-18 Report sizes for any Type I single-panel codebook
+         (`ferrite_ran::codebook`: TS 38.212 Table 6.3.1.1.2-1 widths, the
+         RI field, rank-2 offsets), checked against OCUDU's
+         `get_pmi_sizes_typeI_single_panel`; MAC packs `i1,1 | i1,2 | i1,3 |
+         i2` padded to the widest allowed rank. Before, a 4-port report was
+         5 bits short: on PUCCH it shares one coded payload with HARQ-ACK
+         and SR, so those would have been lost too.
+      2. [x] 2026-11-18 4-port measurement: row 4 (two FD-CDM2 groups),
+         channel per antenna and port, codebook search over every PMI of
+         ranks 1–2 (`csi::type1_precoder`, `pmi_hypotheses`; the beam
+         construction is OCUDU's / TS 38.214 Table 5.2.2.2.1-5/-6).
+      3. [ ] UE capability that says what the UE does (`featureSets` with
+         `maxNumberMIMO-LayersPDSCH` = 2 and the CSI-RS port limits, which
+         the band combinations must reference: `featureSetCombinations`,
+         `supportedBandCombinationList`). Not needed for OCUDU, which reads
+         the capability only for uplink MIMO and the Type II codebook;
+         worth doing for a gNB that honours it. A sizeable UPER job; check
+         the result with Wireshark (S31).
+      4. [x] 2026-11-18 Lab cell T8 (4 TX ports through ferrite-chanem to
+         the UE's two; `lab.sh T8`): S28 passes, the gNB decodes the 11-bit
+         reports (RI 2, i1,1 = 4, i1,3 = 1, i2 = 1, CQI 15 on the unfaded
+         link) and schedules two-layer PDSCHs, 116/0 DL TBs. On the way:
+         the emulator requested upstream ports one after another and
+         blocked on a port the gNB had nothing for yet, while it held the
+         other ports' samples for the same span — with four ports that
+         deadlocked (UE starved, no uplink, no new downlink). Every port
+         now keeps a request outstanding and replies are taken as they
+         come (`zmq::poll`).
 
 ## PHY / L1
 

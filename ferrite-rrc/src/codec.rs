@@ -873,7 +873,25 @@ pub fn apply_cell_group_bwp(
                         acsi::CsiReportQuantity::CriRiCqi => CsiReportQuantity::RiCqi,
                         _ => CsiReportQuantity::Cqi,
                     },
-                    nof_ports: rc.codebook_config.as_ref().map_or(1, |c| c.nof_ports()),
+                    codebook: rc.codebook_config.as_ref().map_or(
+                        ferrite_ran::codebook::Codebook::OnePort,
+                        |c| {
+                            if c.codebook_mode != 1 {
+                                log::warn!(
+                                    "codebookMode {}: CSI reports are sized for mode 1",
+                                    c.codebook_mode
+                                );
+                            }
+                            match c.ports {
+                                acsi::CodebookPorts::Two { .. } => {
+                                    ferrite_ran::codebook::Codebook::TwoPort
+                                }
+                                acsi::CodebookPorts::MoreThanTwo { n1, n2, .. } => {
+                                    ferrite_ran::codebook::Codebook::SinglePanel { n1, n2 }
+                                }
+                            }
+                        },
+                    ),
                     ri_restriction: rc
                         .codebook_config
                         .as_ref()
@@ -1235,7 +1253,7 @@ pub fn apply_cell_group_bwp(
             offset_slots: r.offset_slots,
             pucch_resource: r.pucch_resource,
             quantity: r.quantity,
-            nof_ports: r.nof_ports,
+            codebook: r.codebook,
             allowed_ranks: r.allowed_ranks(),
         })
         .collect();

@@ -153,7 +153,7 @@ pub struct CsiReportMacConfig {
     /// What the report carries and the codebook it refers to (TS 38.212
     /// Table 6.3.1.1.2-7 sizes the PUCCH payload from these).
     pub quantity: ferrite_fapi::config::CsiReportQuantity,
-    pub nof_ports: u8,
+    pub codebook: ferrite_ran::codebook::Codebook,
     pub allowed_ranks: Vec<u8>,
 }
 

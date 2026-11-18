@@ -459,7 +459,7 @@ fn attach_flow() {
         offset_slots: (target.index() % 40) as u16,
         pucch_resource: 8,
         quantity: ferrite_fapi::config::CsiReportQuantity::Cqi,
-        nof_ports: 1,
+        codebook: ferrite_ran::codebook::Codebook::OnePort,
         allowed_ranks: vec![1],
     }];
     mac.reconfigure(c);

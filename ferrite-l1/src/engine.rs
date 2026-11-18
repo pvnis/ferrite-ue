@@ -448,7 +448,7 @@ pub fn run(
                                 if grids.len() == samples.len() {
                                     if let Some(c) = w.measure_csi(slot, &grids) {
                                         log::debug!(
-                                            "CSI {}: sinr {:.1} dB cqi {} ri {} pmi {} ({} rx antennas)",
+                                            "CSI {}: sinr {:.1} dB cqi {} ri {} pmi {:?} ({} rx antennas)",
                                             slot,
                                             c.sinr_db,
                                             c.cqi,
@@ -1387,11 +1387,32 @@ fn csi_rs_row(r: &CsiRsResource) -> Option<csi::CsiRsRow> {
 }
 
 /// Whether the UE measures this resource: the single-port TRS (CQI) and
-/// every two-port NZP resource (rank, PMI and CQI).
+/// every two- or four-port NZP resource (rows 3 / 4: rank, PMI and CQI).
 fn csi_rs_measured(r: &CsiRsResource) -> Option<csi::CsiRsRow> {
     let row = csi_rs_row(r)?;
-    (!r.zero_power && ((r.trs && row == csi::CsiRsRow::Row1) || row == csi::CsiRsRow::Row3))
+    let multi_port =
+        matches!(row, csi::CsiRsRow::Row3) || (row == csi::CsiRsRow::Row4 && r.nof_ports == 4);
+    (!r.zero_power && ((r.trs && row == csi::CsiRsRow::Row1) || (!r.trs && multi_port)))
         .then_some(row)
+}
+
+/// The codebook and highest allowed rank a multi-port resource is measured
+/// against: the CSI report whose codebook has the resource's port count
+/// (two ports: the two-port codebook; four: N1 = 2, N2 = 1, OCUDU's), rank 2
+/// at most (two receive antennas).
+fn csi_codebook(cfg: &PhyConfig, nof_ports: u8) -> (Codebook, u8) {
+    let default = match nof_ports {
+        2 => Codebook::TwoPort,
+        4 => Codebook::SinglePanel { n1: 2, n2: 1 },
+        _ => Codebook::OnePort,
+    };
+    cfg.csi_reports
+        .iter()
+        .find(|c| c.codebook.nof_ports() == nof_ports)
+        .map_or((default, 2), |c| {
+            let max = c.allowed_ranks().into_iter().max().unwrap_or(1);
+            (c.codebook, max.min(2))
+        })
 }
 
 fn worker_config(
@@ -1436,6 +1457,7 @@ fn worker_config(
                 },
                 r.period_slots as u32,
                 r.offset_slots as u32,
+                csi_codebook(cfg, r.nof_ports),
             ));
         }
     }

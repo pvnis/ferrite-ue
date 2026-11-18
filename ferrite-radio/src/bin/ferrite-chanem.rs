@@ -107,7 +107,7 @@ fn parse() -> Result<Args, String> {
 }
 
 /// The two directions' channel configurations.
-fn links(a: &Args, n_dl: usize) -> Result<(LinkConfig, LinkConfig), String> {
+fn links(a: &Args, n_dl: usize, n_ue: usize) -> Result<(LinkConfig, LinkConfig), String> {
     let taps = match &a.model {
         None => Vec::new(),
         Some(m) => profile(m)
@@ -123,7 +123,7 @@ fn links(a: &Args, n_dl: usize) -> Result<(LinkConfig, LinkConfig), String> {
     };
     let dl = LinkConfig {
         n_in: n_dl,
-        n_out: n_dl,
+        n_out: n_ue,
         // The UE samples at fs·(1+ε): each UE sample advances 1/(1+ε) gNB samples.
         rate: 1.0 / (1.0 + eps),
         cfo_hz: -eps * a.dl_freq_hz,
@@ -393,32 +393,54 @@ fn fetch_loop(
     // transmitter replies with whatever it has buffered for that port, so the
     // ports' reply lengths can differ; only their common length is processed
     // and the rest carried over, which keeps the antennas sample-aligned.
-    // Every port is requested every round (as a direct reader would): a
-    // transmitter produces all its ports together, so skipping the port that
-    // is ahead can leave it blocked on that port's full buffer while we wait
-    // for another.
+    // Every port always has a request outstanding (as a direct reader would
+    // keep reading each), and replies are taken as they come: a port the
+    // transmitter has momentarily nothing for must not hold up the others,
+    // whose samples for the same span it already holds (with four ports that
+    // otherwise deadlocks: the UE starves, sends no uplink, and the gNB
+    // produces no more downlink). Only a port already `LEAD` samples ahead of
+    // the slowest waits before its next request — the transmitter keeps that
+    // backlog in its buffer, far from full.
+    const LEAD: usize = 1 << 15;
     let mut pending: Vec<Vec<Complex32>> = vec![Vec::new(); ups.len()];
+    let mut waiting = vec![false; ups.len()];
     loop {
         let t0 = Instant::now();
-        for (p, (u, buf)) in ups.iter().zip(pending.iter_mut()).enumerate() {
-            loop {
+        let low = pending.iter().map(Vec::len).min().unwrap_or(0);
+        for (p, u) in ups.iter().enumerate() {
+            if !waiting[p] && pending[p].len() <= low + LEAD {
                 u.send(&[0u8][..], 0).map_err(zerr("upstream request"))?;
-                match u.recv_bytes(0) {
-                    Ok(b) => {
-                        let samples = to_samples(&b);
-                        if let (0, Some(c)) = (p, counted) {
-                            c.dl_in.fetch_add(samples.len() as u64, Relaxed);
-                        }
-                        buf.extend(samples);
-                        break;
+                waiting[p] = true;
+            }
+        }
+        let mut items: Vec<zmq::PollItem> = ups
+            .iter()
+            .zip(&waiting)
+            .filter(|(_, &w)| w)
+            .map(|(u, _)| u.as_poll_item(zmq::POLLIN))
+            .collect();
+        let ready = zmq::poll(&mut items, 2_000).map_err(zerr("poll"))?;
+        let readable: Vec<bool> = items.iter().map(|i| i.is_readable()).collect();
+        drop(items);
+        if ready == 0 {
+            for (p, _) in waiting.iter().enumerate().filter(|(_, &w)| w) {
+                eprintln!("{name}: upstream port {p} silent for 2 s");
+            }
+            continue;
+        }
+        let polled: Vec<usize> = (0..ups.len()).filter(|&p| waiting[p]).collect();
+        for (&p, _) in polled.iter().zip(&readable).filter(|(_, &r)| r) {
+            match ups[p].recv_bytes(zmq::DONTWAIT) {
+                Ok(b) => {
+                    let samples = to_samples(&b);
+                    if let (0, Some(c)) = (p, counted) {
+                        c.dl_in.fetch_add(samples.len() as u64, Relaxed);
                     }
-                    Err(zmq::Error::EAGAIN) => {
-                        // 2 s receive timeout: report a stalled upstream.
-                        eprintln!("{name}: upstream port {p} silent for 2 s");
-                        continue;
-                    }
-                    Err(e) => return Err(format!("upstream: {e}")),
+                    pending[p].extend(samples);
+                    waiting[p] = false;
                 }
+                Err(zmq::Error::EAGAIN) => {}
+                Err(e) => return Err(format!("upstream: {e}")),
             }
         }
         let n = pending.iter().map(Vec::len).min().unwrap_or(0);
@@ -466,7 +488,7 @@ fn fetch_loop(
 
 /// Throughput of the downlink channel on noise (samples per second).
 fn bench(a: &Args) -> Result<(), String> {
-    let (dl, _) = links(a, a.antennas)?;
+    let (dl, _) = links(a, a.antennas, a.antennas)?;
     let mut link = Link::new(dl);
     let mut rng = ferrite_radio::channel::Rng::new(3);
     let block: Vec<Vec<Complex32>> = (0..a.antennas)
@@ -497,16 +519,19 @@ fn run() -> Result<(), String> {
     if a.bench_s.is_some() {
         return bench(&a);
     }
+    // As many UE ports as gNB ports, or fewer (a 4-port gNB into a
+    // 2-antenna UE: the downlink is a 2×4 channel).
     if a.dl_up.is_empty()
-        || a.dl_up.len() != a.dl_bind.len()
+        || a.dl_bind.is_empty()
+        || a.dl_bind.len() > a.dl_up.len()
         || a.ul_up.len() != 1
         || a.ul_bind.len() != 1
     {
         return Err(format!(
-            "need matching --dl-up/--dl-bind lists and one --ul-up/--ul-bind\n{USAGE}"
+            "need --dl-up and at most as many --dl-bind endpoints, and one --ul-up/--ul-bind\n{USAGE}"
         ));
     }
-    let (dl, ul) = links(&a, a.dl_up.len())?;
+    let (dl, ul) = links(&a, a.dl_up.len(), a.dl_bind.len())?;
     eprintln!(
         "ferrite-chanem: model {:?} (ds {:.0} ns, doppler {} Hz), delay {:.0} ns, UE clock {:+} ppm (DL CFO {:+.0} Hz, UL CFO {:+.0} Hz), SNR DL {:?} UL {:?} dB",
         a.model, a.ds_s * 1e9, a.doppler_hz, a.delay_s * 1e9, a.ppm, dl.cfo_hz, ul.cfo_hz, a.dl_snr_db, a.ul_snr_db

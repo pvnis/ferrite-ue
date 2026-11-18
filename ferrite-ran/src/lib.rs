@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod codebook;
 pub mod dmrs;
 pub mod mcs;
 pub mod prach_config;

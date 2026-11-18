@@ -87,7 +87,7 @@ state beyond the arguments, generalised over `mu ∈ {0,1}` and any `fs`.
 | `pucch` | formats 0, 1, 2, 3 | 38.211 §6.3.2 |
 | `prach` | preamble formats 0–3 and A1–C2, waveform at any `fs` | 38.211 §6.3.3 |
 | `srs` | low-PAPR sequences, SRS modulation | 38.211 §6.4.1.4 |
-| `csi` | NZP-CSI-RS sequence, rows 1/2/3/4 RE patterns, SINR / CQI, two-port rank + PMI selection on the Type I codebook | 38.211 §7.4.1.5, 38.214 §5.2 |
+| `csi` | NZP-CSI-RS sequence, rows 1/2/3/4 RE patterns, SINR / CQI, two- and four-port rank + PMI selection on the Type I single-panel codebook | 38.211 §7.4.1.5, 38.214 §5.2 |
 
 ## 3. Radio transport (ferrite-radio)
 
@@ -240,20 +240,32 @@ order (layer 0 then layer 1 per RE, §7.3.1.3) and the TBS/rate matching use
 `n_layers`. DCI 1_1 antenna-port values with one or two DM-RS ports are
 resolved (`DlGrant::{n_layers, dmrs_ports}`); three and four layers are
 dropped. The CSI report goes out in the TS 38.212 Table 6.3.1.1.2-7 layout
-(`RI | padding | PMI | CQI`, sized from the codebook's ports and the
-`ri-Restriction` whose bit `i` (LSB = rank 1) allows rank `i + 1`). The
-rank and PMI come from the two-port NZP-CSI-RS (Table 7.4.1.5.3-1 row 3: one
-FD-CDM2 group on subcarriers `k0, k0+1`, sequence index `2n + k'`):
-`csi::measure_csi_rs_ports` despreads the two ports on every receive
-antenna per RB, takes the noise from the RB-to-RB spread of the estimates,
-and picks the rank and `i2` of the two-port Type I single-panel codebook
-(TS 38.214 Table 5.2.2.2.1-1: rank 1 `[1, φ_n]/√2`, rank 2
-`[[1, 1], [φ_n, −φ_n]]/2`, `φ_n = e^{jπn/2}`) that maximise the sum of the
-per-layer `log2(1 + SINR)` (MRC gain for rank 1, post-MMSE SINRs for rank
-2); the CQI maps the mean post-equalisation SINR. The engine queues a CSI
-measurement on every occasion of a measured resource (the single-port TRS
-and every two-port resource); the MAC keeps the rank / PMI of the latest
-multi-port measurement and lets a single-port one refresh only the CQI
+(`RI | padding | PMI | CQI`). The field widths come from the codebook
+(`ferrite_ran::codebook::Codebook`: one port, two ports, or a Type I
+single-panel `N1 × N2` panel with `O1 = 4`, `O2 = 4` if `N2 > 1` else 1;
+Table 6.3.1.1.2-1, mode 1) and from the `ri-Restriction`, whose bit `i`
+(LSB = rank 1) allows rank `i + 1`. The PMI is
+`i1,1 | i1,2 | i1,3 | i2`, padded in front to the widest allowed rank; for
+4 ports that is 5 bits at ranks 1 and 2 and 4 at ranks 3 and 4. The rank and
+PMI come from the two-port NZP-CSI-RS (Table 7.4.1.5.3-1 row 3: one FD-CDM2
+group on `k0, k0+1`) or the four-port one (row 4: groups on `k0, k0+1` and
+`k0+2, k0+3`); the sequence index is `2n + k'` in both.
+`csi::measure_csi_rs_ports` despreads the ports on every receive antenna
+per RB, takes the noise from the RB-to-RB spread of the estimates, and
+searches every PMI of ranks 1 and 2 (`csi::pmi_hypotheses`,
+`csi::type1_precoder`):
+* two ports (TS 38.214 Table 5.2.2.2.1-1): rank 1 `[1, φ_n]/√2`, rank 2
+  `[[1, 1], [φ_n, −φ_n]]/2`, `φ_n = e^{jπn/2}`;
+* `2·N1·N2` ports (Tables 5.2.2.2.1-5/-6): rank 1 `[v_{l,m}; φ_n v_{l,m}]`,
+  rank 2 with the second beam `v_{l+k1, m+k2}` and `−φ_n`.
+
+It keeps the PMI that maximises the sum of the per-layer `log2(1 + SINR)`
+(MRC gain for rank 1, post-MMSE SINRs for rank 2). The CQI maps the mean
+post-equalisation SINR. The engine queues a CSI measurement on every
+occasion of a measured resource: the single-port TRS, and every two- or
+four-port resource, measured against the codebook of the report with that
+port count. The MAC keeps the rank / PMI of the latest multi-port
+measurement and lets a single-port one refresh only the CQI
 (`CsiIndication::nof_ports`).
 
 Radio link monitoring (TS 38.133 §8.1) runs once per SSB period on the

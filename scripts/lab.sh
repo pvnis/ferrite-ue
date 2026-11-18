@@ -5,6 +5,7 @@
 #
 # config-id ∈ T1 (tdd_n78_10mhz) T2 (tdd_n78_10mhz_dddsu) T3 (tdd_n78_20mhz)
 #             T4 (tdd_n78_10mhz_drx) T5 (tdd_n78_10mhz_2x2, two DL antennas)
+#             T8 (tdd_n78_10mhz_4x2, four DL antennas through the emulator)
 #             T6 (tdd_n78_10mhz_ulheavy, DDSUUUUUUU)
 #             T7 (tdd_n78_10mhz_dlheavy, DDDDDDDDSU)
 #             C1 (tdd_n48_10mhz, CBRS, DDDDDDDSUU)
@@ -43,6 +44,7 @@ case "$ID" in
   T3) CFG=gnb_zmq_tdd_n78_20mhz;       ARFCN=626000; SRATE=30.72; DLF=3390; ULF=3390;;
   T4) CFG=gnb_zmq_tdd_n78_10mhz_drx;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
   T5) CFG=gnb_zmq_tdd_n78_10mhz_2x2;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102";;
+  T8) CFG=gnb_zmq_tdd_n78_10mhz_4x2;   ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390; UE_TX="tcp://127.0.0.1:2100,tcp://127.0.0.1:2102,tcp://127.0.0.1:2104,tcp://127.0.0.1:2106"; UE_RX_PORTS=2;;
   T6) CFG=gnb_zmq_tdd_n78_10mhz_ulheavy; ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
   T7) CFG=gnb_zmq_tdd_n78_10mhz_dlheavy; ARFCN=626000; SRATE=15.36; DLF=3390; ULF=3390;;
   C1) CFG=gnb_zmq_tdd_n48_10mhz;       ARFCN=640000; SRATE=15.36; DLF=3600; ULF=3600;;
@@ -76,6 +78,10 @@ scenario_args() {
     if ($7 != "-") a = a " --dl-snr-db " $7 " --ul-snr-db " $7;
     print a; found = 1 } END { exit !found }'
 }
+# More gNB TX ports than UE antennas (T8): the emulator must combine them.
+if [ -n "${UE_RX_PORTS:-}" ] && [ -z "${SCENARIO:-}" ] && [ -z "${CHANEM:-}" ]; then
+  SCENARIO=ideal
+fi
 if [ -n "${SCENARIO:-}" ]; then
   [ "$SCENARIO" = list ] && { echo "$SCENARIOS"; exit 0; }
   [ -n "${CHANEM:-}" ] && { echo "set SCENARIO or CHANEM, not both"; exit 2; }
@@ -132,7 +138,8 @@ UE_PORTS=()
 if [ -n "${CHANEM:-}" ]; then
   ( cd "$ROOT" && cargo build --release -q -p ferrite-radio --features zmq --bin ferrite-chanem ) || { echo "chanem build failed"; exit 1; }
   DL_UP=${UE_TX:-tcp://127.0.0.1:2100}
-  DL_BIND=$(echo "$DL_UP" | sed -E 's/:21([0-9][0-9])/:22\1/g')
+  # One UE port per gNB port, or the first UE_RX_PORTS of them.
+  DL_BIND=$(echo "$DL_UP" | sed -E 's/:21([0-9][0-9])/:22\1/g' | cut -d, -f1-"${UE_RX_PORTS:-99}")
   # shellcheck disable=SC2086
   "$ROOT/target/release/ferrite-chanem" --dl-up "$DL_UP" --dl-bind "$DL_BIND" \
       --ul-up tcp://127.0.0.1:2201 --ul-bind tcp://127.0.0.1:2101 \
@@ -219,7 +226,7 @@ fi
 # S28: two-layer PDSCH (only when the gNB config has two DL antennas): the
 # UE reports RI 2, the gNB schedules two-layer PDSCHs and the UE decodes them
 # (DL transport block failures stay below 10 %).
-if grep -q "nof_antennas_dl: 2" "$ROOT/test/$CFG.yml" 2>/dev/null; then
+if grep -qE "nof_antennas_dl: [24]" "$ROOT/test/$CFG.yml" 2>/dev/null; then
   L2=$(grep -c "nof_layers=2" "$OUT/gnb.log" 2>/dev/null); L2=${L2:-0}
   OK=$(grep -o "dl_tb_ok: [0-9]*" "$UE" | tail -1 | awk '{print $2}'); KO=$(grep -o "dl_tb_ko: [0-9]*" "$UE" | tail -1 | awk '{print $2}')
   if [ "${L2:-0}" -gt 0 ] && [ "${OK:-0}" -gt 0 ] && [ $((KO * 10)) -le "$OK" ]; then pass "S28 two-layer PDSCH ($L2 scheduled, DL TB ok/ko $OK/$KO)"; else fail "S28 two-layer PDSCH (layers-2 $L2, DL TB ok/ko ${OK:-0}/${KO:-0})"; fi

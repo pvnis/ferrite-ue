@@ -528,7 +528,8 @@ pub struct WorkerConfig {
     pub scrambling_id: Option<u16>,
     pub dmrs_scrambling_id0: Option<u16>,
     pub csi_patterns: Vec<csi::CsiRsPattern>,
-    pub csi_meas: Vec<(csi::CsiRsMeasurement, u32, u32)>, // (measurement, period, offset)
+    /// (measurement, period, offset, (codebook, highest rank)).
+    pub csi_meas: Vec<(csi::CsiRsMeasurement, u32, u32, (Codebook, u8))>,
     pub csi_rate_match_enabled: bool,
 }
 
@@ -599,16 +600,24 @@ impl PdschWorker {
                 / grids[symbol].len().max(1) as f32;
             10.0 * p.max(1e-12).log10()
         };
-        // A two-port resource in this slot gives rank, PMI and CQI from every
-        // antenna; otherwise the single-port TRS gives the CQI alone (rank 1).
+        // A two- or four-port resource in this slot gives rank, PMI and CQI
+        // from every antenna; otherwise the single-port TRS gives the CQI
+        // alone (rank 1).
         let mut single = None;
-        for (m, period, offset) in &self.cfg.csi_meas {
+        for (m, period, offset, (codebook, max_rank)) in &self.cfg.csi_meas {
             if !csi::csi_rs_slots(*period, *offset, slot) {
                 continue;
             }
-            if m.row == csi::CsiRsRow::Row3 {
+            if matches!(m.row, csi::CsiRsRow::Row3 | csi::CsiRsRow::Row4) {
                 let views: Vec<&[Iq]> = grids_all.iter().map(|g| g[m.symbol].as_slice()).collect();
-                let e = csi::measure_csi_rs_ports(&views, sc_to_bin, m, slot.slot as u32, 2);
+                let e = csi::measure_csi_rs_ports(
+                    &views,
+                    sc_to_bin,
+                    m,
+                    slot.slot as u32,
+                    *codebook,
+                    *max_rank,
+                );
                 return Some(CsiIndication {
                     slot,
                     sinr_db: e.sinr_db,
@@ -616,7 +625,7 @@ impl PdschWorker {
                     rsrp_dbfs: rsrp_dbfs(m.symbol),
                     ri: e.ri,
                     pmi: e.pmi,
-                    nof_ports: 2,
+                    nof_ports: codebook.nof_ports(),
                 });
             }
             single.get_or_insert(m);
@@ -629,7 +638,7 @@ impl PdschWorker {
             cqi: csi::sinr_to_cqi(sinr),
             rsrp_dbfs: rsrp_dbfs(m.symbol),
             ri: 1,
-            pmi: 0,
+            pmi: Pmi::default(),
             nof_ports: 1,
         })
     }

@@ -11,7 +11,7 @@
 # test/results/matrix-<timestamp>.md.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIGS="T1 T2 T3 T4 T5 T6 T7 C1 C2 F1 F2"
+CONFIGS="T1 T2 T3 T4 T5 T6 T7 T8 C1 C2 F1 F2"
 SCENARIOS="ideal static indoor pedestrian urban vehicular dispersive cell-edge"
 PING=20
 DURATION=120

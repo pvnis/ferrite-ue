@@ -502,13 +502,17 @@ impl Link {
             fir.re.fill(0.0);
             fir.im.fill(0.0);
             // Without fading the antennas are wired straight through (output
-            // `o` carries input `o`), not summed into a rank-1 channel.
-            let wired = pair / n_in == pair % n_in;
+            // `o` carries input `o`), not summed into a rank-1 channel; with
+            // more inputs than outputs (4 gNB ports, 2 UE antennas) output `o`
+            // carries every input `i ≡ o (mod n_out)` at a total of unit power.
+            let n_out = self.cfg.n_out.max(1);
+            let wired = pair % n_in % n_out == pair / n_in;
+            let share = (n_out as f32 / n_in.max(n_out) as f32).sqrt();
             for (k, &(d, amp)) in self.taps.iter().enumerate() {
                 let g = if fade {
                     self.faders[pair * n_taps + k].next() * amp
                 } else if wired {
-                    Complex32::new(amp, 0.0)
+                    Complex32::new(amp * share, 0.0)
                 } else {
                     Complex32::new(0.0, 0.0)
                 };
@@ -866,6 +870,39 @@ mod tests {
             assert!(v.len() > 3000);
             for s in &v[100..] {
                 assert!((s - want).norm() < 1e-3, "{s} vs {want}");
+            }
+        }
+    }
+
+    /// Four inputs into two outputs without fading: output `o` carries
+    /// inputs `o` and `o + 2`, each at half power (unit total), so every
+    /// transmit port reaches the UE (a 4-port CSI-RS stays measurable).
+    #[test]
+    fn unfaded_four_to_two_link_combines_port_pairs() {
+        let fs = 1e6;
+        let x: Vec<Vec<Complex32>> = (0..4)
+            .map(|p| vec![Complex32::new(p as f32 + 1.0, 0.0); 4000])
+            .collect();
+        let mut link = Link::new(LinkConfig {
+            n_in: 4,
+            n_out: 2,
+            ..LinkConfig::ideal(fs)
+        });
+        let mut y = [Vec::new(), Vec::new()];
+        for c in 0..8 {
+            let refs: Vec<&[Complex32]> = x.iter().map(|v| &v[c * 500..(c + 1) * 500]).collect();
+            for (acc, o) in y.iter_mut().zip(link.process(&refs)) {
+                acc.extend(o);
+            }
+        }
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        for (v, want) in y.iter().zip([(1.0 + 3.0) * h, (2.0 + 4.0) * h]) {
+            assert!(v.len() > 3000);
+            for s in &v[100..] {
+                assert!(
+                    (s.re - want).abs() < 1e-3 && s.im.abs() < 1e-3,
+                    "{s} vs {want}"
+                );
             }
         }
     }

@@ -7,6 +7,7 @@
 
 use crate::sequence::gold_sequence;
 use ferrite_common::SlotPoint;
+pub use ferrite_ran::codebook::{Codebook, Pmi};
 use num_complex::Complex32;
 use std::f32::consts::FRAC_1_SQRT_2;
 
@@ -202,67 +203,119 @@ pub fn measure_csi_rs_sinr(
     10.0 * (sig / noise).log10()
 }
 
-/// The channel state measured on a two-port CSI-RS occasion: the effective
-/// post-equalisation SINR behind the CQI, and the rank and Type I
-/// single-panel `i2` the UE recommends.
+/// The channel state measured on a multi-port CSI-RS occasion: the
+/// effective post-equalisation SINR behind the CQI, and the rank and Type I
+/// single-panel PMI the UE recommends.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CsiEstimate {
     pub sinr_db: f32,
     pub cqi: u8,
     pub ri: u8,
-    pub pmi: u8,
+    pub pmi: Pmi,
 }
 
-/// Type I single-panel codebook for two CSI-RS ports (TS 38.214 Table
-/// 5.2.2.2.1-1): rank 1 `W = [1, φ_n]ᵀ/√2` (`n = i2 ∈ 0..4`), rank 2
-/// `W = [[1, 1], [φ_n, −φ_n]]/2` (`n ∈ 0..2`), `φ_n = e^{jπn/2}`. Returns
-/// the columns of `W`, one `[w_port0, w_port1]` per layer.
-pub fn two_port_precoder(rank: u8, i2: u8) -> Vec<[Complex32; 2]> {
-    let phi = Complex32::from_polar(1.0, std::f32::consts::FRAC_PI_2 * f32::from(i2));
+/// Type I single-panel precoder `W` (TS 38.214 §5.2.2.2.1, codebook mode 1)
+/// for `rank` 1 or 2, one column (`P` port weights) per layer.
+///
+/// * Two ports (Table 5.2.2.2.1-1): rank 1 `[1, φ_n]ᵀ/√2`, rank 2
+///   `[[1, 1], [φ_n, −φ_n]]/2`, `φ_n = e^{jπn/2}`, `n = i2`.
+/// * `P = 2·N1·N2` ports (Tables 5.2.2.2.1-5 / -6): the beam
+///   `v_{l,m}[i1·N2 + i2'] = e^{j2π l i1/(O1 N1)} e^{j2π m i2'/(O2 N2)}` on
+///   the first polarisation and `±φ_n v` on the second; rank 1
+///   `[v_{l,m}; φ_n v_{l,m}]/√P` with `(l, m) = (i1,1, i1,2)`, rank 2
+///   `[[v_{l,m}, v_{l',m'}]; [φ_n v_{l,m}, −φ_n v_{l',m'}]]/√(2P)` with
+///   `(l', m') = (l + k1, m + k2)` from `i1,3` (Table 5.2.2.2.1-3).
+pub fn type1_precoder(cb: Codebook, rank: u8, pmi: Pmi) -> Vec<Vec<Complex32>> {
+    let phi = Complex32::from_polar(1.0, std::f32::consts::FRAC_PI_2 * f32::from(pmi.i2));
+    let Some((n1, n2, o1, o2)) = cb.panel() else {
+        // Two ports (one port has no PMI: a single unit weight).
+        if cb == Codebook::OnePort {
+            return vec![vec![Complex32::new(1.0, 0.0)]];
+        }
+        return if rank >= 2 {
+            let half = Complex32::new(0.5, 0.0);
+            vec![vec![half, phi * 0.5], vec![half, -phi * 0.5]]
+        } else {
+            let a = Complex32::new(FRAC_1_SQRT_2, 0.0);
+            vec![vec![a, phi * FRAC_1_SQRT_2]]
+        };
+    };
+    let p = 2 * n1 * n2;
+    let beam = |l: usize, m: usize, pol: Complex32, scale: f32| -> Vec<Complex32> {
+        let mut w = vec![Complex32::new(0.0, 0.0); p];
+        for ih in 0..n1 {
+            for iv in 0..n2 {
+                let ph = std::f32::consts::TAU
+                    * ((l * ih) as f32 / (o1 * n1) as f32 + (m * iv) as f32 / (o2 * n2) as f32);
+                let c = Complex32::from_polar(scale, ph);
+                w[ih * n2 + iv] = c;
+                w[p / 2 + ih * n2 + iv] = pol * c;
+            }
+        }
+        w
+    };
+    let (l, m) = (usize::from(pmi.i11), usize::from(pmi.i12));
     if rank >= 2 {
-        let half = Complex32::new(0.5, 0.0);
-        vec![[half, phi * 0.5], [half, -phi * 0.5]]
+        let scale = 1.0 / ((2 * p) as f32).sqrt();
+        let (k1, k2) = cb.rank2_offsets(pmi.i13);
+        vec![beam(l, m, phi, scale), beam(l + k1, m + k2, -phi, scale)]
     } else {
-        vec![[Complex32::new(FRAC_1_SQRT_2, 0.0), phi * FRAC_1_SQRT_2]]
+        vec![beam(l, m, phi, 1.0 / (p as f32).sqrt())]
     }
 }
 
-/// Number of `i2` hypotheses of the two-port codebook for `rank`.
-pub fn two_port_pmi_count(rank: u8) -> u8 {
-    if rank >= 2 {
-        2
-    } else {
-        4
+/// Every PMI the codebook allows at `rank` (the UE's search space).
+pub fn pmi_hypotheses(cb: Codebook, rank: u8) -> Vec<Pmi> {
+    let Some(r) = cb.pmi_ranges(rank) else {
+        return vec![Pmi::default()];
+    };
+    let mut out = Vec::new();
+    for i11 in 0..r.i11 {
+        for i12 in 0..r.i12 {
+            for i13 in 0..r.i13 {
+                for i2 in 0..r.i2 {
+                    out.push(Pmi { i11, i12, i13, i2 });
+                }
+            }
+        }
     }
+    out
 }
 
-/// Measure a two-port NZP-CSI-RS (row 3: ports 3000/3001 FD-CDM2 on
-/// subcarriers `k0, k0+1`, sequence index `m' = 2n + k'`, TS 38.211
-/// §7.4.1.5.3) on every receive antenna — `grids[a]` is antenna `a`'s
-/// demodulated grid of the resource's symbol — and choose the rank and `i2`
-/// that maximise the sum of the per-layer `log2(1 + SINR)` over the RBs
-/// (TS 38.214 §5.2.2.1: the UE reports the RI/PMI yielding the highest
-/// throughput under the codebook). Per RB and antenna the two port channels
-/// come from the CDM despreading; the noise variance is the RB-to-RB spread
-/// of every (antenna, port) estimate (capped at 40 dB SNR on a lossless
-/// channel). The rank-1 SINR is the MRC gain of the precoded channel, the
-/// rank-2 SINRs the per-layer post-MMSE values. `max_rank` caps the rank
-/// (`ri-Restriction`; the number of receive antennas caps it as well).
+/// Measure a multi-port NZP-CSI-RS on every receive antenna — `grids[a]` is
+/// antenna `a`'s demodulated grid of the resource's symbol — and choose the
+/// rank and PMI of `codebook` that maximise the sum of the per-layer
+/// `log2(1 + SINR)` over the RBs (TS 38.214 §5.2.2.1: the UE reports the
+/// RI/PMI yielding the highest throughput under the codebook).
+///
+/// Two ports are row 3 (ports 3000/3001 FD-CDM2 on `k0, k0+1`), four ports
+/// row 4 (CDM groups on `k0, k0+1` and `k0+2, k0+3`: ports 3000/3001 and
+/// 3002/3003); the sequence index is `m' = 2n + k'` in both (α = 2ρ, TS
+/// 38.211 §7.4.1.5.3). Per RB, antenna and CDM group the two port channels
+/// come from despreading `w_f = [+1, ±1]`; the noise variance is the RB-to-RB
+/// spread of every (antenna, port) estimate (capped at 40 dB SNR on a
+/// lossless channel). The rank-1 SINR is the MRC gain of the precoded
+/// channel, the rank-2 SINRs the per-layer post-MMSE values. `max_rank`
+/// caps the rank (`ri-Restriction`); so do the two receive antennas the
+/// estimate uses.
 pub fn measure_csi_rs_ports(
     grids: &[&[Complex32]],
     sc_to_bin: impl Fn(usize) -> usize,
     res: &CsiRsMeasurement,
     slot: u32,
+    codebook: Codebook,
     max_rank: u8,
 ) -> CsiEstimate {
     let none = CsiEstimate {
         sinr_db: f32::NEG_INFINITY,
         cqi: 0,
         ri: 1,
-        pmi: 0,
+        pmi: Pmi::default(),
     };
+    let ports = usize::from(codebook.nof_ports());
+    let row_ok = matches!((res.row, ports), (CsiRsRow::Row3, 2) | (CsiRsRow::Row4, 4));
     let n_ant = grids.len().min(2);
-    if n_ant == 0 || res.n_rb == 0 || res.row != CsiRsRow::Row3 {
+    if n_ant == 0 || res.n_rb == 0 || !row_ok {
         return none;
     }
     let seq = csi_rs_sequence(
@@ -273,38 +326,48 @@ pub fn measure_csi_rs_ports(
     );
     // h[rb][antenna][port].
     let zero = Complex32::new(0.0, 0.0);
-    let h: Vec<[[Complex32; 2]; 2]> = (res.start_rb..res.start_rb + res.n_rb)
+    let h: Vec<Vec<Vec<Complex32>>> = (res.start_rb..res.start_rb + res.n_rb)
         .map(|n| {
-            let mut hn = [[zero; 2]; 2];
-            for (a, grid) in grids.iter().take(n_ant).enumerate() {
-                let y0 = grid[sc_to_bin(12 * n + res.k0)] * seq[2 * n].conj();
-                let y1 = grid[sc_to_bin(12 * n + res.k0 + 1)] * seq[2 * n + 1].conj();
-                // Port 0 has w_f = [+1, +1], port 1 w_f = [+1, −1]; |seq| = 1.
-                hn[a] = [(y0 + y1) / 2.0, (y0 - y1) / 2.0];
-            }
-            hn
+            grids
+                .iter()
+                .take(n_ant)
+                .map(|grid| {
+                    let mut hp = vec![zero; ports];
+                    for g in 0..ports / 2 {
+                        let k = 12 * n + res.k0 + 2 * g;
+                        let y0 = grid[sc_to_bin(k)] * seq[2 * n].conj();
+                        let y1 = grid[sc_to_bin(k + 1)] * seq[2 * n + 1].conj();
+                        // Even port w_f = [+1, +1], odd port [+1, −1]; |seq| = 1.
+                        hp[2 * g] = (y0 + y1) / 2.0;
+                        hp[2 * g + 1] = (y0 - y1) / 2.0;
+                    }
+                    hp
+                })
+                .collect()
         })
         .collect();
-    let entries = || h.iter().flat_map(|hn| hn[..n_ant].iter().flatten());
-    let sig = entries().map(|x| x.norm_sqr()).sum::<f32>() / (h.len() * n_ant * 2) as f32;
+    let entries = || h.iter().flat_map(|hn| hn.iter().flatten());
+    let sig = entries().map(|x| x.norm_sqr()).sum::<f32>() / (h.len() * n_ant * ports) as f32;
     let (mut noise, mut n_noise) = (0.0f32, 0usize);
     for w in h.windows(2) {
         for a in 0..n_ant {
-            for p in 0..2 {
+            for p in 0..ports {
                 noise += (w[1][a][p] - w[0][a][p]).norm_sqr() / 2.0;
                 n_noise += 1;
             }
         }
     }
     let noise = (noise / n_noise.max(1) as f32).max(sig * 1e-4).max(1e-12);
-    let mut best: Option<(f32, u8, u8, f32)> = None;
+    let mut best: Option<(f32, u8, Pmi, f32)> = None;
     for rank in 1..=max_rank.clamp(1, 2).min(n_ant as u8) {
-        for i2 in 0..two_port_pmi_count(rank) {
-            let w = two_port_precoder(rank, i2);
+        for pmi in pmi_hypotheses(codebook, rank) {
+            let w = type1_precoder(codebook, rank, pmi);
             let (mut se, mut sinr_sum) = (0.0f32, 0.0f32);
             for hn in &h {
                 // Precoded channel per antenna and layer: g[a][l] = Σ_p H[a][p]·W[p][l].
-                let g = |a: usize, l: usize| hn[a][0] * w[l][0] + hn[a][1] * w[l][1];
+                let g = |a: usize, l: usize| -> Complex32 {
+                    hn[a].iter().zip(&w[l]).map(|(x, y)| x * y).sum()
+                };
                 if rank == 1 {
                     let gain: f32 = (0..n_ant).map(|a| g(a, 0).norm_sqr()).sum();
                     let sinr = gain / noise;
@@ -333,7 +396,7 @@ pub fn measure_csi_rs_ports(
             }
             if best.is_none_or(|b| se > b.0) {
                 let layers = (h.len() * usize::from(rank)) as f32;
-                best = Some((se, rank, i2, sinr_sum / layers));
+                best = Some((se, rank, pmi, sinr_sum / layers));
             }
         }
     }
@@ -573,7 +636,11 @@ mod tests {
         let measure = |hm, ants: usize, max_rank| {
             let g = two_port_grids(hm, &r, 7);
             let views: Vec<&[Complex32]> = g.iter().take(ants).map(Vec::as_slice).collect();
-            measure_csi_rs_ports(&views, |sc| sc, &r, 7, max_rank)
+            measure_csi_rs_ports(&views, |sc| sc, &r, 7, Codebook::TwoPort, max_rank)
+        };
+        let i2 = |i2| Pmi {
+            i2,
+            ..Pmi::default()
         };
         let identity = [[c(1.0, 0.0), c(0.0, 0.0)], [c(0.0, 0.0), c(1.0, 0.0)]];
         let e = measure(identity, 2, 2);
@@ -587,43 +654,146 @@ mod tests {
             2,
             2,
         );
-        assert_eq!((e.ri, e.pmi), (1, 0), "{e:?}");
+        assert_eq!((e.ri, e.pmi), (1, i2(0)), "{e:?}");
         // Ports in antiphase: i2 = 2 (φ = −1).
         let e = measure(
             [[c(1.0, 0.0), c(-1.0, 0.0)], [c(0.5, 0.0), c(-0.5, 0.0)]],
             2,
             2,
         );
-        assert_eq!((e.ri, e.pmi), (1, 2), "{e:?}");
+        assert_eq!((e.ri, e.pmi), (1, i2(2)), "{e:?}");
         // Port 1 lagging by 90° (h1 = −j·h0): φ = j co-phases them, i2 = 1.
         let e = measure(
             [[c(1.0, 0.0), c(0.0, -1.0)], [c(0.5, 0.0), c(0.0, -0.5)]],
             2,
             2,
         );
-        assert_eq!((e.ri, e.pmi), (1, 1), "{e:?}");
+        assert_eq!((e.ri, e.pmi), (1, i2(1)), "{e:?}");
         // Codebook columns: unit total power per layer, rank-2 columns orthogonal.
-        for rank in [1u8, 2] {
-            for i2 in 0..two_port_pmi_count(rank) {
-                let w = two_port_precoder(rank, i2);
-                for col in &w {
-                    let p: f32 = col.iter().map(|x| x.norm_sqr()).sum();
-                    assert!(
-                        (p - 1.0 / f32::from(rank)).abs() < 1e-6,
-                        "rank {rank} i2 {i2}: {p}"
-                    );
-                }
-                if rank == 2 {
-                    let dot = w[0][0].conj() * w[1][0] + w[0][1].conj() * w[1][1];
-                    assert!(dot.norm() < 1e-6);
-                }
-            }
-        }
+        check_codebook(Codebook::TwoPort, 4, 2);
         // A non-row-3 resource or no antennas: no estimate.
         let r1 = CsiRsMeasurement {
             row: CsiRsRow::Row1,
             ..r
         };
-        assert_eq!(measure_csi_rs_ports(&[], |sc| sc, &r1, 7, 2).ri, 1);
+        assert_eq!(
+            measure_csi_rs_ports(&[], |sc| sc, &r1, 7, Codebook::TwoPort, 2).ri,
+            1
+        );
+    }
+
+    /// Every codebook column has total power 1/rank, rank-2 columns are
+    /// orthogonal, and the search space has the expected size.
+    fn check_codebook(cb: Codebook, n_rank1: usize, n_rank2: usize) {
+        for (rank, n) in [(1u8, n_rank1), (2, n_rank2)] {
+            let hyps = pmi_hypotheses(cb, rank);
+            assert_eq!(hyps.len(), n, "{cb:?} rank {rank}");
+            for pmi in hyps {
+                let w = type1_precoder(cb, rank, pmi);
+                assert_eq!(w.len(), usize::from(rank));
+                for col in &w {
+                    assert_eq!(col.len(), usize::from(cb.nof_ports()));
+                    let p: f32 = col.iter().map(|x| x.norm_sqr()).sum();
+                    assert!((p - 1.0 / f32::from(rank)).abs() < 1e-5, "{pmi:?}: {p}");
+                }
+                if rank == 2 {
+                    let dot: Complex32 = w[0].iter().zip(&w[1]).map(|(a, b)| a.conj() * b).sum();
+                    assert!(dot.norm() < 1e-5, "{pmi:?}: {dot}");
+                }
+            }
+        }
+    }
+
+    /// Grids of a 4-port row-4 resource seen through `h[antenna][port]`.
+    fn four_port_grids(
+        h: &[[Complex32; 4]; 2],
+        res: &CsiRsMeasurement,
+        slot: u32,
+    ) -> Vec<Vec<Complex32>> {
+        let seq = csi_rs_sequence(
+            res.n_id,
+            slot,
+            res.symbol as u32,
+            2 * (res.start_rb + res.n_rb),
+        );
+        let mut g = vec![vec![Complex32::new(0.0, 0.0); 12 * 52]; 2];
+        for n in res.start_rb..res.start_rb + res.n_rb {
+            for (a, ga) in g.iter_mut().enumerate() {
+                for grp in 0..2 {
+                    let (p0, p1) = (h[a][2 * grp], h[a][2 * grp + 1]);
+                    ga[12 * n + res.k0 + 2 * grp] = (p0 + p1) * seq[2 * n];
+                    ga[12 * n + res.k0 + 2 * grp + 1] = (p0 - p1) * seq[2 * n + 1];
+                }
+            }
+        }
+        g
+    }
+
+    const FOUR: Codebook = Codebook::SinglePanel { n1: 2, n2: 1 };
+
+    /// The 4-port (N1 = 2, N2 = 1, O1 = 4) codebook: TS 38.214 Table
+    /// 5.2.2.2.1-5 value, power / orthogonality, and the measurement picks
+    /// the beam and co-phasing of a rank-one channel and rank 2 on a full
+    /// rank one.
+    #[test]
+    fn four_port_codebook_and_measurement() {
+        let c = Complex32::new;
+        // Rank 1, i1,1 = 1, i2 = 1: ½·[1, e^{jπ/4}, j, j·e^{jπ/4}].
+        let w = type1_precoder(
+            FOUR,
+            1,
+            Pmi {
+                i11: 1,
+                i2: 1,
+                ..Pmi::default()
+            },
+        );
+        let e = Complex32::from_polar(1.0, std::f32::consts::FRAC_PI_4);
+        let want = [c(1.0, 0.0), e, c(0.0, 1.0), c(0.0, 1.0) * e].map(|x| x * 0.5);
+        for (got, want) in w[0].iter().zip(want) {
+            assert!((got - want).norm() < 1e-6, "{:?}", w[0]);
+        }
+        check_codebook(FOUR, 32, 32);
+        check_codebook(Codebook::SinglePanel { n1: 4, n2: 1 }, 64, 128);
+
+        let res = CsiRsMeasurement {
+            row: CsiRsRow::Row4,
+            ..two_port_res()
+        };
+        let measure = |h: &[[Complex32; 4]; 2], max_rank| {
+            let g = four_port_grids(h, &res, 7);
+            let views: Vec<&[Complex32]> = g.iter().map(Vec::as_slice).collect();
+            measure_csi_rs_ports(&views, |sc| sc, &res, 7, FOUR, max_rank)
+        };
+        // A rank-one channel matched to beam (l = 3, i2 = 2): h = conj(w)ᵀ on
+        // both antennas (different gains) → that PMI at rank 1.
+        let target = Pmi {
+            i11: 3,
+            i2: 2,
+            ..Pmi::default()
+        };
+        let wt = type1_precoder(FOUR, 1, target);
+        let row = |g: f32| [0, 1, 2, 3].map(|p| wt[0][p].conj() * g);
+        let est = measure(&[row(1.0), row(0.6)], 2);
+        assert_eq!((est.ri, est.pmi), (1, target), "{est:?}");
+        assert!(est.cqi == 15, "{est:?}");
+        // Two antennas seeing different port pairs: full rank → rank 2.
+        let h = [
+            [c(1.0, 0.0), c(0.0, 0.0), c(0.0, 0.0), c(0.0, 0.0)],
+            [c(0.0, 0.0), c(0.0, 0.0), c(1.0, 0.0), c(0.0, 0.0)],
+        ];
+        assert_eq!(measure(&h, 2).ri, 2);
+        assert_eq!(measure(&h, 1).ri, 1);
+        // A 4-port codebook on a row-3 resource is not measured.
+        let r3 = CsiRsMeasurement {
+            row: CsiRsRow::Row3,
+            ..res
+        };
+        let g = four_port_grids(&h, &r3, 7);
+        let views: Vec<&[Complex32]> = g.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            measure_csi_rs_ports(&views, |sc| sc, &r3, 7, FOUR, 2).sinr_db,
+            f32::NEG_INFINITY
+        );
     }
 }
