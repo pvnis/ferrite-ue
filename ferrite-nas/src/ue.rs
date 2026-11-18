@@ -324,6 +324,14 @@ impl PduSession {
     }
 }
 
+/// A NAS message in plain text (before protection / after deciphering),
+/// for a protocol capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NasTrace {
+    pub uplink: bool,
+    pub plain: Vec<u8>,
+}
+
 /// Events for the application / RRC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NasEvent {
@@ -440,6 +448,8 @@ pub struct NasUe {
     reregister: bool,
     /// The initial NAS message waiting for an N1 connection (5GMM-IDLE).
     pending_initial: Option<Vec<u8>>,
+    /// Plain NAS messages for a protocol capture (`set_trace`).
+    trace: Option<Vec<NasTrace>>,
 }
 
 impl NasUe {
@@ -485,6 +495,7 @@ impl NasUe {
             registration_requested: false,
             reregister: false,
             pending_initial: None,
+            trace: None,
         }
     }
 
@@ -532,6 +543,26 @@ impl NasUe {
 
     pub fn is_deregistered(&self) -> bool {
         matches!(self.state(), MmState::Deregistered(_))
+    }
+
+    /// Keep (or stop keeping) every NAS message in plain text for
+    /// [`NasUe::take_trace`].
+    pub fn set_trace(&mut self, on: bool) {
+        self.trace = on.then(Vec::new);
+    }
+
+    /// The plain NAS messages since the last call (empty unless tracing).
+    pub fn take_trace(&mut self) -> Vec<NasTrace> {
+        self.trace.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn trace(&mut self, uplink: bool, plain: &[u8]) {
+        if let Some(t) = self.trace.as_mut() {
+            t.push(NasTrace {
+                uplink,
+                plain: plain.to_vec(),
+            });
+        }
     }
 
     /// 5GMM-CONNECTED / 5GMM-IDLE.
@@ -675,6 +706,7 @@ impl NasUe {
     }
 
     fn tx_sht(&mut self, plain: Vec<u8>, sht: SecurityHeaderType) -> Vec<u8> {
+        self.trace(true, &plain);
         match self.ctx.as_mut() {
             Some(c) => {
                 self.last_ul_count = Some(c.next_ul_count());
@@ -1145,6 +1177,7 @@ impl NasUe {
                     return Err(NasError::BadHeader);
                 }
                 let smc = SecurityModeCommand::decode(inner)?;
+                self.trace(false, inner);
                 return self.on_security_mode_command(pdu, &h, smc);
             }
             Some(h) => {
@@ -1152,6 +1185,7 @@ impl NasUe {
                 ctx.unprotect(pdu, &h)?
             }
         };
+        self.trace(false, &plain);
         let msg = decode_mm(&plain)?;
         Ok(self.dispatch(msg))
     }
@@ -1388,10 +1422,14 @@ impl NasUe {
                 None
             },
         };
-        let (out, count) = ctx.protect(
-            SecurityHeaderType::IntegrityCipheredNewContext,
-            &complete.encode(),
-        );
+        let complete = complete.encode();
+        if let Some(t) = self.trace.as_mut() {
+            t.push(NasTrace {
+                uplink: true,
+                plain: complete.clone(),
+            });
+        }
+        let (out, count) = ctx.protect(SecurityHeaderType::IntegrityCipheredNewContext, &complete);
         self.ul_count_at_activation = Some(count);
         self.ctx = Some(ctx);
         self.pending_keys = None;

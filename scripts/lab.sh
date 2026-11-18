@@ -144,7 +144,8 @@ if [ -n "${CHANEM:-}" ]; then
   UE_PORTS=(--rx tcp://127.0.0.1:2201)
 fi
 ( cd "$ROOT" && RUST_LOG="${UE_LOG:-info}" cargo run --release -p ferrite-ue -q -- --dl-arfcn "$ARFCN" --srate "$SRATE" \
-    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_TX:+--tx "$UE_TX"} "${UE_PORTS[@]}" ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
+    --ping "$PING" --exit-after-ping --timeout "$DURATION" --log "${UE_LOG:-info}" ${UE_TX:+--tx "$UE_TX"} "${UE_PORTS[@]}" \
+    --pcap "$OUT/ue.pcap" --pcap-mac-udp ${UE_ARGS:-} > "$OUT/ue.log" 2>&1 ) &
 UE_PID=$!
 # DL_PING=1: once the gNB has released the UE to idle, ping its IP from the
 # host (through qcore) so the network has to page it.
@@ -237,6 +238,29 @@ if grep -q "emulating a .* ppm LO error" "$UE"; then
     pass "S29 CFO tracking (DL $WANT Hz tracked as $GOT Hz, gNB sees UL at $UL Hz)"
   else
     fail "S29 CFO tracking (DL ${WANT:-?} Hz, tracked ${GOT:-?} Hz, gNB UL ${UL:-?} Hz, steps ${STEPS:-?})"
+  fi
+fi
+# S31: protocol capture (every run writes `ue.pcap`: MAC-NR as UDP for
+# Wireshark < 4.4, RRC, NAS in plain text; open it with `wireshark
+# --enable-heuristic mac_nr_udp ue.pcap`, or drop `--pcap-mac-udp` for
+# Wireshark >= 4.4). With tshark installed, Wireshark's dissectors must find
+# no error and no warning, except what the capture cannot avoid (the UDP
+# framing's zero checksum, PDCP MAC-I without the keys) and RLC ARQ at work
+# (NACKs in STATUS PDUs, the retransmitted sequence numbers; counted in the
+# stage line, expected on a lossy channel).
+if command -v tshark > /dev/null && [ -s "$OUT/ue.pcap" ]; then
+  # Severity: 8388608 error, 6291456 warning.
+  EXPERT=$(tshark -r "$OUT/ue.pcap" --enable-heuristic mac_nr_udp -T fields -e _ws.expert.severity -e _ws.expert.message 2>/dev/null \
+    | awk -F'\t' '{n=split($1,sv,","); split($2,m,","); for(i=1;i<=n;i++) if (sv[i]>=6291456) print m[i]}' \
+    | grep -v "Illegal checksum value\|MAC-I Digest wrong" | sort | uniq -c | sort -rn)
+  ARQ="repeated\|Status PDU reports NACK"
+  REPEATS=$(echo "$EXPERT" | grep "$ARQ" | awk '{s+=$1} END {print s+0}')
+  BAD=$(echo "$EXPERT" | grep -v "$ARQ" | grep -E "[A-Za-z]")
+  NPKT=$(tshark -r "$OUT/ue.pcap" 2>/dev/null | wc -l)
+  if [ -z "$BAD" ]; then
+    pass "S31 protocol capture clean ($NPKT packets, ue.pcap; $REPEATS RLC ARQ events)"
+  else
+    fail "S31 protocol capture: Wireshark reports $(echo "$BAD" | head -3 | sed 's/^ *//' | paste -sd';' -)"
   fi
 fi
 # S30: channel emulator (only with `CHANEM`): the emulator carried both

@@ -239,6 +239,10 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       rejects anything but 6–15 digits), the CCCH SDU length, and four
       PDSCH asserts on network-configured values (bundle size, DM-RS
       reference CRB, Qm, slot index).
+- [ ] Cell edge (T1, 5 dB, 3 µs, 2 ppm): about one run in several syncs
+      with the timing loop flipping by ±4 samples (88 re-alignments in a
+      run), and the gNB then detects none of the UE's preambles (47 random
+      access attempts). The rerun attached at once (4 re-alignments).
 - [ ] About 25 `assert!` remain in the DSP crates (`ferrite-phy`: polar,
       LDPC, OFDM, rate matching, PSS / SSS, cell search) on internal shape
       invariants (lengths the same module computed). Not reachable from the
@@ -423,9 +427,13 @@ FAPI already improve on them.
          TLA+/Quint) for deadlock and liveness ("registration attempts
          always end"), checked against lab runs by validating the logged
          transition traces.
-- [ ] **Protocol capture for Wireshark** (GSMTAP's role): MAC-NR PDUs (and
-      RRC / NAS) to a pcap file or UDP in Wireshark's `mac-nr` framing, as
-      srsRAN / OAI do. No new dependency.
+- [x] 2026-11-16 **Protocol capture for Wireshark** (GSMTAP's role): `--pcap
+      FILE` writes MAC-NR PDUs (`mac-nr-framed`, or UDP with
+      `--pcap-mac-udp` for Wireshark < 4.4), RRC (after PDCP) and NAS (plain
+      text) as exported PDUs; `lab.sh` captures every run and stage S31 has
+      tshark check it. The first capture showed UL MAC CEs (PHR, C-RNTI)
+      placed before the MAC SDUs; 38.321 §6.1.2 puts them after (fixed,
+      attach test checks every UL PDU's layout).
 - [ ] **Machine-readable state** instead of log greps (`lab.sh` has 49):
       a JSON summary at exit (counters, RRC/NAS state, tracking), later a
       control socket (VTY's role: status, detach, re-register).

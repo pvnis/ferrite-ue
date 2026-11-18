@@ -31,6 +31,6 @@ pub use mm::{Guti, Plmn, Snssai, Tai, UeSecurityCapability};
 pub use security::NasSecurityContext;
 pub use sm::PduSessionType;
 pub use ue::{
-    CmState, ConnectionCause, DeregisteredSub, MmState, NasConfig, NasEvent, NasUe, PduSession,
-    RegisteredSub, SmState, UeIdentity,
+    CmState, ConnectionCause, DeregisteredSub, MmState, NasConfig, NasEvent, NasTrace, NasUe,
+    PduSession, RegisteredSub, SmState, UeIdentity,
 };

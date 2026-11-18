@@ -11,6 +11,7 @@
 
 use crate::bearers::Bearers;
 use crate::config::UeConfig;
+use crate::pcap::{Dir, MacContext, Pcap, RntiType, RrcChannel};
 use crate::userplane::{UserPlane, UserPlaneEvent};
 use ferrite_common::{Numerology, SlotPoint};
 use ferrite_fapi::*;
@@ -99,6 +100,65 @@ pub struct Stack {
     nas_us: u64,
     /// NAS asked for an N1 connection (`NasEvent::ConnectionNeeded`).
     nas_connect_pending: bool,
+    /// Wireshark capture (`--pcap`).
+    pcap: Option<Pcap>,
+    /// The last UL transport block captured per HARQ process: a HARQ
+    /// retransmission (the same bytes again) is not captured twice.
+    ul_captured: std::collections::BTreeMap<u8, Vec<u8>>,
+}
+
+/// A PHY sink that copies every PUSCH transport block for the capture.
+struct CaptureUl<'a> {
+    inner: &'a mut dyn MacToPhySink,
+    ul: &'a mut Vec<(MacContext, Vec<u8>)>,
+    tdd: bool,
+}
+
+impl MacToPhySink for CaptureUl<'_> {
+    fn send(&mut self, msg: MacToPhy) {
+        if let MacToPhy::UlTti(req) = &msg {
+            for pdu in &req.pdus {
+                if let UlTtiPdu::Pusch { grant, tb, .. } = pdu {
+                    let c = mac_context(
+                        self.tdd,
+                        Dir::Uplink,
+                        grant.rnti_kind,
+                        grant.rnti.0,
+                        grant.harq_id,
+                        grant.pusch_slot,
+                    );
+                    self.ul.push((c, tb.clone()));
+                }
+            }
+        }
+        self.inner.send(msg);
+    }
+}
+
+/// The MAC-NR capture context of a PDU.
+fn mac_context(
+    tdd: bool,
+    dir: Dir,
+    kind: ferrite_common::RntiKind,
+    rnti: u16,
+    harq_id: u8,
+    slot: SlotPoint,
+) -> MacContext {
+    use ferrite_common::RntiKind as K;
+    MacContext {
+        tdd,
+        dir,
+        rnti_type: match kind {
+            K::Si => RntiType::Si,
+            K::P => RntiType::P,
+            K::Ra => RntiType::Ra,
+            K::Tc | K::C => RntiType::C,
+        },
+        rnti,
+        harq_id,
+        sfn: slot.sfn,
+        subframe: (u32::from(slot.slot) / slot.numerology.slots_per_subframe().max(1)) as u8,
+    }
 }
 
 impl Stack {
@@ -122,11 +182,25 @@ impl Stack {
         });
         // A placeholder MAC config until SIB1 (reconfigured by RRC).
         let mac = MacEntity::new(placeholder_mac(numerology, cfg.duplex, cfg.tx_lead));
+        let pcap = cfg.pcap.as_ref().and_then(|p| {
+            match Pcap::create(std::path::Path::new(p), cfg.pcap_mac_udp) {
+                Ok(w) => {
+                    log::info!("capturing MAC-NR / RRC / NAS to {p}");
+                    Some(w)
+                }
+                Err(e) => {
+                    log::error!("pcap {p}: {e}; running without a capture");
+                    None
+                }
+            }
+        });
+        let mut nas = NasUe::new(id, nas_cfg);
+        nas.set_trace(pcap.is_some());
         Self {
             mac,
             bearers: Bearers::new(numerology),
             rrc,
-            nas: NasUe::new(id, nas_cfg),
+            nas,
             user_plane: UserPlane::new(&cfg),
             numerology,
             mib,
@@ -143,6 +217,8 @@ impl Stack {
             rlf_injected: false,
             nas_us: 0,
             nas_connect_pending: false,
+            pcap,
+            ul_captured: std::collections::BTreeMap::new(),
             cfg,
         }
     }
@@ -241,6 +317,34 @@ impl Stack {
         self.mac.stats()
     }
 
+    /// Write out the capture's buffered packets (before the process exits).
+    pub fn flush_capture(&mut self) {
+        self.capture_nas();
+        if let Some(p) = self.pcap.as_mut() {
+            p.flush();
+            log::info!("pcap: {} packets", p.packets());
+        }
+    }
+
+    fn capture_rrc(&mut self, ch: RrcChannel, pdu: &[u8]) {
+        if let Some(p) = self.pcap.as_mut() {
+            p.rrc(ch, pdu);
+        }
+    }
+
+    fn capture_nas(&mut self) {
+        let trace = self.nas.take_trace();
+        if let Some(p) = self.pcap.as_mut() {
+            for t in trace {
+                p.nas(&t.plain);
+            }
+        }
+    }
+
+    fn tdd(&self) -> bool {
+        self.cfg.duplex == ferrite_common::DuplexMode::Tdd
+    }
+
     pub fn rrc_state(&self) -> RrcState {
         self.rrc.state()
     }
@@ -282,7 +386,10 @@ impl Stack {
                 }
             }
             // SRB0 (CCCH) is transparent: MAC carries the SDU in Msg3.
-            RrcEvent::StartRa { ccch } => self.mac.start_ra(ccch),
+            RrcEvent::StartRa { ccch } => {
+                self.capture_rrc(RrcChannel::UlCcch, &ccch);
+                self.mac.start_ra(ccch)
+            }
             RrcEvent::Reestablishing => self.on_reestablishing(phy),
             RrcEvent::VerifyReestablishment(sec) => self.on_verify_reestablishment(sec),
             RrcEvent::Reestablished => {
@@ -318,6 +425,7 @@ impl Stack {
             }
             RrcEvent::VerifySecurity(sec) => self.on_verify_security(sec, phy, now),
             RrcEvent::TxSrb { srb, pdu } => {
+                self.capture_rrc(RrcChannel::UlDcch, &pdu);
                 if !self.bearers.tx_srb(srb, &pdu, now) {
                     log::warn!("no SRB{srb} bearer for an RRC PDU");
                 }
@@ -592,6 +700,7 @@ impl Stack {
                     self.pending_smc_pdu = Some(raw);
                 }
             }
+            self.capture_rrc(RrcChannel::DlDcch, &pdu);
             self.rrc.on_dl_dcch(srb, &pdu);
         }
         for pkt in d.ip {
@@ -606,12 +715,19 @@ impl Stack {
         for ev in self.mac.take_events() {
             match ev {
                 MacEvent::Bcch(tb) => {
+                    self.capture_rrc(RrcChannel::BcchDlSch, &tb);
                     if let Some(mib) = self.mib.clone() {
                         self.rrc.on_bcch(&tb, &mib, &self.radio);
                     }
                 }
-                MacEvent::Ccch(pdu) => self.rrc.on_dl_ccch(&pdu),
-                MacEvent::Pcch(pdu) => self.rrc.on_pcch(&pdu),
+                MacEvent::Ccch(pdu) => {
+                    self.capture_rrc(RrcChannel::DlCcch, &pdu);
+                    self.rrc.on_dl_ccch(&pdu)
+                }
+                MacEvent::Pcch(pdu) => {
+                    self.capture_rrc(RrcChannel::Pcch, &pdu);
+                    self.rrc.on_pcch(&pdu)
+                }
                 MacEvent::RaSucceeded { c_rnti } => {
                     log::info!("RA succeeded, C-RNTI {c_rnti}");
                     self.rrc
@@ -637,6 +753,54 @@ impl Stack {
 
 impl MacHandler for Stack {
     fn handle(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink) {
+        // With a capture, DL transport blocks are copied here and UL ones on
+        // their way to the PHY.
+        if self.pcap.is_none() {
+            return self.handle_inner(msg, phy);
+        }
+        let tdd = self.tdd();
+        if let (PhyToMac::RxData(d), Some(p)) = (&msg, self.pcap.as_mut()) {
+            if let Some(tb) = &d.tb {
+                let c = mac_context(
+                    tdd,
+                    Dir::Downlink,
+                    d.rnti_kind,
+                    d.rnti.0,
+                    d.harq_id,
+                    d.pdsch_slot,
+                );
+                p.mac(&c, tb);
+            }
+        }
+        let periodic =
+            matches!(&msg, PhyToMac::Slot(s) if s.slot.slot == 0 && s.slot.sfn % 100 == 0);
+        let mut ul = Vec::new();
+        self.handle_inner(
+            msg,
+            &mut CaptureUl {
+                inner: phy,
+                ul: &mut ul,
+                tdd,
+            },
+        );
+        self.capture_nas();
+        if let Some(p) = self.pcap.as_mut() {
+            for (c, tb) in ul {
+                if self.ul_captured.get(&c.harq_id) != Some(&tb) {
+                    p.mac(&c, &tb);
+                    self.ul_captured.insert(c.harq_id, tb);
+                }
+            }
+            if periodic {
+                // About once a second: a killed process loses at most that.
+                p.flush();
+            }
+        }
+    }
+}
+
+impl Stack {
+    fn handle_inner(&mut self, msg: PhyToMac, phy: &mut dyn MacToPhySink) {
         let now = match &msg {
             PhyToMac::Slot(s) => s.slot,
             PhyToMac::Dci(d) => d.slot,

@@ -242,6 +242,40 @@ pub fn push_long_bsr(out: &mut Vec<u8>, lcg_bytes: &[(u8, usize)], truncated: bo
     }
 }
 
+/// The LCIDs of a UL MAC PDU's subPDUs in order (TS 38.321 §6.1.2,
+/// Table 6.2.1-2): SDUs and variable-size CEs carry an L field, the fixed
+/// CEs their size, padding ends the PDU. `None` on a malformed chain.
+pub fn ul_subpdu_lcids(pdu: &[u8]) -> Option<Vec<u8>> {
+    use crate::*;
+    let mut lcids = Vec::new();
+    let mut i = 0;
+    while let Some(&h) = pdu.get(i) {
+        let lcid = h & 0x3f;
+        lcids.push(lcid);
+        let fixed = match lcid {
+            LCID_PADDING => return Some(lcids),
+            LCID_UL_CCCH48 => Some(6),
+            LCID_UL_CCCH64 => Some(8),
+            LCID_SINGLE_PHR | LCID_CRNTI => Some(2),
+            LCID_SHORT_BSR | LCID_SHORT_TRUNC_BSR => Some(1),
+            _ => None,
+        };
+        let (hdr, len) = match fixed {
+            Some(n) => (1, n),
+            None if h & 0x40 != 0 => {
+                let l = u16::from_be_bytes([*pdu.get(i + 1)?, *pdu.get(i + 2)?]);
+                (3, usize::from(l))
+            }
+            None => (2, usize::from(*pdu.get(i + 1)?)),
+        };
+        i += hdr + len;
+        if i > pdu.len() {
+            return None;
+        }
+    }
+    Some(lcids)
+}
+
 /// Build a C-RNTI MAC CE subPDU.
 pub fn push_crnti_ce(out: &mut Vec<u8>, crnti: u16) {
     out.push(LCID_CRNTI);

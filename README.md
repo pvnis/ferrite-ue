@@ -106,6 +106,8 @@ All options can also come from a TOML file (`--config`; flags override it).
 | `--independent-lo` | off | The radio's LO is not locked to its sample clock (don't predict timing drift from the CFO) |
 | `--emulate-lo-ppm`, `--rlf-at-s`, `--rlm-outage-s`, `--t3512-s` | off | Test aids (oscillator error, radio link failure, RLM outage, periodic registration) |
 | `--log` | `info` | Log level (`RUST_LOG`-style filters also work) |
+| `--pcap FILE` | off | Wireshark capture: MAC-NR PDUs, RRC and NAS in plain text (deciphered), one file of exported PDUs. Opens as is in Wireshark ≥ 4.4 |
+| `--pcap-mac-udp` | off | MAC PDUs as UDP datagrams for Wireshark < 4.4 (`wireshark --enable-heuristic mac_nr_udp`) |
 
 Diagnostic environment variables: `FERRITE_PERF` (radio-read overrun
 reports), `FERRITE_DRIFT` (uplink waveform overlap audit), and

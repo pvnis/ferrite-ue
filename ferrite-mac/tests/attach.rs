@@ -83,12 +83,41 @@ fn slot(n: u64) -> SlotPoint {
 fn step(mac: &mut MacEntity, up: &mut FakeUpper, msg: PhyToMac) -> Vec<MacToPhy> {
     let mut out = Vec::new();
     mac.handle_with(msg, &mut out, up);
+    for m in &out {
+        if let MacToPhy::UlTti(r) = m {
+            for p in &r.pdus {
+                if let UlTtiPdu::Pusch { tb, .. } = p {
+                    check_ul_layout(tb);
+                }
+            }
+        }
+    }
     out
+}
+
+/// TS 38.321 §6.1.2: in a UL MAC PDU the subPDUs with MAC SDUs come first,
+/// then those with MAC CEs, then padding.
+fn check_ul_layout(tb: &[u8]) {
+    let lcids = ferrite_mac::pdu::ul_subpdu_lcids(tb).expect("well-formed UL MAC PDU");
+    let is_ce = |l: u8| (53..=62).contains(&l);
+    let first_ce = lcids.iter().position(|&l| is_ce(l)).unwrap_or(lcids.len());
+    assert!(
+        lcids[first_ce..].iter().all(|&l| is_ce(l) || l == 63),
+        "MAC SDU after a MAC CE: LCIDs {lcids:?}"
+    );
 }
 
 #[test]
 fn attach_flow() {
-    let mut mac = MacEntity::new(config());
+    // PHR configured (reported periodically): its CE shares PUSCHs with
+    // MAC SDUs, which `check_ul_layout` holds to the §6.1.2 order.
+    let mut cfg = config();
+    cfg.phr = Some(ferrite_mac::phr::PhrMacConfig {
+        periodic_ms: Some(10),
+        prohibit_ms: 0,
+        tx_power_factor_change_db: None,
+    });
+    let mut mac = MacEntity::new(cfg);
     let mut up = FakeUpper {
         pending: Vec::new(),
         rx: Vec::new(),

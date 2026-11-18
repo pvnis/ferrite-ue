@@ -163,10 +163,12 @@ fn main() {
     match result {
         Ok(stats) => {
             log::info!("engine stopped: {stats:?}; MAC {:?}", stack.mac_stats());
+            stack.flush_capture();
             std::process::exit(if ping_succeeded(&stack) { 0 } else { 1 });
         }
         Err(e) => {
             log::error!("engine failed: {e}");
+            stack.flush_capture();
             std::process::exit(1);
         }
     }

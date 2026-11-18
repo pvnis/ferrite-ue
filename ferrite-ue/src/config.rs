@@ -136,6 +136,14 @@ pub struct Cli {
     /// power in dBm. Unset ⇒ waveforms are peak-normalised (the ZMQ case).
     #[arg(long, allow_hyphen_values = true)]
     pub tx_power_offset_db: Option<f32>,
+    /// Write a Wireshark capture (MAC-NR PDUs, RRC and NAS in plain text)
+    /// to this pcap file.
+    #[arg(long)]
+    pub pcap: Option<String>,
+    /// Write MAC PDUs to the capture as UDP datagrams (Wireshark before 4.4,
+    /// with the `mac_nr_udp` heuristic enabled) instead of `mac-nr-framed`.
+    #[arg(long)]
+    pub pcap_mac_udp: bool,
     /// Test aid: inject a radio link failure this many seconds after start
     /// (while connected) to exercise RRC re-establishment. 0 = never.
     #[arg(long)]
@@ -198,6 +206,7 @@ pub struct FileConfig {
     pub rlm_outage_ms: Option<u64>,
     pub t3512_s: Option<u64>,
     pub log: Option<String>,
+    pub pcap: Option<String>,
 }
 
 /// The resolved configuration.
@@ -240,6 +249,9 @@ pub struct UeConfig {
     /// Test aid: T3512 override (seconds).
     pub t3512_s: Option<u64>,
     pub log: String,
+    /// Wireshark capture file (MAC-NR, RRC, NAS).
+    pub pcap: Option<String>,
+    pub pcap_mac_udp: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +382,8 @@ impl UeConfig {
                 .or(file.rlm_outage_s)
                 .map(|s| (s, pick!(rlm_outage_ms, 1500))),
             t3512_s: cli.t3512_s.or(file.t3512_s),
+            pcap: cli.pcap.clone().or(file.pcap.clone()),
+            pcap_mac_udp: cli.pcap_mac_udp,
             log: pick!(log, "info".into()),
         })
     }

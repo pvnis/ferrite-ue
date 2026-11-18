@@ -880,10 +880,10 @@ impl MacEntity {
         );
     }
 
-    /// Build a UL-SCH MAC PDU of exactly `tbs` bytes (§5.4.3, §6.1.2): C-RNTI CE,
-    /// PHR CE, BSR CE, then MAC SDUs by LCP, then a padding BSR if room, then
-    /// padding. (CEs precede SDUs; among them the C-RNTI CE has the highest
-    /// priority, §5.4.3.1.3.)
+    /// Build a UL-SCH MAC PDU of exactly `tbs` bytes (§5.4.3, §6.1.2). Room is
+    /// given in LCP priority order (§5.4.3.1.3: C-RNTI CE, PHR CE, the BSR's
+    /// reservation, then MAC SDUs), but the layout is the UL one of §6.1.2:
+    /// MAC SDUs first, then the CEs (C-RNTI, PHR, BSR), then padding.
     fn build_ul_pdu(
         &mut self,
         tbs: usize,
@@ -891,11 +891,13 @@ impl MacEntity {
         upper: &mut dyn UpperLayers,
     ) -> (Vec<u8>, bool, bool) {
         let mut out = Vec::with_capacity(tbs);
+        // CEs other than the BSR: room taken now, placed after the SDUs.
+        let mut ces = Vec::new();
         let mut left = tbs;
         if self.crnti_ce_pending {
             if let Some(c) = self.c_rnti {
                 if left >= 3 {
-                    push_crnti_ce(&mut out, c.0);
+                    push_crnti_ce(&mut ces, c.0);
                     left -= 3;
                 }
             }
@@ -903,7 +905,7 @@ impl MacEntity {
         if self.phr.pending && left >= 3 {
             // Type 1 PH for the virtual reference PUSCH (TS 38.213 §7.7.1).
             let ph = self.power.headroom(None);
-            push_single_phr(&mut out, ph.ph_db, ph.pcmax_dbm);
+            push_single_phr(&mut ces, ph.ph_db, ph.pcmax_dbm);
             left -= 3;
             self.phr.on_sent(now, ph.pathloss_db);
             self.stats.phr_sent += 1;
@@ -942,6 +944,8 @@ impl MacEntity {
                 left -= cost;
             }
         }
+        // §6.1.2: UL MAC CEs follow the MAC SDUs.
+        out.extend_from_slice(&ces);
         // BSR (regular/periodic, or padding BSR when ≥ the CE size remains).
         // Bytes per LCG and the best (lowest) channel priority in each LCG.
         let mut remaining: BTreeMap<u8, usize> = BTreeMap::new();

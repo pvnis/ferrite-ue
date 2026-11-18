@@ -4,6 +4,7 @@
 pub mod bearers;
 pub mod config;
 pub mod ip;
+pub mod pcap;
 pub mod stack;
 pub mod tun;
 pub mod userplane;

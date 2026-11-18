@@ -82,6 +82,8 @@ fn config() -> UeConfig {
         rlm_outage: None,
         t3512_s: None,
         log: "info".into(),
+        pcap: None,
+        pcap_mac_udp: false,
     }
 }
 
