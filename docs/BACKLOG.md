@@ -10,6 +10,36 @@ Over-the-air items are listed last and are deliberately deferred until an
 SDR is on the bench; nothing in the other groups may assume the ZMQ
 transport (see `ARCHITECTURE.md`, radio backend section).
 
+## Top priority
+
+- [ ] **4-port CSI** (a gNB with four DL antenna ports, e.g. 4T4R over the
+      air). Today `pmi_bits` (`ferrite-mac/src/entity.rs`) knows one and two
+      ports only and gives 0 PMI bits otherwise, and the PHY measures the
+      two-port row 3 and the single-port TRS only (a 4-port resource is
+      rate-matched around, not measured). A gNB that configures a 4-port
+      NZP-CSI-RS (Type I single panel, N1 = 2, N2 = 1) would get CSI
+      reports shorter than it expects: on PUCCH the CSI shares one coded
+      payload with HARQ-ACK and SR, so those are lost too; on PUSCH the CSI
+      part 1 size changes the UCI RE count and corrupts the UL-SCH. PDSCH
+      itself is unaffected (DM-RS ports follow the layers, at most two with
+      two receive antennas). In order:
+      1. Correctly sized reports for any configured port count (TS 38.212
+         Table 6.3.1.1.2-1: i1,1 / i1,2 / i1,3 / i2 per rank and codebook
+         mode, RI under the `ri-Restriction`), with default values where
+         nothing is measured. On its own this keeps HARQ-ACK and the UL-SCH
+         intact on a 4T cell.
+      2. 4-port measurement: the CSI-RS rows OCUDU configures for four
+         ports (Table 7.4.1.5.3-1 rows 4 / 5), channel per port pair, Type I
+         single-panel codebook search (TS 38.214 §5.2.2.2.1, O1 = 4) for
+         ranks 1 and 2, CQI at the chosen rank.
+      3. UE capability that says what the UE does: `featureSets` with
+         `codebookParameters` (type I single panel, maximum ports per
+         resource) and `maxNumberMIMO-LayersPDSCH` = 2, so a gNB that
+         honours capabilities configures within them. Check what OCUDU
+         does with the port count (antennas vs capability).
+      4. A 4-antenna lab cell (T5 with `nof_antennas_dl: 4`, four ZMQ ports
+         through the emulator to the UE's two) and a stage like S28.
+
 ## PHY / L1
 
 - [x] 2026-11-14 Radio link monitoring: one `SYNC.indication` per SSB period
