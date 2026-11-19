@@ -28,6 +28,11 @@ fn architecture_diagrams_match_the_tables() {
         check::<ferrite_nas::machine::MmMachine>(&doc),
         check::<ferrite_nas::machine::CmMachine>(&doc),
         check::<ferrite_nas::machine::SmMachine>(&doc),
+        check::<ferrite_mac::harq::DlHarqMachine>(&doc),
+        check::<ferrite_mac::harq::UlHarqMachine>(&doc),
+        check::<ferrite_rlc::AmTxMachine>(&doc),
+        check::<ferrite_ue::machine::SecMachine>(&doc),
+        check::<ferrite_ue::machine::ConnMachine>(&doc),
     ]
     .into_iter()
     .flatten()

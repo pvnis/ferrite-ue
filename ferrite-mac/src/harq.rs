@@ -5,11 +5,12 @@
 //! and reports CRC per transmission); MAC keeps the *process* bookkeeping:
 //! NDI history, delivered flag, and the per-slot ACK codebook.
 
+use ferrite_common::fsm::{Fsm, FsmStats, Machine, Rule};
 use ferrite_common::{Rnti, SlotPoint};
 use std::collections::BTreeMap;
 
 /// One DL HARQ process (§5.3.2).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DlHarqProcess {
     /// NDI of the last received DCI on this process, if any.
     pub ndi: Option<u8>,
@@ -17,97 +18,288 @@ pub struct DlHarqProcess {
     pub delivered: bool,
 }
 
+/// [`DlHarqProcess`] without its NDI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DlHarqPhase {
+    /// No assignment yet (or after a MAC reset).
+    Idle,
+    /// A TB is being received (initial transmission or retransmissions).
+    Receiving,
+    /// That TB was decoded and delivered; retransmissions are ACKed unread.
+    Delivered,
+}
+
+/// What moves a DL HARQ process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DlHarqTrigger {
+    /// An assignment with a toggled (or first) NDI: a new TB.
+    NewData,
+    /// The TB passed its CRC and went to the disassembly entity.
+    Decoded,
+    /// MAC reset.
+    Reset,
+}
+
+/// The DL HARQ process machine.
+pub struct DlHarqMachine;
+
+impl Machine for DlHarqMachine {
+    const NAME: &'static str = "DL HARQ";
+    type State = DlHarqProcess;
+    type Kind = DlHarqPhase;
+    type Event = DlHarqTrigger;
+    const KINDS: &'static [DlHarqPhase] = &[
+        DlHarqPhase::Idle,
+        DlHarqPhase::Receiving,
+        DlHarqPhase::Delivered,
+    ];
+    const EVENTS: &'static [DlHarqTrigger] = &[
+        DlHarqTrigger::NewData,
+        DlHarqTrigger::Decoded,
+        DlHarqTrigger::Reset,
+    ];
+    const INITIAL: DlHarqPhase = DlHarqPhase::Idle;
+    const RULES: &'static [Rule<DlHarqPhase, DlHarqTrigger>] = {
+        use DlHarqPhase::*;
+        use DlHarqTrigger::*;
+        &[
+            Rule {
+                from: &[Idle, Delivered],
+                event: NewData,
+                to: Receiving,
+                clause: "38.321 §5.3.2.2 (NDI toggled: new transmission)",
+            },
+            Rule {
+                from: &[Receiving],
+                event: Decoded,
+                to: Delivered,
+                clause: "38.321 §5.3.2.2 (successfully decoded: deliver)",
+            },
+            Rule {
+                from: &[Receiving, Delivered],
+                event: Reset,
+                to: Idle,
+                clause: "38.321 §5.12 (MAC reset: NDI considered toggled)",
+            },
+        ]
+    };
+    fn kind(s: &DlHarqProcess) -> DlHarqPhase {
+        match (s.ndi, s.delivered) {
+            (None, _) => DlHarqPhase::Idle,
+            (Some(_), false) => DlHarqPhase::Receiving,
+            (Some(_), true) => DlHarqPhase::Delivered,
+        }
+    }
+}
+
+/// Enter `to` on `t` (refusals logged; a refusal is a bug, see
+/// [`ferrite_common::fsm`]).
+fn go<M: Machine>(f: &mut Fsm<M>, t: M::Event, to: M::State) {
+    match f.transition(t, to) {
+        Ok(Some(t)) => log::trace!("{t}"),
+        Ok(None) => {}
+        Err(v) => log::error!("{v}"),
+    }
+}
+
+fn sum_stats<'a, M: Machine>(fs: impl Iterator<Item = &'a Fsm<M>>) -> FsmStats {
+    fs.fold(FsmStats::default(), |a, f| FsmStats {
+        transitions: a.transitions + f.stats().transitions,
+        violations: a.violations + f.stats().violations,
+    })
+}
+
 /// Downlink HARQ entity.
 #[derive(Clone, Debug)]
 pub struct DlHarqEntity {
-    processes: Vec<DlHarqProcess>,
+    processes: Vec<Fsm<DlHarqMachine>>,
 }
 
 impl DlHarqEntity {
     pub fn new(n: u8) -> Self {
         Self {
-            processes: vec![DlHarqProcess::default(); n.max(1) as usize],
+            processes: (0..n.max(1))
+                .map(|_| Fsm::new(DlHarqProcess::default()))
+                .collect(),
         }
+    }
+
+    fn process(&mut self, harq_id: u8) -> &mut Fsm<DlHarqMachine> {
+        let n = self.processes.len();
+        &mut self.processes[harq_id as usize % n]
     }
 
     /// Classify a DL assignment: returns `(is_new_data, already_delivered)`.
     /// A toggled (or first) NDI means a new TB; the same NDI is a retransmission,
     /// which may already have been delivered (then it is ACKed without decode).
     pub fn on_assignment(&mut self, harq_id: u8, ndi: u8) -> (bool, bool) {
-        let n = self.processes.len();
-        let p = &mut self.processes[harq_id as usize % n];
-        match p.ndi {
-            Some(prev) if prev == ndi => (false, p.delivered),
+        let p = self.process(harq_id);
+        let cur = *p.state();
+        match cur.ndi {
+            Some(prev) if prev == ndi => (false, cur.delivered),
             _ => {
-                *p = DlHarqProcess {
-                    ndi: Some(ndi),
-                    delivered: false,
-                };
+                go(
+                    p,
+                    DlHarqTrigger::NewData,
+                    DlHarqProcess {
+                        ndi: Some(ndi),
+                        delivered: false,
+                    },
+                );
                 (true, false)
             }
         }
     }
 
     pub fn is_delivered(&self, harq_id: u8) -> bool {
-        self.processes[harq_id as usize % self.processes.len()].delivered
+        self.processes[harq_id as usize % self.processes.len()]
+            .state()
+            .delivered
     }
 
     pub fn mark_delivered(&mut self, harq_id: u8) {
-        let n = self.processes.len();
-        self.processes[harq_id as usize % n].delivered = true;
+        let p = self.process(harq_id);
+        let cur = *p.state();
+        if cur.ndi.is_some() && !cur.delivered {
+            go(
+                p,
+                DlHarqTrigger::Decoded,
+                DlHarqProcess {
+                    delivered: true,
+                    ..cur
+                },
+            );
+        }
     }
 
     pub fn reset(&mut self) {
         for p in &mut self.processes {
-            *p = DlHarqProcess::default();
+            if p.kind() != DlHarqPhase::Idle {
+                go(p, DlHarqTrigger::Reset, DlHarqProcess::default());
+            }
         }
+    }
+
+    /// Transitions made and refused over the processes.
+    pub fn fsm_stats(&self) -> FsmStats {
+        sum_stats(self.processes.iter())
     }
 }
 
 /// One UL HARQ process (§5.4.2): the stored TB for retransmissions.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UlHarqProcess {
     pub ndi: Option<u8>,
     pub tbs_bits: u32,
     pub tb: Vec<u8>,
 }
 
+/// [`UlHarqProcess`] without its TB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UlHarqPhase {
+    /// Nothing stored.
+    Empty,
+    /// A TB is stored for retransmissions on this process.
+    Holding,
+}
+
+/// What moves a UL HARQ process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UlHarqTrigger {
+    /// A new TB went out (NDI toggled, or the first grant).
+    NewTransmission,
+    /// MAC reset (the HARQ buffers are flushed).
+    Reset,
+}
+
+/// The UL HARQ process machine.
+pub struct UlHarqMachine;
+
+impl Machine for UlHarqMachine {
+    const NAME: &'static str = "UL HARQ";
+    type State = UlHarqProcess;
+    type Kind = UlHarqPhase;
+    type Event = UlHarqTrigger;
+    const KINDS: &'static [UlHarqPhase] = &[UlHarqPhase::Empty, UlHarqPhase::Holding];
+    const EVENTS: &'static [UlHarqTrigger] =
+        &[UlHarqTrigger::NewTransmission, UlHarqTrigger::Reset];
+    const INITIAL: UlHarqPhase = UlHarqPhase::Empty;
+    const RULES: &'static [Rule<UlHarqPhase, UlHarqTrigger>] = &[
+        Rule {
+            from: &[UlHarqPhase::Empty],
+            event: UlHarqTrigger::NewTransmission,
+            to: UlHarqPhase::Holding,
+            clause: "38.321 §5.4.2.2 (new transmission: store the MAC PDU)",
+        },
+        Rule {
+            from: &[UlHarqPhase::Holding],
+            event: UlHarqTrigger::Reset,
+            to: UlHarqPhase::Empty,
+            clause: "38.321 §5.12 (MAC reset: flush the HARQ buffers)",
+        },
+    ];
+    fn kind(s: &UlHarqProcess) -> UlHarqPhase {
+        if s.tb.is_empty() {
+            UlHarqPhase::Empty
+        } else {
+            UlHarqPhase::Holding
+        }
+    }
+}
+
 /// Uplink HARQ entity.
 #[derive(Clone, Debug)]
 pub struct UlHarqEntity {
-    processes: Vec<UlHarqProcess>,
+    processes: Vec<Fsm<UlHarqMachine>>,
 }
 
 impl UlHarqEntity {
     pub fn new(n: u8) -> Self {
         Self {
-            processes: vec![UlHarqProcess::default(); n.max(1) as usize],
+            processes: (0..n.max(1))
+                .map(|_| Fsm::new(UlHarqProcess::default()))
+                .collect(),
         }
+    }
+
+    fn get(&self, harq_id: u8) -> &UlHarqProcess {
+        self.processes[harq_id as usize % self.processes.len()].state()
     }
 
     /// Is a grant with this NDI/TBS a retransmission of the stored TB?
     pub fn is_retx(&self, harq_id: u8, ndi: u8, tbs_bits: u32) -> bool {
-        let p = &self.processes[harq_id as usize % self.processes.len()];
+        let p = self.get(harq_id);
         p.ndi == Some(ndi) && p.tbs_bits == tbs_bits && !p.tb.is_empty()
     }
 
     pub fn stored(&self, harq_id: u8) -> &[u8] {
-        &self.processes[harq_id as usize % self.processes.len()].tb
+        &self.get(harq_id).tb
     }
 
     pub fn store(&mut self, harq_id: u8, ndi: u8, tbs_bits: u32, tb: Vec<u8>) {
         let n = self.processes.len();
-        self.processes[harq_id as usize % n] = UlHarqProcess {
-            ndi: Some(ndi),
-            tbs_bits,
-            tb,
-        };
+        go(
+            &mut self.processes[harq_id as usize % n],
+            UlHarqTrigger::NewTransmission,
+            UlHarqProcess {
+                ndi: Some(ndi),
+                tbs_bits,
+                tb,
+            },
+        );
     }
 
     pub fn reset(&mut self) {
         for p in &mut self.processes {
-            *p = UlHarqProcess::default();
+            if p.kind() != UlHarqPhase::Empty {
+                go(p, UlHarqTrigger::Reset, UlHarqProcess::default());
+            }
         }
+    }
+
+    /// Transitions made and refused over the processes.
+    pub fn fsm_stats(&self) -> FsmStats {
+        sum_stats(self.processes.iter())
     }
 }
 

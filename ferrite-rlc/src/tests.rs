@@ -307,6 +307,12 @@ fn am_duplex(sn_len: SnLen, seed: u64, loss_pct: u64, count: usize, slots: u64) 
     }
     assert!(a.events().is_empty() && b.events().is_empty());
     assert_eq!(a.unacked_sdus(), 0, "everything A sent was acknowledged");
+    // Every SDU's transmit state moved along the table (RLC AM TX).
+    for e in [&a, &b] {
+        let st = e.fsm_stats();
+        assert_eq!(st.violations, 0);
+        assert!(st.transitions >= 2 * count as u64, "{st:?}");
+    }
     assert_eq!(b.unacked_sdus(), 0);
     assert_eq!(a.buffer_status(), 0);
     assert_eq!(b.buffer_status(), 0);
@@ -681,4 +687,32 @@ fn invalid_sn_lengths_are_clamped() {
         MU,
     );
     assert!(matches!(a.mode(), RlcMode::Am(_)));
+}
+
+#[test]
+fn am_tx_table_is_well_formed() {
+    assert_eq!(ferrite_common::fsm::check::<crate::AmTxMachine>(), Ok(()));
+}
+
+/// A STATUS PDU that acknowledges an SDU the transmitter has not finished
+/// submitting cannot be right (the peer cannot have received the rest): the
+/// acknowledgement is ignored and the remaining segments still go out.
+#[test]
+fn am_ack_of_a_partially_sent_sdu_is_ignored() {
+    let mut tx = am(SnLen::Bits12);
+    tx.tx_sdu(sdu(7, 300));
+    let first = tx.pull_pdu(100, at(0)).expect("first segment");
+    assert!(first.len() <= 100);
+    let st = StatusPdu {
+        ack_sn: 1,
+        nacks: vec![],
+    };
+    tx.rx_pdu(&st.encode(SnLen::Bits12), at(1));
+    assert_eq!(tx.unacked_sdus(), 1, "SN 0 is still being segmented");
+    let mut rest = 0;
+    while let Some(p) = tx.pull_pdu(100, at(2)) {
+        rest += p.len();
+    }
+    assert!(rest >= 200, "the remaining bytes still go out ({rest})");
+    assert_eq!(tx.fsm_stats().violations, 0);
 }

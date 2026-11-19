@@ -601,6 +601,25 @@ impl NasUe {
         }
     }
 
+    /// The lower layers could not establish (or lost) the N1 signalling
+    /// connection during a registration: TS 24.501 §5.5.1.2.7 / §5.5.1.3.7
+    /// abnormal case "lower layer failure before REGISTRATION ACCEPT /
+    /// REJECT" — T3510 stopped, the attempt counter incremented, T3511 (or,
+    /// after five attempts, T3502) before the next try. Outside a
+    /// registration it changes nothing (a service request is abandoned by
+    /// [`NasUe::on_connection_released`]).
+    pub fn on_lower_layer_failure(&mut self) {
+        if matches!(
+            self.state(),
+            MmState::RegistrationInitiated | MmState::Authenticating | MmState::SecurityMode
+        ) {
+            log::warn!("NAS: lower-layer failure during registration");
+            self.t3510 = None;
+            self.pending_keys = None;
+            self.registration_attempt_failed(MmTrigger::RegistrationFailed, None);
+        }
+    }
+
     fn set_cm(&mut self, trigger: CmTrigger, cm: CmState) {
         match self.cm.transition(trigger, cm) {
             Ok(Some(t)) => log::info!("{t}"),

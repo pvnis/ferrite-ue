@@ -146,8 +146,12 @@ fn sib1_configures_the_phy_and_starts_registration() {
     assert!(prach > 0, "no PRACH request within 400 slots");
 }
 
+/// A failed establishment is a NAS abnormal case (TS 24.501 §5.5.1.2.7):
+/// the next attempt waits T3511 (10 s), not the stack's own sub-second
+/// retry that restarted the registration and kept the attempt counter from
+/// ever reaching T3502 (formal/ue.qnt, `backoff`).
 #[test]
-fn failed_attempt_is_retried_after_a_backoff() {
+fn failed_attempt_is_retried_after_t3511() {
     let mut stack = Stack::new(config(), Some(mib()));
     let mut phy: Vec<MacToPhy> = Vec::new();
     stack.handle(sib1(0), &mut phy);
@@ -156,6 +160,7 @@ fn failed_attempt_is_retried_after_a_backoff() {
     // reports the failure, and the stack must try again later.
     let mut failed_at = None;
     let mut prach_after_failure = 0;
+    let mut retry_at = None;
     for n in 1..40_000u64 {
         phy.clear();
         stack.handle(PhyToMac::Slot(SlotIndication { slot: slot(n) }), &mut phy);
@@ -170,6 +175,7 @@ fn failed_attempt_is_retried_after_a_backoff() {
         } else {
             prach_after_failure += prach_requests(&phy);
             if prach_after_failure > 0 {
+                retry_at = Some(n);
                 break;
             }
         }
@@ -180,4 +186,11 @@ fn failed_attempt_is_retried_after_a_backoff() {
         "no new random access after the failure at slot {failed_at}"
     );
     assert_eq!(stack.rrc_state(), RrcState::Connecting);
+    // 30 kHz: 2 slots per ms; T3511 = 10 s.
+    let waited = retry_at.unwrap_or(0) - failed_at;
+    assert!(
+        waited >= 20_000,
+        "retried {waited} slots after the failure, before T3511"
+    );
+    assert_eq!(stack.fsm_stats().violations, 0);
 }

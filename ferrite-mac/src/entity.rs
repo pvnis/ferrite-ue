@@ -233,6 +233,8 @@ impl MacEntity {
             self.ra.fsm_stats(),
             self.ta.fsm_stats(),
             self.drx.fsm_stats(),
+            self.dl_harq.fsm_stats(),
+            self.ul_harq.fsm_stats(),
         ]
         .into_iter()
         .chain(self.sr.iter().map(|s| s.fsm_stats()));

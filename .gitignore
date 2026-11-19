@@ -7,3 +7,6 @@
 *.rec
 # Lab run logs/captures (scripts/lab.sh, scripts/probe.sh)
 /test/results/
+# Apalache / Quint output, generated traces
+_apalache-out/
+/formal/trace.qnt

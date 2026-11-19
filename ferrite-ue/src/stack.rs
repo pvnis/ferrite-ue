@@ -11,8 +11,10 @@
 
 use crate::bearers::Bearers;
 use crate::config::UeConfig;
+use crate::machine::{ConnMachine, ConnPhase, ConnTrigger, SecMachine, SecState, SecTrigger};
 use crate::pcap::{Dir, MacContext, Pcap, RntiType, RrcChannel};
 use crate::userplane::{UserPlane, UserPlaneEvent};
+use ferrite_common::fsm::Fsm;
 use ferrite_common::{Numerology, SlotPoint};
 use ferrite_fapi::*;
 use ferrite_mac::{MacConfig, MacEntity, MacEvent, MacStats};
@@ -58,15 +60,6 @@ pub enum StackEvent {
     Deregistered,
 }
 
-/// Connection-establishment retry (an RRC failure is not final; TS 38.331
-/// leaves the retry to the upper layers).
-#[derive(Default)]
-struct ConnectionRetry {
-    started: bool,
-    attempts: u32,
-    retry_at: Option<SlotPoint>,
-}
-
 /// The UE stack.
 pub struct Stack {
     cfg: UeConfig,
@@ -80,12 +73,16 @@ pub struct Stack {
     radio: derive::RadioInfo,
     /// AS security in force (`None` before the SecurityModeCommand is verified
     /// and after release / re-establishment until the new keys are verified).
-    security: Option<AsSecurity>,
+    /// AS security, changed only through [`SecMachine`]'s table.
+    security: Fsm<SecMachine>,
     /// Raw PDCP PDU of the SecurityModeCommand, verified once the keys are known.
     pending_smc_pdu: Option<Vec<u8>>,
     /// Raw PDCP PDU of the RRCReestablishment, verified with the refreshed keys.
     pending_reest_pdu: Option<Vec<u8>>,
-    conn: ConnectionRetry,
+    /// The connection lifecycle, changed only through [`ConnMachine`]'s table.
+    /// Retries after a failure are the NAS's (T3511 / T3502, TS 24.501
+    /// §5.5.1.2.7), not the stack's: see `formal/ue.qnt`.
+    conn: Fsm<ConnMachine>,
     /// Uplink IP packets waiting for the DRB to come back (idle → service request).
     idle_pending_ul: Vec<Vec<u8>>,
     /// Paging identity to hand to the PHY on the next message (`Some(None)` stops).
@@ -205,10 +202,10 @@ impl Stack {
             numerology,
             mib,
             radio,
-            security: None,
+            security: Fsm::new(SecState::Inactive),
             pending_smc_pdu: None,
             pending_reest_pdu: None,
-            conn: ConnectionRetry::default(),
+            conn: Fsm::new(ConnPhase::NotStarted),
             idle_pending_ul: Vec::new(),
             pending_paging_cfg: None,
             events: VecDeque::new(),
@@ -260,7 +257,7 @@ impl Stack {
                 self.rrc.set_k_gnb(k);
             }
             log::info!("NAS signalling connection requested (mo-Signalling)");
-            self.rrc.connect_for(pdu, now, 3);
+            self.connect(|rrc| rrc.connect_for(pdu, now, 3));
         }
     }
 
@@ -311,6 +308,50 @@ impl Stack {
     /// `(sent, received)` once the built-in ping probe has finished.
     pub fn ping_result(&self) -> Option<(u32, u32)> {
         self.user_plane.ping_result()
+    }
+
+    /// The verified AS keys, if security is active.
+    fn as_keys(&self) -> Option<AsSecurity> {
+        match self.security.state() {
+            SecState::Active(k) => Some(*k),
+            _ => None,
+        }
+    }
+
+    /// Move the AS security context along [`SecMachine`] (a move to the
+    /// current phase only updates the keys; a refusal is logged).
+    fn sec_go(&mut self, t: SecTrigger, to: SecState) {
+        match self.security.transition(t, to) {
+            Ok(Some(t)) => log::info!("{t}"),
+            Ok(None) => {}
+            Err(v) => log::error!("{v}"),
+        }
+    }
+
+    /// Transitions made and refused by the stack's machines (AS security,
+    /// connection).
+    pub fn fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        let (a, b) = (self.security.stats(), self.conn.stats());
+        ferrite_common::fsm::FsmStats {
+            transitions: a.transitions + b.transitions,
+            violations: a.violations + b.violations,
+        }
+    }
+
+    /// Ask RRC for a connection and, when it starts one, record it.
+    fn connect(&mut self, request: impl FnOnce(&mut RrcUe)) {
+        request(&mut self.rrc);
+        if self.rrc.state() == RrcState::Connecting {
+            self.conn_go(ConnTrigger::Connect, ConnPhase::Connecting);
+        }
+    }
+
+    fn conn_go(&mut self, t: ConnTrigger, to: ConnPhase) {
+        match self.conn.transition(t, to) {
+            Ok(Some(t)) => log::info!("{t}"),
+            Ok(None) => {}
+            Err(v) => log::error!("{v}"),
+        }
     }
 
     pub fn mac_stats(&self) -> MacStats {
@@ -380,8 +421,7 @@ impl Stack {
                 self.events
                     .push_back(StackEvent::CellConfigured { plmn, tac });
                 // Start registration: NAS → RRC connection request.
-                if !self.conn.started {
-                    self.conn.started = true;
+                if *self.conn.state() == ConnPhase::NotStarted {
                     self.start_connection(now);
                 }
             }
@@ -395,7 +435,7 @@ impl Stack {
             RrcEvent::Reestablished => {
                 // §5.3.7.5: the refreshed keys apply to every bearer (COUNTs kept);
                 // SRB1 already has them.
-                if let Some(sec) = self.security {
+                if let Some(sec) = self.as_keys() {
                     self.bearers.install_security(&sec, |rb| rb != RbId::Srb(1));
                 }
                 self.events.push_back(StackEvent::Reestablished);
@@ -410,7 +450,8 @@ impl Stack {
                 }
             }
             RrcEvent::SetupBearer(b) => {
-                self.bearers.setup(b, self.security.as_ref());
+                let keys = self.as_keys();
+                self.bearers.setup(b, keys.as_ref());
                 // Data that queued up while idle goes out as soon as the DRB is back.
                 if self.bearers.drb_lcid().is_some() && !self.idle_pending_ul.is_empty() {
                     let q = std::mem::take(&mut self.idle_pending_ul);
@@ -433,6 +474,7 @@ impl Stack {
             RrcEvent::DlNas(nas) => self.on_dl_nas(&nas, now),
             RrcEvent::Connected => {
                 log::info!("RRC connected");
+                self.conn_go(ConnTrigger::Established, ConnPhase::Connected);
                 self.nas.on_connection_established();
                 self.events.push_back(StackEvent::RrcConnected);
             }
@@ -440,8 +482,9 @@ impl Stack {
                 // §5.3.8.3: to idle; the NAS stays registered, the PDU
                 // session stays active, and the PHY keeps monitoring paging.
                 log::info!("RRC released (idle)");
+                self.conn_go(ConnTrigger::Released, ConnPhase::Idle);
                 self.bearers.clear();
-                self.security = None;
+                self.sec_go(SecTrigger::ConnectionEnded, SecState::Inactive);
                 self.mac.reset(phy);
                 self.nas.on_connection_released();
                 self.on_nas_events(now);
@@ -453,16 +496,20 @@ impl Stack {
             }
             RrcEvent::Failed(why) => {
                 log::warn!("RRC failure: {why}");
+                self.conn_go(ConnTrigger::Failed, ConnPhase::Idle);
+                // TS 24.501 §5.5.1.2.7: a lower-layer failure is an abnormal
+                // case of the registration (attempt counter, T3511 / T3502);
+                // the NAS asks for the next connection (ConnectionNeeded).
+                // The stack used to retry by itself within a second and
+                // restart the registration, so the counter never advanced and
+                // T3502 never applied (formal/ue.qnt, `backoff`).
                 self.nas.on_connection_released();
+                self.nas.on_lower_layer_failure();
+                self.on_nas_events(now);
                 self.events.push_back(StackEvent::Failed(why.to_string()));
-                // Back off and try again (a failed RA / T300 is not final).
                 self.bearers.clear();
-                self.security = None;
+                self.sec_go(SecTrigger::ConnectionEnded, SecState::Inactive);
                 self.mac.reset(phy);
-                let backoff_slots = 200
-                    * self.numerology.slots_per_subframe() as u64
-                    * (1 + self.conn.attempts.min(4) as u64);
-                self.conn.retry_at = Some(now.add(backoff_slots));
             }
         }
     }
@@ -473,7 +520,7 @@ impl Stack {
     fn on_reestablishing(&mut self, phy: &mut dyn MacToPhySink) {
         log::info!("RRC re-establishment: resetting MAC, suspending DRBs");
         self.mac.reset(phy);
-        self.security = None;
+        self.sec_go(SecTrigger::Reestablishing, SecState::Suspended);
         self.pending_reest_pdu = None;
         self.bearers.begin_reestablishment();
         self.events.push_back(StackEvent::Reestablishing);
@@ -491,7 +538,7 @@ impl Stack {
         };
         if ok {
             self.bearers.install_security(&sec, |rb| rb == RbId::Srb(1));
-            self.security = Some(sec);
+            self.sec_go(SecTrigger::ReestablishmentVerified, SecState::Active(sec));
             log::info!("RRCReestablishment verified; SRB1 keys refreshed");
         } else {
             log::warn!("RRCReestablishment MAC-I check failed");
@@ -512,7 +559,7 @@ impl Stack {
             _ => false,
         };
         if ok {
-            self.security = Some(sec);
+            self.sec_go(SecTrigger::SmcVerified, SecState::Active(sec));
             self.bearers
                 .install_security(&sec, |rb| matches!(rb, RbId::Srb(_)));
             self.bearers.set_srb_tx_cipher(false);
@@ -535,9 +582,8 @@ impl Stack {
 
     /// NAS registration request → RRC connection establishment.
     fn start_connection(&mut self, now: SlotPoint) {
-        self.conn.attempts += 1;
         match self.nas.start_registration() {
-            Some(nas) => self.rrc.connect(nas, now),
+            Some(nas) => self.connect(|rrc| rrc.connect(nas, now)),
             None => log::warn!(
                 "registration not allowed in NAS state {:?}",
                 self.nas.state()
@@ -562,7 +608,7 @@ impl Stack {
                 self.events.push_back(StackEvent::ServiceRequest {
                     cause: if cause == 2 { "mt-Access" } else { "mo-Data" },
                 });
-                self.rrc.connect_for(pdu, now, cause);
+                self.connect(|rrc| rrc.connect_for(pdu, now, cause));
             }
             None => log::warn!("service request not possible (NAS not registered)"),
         }
@@ -693,7 +739,7 @@ impl Stack {
         for (srb, pdu, raw) in d.srb {
             // A SecurityModeCommand needs the raw PDCP PDU for verification;
             // so does the RRCReestablishment (with the refreshed keys).
-            if self.security.is_none() {
+            if self.as_keys().is_none() {
                 if self.rrc.state() == RrcState::Reestablishing && srb == 1 {
                     self.pending_reest_pdu = Some(raw);
                 } else {
@@ -834,24 +880,6 @@ impl Stack {
         if is_slot {
             self.bearers.tick(now);
             self.rrc.tick(now);
-            if let Some(t) = self.conn.retry_at {
-                if now.diff(&t) >= 0
-                    && self.rrc.state() == RrcState::Idle
-                    && self.rrc.cell().is_some()
-                {
-                    self.conn.retry_at = None;
-                    if self.nas.is_registered() || self.nas_connect_pending {
-                        // A registered UE's NAS owns its retries (T3511 / T3502).
-                        self.nas_connect_pending = true;
-                    } else {
-                        log::info!(
-                            "retrying the connection (attempt {})",
-                            self.conn.attempts + 1
-                        );
-                        self.start_connection(now);
-                    }
-                }
-            }
             // The NAS timers run on air-interface time: one slot (1 ms / 2^µ) per SLOT.indication.
             self.nas_us += 1_000 / u64::from(self.numerology.slots_per_subframe()).max(1);
             let nas_pdus = self.nas.tick(self.nas_us / 1000);

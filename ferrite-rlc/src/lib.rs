@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 
 use ferrite_common::{Numerology, SlotPoint};
 
+pub use am::{AmTxMachine, AmTxPhase, AmTxTrigger, TxSduState};
 pub use header::{is_status_pdu, AmdHeader, Nack, Si, StatusPdu, UmdHeader, SO_END_ALL};
 
 /// Sequence-number field length (TS 38.322 §7.1: UM 6 or 12 bits, AM 12 or 18).
@@ -286,6 +287,15 @@ impl RlcEntity {
         match &self.inner {
             Inner::Am(a) => a.unacked_sdus(),
             _ => 0,
+        }
+    }
+
+    /// Transitions made and refused by the AM transmit-side SDUs
+    /// ([`AmTxMachine`]); zero for TM / UM.
+    pub fn fsm_stats(&self) -> ferrite_common::fsm::FsmStats {
+        match &self.inner {
+            Inner::Am(a) => a.fsm_stats(),
+            _ => ferrite_common::fsm::FsmStats::default(),
         }
     }
 }

@@ -415,7 +415,7 @@ Practices taken from OsmocomBB (`src/host/layer23`, `src/host/trxcon`,
 callbacks, 5–7k-line files) are not adopted; the crate split and the typed
 FAPI already improve on them.
 
-- [~] **Explicit state machines with declared transitions** (priority).
+- [x] 2026-11-19 **Explicit state machines with declared transitions** (priority).
       2026-11-16: helper `ferrite_common::fsm` done; RRC and MAC RA
       converted, with a randomised RRC entity test and two Kani proofs on RA
       (inductive invariant, bounded 6-step), diagrams generated into
@@ -450,8 +450,24 @@ FAPI already improve on them.
         now survives until the RA starts (unit test, Kani).
       * L1: a dedicated CONFIG.request before SIB1 is refused.
       Open: `Registered(LimitedService)` / `Registered(PlmnSearch)` are never
-      entered (dead substates); the implicit machines (HARQ, RLC AM, stack
-      retry / security hand-over); the composed NAS × RRC × MAC model.
+      entered (dead substates).
+      2026-11-19 (last step): the implicit machines are on tables too —
+      DL / UL HARQ processes, the RLC AM transmit-side SDU (an ACK of an SDU
+      not fully submitted is now ignored as a malformed STATUS PDU instead of
+      dropping the unsent rest), the stack's AS security and connection.
+      The composed model `formal/ue.qnt` (Quint: NAS × 5GMM-CM × RRC × stack
+      glue, network and timers nondeterministic; properties noStuck,
+      t3510Consistent, cmFollowsRrc, backoff) found, by simulation and
+      Apalache, that the stack retried a failed RRC establishment by itself
+      within a second and restarted the registration, resetting the NAS
+      attempt counter: a UE whose random access kept failing never backed
+      off to T3502 (24.501 §5.5.1.2.7). Fixed (`NasUe::on_lower_layer_failure`;
+      the stack no longer retries by itself); lab: with the uplink at −20 dB
+      the UE makes five attempts 10 s apart, then waits T3502. Trace
+      validation: `scripts/trace_to_quint.py` replays a lab run's logged
+      transitions against the model (`quint test`); the lab logs so far
+      replay whole, `formal/traces/ul_failure.qnt` is the failure-path one.
+      Not done: a CI job running the model (needs Node + Quint in CI).
       Today 11 FSMs are enums changed by plain assignment: L1 `CellPhase`,
       `RlmState`; MAC `RaState`, `SrState`, `DrxState`, `TaState`; RRC
       `RrcState` (one `set_state` already); NAS `MmState` (with substates),

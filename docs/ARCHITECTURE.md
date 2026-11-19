@@ -538,15 +538,47 @@ Checks, cheapest first:
    checks show that the failure, success and RAR paths are reachable, so
    the proof is not vacuous. `ra_moves_only_along_its_table` replays every
    6-input sequence from a fresh procedure. About 30 s and 10 min.
-4. Planned: a composed NAS × RRC × MAC RA model for deadlock and liveness,
-   validated against the transition logs of lab runs.
+4. A composed model in Quint (`formal/ue.qnt`) of what the tables cannot
+   see: how the layers combine. It covers NAS 5GMM with T3510 / T3511 /
+   T3502 and the attempt counter, 5GMM-IDLE / CONNECTED, RRC with random
+   access folded into Connecting, and the stack glue. The gNB, the core and
+   the timers act nondeterministically. Its properties:
+   * `noStuck`: a UE that wants to register always has something pending
+     that makes progress;
+   * `t3510Consistent`: T3510 runs exactly during a registration;
+   * `cmFollowsRrc`: 5GMM-CONNECTED exactly with RRC_CONNECTED;
+   * `backoff`: at most five registration attempts in a row without the
+     T3502 wait (TS 24.501 §5.5.1.2.7).
+
+   Simulation (`quint run`) and bounded model checking with Apalache
+   (`quint verify`) both found the stack breaking `backoff`. After an RRC
+   establishment failure it retried by itself within a second and
+   restarted the registration, which reset the attempt counter. A UE whose
+   random access kept failing retried every second, forever. Apalache's
+   shortest counterexample is six failed random accesses in a row. Fixed:
+   the failure is the NAS's abnormal case (`NasUe::on_lower_layer_failure`:
+   counter, T3511, T3502), and the stack no longer retries by itself. With
+   `FIXED`, every property holds (Apalache to 10 steps; 50 000 random
+   traces of 60 steps).
+
+   **Trace validation**: `scripts/trace_to_quint.py ue.log` turns a lab
+   run's logged transitions into a Quint run that `quint test` replays
+   against the model, failing at the first step the model does not allow
+   and checking the invariants after each one. The replay stops at the
+   first transition the model does not cover and says so.
+
+   ```
+   quint run formal/ue.qnt --main=fixed --invariant=allProps
+   quint verify formal/ue.qnt --main=fixed --invariant=allProps --max-steps=10
+   quint run formal/ue.qnt --main=current --invariant=backoff    # the old bug
+   scripts/trace_to_quint.py test/results/<run>/ue.log > formal/trace.qnt
+   quint test formal/trace.qnt --main=trace
+   ```
 
 The diagrams below are generated from the tables, and
 `ferrite-ue/tests/fsm_docs.rs` fails when they differ.
 
-Machines on tables. This is everything in BACKLOG's plan except the
-implicit machines: HARQ processes, RLC AM windows, and the stack's
-connection retry and AS-security hand-over.
+Machines on tables (all of BACKLOG's plan):
 
 | Layer | Machine | Kinds | Verified by |
 |---|---|---|---|
@@ -560,6 +592,11 @@ connection retry and AS-security hand-over.
 | NAS | `ferrite_nas::machine::MmMachine` | 15 (state × substate) | randomised entity test |
 | NAS | `ferrite_nas::machine::CmMachine` | Idle, Connected | randomised entity test |
 | NAS | `ferrite_nas::machine::SmMachine` | 4 (per PDU session) | randomised entity test |
+| MAC | `ferrite_mac::harq::DlHarqMachine` | Idle, Receiving, Delivered (per process) | table check; attach test |
+| MAC | `ferrite_mac::harq::UlHarqMachine` | Empty, Holding (per process) | table check; attach test |
+| RLC | `ferrite_rlc::AmTxMachine` | Segmenting, Sent, Retransmitting, MaxRetx, Acked (per SDU) | table check; lossy duplex tests |
+| Stack | `ferrite_ue::machine::SecMachine` | AS security: Inactive, Active, Suspended | table check; stack test |
+| Stack | `ferrite_ue::machine::ConnMachine` | NotStarted, Connecting, Connected, Idle | table check; stack test; Quint model |
 
 The 5GMM randomised test (150 seeds × 150 inputs, partial registrations
 with a fake core) reaches most edges. The ones it misses mostly leave
@@ -861,6 +898,76 @@ stateDiagram-v2
     ActivePending --> Inactive: LocalRelease
     Active --> Inactive: LocalRelease
     InactivePending --> Inactive: LocalRelease
+```
+
+</details>
+
+<details><summary>MAC DL HARQ process (<code>DlHarqMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Receiving: NewData
+    Delivered --> Receiving: NewData
+    Receiving --> Delivered: Decoded
+    Receiving --> Idle: Reset
+    Delivered --> Idle: Reset
+```
+
+</details>
+
+<details><summary>MAC UL HARQ process (<code>UlHarqMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Holding: NewTransmission
+    Holding --> Empty: Reset
+```
+
+</details>
+
+<details><summary>RLC AM transmit-side SDU (<code>AmTxMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Segmenting
+    Segmenting --> Sent: FullySubmitted
+    Segmenting --> Retransmitting: RetxConsidered
+    Sent --> Retransmitting: RetxConsidered
+    Retransmitting --> MaxRetx: MaxRetxReached
+    Sent --> Acked: Acked
+    Retransmitting --> Acked: Acked
+    MaxRetx --> Acked: Acked
+```
+
+</details>
+
+<details><summary>Stack AS security (<code>SecMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> Inactive
+    Inactive --> Active: SmcVerified
+    Active --> Suspended: Reestablishing
+    Suspended --> Active: ReestablishmentVerified
+    Active --> Inactive: ConnectionEnded
+    Suspended --> Inactive: ConnectionEnded
+```
+
+</details>
+
+<details><summary>Stack connection (<code>ConnMachine</code>)</summary>
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotStarted
+    NotStarted --> Connecting: Connect
+    Idle --> Connecting: Connect
+    Connecting --> Connected: Established
+    Connected --> Idle: Released
+    Connecting --> Idle: Failed
+    Connected --> Idle: Failed
 ```
 
 </details>

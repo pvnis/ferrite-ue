@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use ferrite_common::fsm::{Fsm, FsmStats, Machine, Rule};
 use ferrite_common::{Numerology, SlotPoint};
 
 use crate::header::{is_status_pdu, AmdHeader, Nack, Si, StatusPdu, SO_END_ALL};
@@ -9,15 +10,158 @@ use crate::reasm::RxSdu;
 use crate::timer::Timer;
 use crate::{sn_mod, AmConfig, RlcEvent, SnLen};
 
-/// An SDU with an assigned SN, kept until positively acknowledged.
+/// An SDU with an assigned SN, kept until positively acknowledged; its
+/// transmit state changes only through [`AmTxMachine`]'s table.
 #[derive(Debug)]
 struct TxSdu {
     data: Vec<u8>,
+    meta: Fsm<AmTxMachine>,
+}
+
+/// The transmit-side state of one AMD SDU (TS 38.322 §5.2.3.1, §5.3.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxSduState {
+    /// SDU length (bytes).
+    pub len: usize,
     /// Bytes `[0, sent)` have been submitted to lower layer at least once.
-    sent: usize,
+    pub sent: usize,
     /// RETX_COUNT (§7.1); `None` until first considered for retransmission.
-    retx_count: Option<u32>,
-    max_reported: bool,
+    pub retx_count: Option<u32>,
+    /// maxRetxThreshold was reached (reported to RRC once).
+    pub max_reported: bool,
+    /// Positively acknowledged (the SDU is then discarded).
+    pub acked: bool,
+}
+
+/// [`TxSduState`] as the transition table sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmTxPhase {
+    /// Being segmented: not every byte submitted yet.
+    Segmenting,
+    /// Every byte submitted once, awaiting the STATUS PDU.
+    Sent,
+    /// Considered for retransmission (NACKed, or picked at t-PollRetransmit
+    /// expiry): RETX_COUNT running.
+    Retransmitting,
+    /// RETX_COUNT reached maxRetxThreshold (radio link failure reported).
+    MaxRetx,
+    Acked,
+}
+
+/// What moves an AMD SDU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmTxTrigger {
+    /// The last byte was submitted to lower layer.
+    FullySubmitted,
+    /// A STATUS NACK or a t-PollRetransmit expiry considers it for
+    /// retransmission.
+    RetxConsidered,
+    MaxRetxReached,
+    /// Below ACK_SN and not NACKed in a STATUS PDU.
+    Acked,
+}
+
+/// The AM transmit-side SDU machine.
+pub struct AmTxMachine;
+
+impl Machine for AmTxMachine {
+    const NAME: &'static str = "RLC AM TX";
+    type State = TxSduState;
+    type Kind = AmTxPhase;
+    type Event = AmTxTrigger;
+    const KINDS: &'static [AmTxPhase] = &[
+        AmTxPhase::Segmenting,
+        AmTxPhase::Sent,
+        AmTxPhase::Retransmitting,
+        AmTxPhase::MaxRetx,
+        AmTxPhase::Acked,
+    ];
+    const EVENTS: &'static [AmTxTrigger] = &[
+        AmTxTrigger::FullySubmitted,
+        AmTxTrigger::RetxConsidered,
+        AmTxTrigger::MaxRetxReached,
+        AmTxTrigger::Acked,
+    ];
+    const INITIAL: AmTxPhase = AmTxPhase::Segmenting;
+    const RULES: &'static [Rule<AmTxPhase, AmTxTrigger>] = {
+        use AmTxPhase::*;
+        use AmTxTrigger::*;
+        &[
+            Rule {
+                from: &[Segmenting],
+                event: FullySubmitted,
+                to: Sent,
+                clause: "38.322 §5.2.3.1.1",
+            },
+            Rule {
+                // A NACKed segment of an SDU still being segmented is
+                // retransmitted too; the rest follows as new data.
+                from: &[Segmenting, Sent],
+                event: RetxConsidered,
+                to: Retransmitting,
+                clause: "38.322 §5.3.2 (NACK), §5.3.3.4 (t-PollRetransmit)",
+            },
+            Rule {
+                from: &[Retransmitting],
+                event: MaxRetxReached,
+                to: MaxRetx,
+                clause: "38.322 §5.3.2 (RETX_COUNT = maxRetxThreshold)",
+            },
+            Rule {
+                // Not while segmenting: the peer cannot have received bytes
+                // never submitted (such a STATUS PDU is ignored).
+                from: &[Sent, Retransmitting, MaxRetx],
+                event: AmTxTrigger::Acked,
+                to: AmTxPhase::Acked,
+                clause: "38.322 §5.2.3.1.1 (positive acknowledgement)",
+            },
+        ]
+    };
+    fn kind(s: &TxSduState) -> AmTxPhase {
+        if s.acked {
+            AmTxPhase::Acked
+        } else if s.max_reported {
+            AmTxPhase::MaxRetx
+        } else if s.retx_count.is_some() {
+            AmTxPhase::Retransmitting
+        } else if s.sent < s.len {
+            AmTxPhase::Segmenting
+        } else {
+            AmTxPhase::Sent
+        }
+    }
+}
+
+fn add_stats(a: FsmStats, b: FsmStats) -> FsmStats {
+    FsmStats {
+        transitions: a.transitions + b.transitions,
+        violations: a.violations + b.violations,
+    }
+}
+
+impl TxSdu {
+    fn new(data: Vec<u8>) -> Self {
+        let len = data.len();
+        Self {
+            data,
+            meta: Fsm::new(TxSduState {
+                len,
+                ..TxSduState::default()
+            }),
+        }
+    }
+
+    fn sent(&self) -> usize {
+        self.meta.state().sent
+    }
+
+    fn go(&mut self, t: AmTxTrigger, to: TxSduState) {
+        match self.meta.transition(t, to) {
+            Ok(Some(t)) => log::trace!("{t}"),
+            Ok(None) => {}
+            Err(v) => log::error!("{v}"),
+        }
+    }
 }
 
 /// A byte range `[start, end)` of an SDU pending retransmission (§5.3.2).
@@ -42,6 +186,8 @@ pub(crate) struct AmEntity {
     // --- transmitting side (§7.1) ---
     tx_queue: VecDeque<Vec<u8>>,
     tx_sdus: BTreeMap<u32, TxSdu>,
+    /// Transitions of the SDUs already acknowledged (for [`AmEntity::fsm_stats`]).
+    retired: FsmStats,
     retx: VecDeque<RetxSeg>,
     tx_next_ack: u32,
     tx_next: u32,
@@ -80,6 +226,7 @@ impl AmEntity {
             events: Vec::new(),
             tx_queue: VecDeque::new(),
             tx_sdus: BTreeMap::new(),
+            retired: FsmStats::default(),
             retx: VecDeque::new(),
             tx_next_ack: 0,
             tx_next: 0,
@@ -124,6 +271,14 @@ impl AmEntity {
         self.delivered.pop_front()
     }
 
+    /// Transitions made and refused over the transmit-side SDUs (a refusal
+    /// is a bug: see [`AmTxMachine`]).
+    pub fn fsm_stats(&self) -> FsmStats {
+        self.tx_sdus
+            .values()
+            .fold(self.retired, |a, s| add_stats(a, s.meta.stats()))
+    }
+
     pub fn unacked_sdus(&self) -> usize {
         self.tx_sdus.len()
     }
@@ -136,7 +291,7 @@ impl AmEntity {
     fn partial_at_tx_next(&self) -> bool {
         self.tx_sdus
             .get(&self.tx_next)
-            .is_some_and(|s| s.sent < s.data.len())
+            .is_some_and(|s| s.sent() < s.data.len())
     }
 
     /// No new data available for transmission (transmission buffer empty).
@@ -151,7 +306,11 @@ impl AmEntity {
 
     /// Highest SN among the AMD PDUs submitted to lower layer, if any.
     fn highest_submitted_sn(&self) -> Option<u32> {
-        if self.tx_sdus.get(&self.tx_next).is_some_and(|s| s.sent > 0) {
+        if self
+            .tx_sdus
+            .get(&self.tx_next)
+            .is_some_and(|s| s.sent() > 0)
+        {
             Some(self.tx_next)
         } else if self.tx_next != self.tx_next_ack {
             Some(self.tx_next.wrapping_sub(1) & (self.modulus - 1))
@@ -270,18 +429,10 @@ impl AmEntity {
                 return None;
             }
             let data = self.tx_queue.pop_front()?;
-            self.tx_sdus.insert(
-                sn,
-                TxSdu {
-                    data,
-                    sent: 0,
-                    retx_count: None,
-                    max_reported: false,
-                },
-            );
+            self.tx_sdus.insert(sn, TxSdu::new(data));
         }
         let sdu = self.tx_sdus.get(&sn)?;
-        let (len, start) = (sdu.data.len(), sdu.sent);
+        let (len, start) = (sdu.data.len(), sdu.sent());
         let hdr = self.hdr_base() + if start > 0 { 2 } else { 0 };
         if max_bytes <= hdr {
             return None;
@@ -290,7 +441,8 @@ impl AmEntity {
         let end = start + take;
         let data = sdu.data[start..end].to_vec();
         if let Some(s) = self.tx_sdus.get_mut(&sn) {
-            s.sent = end;
+            let m = *s.meta.state();
+            s.go(AmTxTrigger::FullySubmitted, TxSduState { sent: end, ..m });
         }
         if end == len {
             self.tx_next = (self.tx_next + 1) % self.modulus;
@@ -306,9 +458,9 @@ impl AmEntity {
         let partial = self
             .tx_sdus
             .get(&self.tx_next)
-            .filter(|s| s.sent < s.data.len())
+            .filter(|s| s.sent() < s.data.len())
             .map_or(0, |s| {
-                s.data.len() - s.sent + base + if s.sent > 0 { 2 } else { 0 }
+                s.data.len() - s.sent() + base + if s.sent() > 0 { 2 } else { 0 }
             });
         let retx: usize = self
             .retx
@@ -341,7 +493,7 @@ impl AmEntity {
             return;
         };
         // Only transmitted bytes can be retransmitted.
-        let end = end.min(sdu.sent);
+        let end = end.min(sdu.sent());
         if start >= end {
             return;
         }
@@ -349,16 +501,25 @@ impl AmEntity {
             .retx
             .iter()
             .any(|r| r.sn == sn && r.start <= start && end <= r.end);
-        match sdu.retx_count {
-            None => sdu.retx_count = Some(0),
+        let m = *sdu.meta.state();
+        let retx_count = match m.retx_count {
+            None => Some(0),
             Some(c) if !already_pending && !incremented.contains(&sn) => {
-                sdu.retx_count = Some(c + 1);
                 incremented.insert(sn);
+                Some(c.saturating_add(1))
             }
-            _ => {}
-        }
-        if sdu.retx_count.is_some_and(|c| c >= self.max_retx_threshold) && !sdu.max_reported {
-            sdu.max_reported = true;
+            c => c,
+        };
+        sdu.go(AmTxTrigger::RetxConsidered, TxSduState { retx_count, ..m });
+        if retx_count.is_some_and(|c| c >= self.max_retx_threshold) && !m.max_reported {
+            let m = *sdu.meta.state();
+            sdu.go(
+                AmTxTrigger::MaxRetxReached,
+                TxSduState {
+                    max_reported: true,
+                    ..m
+                },
+            );
             log::warn!("rlc am: maxRetxThreshold reached for SN {sn}");
             self.events.push(RlcEvent::MaxRetxReached { sn });
         }
@@ -408,12 +569,28 @@ impl AmEntity {
                 nacked_sns.insert(sn);
             }
         }
-        // Positive acknowledgements: every SN below ACK_SN not NACKed.
+        // Positive acknowledgements: every SN below ACK_SN not NACKed. An
+        // SDU not fully submitted cannot have been received: ignore that
+        // acknowledgement (a malformed STATUS PDU) rather than drop the
+        // unsent rest.
         for rel in 0..ack_rel {
             let sn = (base + rel) % m;
-            if !nacked_sns.contains(&sn) && self.tx_sdus.remove(&sn).is_some() {
-                self.retx.retain(|r| r.sn != sn);
+            if nacked_sns.contains(&sn) {
+                continue;
             }
+            let Some(sdu) = self.tx_sdus.get_mut(&sn) else {
+                continue;
+            };
+            if sdu.meta.kind() == AmTxPhase::Segmenting {
+                log::warn!("rlc am: STATUS acknowledges SN {sn}, not fully submitted: ignored");
+                continue;
+            }
+            let st = *sdu.meta.state();
+            sdu.go(AmTxTrigger::Acked, TxSduState { acked: true, ..st });
+            if let Some(done) = self.tx_sdus.remove(&sn) {
+                self.retired = add_stats(self.retired, done.meta.stats());
+            }
+            self.retx.retain(|r| r.sn != sn);
         }
         // §5.3.3.3: the poll was answered (positively or negatively).
         if sn_mod(self.poll_sn, base, m) < ack_rel {
@@ -450,7 +627,7 @@ impl AmEntity {
                         .max_by_key(|&sn| sn_mod(sn, base, m))
                 });
             if let Some(sn) = candidate {
-                let sent = self.tx_sdus.get(&sn).map_or(0, |s| s.sent);
+                let sent = self.tx_sdus.get(&sn).map_or(0, |s| s.sent());
                 let mut incremented = BTreeSet::new();
                 self.consider_retx(sn, 0, sent, &mut incremented);
             }
@@ -692,6 +869,7 @@ impl AmEntity {
     pub fn reestablish(&mut self) {
         self.events.clear();
         self.tx_queue.clear();
+        self.retired = self.fsm_stats();
         self.tx_sdus.clear();
         self.retx.clear();
         self.tx_next_ack = 0;

@@ -1270,3 +1270,51 @@ fn random_inputs_stay_inside_the_tables() {
         missing.len()
     );
 }
+
+/// Lower-layer failures during registration (random access, T300) count
+/// like any abnormal case (TS 24.501 §5.5.1.2.7): T3511 between attempts,
+/// and T3502 (12 min) after the fifth.
+#[test]
+fn lower_layer_failures_back_off_to_t3502() {
+    let mut u = ue(NasConfig::default());
+    let mut t = 1_000;
+    u.tick(t);
+    let _ = u.start_registration();
+    for attempt in 1..=5 {
+        u.on_lower_layer_failure();
+        assert_eq!(
+            u.state(),
+            MmState::Deregistered(DeregisteredSub::AttemptingRegistration),
+            "attempt {attempt}"
+        );
+        if attempt < 5 {
+            t += 10_000; // T3511
+            u.tick(t);
+            assert_eq!(
+                u.state(),
+                MmState::RegistrationInitiated,
+                "retry after T3511 ({attempt})"
+            );
+            assert!(
+                u.take_pending_initial_message().is_some(),
+                "behind a ConnectionNeeded"
+            );
+        }
+    }
+    // Fifth failure: T3502, not T3511.
+    t += 10_000;
+    u.tick(t);
+    assert_eq!(
+        u.state(),
+        MmState::Deregistered(DeregisteredSub::AttemptingRegistration),
+        "no retry after 10 s: T3502 runs"
+    );
+    t += 12 * 60_000;
+    u.tick(t);
+    assert_eq!(
+        u.state(),
+        MmState::RegistrationInitiated,
+        "retry after T3502"
+    );
+    assert_eq!(u.fsm_stats().violations, 0);
+}

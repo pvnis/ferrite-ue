@@ -20,7 +20,7 @@
 pub(crate) mod bsr;
 pub mod drx;
 pub mod entity;
-pub(crate) mod harq;
+pub mod harq;
 pub(crate) mod lcp;
 pub mod pdu;
 pub mod phr;
