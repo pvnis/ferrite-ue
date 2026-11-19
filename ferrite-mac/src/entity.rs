@@ -814,7 +814,9 @@ impl MacEntity {
         // the C-RNTI MAC CE in Msg3 is resolved by a PDCCH addressed to the
         // C-RNTI with a UL grant for a new transmission (TS 38.321 §5.1.5), not
         // by any PDCCH: resolving it on the SIB1's SI-RNTI DCI declared
-        // success 20 ms after every Msg3, received or not.
+        // success 20 ms after every Msg3, received or not. Any C-RNTI UL grant
+        // counts: Msg3 sits in UL HARQ process 0 with NDI 0, so an NDI test
+        // would take a gNB's first grant on that process for a retransmission.
         let resolves_crnti_ra = matches!(&dci, Dci::Ul(g) if g.rnti_kind == RntiKind::C);
         match dci {
             Dci::Dl(g) => self.on_dl_grant(slot, g),
