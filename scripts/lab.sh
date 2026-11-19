@@ -260,7 +260,10 @@ if command -v tshark > /dev/null && [ -s "$OUT/ue.pcap" ]; then
   EXPERT=$(tshark -r "$OUT/ue.pcap" --enable-heuristic mac_nr_udp -T fields -e _ws.expert.severity -e _ws.expert.message 2>/dev/null \
     | awk -F'\t' '{n=split($1,sv,","); split($2,m,","); for(i=1;i<=n;i++) if (sv[i]>=6291456) print m[i]}' \
     | grep -v "Illegal checksum value\|MAC-I Digest wrong" | sort | uniq -c | sort -rn)
-  ARQ="repeated\|Status PDU reports NACK"
+  # "PDCP SN missing" too: Wireshark's RLC reassembly gives up on an SDU
+  # whose segments arrive out of order, which HARQ retransmissions cause
+  # (the UE's RLC reassembles and acknowledges it).
+  ARQ="repeated\|Status PDU reports NACK\|PDCP SN ([0-9]*) missing"
   REPEATS=$(echo "$EXPERT" | grep "$ARQ" | awk '{s+=$1} END {print s+0}')
   BAD=$(echo "$EXPERT" | grep -v "$ARQ" | grep -E "[A-Za-z]")
   NPKT=$(tshark -r "$OUT/ue.pcap" 2>/dev/null | wc -l)

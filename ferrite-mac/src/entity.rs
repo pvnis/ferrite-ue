@@ -102,7 +102,14 @@ pub struct MacEntity {
     bwp_timer_arm: bool,
     c_rnti: Option<Rnti>,
     tc_rnti: Option<Rnti>,
+    /// Test switch (`FERRITE_TEST_DROP_MSG4_ACKS=N`): send no HARQ-ACK for
+    /// the first N TC-RNTI PDSCHs, so the gNB retransmits Msg4 after the
+    /// UE has resolved the contention (the lab's missed-ACK case).
+    drop_msg4_acks: u32,
     pending_pusch: BTreeMap<u64, PendingPusch>,
+    /// The slot of the Msg3 handed to the PHY, which is not in
+    /// `pending_pusch`: no PUCCH goes out in it (an SR there replaced Msg3).
+    msg3_slot: Option<SlotPoint>,
     /// Latest CSI measurement and the slot it was taken in.
     latest_csi: Option<(CsiValues, SlotPoint)>,
     /// Rank and PMI from the latest multi-port CSI-RS measurement; a
@@ -155,7 +162,12 @@ impl MacEntity {
                 && cfg.dl_bwp_id != cfg.default_dl_bwp_id,
             c_rnti: None,
             tc_rnti: None,
+            drop_msg4_acks: std::env::var("FERRITE_TEST_DROP_MSG4_ACKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             pending_pusch: BTreeMap::new(),
+            msg3_slot: None,
             latest_csi: None,
             csi_rank: None,
             crnti_ce_pending: false,
@@ -324,6 +336,7 @@ impl MacEntity {
     pub fn reset(&mut self, phy: &mut dyn MacToPhySink) {
         self.c_rnti = None;
         self.tc_rnti = None;
+        self.msg3_slot = None;
         self.dl_harq.reset();
         self.ul_harq.reset();
         self.ack_book = AckBook::default();
@@ -540,6 +553,20 @@ impl MacEntity {
     /// Assemble what must be transmitted in `target` (TS 38.213 §9.2.5 UCI
     /// multiplexing: a PUSCH in the slot carries the UCI; else a PUCCH).
     fn build_target_slot(&mut self, target: SlotPoint, now: SlotPoint, phy: &mut dyn MacToPhySink) {
+        if self.msg3_slot.is_some_and(|m| target.diff(&m) > 0) {
+            self.msg3_slot = None; // passed (slot numbers wrap after 1024 frames)
+        }
+        if self.msg3_slot == Some(target) {
+            // Msg3 is this slot's PUSCH. A UE does not signal an SR that
+            // overlaps a UL-SCH resource (TS 38.321 §5.4.4) and Msg3 carries
+            // no UCI, so nothing else goes out (no HARQ-ACK is due during
+            // contention resolution, and a CSI report waits for the next one).
+            self.msg3_slot = None;
+            if self.ack_book.has_slot(target) {
+                log::warn!("HARQ-ACK due at {target} dropped for the Msg3 there");
+            }
+            return;
+        }
         let pusch = self.pending_pusch.remove(&target.index());
         let has_ack = self.ack_book.has_slot(target);
         let pri = self.ack_book.pri(target).unwrap_or(0);
@@ -783,6 +810,12 @@ impl MacEntity {
         phy: &mut dyn MacToPhySink,
         upper: &mut dyn UpperLayers,
     ) {
+        // A random access the MAC started (SR failure, no SR configured) with
+        // the C-RNTI MAC CE in Msg3 is resolved by a PDCCH addressed to the
+        // C-RNTI with a UL grant for a new transmission (TS 38.321 §5.1.5), not
+        // by any PDCCH: resolving it on the SIB1's SI-RNTI DCI declared
+        // success 20 ms after every Msg3, received or not.
+        let resolves_crnti_ra = matches!(&dci, Dci::Ul(g) if g.rnti_kind == RntiKind::C);
         match dci {
             Dci::Dl(g) => self.on_dl_grant(slot, g),
             Dci::Ul(g) => self.on_ul_grant(slot, g, phy, upper),
@@ -792,8 +825,7 @@ impl MacEntity {
                 self.events.push(MacEvent::BwpSwitch { dl_bwp, ul_bwp });
             }
         }
-        // C-RNTI based RA resolves on any C-RNTI PDCCH (§5.1.5).
-        if self.c_rnti.is_some() {
+        if resolves_crnti_ra && self.c_rnti.is_some() {
             let acts = self.ra.on_crnti_pdcch();
             self.apply_ra_actions(acts, phy);
         }
@@ -805,7 +837,31 @@ impl MacEntity {
         }
         // The DCI's TPC steers the PUCCH loop (TS 38.213 §7.2.1).
         self.power.on_pucch_tpc(g.tpc);
-        let (_new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
+        let (new, delivered) = self.dl_harq.on_assignment(g.harq_id, g.ndi);
+        log::debug!(
+            "DL assignment {:?} {} PDSCH {} harq {} ndi {}: {} (ACK at {:?})",
+            g.rnti_kind,
+            g.rnti,
+            g.pdsch_slot,
+            g.harq_id,
+            g.ndi,
+            if new {
+                "new data"
+            } else if delivered {
+                "retransmission of a delivered TB"
+            } else {
+                "retransmission"
+            },
+            g.ack_slot.map(|s| s.to_string())
+        );
+        if g.rnti_kind == RntiKind::Tc && self.drop_msg4_acks > 0 {
+            self.drop_msg4_acks -= 1;
+            log::warn!(
+                "test: no HARQ-ACK for the TC-RNTI PDSCH at {}",
+                g.pdsch_slot
+            );
+            return;
+        }
         if g.rnti_kind == RntiKind::C {
             self.drx.on_crnti_pdcch(slot);
             self.restart_bwp_timer(slot);
@@ -1093,6 +1149,7 @@ impl MacEntity {
         // NDI 0 is then a retransmission request (§5.4.2.1).
         self.ul_harq.store(0, 0, tbs_bits, tb.clone());
         self.ra.on_msg3_scheduled(grant.pusch_slot);
+        self.msg3_slot = Some(grant.pusch_slot);
         self.stats.ul_tb += 1;
         let power_dbm = self.power.pusch_dbm(u32::from(grant.n_prb), true);
         phy.send(MacToPhy::UlTti(UlTtiRequest {

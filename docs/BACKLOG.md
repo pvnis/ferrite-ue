@@ -284,8 +284,40 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       rejects anything but 6–15 digits), the CCCH SDU length, and four
       PDSCH asserts on network-configured values (bundle size, DM-RS
       reference CRB, Qm, slot index).
-- [ ] Intermittent uplink loss with the downlink fine (about one run in
-      several, the rerun of the same scenario passes):
+- [x] 2026-11-19 Intermittent uplink loss with the downlink fine (about one run in
+      several, the rerun of the same scenario passes). Reproduced at the
+      cell edge (1 run in 16, after dc42c02 none in 16 pedestrian runs):
+      it was not the uplink but three MAC bugs chained together.
+      1. The gNB missed the Msg4 HARQ-ACK and retransmitted Msg4 after the
+         UE had resolved the contention. The UE booked "already delivered:
+         ACK", then let the failed re-decode of the retransmission overwrite
+         it (`AckBook::set_result`): NACK, three times. OCUDU applied the
+         dedicated configuration (RRCSetupComplete) while still in fallback,
+         left fallback on the late ACK and never scheduled the UE again
+         (SRs detected, 51 B of NAS queued, no grant).
+      2. The UE's SR failures then ran C-RNTI random accesses whose Msg3
+         always landed on an SR occasion; Msg3 is not in `pending_pusch`,
+         so the MAC also sent the positive SR for that slot and the PUCCH
+         request replaced the Msg3 (gNB: SR detected, PUSCH −30 dB).
+      3. The C-RNTI random access then "succeeded" on any DCI — the SIB1's
+         SI-RNTI one, 20 ms later — instead of a C-RNTI UL grant
+         (38.321 §5.1.5), so the loop never ended.
+      Fixed all three; `ferrite-mac/tests/fallback.rs` fails without each.
+      `FERRITE_TEST_DROP_MSG4_ACKS=N` (no HARQ-ACK for the first N
+      TC-RNTI PDSCHs) forces case 1. Lab: 16 cell-edge runs and 4 with the
+      forced ACK loss all register and ping (before: 1 in 16 stalled).
+      Left as found:
+      * after the contention resolution a Msg4 retransmission is decoded as
+        C-RNTI: no soft combining with the TC-RNTI transmission (buffers
+        keyed by RNTI kind), and the PDSCH worker picks the CORESET#0
+        reference point and the cell-ID scrambling by RNTI kind, where
+        38.211 §7.3.1.1 / §7.4.1.1.2 say "DCI 1_0 in a common search
+        space". Harmless in the lab cell (CORESET#0 at CRB 0, scrambling
+        IDs = PCI), wrong for a cell with either set; needs an `in_css`
+        flag on the grants;
+      * 38.321 §5.4.4 also releases PUCCH / SRS on an SR failure (the UE
+        keeps them until RRC reconfigures).
+      Original notes:
       * cell edge (T1, 5 dB, 3 µs, 2 ppm): the timing loop flipping by ±4
         samples (88 re-alignments in a run), and the gNB detects none of the
         UE's preambles (47 random access attempts);

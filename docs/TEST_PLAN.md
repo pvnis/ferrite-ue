@@ -160,6 +160,11 @@ cycle the uplink timing offset per PRACH attempt / PUSCH transmission and the
 gNB PHY log shows which ones were detected (`PRACH: … detected_preambles=[…
 ta=…]`, `PUSCH: … crc=OK`).
 
+A lost Msg4 HARQ-ACK (the gNB retransmits Msg4 after the UE resolved the
+contention, the case behind the 2026-11-19 cell-edge stall):
+`FERRITE_TEST_DROP_MSG4_ACKS=1 scripts/lab.sh T1 --scenario cell-edge`; it must
+register and ping like any run.
+
 ### 5.2 Channel emulator (`ferrite-chanem`)
 
 `ferrite-chanem` (`ferrite-radio`, feature `zmq`) sits between the gNB and

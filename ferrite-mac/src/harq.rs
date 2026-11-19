@@ -337,14 +337,19 @@ impl AckBook {
         }
     }
 
-    /// Record the decode result for a PDSCH (by its slot + HARQ id).
+    /// Record the decode result for a PDSCH (by its slot + HARQ id). An entry
+    /// booked as ACK stays one: that PDSCH retransmits a TB already delivered,
+    /// which TS 38.321 §5.3.2.2 acknowledges whatever this decode gives. A
+    /// NACK there makes the gNB retransmit a TB the UE already has, and
+    /// OCUDU, once a Msg4 is ACKed only after the RRCSetupComplete, never
+    /// schedules the UE again.
     pub fn set_result(&mut self, pdsch_slot: SlotPoint, harq_id: u8, ack: bool) -> bool {
         for v in self.slots.values_mut() {
             if let Some(e) = v
                 .iter_mut()
                 .find(|e| e.pdsch_slot == pdsch_slot && e.harq_id == harq_id)
             {
-                e.ack = Some(ack);
+                e.ack = Some(ack || e.ack == Some(true));
                 return true;
             }
         }
@@ -471,6 +476,30 @@ mod tests {
         // Nothing booked but a grant says one ACK bit is expected.
         assert_eq!(b.take(ack, Some(0)), vec![0]);
         assert_eq!(b.take(ack, Some(3)), Vec::<u8>::new());
+    }
+
+    /// A retransmission of a delivered TB is ACKed even when its decode fails.
+    #[test]
+    fn delivered_retransmission_stays_acked() {
+        let mut b = AckBook::default();
+        b.book(
+            sp(5),
+            AckEntry {
+                rnti: Rnti(0x4601),
+                pdsch_slot: sp(1),
+                harq_id: 0,
+                dai: 0,
+                ack: Some(true),
+                pri: 0,
+            },
+        );
+        assert!(b.set_result(sp(1), 0, false));
+        let e = b
+            .slots
+            .get(&sp(5).index())
+            .and_then(|v| v.first())
+            .map(|e| e.ack);
+        assert_eq!(e, Some(Some(true)));
     }
 
     #[test]
