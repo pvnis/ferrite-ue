@@ -260,8 +260,9 @@ searches every PMI of ranks 1 and 2 (`csi::pmi_hypotheses`,
   rank 2 with the second beam `v_{l+k1, m+k2}` and `−φ_n`.
 
 It keeps the PMI that maximises the sum of the per-layer `log2(1 + SINR)`
-(MRC gain for rank 1, post-MMSE SINRs for rank 2). The CQI maps the mean
-post-equalisation SINR. The engine queues a CSI measurement on every
+(MRC gain for rank 1, post-MMSE SINRs for rank 2). The CQI maps the
+capacity-equivalent SINR of that choice, `2^(mean log2(1 + SINR)) − 1`
+over RBs and layers (one codeword spans them all). The engine queues a CSI measurement on every
 occasion of a measured resource: the single-port TRS, and every two- or
 four-port resource, measured against the codebook of the report with that
 port count. The MAC keeps the rank / PMI of the latest multi-port

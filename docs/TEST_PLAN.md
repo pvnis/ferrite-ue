@@ -242,7 +242,7 @@ the post-exit grants noted above. Failures by cause, and their fixes:
 | 18 S30 failures (vehicular, dispersive, some cell-edge): UE drift 0.2–0.7 ppm off | Not the CFO (within 1 % in every run): the timing loop's rate integrator turned the timing wander of fading multipath into drift, on top of the CFO feed-forward that already carries it | Fixed: rate gain × 0.05 while the feed-forward is on (test `multipath_timing_wander_is_not_drift`); reruns of T1/C1/F1/T6 × vehicular/dispersive all within 0.02 ppm. S30 now also checks the CFO, as ppm of the DL carrier, within 0.1 ppm |
 | 10 runs lost 1–3 pings | Mostly cell-edge (5 dB) and 2x2 fading at 0.17–0.3× emulator pace | Open: link margin and the slow emulator path |
 | 4 S22 failures (T3 urban, vehicular, dispersive, cell-edge) | S22 asks for ≥ 90 % gNB PUSCH CRC OK, a clean-channel limit; under fading the CP-OFDM configs show the same UL failure rates (T1 urban 54/25), so this is the gNB's decoding and link adaptation, not the UE's DFT-s-OFDM | By design: read S22 on `ideal` / `static` |
-| T5 S28 under fading (after the hang fix: indoor 62/33, vehicular 87/22 DL TB ok/ko) | Two-layer PDSCH BLER above the 10 % limit, which is set for the clean channel; indoor at 30 dB should not fail a third of its TBs | Open: rank-2 decoding under fading (rank / PMI reporting vs MMSE) |
+| T5 S28 under fading (after the hang fix: indoor 62/33, vehicular 87/22 DL TB ok/ko) | The receiver trusted antenna 0 / DM-RS port 0 alone: its DM-RS gate dropped two-layer PDSCHs (and their retransmissions) whenever that path faded, and the residual-CFO slope came from it | Fixed 2026-11-18: both over every antenna and port; T5 indoor 75/1, T8 pedestrian 76/0 |
 
 ## 6. Over-the-air addendum (L4)
 

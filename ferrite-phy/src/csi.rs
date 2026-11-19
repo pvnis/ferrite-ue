@@ -295,7 +295,8 @@ pub fn pmi_hypotheses(cb: Codebook, rank: u8) -> Vec<Pmi> {
 /// come from despreading `w_f = [+1, ±1]`; the noise variance is the RB-to-RB
 /// spread of every (antenna, port) estimate (capped at 40 dB SNR on a
 /// lossless channel). The rank-1 SINR is the MRC gain of the precoded
-/// channel, the rank-2 SINRs the per-layer post-MMSE values. `max_rank`
+/// channel, the rank-2 SINRs the per-layer post-MMSE values; the CQI maps
+/// the capacity-equivalent SINR of the chosen rank and PMI. `max_rank`
 /// caps the rank (`ri-Restriction`); so do the two receive antennas the
 /// estimate uses.
 pub fn measure_csi_rs_ports(
@@ -362,7 +363,7 @@ pub fn measure_csi_rs_ports(
     for rank in 1..=max_rank.clamp(1, 2).min(n_ant as u8) {
         for pmi in pmi_hypotheses(codebook, rank) {
             let w = type1_precoder(codebook, rank, pmi);
-            let (mut se, mut sinr_sum) = (0.0f32, 0.0f32);
+            let mut se = 0.0f32;
             for hn in &h {
                 // Precoded channel per antenna and layer: g[a][l] = Σ_p H[a][p]·W[p][l].
                 let g = |a: usize, l: usize| -> Complex32 {
@@ -372,7 +373,6 @@ pub fn measure_csi_rs_ports(
                     let gain: f32 = (0..n_ant).map(|a| g(a, 0).norm_sqr()).sum();
                     let sinr = gain / noise;
                     se += (1.0 + sinr).log2();
-                    sinr_sum += sinr;
                 } else {
                     // Post-MMSE SINR per layer: 1 / [(I + GᴴG/σ²)⁻¹]_ll − 1.
                     let gg = |l: usize, m: usize| {
@@ -390,13 +390,17 @@ pub fn measure_csi_rs_ports(
                         let inv_ll = (other / det).re.max(1e-9);
                         let sinr = (1.0 / inv_ll - 1.0).max(0.0);
                         se += (1.0 + sinr).log2();
-                        sinr_sum += sinr;
                     }
                 }
             }
             if best.is_none_or(|b| se > b.0) {
+                // Effective SINR for the CQI: the SINR whose capacity is the
+                // mean capacity over RBs and layers (one codeword spans
+                // them all). The linear mean let the strong RBs / layer hide
+                // the weak ones: CQI 13–15 on a fading 2×2 channel the
+                // resulting 64-QAM then failed on (19 of 96 TBs, T5 indoor).
                 let layers = (h.len() * usize::from(rank)) as f32;
-                best = Some((se, rank, pmi, sinr_sum / layers));
+                best = Some((se, rank, pmi, (se / layers).exp2() - 1.0));
             }
         }
     }
@@ -647,6 +651,15 @@ mod tests {
         assert_eq!(e.ri, 2, "{e:?}");
         assert!(e.sinr_db > 30.0 && e.cqi == 15, "{e:?}");
         assert_eq!(measure(identity, 2, 1).ri, 1);
+        // Precoded channel diag(1, 0.01) (H = diag(1, 0.01)·W⁻¹ for the
+        // rank-2 i2 = 0 precoder W = [[1, 1], [1, −1]]/2): rank 2 still
+        // carries more than rank 1, but the reported SINR is the
+        // capacity-equivalent one of the codeword (≈ 24 dB), not the linear
+        // mean the strong layer dominates (≈ 40 dB).
+        let skewed = [[c(1.0, 0.0), c(1.0, 0.0)], [c(0.01, 0.0), c(-0.01, 0.0)]];
+        let e = measure(skewed, 2, 2);
+        assert_eq!(e.ri, 2, "{e:?}");
+        assert!(e.sinr_db > 20.0 && e.sinr_db < 28.0, "{e:?}");
         assert_eq!(measure(identity, 1, 2).ri, 1);
         // Ports in phase: i2 = 0 (φ = 1).
         let e = measure(

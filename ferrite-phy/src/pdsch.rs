@@ -593,7 +593,7 @@ fn inv2(m: [[Complex32; 2]; 2]) -> Option<[[Complex32; 2]; 2]> {
 /// with the frequency OCC `[+1, +1]` / `[+1, −1]` over each RE pair, ports
 /// 2/3 the same in group 1, TS 38.211 §7.4.1.1.2). Per RB and layer the
 /// channel of every antenna is estimated from the DM-RS (de-rotated by the
-/// residual-CFO slope of antenna 0 / the first port, as [`extract_pdsch`]),
+/// residual-CFO slope measured over every antenna and port),
 /// the noise variance from the spread of the pair estimates, and every data
 /// RE is equalised with a regularised zero-forcing (MMSE) combiner; the
 /// LLRs come out in codeword order (layer 0 then layer 1 of each RE,
@@ -630,8 +630,11 @@ pub fn extract_pdsch_mimo(
     let mut h = vec![Complex32::new(0.0, 0.0); n_sym * n_ant * n_lay * n_rb];
     let mut noise_acc = 0f32;
     let mut noise_n = 0usize;
-    let mut corr_pow = 0f32;
-    let mut per_sym_corr = vec![Complex32::new(0.0, 0.0); n_sym];
+    // DM-RS coherence over every antenna and port (see `dmrs_metric` below):
+    // the received DM-RS energy, and per (symbol, antenna, port) the
+    // channel estimate summed over the RBs.
+    let mut rx_pow = 0f32;
+    let mut coherent = vec![Complex32::new(0.0, 0.0); n_sym * n_ant * n_lay];
     for (si, &l) in dmrs_syms.iter().enumerate() {
         let full_ref =
             pdsch_dmrs_sequence(alloc.scrambling_id, alloc.n_scid, slot, l as u32, ref_len);
@@ -641,6 +644,8 @@ pub fn extract_pdsch_mimo(
                 for (p, &port) in ports.iter().enumerate() {
                     let delta = usize::from(port / 2);
                     let occ = if port % 2 == 1 { -1.0f32 } else { 1.0 };
+                    // Count each CDM group's REs once per antenna.
+                    let first_of_group = ports[..p].iter().all(|q| q / 2 != port / 2);
                     let mut pairs = [Complex32::new(0.0, 0.0); 3];
                     for (n, pair) in pairs.iter_mut().enumerate() {
                         let y0 = grid[sc_to_bin(12 * p_rb + 4 * n + delta)];
@@ -648,8 +653,8 @@ pub fn extract_pdsch_mimo(
                         let r0 = full_ref[seq_base + 6 * p_rb + 2 * n];
                         let r1 = full_ref[seq_base + 6 * p_rb + 2 * n + 1];
                         *pair = (y0 * r0.conj() + occ * y1 * r1.conj()) / 2.0;
-                        if a == 0 && p == 0 {
-                            corr_pow += y0.norm_sqr() + y1.norm_sqr();
+                        if first_of_group {
+                            rx_pow += y0.norm_sqr() + y1.norm_sqr();
                         }
                     }
                     let mean = (pairs[0] + pairs[1] + pairs[2]) / 3.0;
@@ -659,17 +664,20 @@ pub fn extract_pdsch_mimo(
                         noise_acc += 2.0 * (pr - mean).norm_sqr();
                         noise_n += 1;
                     }
-                    if a == 0 && p == 0 {
-                        per_sym_corr[si] += mean * 6.0;
-                    }
+                    coherent[(si * n_ant + a) * n_lay + p] += mean * 6.0;
                 }
             }
         }
     }
-    let n_dmrs_re = n_sym * n_rb * 6;
-    let dmrs_metric = if corr_pow > 0.0 {
-        per_sym_corr.iter().map(|c| c.norm()).sum::<f32>()
-            / (corr_pow.sqrt() * (n_dmrs_re as f32).sqrt())
+    // How much of the received DM-RS energy the estimated channels explain,
+    // coherently over the allocation: sqrt(Σ_{sym,ant,port} |Σ_rb 6ĥ|² /
+    // (6·n_rb) / Σ|y|²). 1 on a clean channel however the energy splits
+    // over the antennas and ports (a fade on one path does not lower it),
+    // about √(ports / (6·n_rb)) for a DM-RS that does not match. Antenna 0
+    // / port 0 alone dropped a decodable two-layer PDSCH whenever that one
+    // path faded.
+    let dmrs_metric = if rx_pow > 0.0 {
+        (coherent.iter().map(|c| c.norm_sqr()).sum::<f32>() / (6 * n_rb) as f32 / rx_pow).sqrt()
     } else {
         0.0
     };
@@ -785,11 +793,17 @@ pub fn extract_pdsch_mimo(
         (err / n.max(1) as f32).sqrt()
     };
 
-    // Residual-CFO slope from antenna 0 / first port (see `extract_pdsch`).
+    // Residual-CFO slope (see `extract_pdsch`): each DM-RS symbol's phase
+    // relative to the first, energy-weighted over every antenna, port and RB
+    // (`arg Σ h[si]·conj(h[0])`), so a path in a deep fade does not decide it
+    // and the per-RB channel phase cancels. Antenna 0 / port 0 alone gave a
+    // random slope whenever that one path faded, and the whole PDSCH failed.
     let sym_phase: Vec<f32> = (0..n_sym)
         .map(|si| {
-            (0..n_rb)
-                .map(|rb| h[idx(si, 0, 0, rb)])
+            (0..n_ant)
+                .flat_map(|a| (0..n_lay).map(move |p| (a, p)))
+                .flat_map(|(a, p)| (0..n_rb).map(move |rb| (a, p, rb)))
+                .map(|(a, p, rb)| h[idx(si, a, p, rb)] * h[idx(0, a, p, rb)].conj())
                 .sum::<Complex32>()
                 .arg()
         })
@@ -1093,6 +1107,28 @@ mod tests {
             &mut bit,
         );
         assert_eq!(errors(&out, &tx), 0, "identity: evm {}", out.evm);
+        assert!(
+            out.dmrs_metric > 0.9,
+            "identity: dmrs metric {}",
+            out.dmrs_metric
+        );
+        // Antenna 0 sees nothing of layer 0 (that path in a deep fade): the
+        // DM-RS still match (the metric covers every antenna and port, so
+        // the PDSCH is not dropped before decoding) and the MMSE combiner
+        // still recovers both layers.
+        let (out, tx) = run(
+            vec![
+                vec![Complex32::new(0.0, 0.0), Complex32::new(0.7, 0.3)],
+                vec![Complex32::new(0.8, -0.2), Complex32::new(0.1, 0.6)],
+            ],
+            &mut bit,
+        );
+        assert!(
+            out.dmrs_metric > 0.5,
+            "faded path: dmrs metric {}",
+            out.dmrs_metric
+        );
+        assert_eq!(errors(&out, &tx), 0, "faded path: evm {}", out.evm);
         // One layer, two antennas (MRC) and the plain 1x1 case.
         let (out, tx) = run(
             vec![

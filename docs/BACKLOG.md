@@ -158,9 +158,17 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       S30): T5 keeps two layers through 2x2 TDL-A. Open: three/four layers,
       the SDR two-channel receive path, CDL / Sionna RT ray-traced channels
       (spatially correlated antennas), and a faster 2x2 fading path (the
-      emulator runs 2x2 TDL at ~0.3–0.6× real time); two-layer PDSCH BLER
-      under fading (T5 indoor 62/33 DL TB ok/ko, 2026-11-16 matrix, TEST_PLAN
-      §5.2).
+      emulator runs 2x2 TDL at ~0.3–0.6× real time). Fixed 2026-11-18:
+      two-layer PDSCH failed a fifth to a third of its TBs under fading
+      (T5 indoor 77/19, T8 pedestrian 73/16), in bursts of one TB and its
+      retransmissions: the receiver trusted antenna 0 / DM-RS port 0 alone
+      twice. Its DM-RS gate (`dmrs_metric < 0.3` → not decoded, not
+      combined) dropped every PDSCH while that one path faded, and the
+      residual-CFO slope came from that path too (garbage when it faded).
+      Both are now measured over every antenna and port (a unit test fades
+      that path out completely). With them T5 indoor 75/1, T8 pedestrian
+      76/0, T5 pedestrian 77/5. The CQI also maps the capacity-equivalent
+      SINR now (the linear mean let the strong RBs / layer hide the weak).
 - [ ] FR2: 120 kHz numerology, beam management (SSB/CSI-RS beam reports).
 
 ## MAC
@@ -276,10 +284,18 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       rejects anything but 6–15 digits), the CCCH SDU length, and four
       PDSCH asserts on network-configured values (bundle size, DM-RS
       reference CRB, Qm, slot index).
-- [ ] Cell edge (T1, 5 dB, 3 µs, 2 ppm): about one run in several syncs
-      with the timing loop flipping by ±4 samples (88 re-alignments in a
-      run), and the gNB then detects none of the UE's preambles (47 random
-      access attempts). The rerun attached at once (4 re-alignments).
+- [ ] Intermittent uplink loss with the downlink fine (about one run in
+      several, the rerun of the same scenario passes):
+      * cell edge (T1, 5 dB, 3 µs, 2 ppm): the timing loop flipping by ±4
+        samples (88 re-alignments in a run), and the gNB detects none of the
+        UE's preambles (47 random access attempts);
+      * T5 pedestrian (2026-11-18): RRC connects, then the gNB fails most
+        PUSCHs (785 KO vs 634 OK; a normal run is 73 / 10), SR failures
+        (157) drive C-RNTI random accesses in a loop, registration never
+        gets past T3510 — while the timing tracking is clean (0
+        re-alignments, drift +1.001 ppm) and 641 DL TBs decoded.
+      Look at the UL timing advance and CFO pre-compensation in such a run
+      (the capture, `ue.pcap`, shows the procedure side).
 - [ ] About 25 `assert!` remain in the DSP crates (`ferrite-phy`: polar,
       LDPC, OFDM, rate matching, PSS / SSS, cell search) on internal shape
       invariants (lengths the same module computed). Not reachable from the

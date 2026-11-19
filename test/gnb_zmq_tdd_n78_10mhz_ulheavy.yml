@@ -70,10 +70,8 @@ cell_cfg:
  nof_antennas_ul: 1
  nof_antennas_dl: 1
  pdsch:
-  # Cap DL/UL to QPSK on the qam64 table: the lossless ZMQ channel reports
-  # infinite SINR so link adaptation would otherwise pick 64/256-QAM, which the
-  # Ferrite UE's QPSK-tested modem can't yet produce/consume. MCS ≤ 9 = QPSK, and
-  # matches the UE's qam64 mcs_params so brute-forced DL decode + UL grants align.
+  # The 64-QAM MCS table; no MCS cap (link adaptation runs from the UE's
+  # CQI, 64-QAM both ways).
   mcs_table: qam64
  pusch:
   mcs_table: qam64
