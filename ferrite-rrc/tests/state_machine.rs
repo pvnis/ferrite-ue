@@ -553,6 +553,60 @@ fn bwp_switch_to_an_unknown_bwp_is_ignored() {
     assert!(ue.take_events().is_empty());
 }
 
+/// The dedicated PHY / MAC configuration of a `Reconfigure` event.
+fn reconfigured(ev: &[RrcEvent]) -> Vec<(ferrite_fapi::config::PhyConfig, ferrite_mac::MacConfig)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            RrcEvent::Reconfigure { phy, mac } => Some(((**phy).clone(), (**mac).clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn sr_failure_releases_pucch_and_srs() {
+    // The captured RRCSetup's configuration, as the stack applied it.
+    let mut ue = camped();
+    ue.connect(vec![0x7e, 0x00, 0x41], slot(0));
+    ue.on_mac(MacNotification::RaSucceeded { c_rnti: 0x4601 });
+    ue.on_dl_ccch(&hex(RRC_SETUP_HEX));
+    let (phy0, mac0) = reconfigured(&ue.take_events()).pop().unwrap();
+    assert!(!phy0.pucch.resources.is_empty() && !mac0.sr.is_empty());
+
+    // TS 38.321 §5.4.4: MAC asks RRC to release PUCCH and SRS.
+    ue.on_mac(MacNotification::SrFailure);
+    let cfgs = reconfigured(&ue.take_events());
+    assert_eq!(cfgs.len(), 1, "one CONFIG.request");
+    let (phy, mac) = &cfgs[0];
+    assert!(phy.pucch.resources.is_empty() && phy.pucch.resource_sets.is_empty());
+    assert!(phy.pucch.sr_resources.is_empty() && phy.srs.is_empty());
+    assert!(phy.csi_reports.is_empty());
+    assert!(mac.sr.is_empty() && mac.pucch.resources.is_empty());
+    assert!(mac.csi_reports.is_empty() && mac.srs_occasions.is_empty());
+    // The common PUCCH resource stays: HARQ-ACKs go there now.
+    assert_eq!(phy.pucch.resource_common, phy0.pucch.resource_common);
+    assert_eq!(ue.state(), RrcState::Connected);
+
+    // Nothing left to release: no new configuration.
+    ue.on_mac(MacNotification::SrFailure);
+    ue.on_mac(MacNotification::TimeAlignmentExpired);
+    assert!(reconfigured(&ue.take_events()).is_empty());
+}
+
+#[test]
+fn time_alignment_expiry_releases_pucch_and_srs_but_not_in_idle() {
+    let mut ue = connected();
+    ue.on_mac(MacNotification::TimeAlignmentExpired);
+    let cfgs = reconfigured(&ue.take_events());
+    assert_eq!(cfgs.len(), 1);
+    assert!(cfgs[0].0.pucch.resources.is_empty() && cfgs[0].1.sr.is_empty());
+
+    let mut idle = camped();
+    idle.on_mac(MacNotification::SrFailure);
+    idle.on_mac(MacNotification::TimeAlignmentExpired);
+    assert!(idle.take_events().is_empty());
+}
+
 /// RRCReject (DL-CCCH c1 index 0) without a wait time.
 fn reject() -> Vec<u8> {
     let mut b = Bits::new();

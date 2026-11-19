@@ -306,17 +306,26 @@ transport (see `ARCHITECTURE.md`, radio backend section).
       `FERRITE_TEST_DROP_MSG4_ACKS=N` (no HARQ-ACK for the first N
       TC-RNTI PDSCHs) forces case 1. Lab: 16 cell-edge runs and 4 with the
       forced ACK loss all register and ping (before: 1 in 16 stalled).
-      Left as found:
-      * after the contention resolution a Msg4 retransmission is decoded as
-        C-RNTI: no soft combining with the TC-RNTI transmission (buffers
-        keyed by RNTI kind), and the PDSCH worker picks the CORESET#0
-        reference point and the cell-ID scrambling by RNTI kind, where
-        38.211 §7.3.1.1 / §7.4.1.1.2 say "DCI 1_0 in a common search
-        space". Harmless in the lab cell (CORESET#0 at CRB 0, scrambling
-        IDs = PCI), wrong for a cell with either set; needs an `in_css`
-        flag on the grants;
-      * 38.321 §5.4.4 also releases PUCCH / SRS on an SR failure (the UE
-        keeps them until RRC reconfigures).
+      Left as found then, fixed the same day:
+      * the PDSCH worker picked the CORESET#0 reference point and the
+        cell-ID scrambling by RNTI kind; `DlGrant::common_search_space`
+        now carries "DCI 1_0 in a common search space" (38.211 §7.3.1.1,
+        §7.4.1.1.2), so a fallback C-RNTI PDSCH is decoded like a TC-RNTI
+        one (harmless in the lab cell: CORESET#0 at CRB 0, scrambling IDs
+        = PCI). Soft buffers are keyed by HARQ entity, not RNTI kind:
+        TC-RNTI and C-RNTI transmissions of a process combine;
+      * an SR failure or a timeAlignmentTimer expiry now releases PUCCH
+        and SRS (38.321 §5.4.4 / §5.2 → RRC drops PUCCH-Config, SR
+        resources, periodic CSI on PUCCH and SRS-Config on every BWP):
+        HARQ-ACKs go on the common PUCCH resource, new data starts a
+        random access, until the network reconfigures.
+        `FERRITE_TEST_MUTE_SR_FROM=K` forces an SR failure. Against OCUDU
+        (which ignores a C-RNTI CE from a connected UE and never
+        reconfigures) the UE recovers by RLC max retransmissions → RLF →
+        re-establishment in about 0.5 s (T1, F1: 18/20 pings); before, it
+        kept the resources the gNB still used and lost nothing. Spec over
+        lab convenience: a network that does reconfigure gets the spec's
+        behaviour.
       Original notes:
       * cell edge (T1, 5 dB, 3 µs, 2 ppm): the timing loop flipping by ±4
         samples (88 re-alignments in a run), and the gNB detects none of the

@@ -543,8 +543,14 @@ impl RrcUe {
                 RrcState::Connected => self.start_reestablishment(),
                 RrcState::Idle => {}
             },
-            MacNotification::SrFailure => log::info!("SR failure: MAC runs a C-RNTI random access"),
-            MacNotification::TimeAlignmentExpired => log::warn!("uplink time alignment lost"),
+            MacNotification::SrFailure => {
+                log::info!("SR failure: MAC runs a C-RNTI random access");
+                self.release_pucch_srs();
+            }
+            MacNotification::TimeAlignmentExpired => {
+                log::warn!("uplink time alignment lost");
+                self.release_pucch_srs();
+            }
             MacNotification::RlcMaxRetx { .. } | MacNotification::RadioLinkFailure => {
                 if self.state() == RrcState::Connected {
                     self.start_reestablishment();
@@ -553,6 +559,36 @@ impl RrcUe {
             MacNotification::SyncIndication { in_sync } => self.on_sync_indication(in_sync),
             MacNotification::BwpSwitch { dl_bwp, ul_bwp } => self.switch_bwp(dl_bwp, ul_bwp),
         }
+    }
+
+    /// The PUCCH and SRS release requests of MAC (TS 38.321 §5.4.4 on an SR
+    /// failure, §5.2 on a timeAlignmentTimer expiry): RRC releases
+    /// PUCCH-Config (its resources, the SR resources and the periodic CSI
+    /// reports on PUCCH) and SRS-Config on every BWP (TS 38.331, "PUCCH /
+    /// SRS release request from lower layers"). Until the network
+    /// reconfigures them, a HARQ-ACK goes on the common PUCCH resource and
+    /// new data starts a random access (no SR resource). Only while
+    /// connected: a re-establishment already runs on the common
+    /// configuration and gets a new dedicated one.
+    fn release_pucch_srs(&mut self) {
+        if self.state() != RrcState::Connected {
+            return;
+        }
+        let Some(cell) = self.cell.as_mut() else {
+            return;
+        };
+        if !has_pucch_or_srs(&cell.phy, &cell.mac) {
+            return;
+        }
+        log::warn!("PUCCH and SRS configuration released until the network reconfigures them");
+        release_pucch_srs(&mut cell.phy, &mut cell.mac);
+        for (phy, mac) in cell.bwps.values_mut() {
+            release_pucch_srs(phy, mac);
+        }
+        self.events.push(RrcEvent::Reconfigure {
+            phy: Box::new(cell.phy.clone()),
+            mac: Box::new(cell.mac.clone()),
+        });
     }
 
     /// Activate the configuration of DL BWP `dl_bwp` (or, for a UL-only
@@ -1019,4 +1055,33 @@ impl RrcUe {
     pub fn security(&self) -> Option<&AsSecurity> {
         self.security.as_ref()
     }
+}
+
+/// Whether a configuration has any dedicated PUCCH or SRS resource.
+fn has_pucch_or_srs(phy: &PhyConfig, mac: &MacConfig) -> bool {
+    !phy.pucch.resources.is_empty()
+        || !phy.srs.is_empty()
+        || !mac.sr.is_empty()
+        || !mac.srs_occasions.is_empty()
+}
+
+/// Drop PUCCH-Config and SRS-Config from a BWP's PHY / MAC configuration,
+/// keeping the common PUCCH resource (`pucch-ResourceCommon`, hopping).
+/// SchedulingRequestConfig (sr-TransMax) stays in MAC-CellGroupConfig, but
+/// with no SR resource an SR is a random access (TS 38.321 §5.4.4), which is
+/// what an empty `MacConfig::sr` means.
+fn release_pucch_srs(phy: &mut PhyConfig, mac: &mut MacConfig) {
+    let p = &mut phy.pucch;
+    p.resource_sets.clear();
+    p.resources.clear();
+    p.sr_resources.clear();
+    p.k1_list.clear();
+    phy.csi_reports.clear();
+    phy.srs.clear();
+    mac.sr.clear();
+    mac.pucch.resource_sets.clear();
+    mac.pucch.resources.clear();
+    mac.pucch.shapes.clear();
+    mac.csi_reports.clear();
+    mac.srs_occasions.clear();
 }

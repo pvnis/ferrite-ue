@@ -405,6 +405,7 @@ impl DciResolver {
         Some(Dci::Dl(DlGrant {
             rnti,
             rnti_kind: kind,
+            common_search_space: in_css,
             pdsch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
@@ -535,6 +536,7 @@ impl DciResolver {
         Some(Dci::Dl(DlGrant {
             rnti,
             rnti_kind: RntiKind::C,
+            common_search_space: false,
             pdsch_slot,
             prb_start: rb_start as u16,
             n_prb: n_rb as u16,
@@ -837,6 +839,14 @@ mod tests {
         // r_PUCCH = ⌊2·n_CCE,0 / N_CCE⌋ + 2·Δ_PRI (§9.2.1).
         assert_eq!(g.r_pucch_common, (2 * 4) / 8 + 2 * 2);
         assert_eq!(g.rnti_kind, RntiKind::C);
+        // A C-RNTI 1_0 in a CSS (fallback) is a common-search-space PDSCH:
+        // CORESET#0 reference point and cell-ID scrambling (TS 38.211
+        // §7.3.1.1); the same DCI in a USS is not.
+        assert!(g.common_search_space);
+        if r.sizes.f1_0_uss.is_none() {
+            let u = dl(r.resolve_1_0(&bits, Rnti(0x4601), RntiKind::C, false, slot(20), 4, 8));
+            assert!(!u.common_search_space);
+        }
     }
 
     #[test]
@@ -1282,6 +1292,7 @@ mod tests {
         // Antenna-port value 3 (Table 7.3.1.2.2-1): port 1000 with 2 CDM groups without data.
         let bits = dci_1_1(&r, riv_encode(0, 24, N_RB), 0, 20, 1, 0, 7, 2, 1, 2, 3);
         let g = dl(r.resolve_1_1(&bits, Rnti(0x4601), slot(40), 8, 16));
+        assert!(!g.common_search_space, "DCI 1_1 is never in a CSS");
         assert_eq!((g.time.start_symbol, g.time.n_symbols), (1, 13));
         assert_eq!(g.pdsch_slot, slot(40));
         assert_eq!(g.ack_slot, Some(slot(40 + 6)), "k1 = k1_list[2]");

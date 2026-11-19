@@ -283,6 +283,7 @@ fn attach_flow() {
     let dl = DlGrant {
         rnti: Rnti(0x4601),
         rnti_kind: RntiKind::Tc,
+        common_search_space: true,
         pdsch_slot: m4_slot,
         prb_start: 0,
         n_prb: 21,
@@ -534,6 +535,7 @@ fn bwp_inactivity_timer_and_switch_requests() {
     let dl = DlGrant {
         rnti: Rnti(0x4601),
         rnti_kind: RntiKind::C,
+        common_search_space: false,
         pdsch_slot: slot(19),
         prb_start: 0,
         n_prb: 4,

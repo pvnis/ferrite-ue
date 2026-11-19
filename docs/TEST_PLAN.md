@@ -165,6 +165,15 @@ contention, the case behind the 2026-11-19 cell-edge stall):
 `FERRITE_TEST_DROP_MSG4_ACKS=1 scripts/lab.sh T1 --scenario cell-edge`; it must
 register and ping like any run.
 
+An SR failure (the gNB never sees the UE's scheduling requests; from the
+K-th positive SR the UE sends negative ones until sr-TransMax):
+`FERRITE_TEST_MUTE_SR_FROM=K scripts/lab.sh T1`. The UE releases PUCCH and
+SRS and runs a random access with its C-RNTI. OCUDU does not reconfigure
+the UE after that (it keeps listening on the dedicated PUCCH resources), so
+SRB1 reaches RLC max retransmissions about 0.5 s later and the UE
+re-establishes the connection, which restores the dedicated configuration:
+S19 passes, and the outage costs one or two pings.
+
 ### 5.2 Channel emulator (`ferrite-chanem`)
 
 `ferrite-chanem` (`ferrite-radio`, feature `zmq`) sits between the gNB and

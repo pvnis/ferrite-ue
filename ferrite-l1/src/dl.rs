@@ -541,12 +541,67 @@ struct SoftBuffer {
     n_rx: u32,
 }
 
-/// The PDSCH worker: owns the HARQ soft buffers (one per RNTI kind + process).
+/// The scrambling identities of a PDSCH and its DM-RS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PdschIds {
+    data: u16,
+    dmrs: u16,
+}
+
+/// TS 38.211 §7.3.1.1: `dataScramblingIdentityPDSCH` applies to a C-RNTI
+/// PDSCH that is not scheduled by DCI 1_0 in a common search space (a
+/// fallback C-RNTI PDSCH uses the cell ID). §7.4.1.1.1: `scramblingID0`
+/// applies to a C-RNTI PDSCH, DCI 1_0 included.
+fn pdsch_ids(cfg: &WorkerConfig, kind: RntiKind, common_search_space: bool) -> PdschIds {
+    let configured = PdschIds {
+        data: cfg.scrambling_id.unwrap_or(cfg.cell_id),
+        dmrs: cfg.dmrs_scrambling_id0.unwrap_or(cfg.cell_id),
+    };
+    select_pdsch_ids(cfg.cell_id, configured, kind, common_search_space)
+}
+
+fn select_pdsch_ids(
+    cell_id: u16,
+    configured: PdschIds,
+    kind: RntiKind,
+    common_search_space: bool,
+) -> PdschIds {
+    let c_rnti = kind == RntiKind::C;
+    PdschIds {
+        data: if c_rnti && !common_search_space {
+            configured.data
+        } else {
+            cell_id
+        },
+        dmrs: if c_rnti { configured.dmrs } else { cell_id },
+    }
+}
+
+/// Which HARQ entity a PDSCH belongs to. TC-RNTI and C-RNTI transmissions
+/// share the unicast one (TS 38.321 §5.3.2.1: Msg4 is a HARQ process of the
+/// serving cell's entity, retransmitted to the C-RNTI once the contention is
+/// resolved); SI, RA and P-RNTI PDSCHs never combine with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum HarqSpace {
+    Unicast,
+    Broadcast(RntiKind),
+}
+
+impl HarqSpace {
+    fn of(kind: RntiKind) -> Self {
+        match kind {
+            RntiKind::Tc | RntiKind::C => Self::Unicast,
+            k => Self::Broadcast(k),
+        }
+    }
+}
+
+/// The PDSCH worker: owns the HARQ soft buffers (one per HARQ entity + process).
 pub struct PdschWorker {
     pub cfg: WorkerConfig,
     ofdm: Ofdm,
     comp: PhaseCompensation,
-    buffers: HashMap<(RntiKind, u8), SoftBuffer>,
+    buffers: HashMap<(HarqSpace, u8), SoftBuffer>,
     pub max_iter: usize,
     /// Tracking measurement of the last decoded PDSCH.
     last_sync: Option<PdschSync>,
@@ -688,10 +743,10 @@ impl PdschWorker {
         ) else {
             return fail(0.0);
         };
-        // Common (SI/RA/TC in CSS, DCI 1_0): PRBs and DMRS referenced to CORESET0's
-        // lowest RB when CORESET0 exists; dedicated: the BWP / CRB 0.
-        let common = matches!(g.rnti_kind, RntiKind::Si | RntiKind::Ra | RntiKind::P)
-            || (g.rnti_kind == RntiKind::Tc);
+        // DCI 1_0 in a common search space (any RNTI, a C-RNTI one in fallback
+        // too): PRBs and DM-RS referenced to CORESET#0's lowest RB when
+        // CORESET#0 exists; otherwise the BWP / CRB 0.
+        let common = g.common_search_space;
         let (bwp_start, dmrs_ref, vrb) = if common && self.cfg.coreset0_rb > 0 {
             let vrb = if g.vrb_to_prb_interleaved {
                 VrbToPrb::coreset0(self.cfg.coreset0_rb)
@@ -722,16 +777,10 @@ impl PdschWorker {
         } else {
             g.prb_start as usize
         };
-        let scrambling_id = if g.rnti_kind == RntiKind::C {
-            self.cfg.scrambling_id.unwrap_or(self.cfg.cell_id)
-        } else {
-            self.cfg.cell_id
-        };
-        let dmrs_id = if g.rnti_kind == RntiKind::C {
-            self.cfg.dmrs_scrambling_id0.unwrap_or(self.cfg.cell_id)
-        } else {
-            self.cfg.cell_id
-        };
+        let PdschIds {
+            data: scrambling_id,
+            dmrs: dmrs_id,
+        } = pdsch_ids(&self.cfg, g.rnti_kind, g.common_search_space);
         let alloc = PdschAlloc {
             rb_start: prb_start,
             n_rb: g.n_prb as usize,
@@ -934,11 +983,11 @@ impl PdschWorker {
         );
         // TBS: a retransmission keeps the initial TB's size (MAC passes it in the grant).
         let tbs = g.tbs_bits as usize;
-        let Some(r1024) = g
-            .mcs
-            .r_x1024
-            .or_else(|| self.buffers.get(&(g.rnti_kind, g.harq_id)).map(|_| 0))
-        else {
+        let Some(r1024) = g.mcs.r_x1024.or_else(|| {
+            self.buffers
+                .get(&(HarqSpace::of(g.rnti_kind), g.harq_id))
+                .map(|_| 0)
+        }) else {
             return fail(sinr);
         };
         let r = if r1024 == 0 {
@@ -950,7 +999,7 @@ impl PdschWorker {
             return fail(sinr);
         }
         let qm = g.mcs.qm as usize;
-        let key = (g.rnti_kind, g.harq_id);
+        let key = (HarqSpace::of(g.rnti_kind), g.harq_id);
         // Standalone decode first (fast path); then soft-combine for retransmissions.
         let (bits, _conv, crc) =
             dlsch::dlsch_decode_single_bits(&llr, tbs, r, qm, g.rv, self.max_iter);
@@ -1005,4 +1054,34 @@ fn pack_bits(bits: &[u8]) -> Vec<u8> {
     bits.chunks(8)
         .map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_c_rnti_pdsch_is_scrambled_with_the_cell_id() {
+        let cfg = PdschIds {
+            data: 700,
+            dmrs: 800,
+        };
+        let ids = |kind, css| select_pdsch_ids(1, cfg, kind, css);
+        // DCI 1_1 / 1_0 in a USS: the configured identities.
+        assert_eq!(ids(RntiKind::C, false), cfg);
+        // DCI 1_0 in a CSS with the C-RNTI: the cell ID for the data
+        // (§7.3.1.1); scramblingID0 still for the DM-RS (§7.4.1.1.1).
+        assert_eq!(ids(RntiKind::C, true), PdschIds { data: 1, dmrs: 800 });
+        // Every other RNTI: the cell ID.
+        for k in [RntiKind::Tc, RntiKind::Si, RntiKind::Ra, RntiKind::P] {
+            assert_eq!(ids(k, true), PdschIds { data: 1, dmrs: 1 });
+        }
+    }
+
+    #[test]
+    fn tc_and_c_rnti_share_the_unicast_harq_entity() {
+        assert_eq!(HarqSpace::of(RntiKind::Tc), HarqSpace::of(RntiKind::C));
+        assert_ne!(HarqSpace::of(RntiKind::Si), HarqSpace::of(RntiKind::C));
+        assert_ne!(HarqSpace::of(RntiKind::Si), HarqSpace::of(RntiKind::P));
+    }
 }

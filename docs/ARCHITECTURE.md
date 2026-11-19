@@ -329,11 +329,15 @@ views. Sub-procedures and their states:
   is the wait for the PHY's resolution of the RAR grant.
 * **Scheduling request** (§5.4.4), `SrState`: `Idle → Pending { counter,
   prohibit } → Idle` (a BSR went out) or `→ Failed` (sr-TransMax: the entity
-  starts a C-RNTI random access and reports `SrFailure`). An SR configuration
-  is triggered only by logical channels mapped to it (`schedulingRequestID`).
+  starts a C-RNTI random access and reports `SrFailure`; RRC then releases
+  PUCCH and SRS on every BWP, so HARQ-ACKs use the common PUCCH resource and
+  data starts a random access until the network reconfigures). An SR
+  configuration is triggered only by logical channels mapped to it
+  (`schedulingRequestID`).
 * **Timing advance** (§5.2), `TaState`: `NotAligned → Aligned { expiry }` on
   the RAR / every TA Command CE; on `timeAlignmentTimer` expiry the HARQ
-  buffers are flushed, no uplink but PRACH is transmitted and RRC is told.
+  buffers are flushed, no uplink but PRACH is transmitted and RRC is told
+  (and releases PUCCH and SRS, as on an SR failure).
 * **HARQ**: DL per process `ndi` / `delivered` (duplicates of a delivered TB
   are dropped); UL per process the stored TB for retransmissions at the
   signalled RV; the HARQ-ACK codebook (dynamic, §9.1.3) is booked per slot.

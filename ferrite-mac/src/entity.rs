@@ -106,6 +106,11 @@ pub struct MacEntity {
     /// the first N TC-RNTI PDSCHs, so the gNB retransmits Msg4 after the
     /// UE has resolved the contention (the lab's missed-ACK case).
     drop_msg4_acks: u32,
+    /// Test switch (`FERRITE_TEST_MUTE_SR_FROM=K`): from the K-th positive SR
+    /// on, send it as a negative one until the SR fails (sr-TransMax), once:
+    /// the gNB never sees the requests, as with a lost uplink.
+    mute_sr_from: u32,
+    positive_srs: u32,
     pending_pusch: BTreeMap<u64, PendingPusch>,
     /// The slot of the Msg3 handed to the PHY, which is not in
     /// `pending_pusch`: no PUCCH goes out in it (an SR there replaced Msg3).
@@ -166,6 +171,11 @@ impl MacEntity {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            mute_sr_from: std::env::var("FERRITE_TEST_MUTE_SR_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            positive_srs: 0,
             pending_pusch: BTreeMap::new(),
             msg3_slot: None,
             latest_csi: None,
@@ -477,6 +487,7 @@ impl MacEntity {
             .count()
             > 0;
         if sr_failed {
+            self.mute_sr_from = 0;
             for s in &mut self.sr {
                 s.cancel();
             }
@@ -582,6 +593,13 @@ impl MacEntity {
                         sr_res = Some(r2);
                     }
                 }
+            }
+        }
+        if sr_positive {
+            self.positive_srs += 1;
+            if self.mute_sr_from > 0 && self.positive_srs >= self.mute_sr_from {
+                log::warn!("test: positive SR at {target} sent as negative");
+                sr_positive = false;
             }
         }
         // CSI report occasion? Not outside DRX Active Time (§5.7).

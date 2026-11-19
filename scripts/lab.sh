@@ -264,6 +264,11 @@ if command -v tshark > /dev/null && [ -s "$OUT/ue.pcap" ]; then
   # whose segments arrive out of order, which HARQ retransmissions cause
   # (the UE's RLC reassembles and acknowledges it).
   ARQ="repeated\|Status PDU reports NACK\|PDCP SN ([0-9]*) missing"
+  # A re-establishment restarts SRB1's PDCP numbering at 0 (TS 38.323
+  # §5.1.2), which Wireshark reports as the SNs up to the wrap missing.
+  if grep -q "RRC re-established" "$UE"; then
+    ARQ="$ARQ\|PDCP SNs ([0-9]* to 4095) missing"
+  fi
   REPEATS=$(echo "$EXPERT" | grep "$ARQ" | awk '{s+=$1} END {print s+0}')
   BAD=$(echo "$EXPERT" | grep -v "$ARQ" | grep -E "[A-Za-z]")
   NPKT=$(tshark -r "$OUT/ue.pcap" 2>/dev/null | wc -l)

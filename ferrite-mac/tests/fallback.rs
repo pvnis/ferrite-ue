@@ -186,6 +186,7 @@ fn dl_grant(kind: RntiKind, pdsch_slot: SlotPoint, ndi: u8) -> DlGrant {
     DlGrant {
         rnti: Rnti(0x4601),
         rnti_kind: kind,
+        common_search_space: true,
         pdsch_slot,
         prb_start: 0,
         n_prb: 21,
@@ -406,4 +407,56 @@ fn crnti_random_access_after_sr_failure() {
             c_rnti: Rnti(0x4601)
         }
     )));
+}
+
+/// After RRC released PUCCH and SRS (the SR failure's release request,
+/// §5.4.4), a HARQ-ACK goes on the common PUCCH resource and new data starts
+/// a random access: there is no SR resource left to signal it on.
+#[test]
+fn released_pucch_uses_the_common_resource_and_random_access() {
+    let mut mac = MacEntity::new(config(64));
+    let mut up = FakeUpper {
+        pending: Vec::new(),
+    };
+    let m4 = connect(&mut mac, &mut up);
+    let mut released = config(64);
+    released.pucch.resource_sets.clear();
+    released.pucch.resources.clear();
+    released.sr.clear();
+    mac.reconfigure(released);
+    let at = m4.add(10);
+    dci(&mut mac, &mut up, at, Dci::Dl(dl_grant(RntiKind::C, at, 1)));
+    step(
+        &mut mac,
+        &mut up,
+        PhyToMac::RxData(RxDataIndication {
+            rnti: Rnti(0x4601),
+            rnti_kind: RntiKind::C,
+            harq_id: 0,
+            ndi: 1,
+            pdsch_slot: at,
+            tb: Some(vec![63, 0, 0]),
+            sinr_db: 30.0,
+        }),
+    );
+    let mut resources = Vec::new();
+    let mut s = m4.add(5);
+    for _ in 0..12 {
+        for m in tick(&mut mac, &mut up, s) {
+            if let MacToPhy::UlTti(r) = m {
+                for p in r.pdus {
+                    if let UlTtiPdu::Pucch { resource, .. } = p {
+                        resources.push(resource);
+                    }
+                }
+            }
+        }
+        s = s.add(1);
+    }
+    assert!(
+        matches!(resources.as_slice(), [PucchResourceRef::Common { .. }]),
+        "{resources:?}"
+    );
+    up.pending = vec![0x55; 40];
+    until_prach(&mut mac, &mut up, s);
 }

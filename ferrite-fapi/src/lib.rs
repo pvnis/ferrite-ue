@@ -62,6 +62,12 @@ pub struct TimeAlloc {
 pub struct DlGrant {
     pub rnti: Rnti,
     pub rnti_kind: RntiKind,
+    /// Scheduled by DCI format 1_0 in a common search space. Such a PDSCH is
+    /// numbered and its DM-RS referenced from CORESET#0 (TS 38.214
+    /// §5.1.2.2.2, TS 38.211 §7.4.1.1.2) and scrambled with the cell ID
+    /// (TS 38.211 §7.3.1.1), whatever the RNTI: a C-RNTI PDSCH in fallback
+    /// is one.
+    pub common_search_space: bool,
     /// Slot the PDSCH is in (n + k0).
     pub pdsch_slot: SlotPoint,
     pub prb_start: u16,
