@@ -510,6 +510,14 @@ FAPI already improve on them.
       queues, MAC (HARQ timing) stays on T0, so a slow ASN.1 decode or crypto
       step cannot cost an uplink deadline over the air (osmocom: real-time
       L1, non-real-time L23).
+      2026-11-19 measured (`FERRITE_PERF=1`, per-layer mean / worst at
+      exit), T1, 50 000 calls, 500 µs slots: whole stack mean 2.5 µs, worst
+      232 µs (MAC); RLC/PDCP 0.4 / 29 µs; RRC + NAS + user plane 0.9 /
+      143 µs (one RX_DATA during setup); 0 late UL. Deferred: the move would
+      buy nothing yet and adds MAC↔RRC ordering and interleavings to the
+      tables and the Quint model. Revisit if the numbers grow (OTA, a heavy
+      user plane, slower hardware); then move the user plane and NAS first
+      (no HARQ-timing coupling), RRC last.
 - [ ] **Persisted subscriber state** (`gsm_subscriber`'s role): 5G-GUTI,
       last TAI, NAS security context, forbidden PLMNs, USIM SQN (`NasUe`
       exposes the SQN "to persist" but nothing saves it), so the UE

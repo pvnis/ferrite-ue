@@ -163,6 +163,9 @@ fn main() {
     match result {
         Ok(stats) => {
             log::info!("engine stopped: {stats:?}; MAC {:?}", stack.mac_stats());
+            for line in stack.perf_report() {
+                log::info!("{line}");
+            }
             stack.flush_capture();
             std::process::exit(if ping_succeeded(&stack) { 0 } else { 1 });
         }

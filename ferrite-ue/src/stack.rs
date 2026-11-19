@@ -99,6 +99,10 @@ pub struct Stack {
     nas_connect_pending: bool,
     /// Wireshark capture (`--pcap`).
     pcap: Option<Pcap>,
+    /// Time spent per layer on the slot thread (`FERRITE_PERF`).
+    perf: Option<Perf>,
+    /// RLC / PDCP time within the current `handle` (for `perf`).
+    l2_time: std::time::Duration,
     /// The last UL transport block captured per HARQ process: a HARQ
     /// retransmission (the same bytes again) is not captured twice.
     ul_captured: std::collections::BTreeMap<u8, Vec<u8>>,
@@ -215,7 +219,9 @@ impl Stack {
             nas_us: 0,
             nas_connect_pending: false,
             pcap,
+            perf: std::env::var_os("FERRITE_PERF").map(|_| Perf::default()),
             ul_captured: std::collections::BTreeMap::new(),
+            l2_time: std::time::Duration::ZERO,
             cfg,
         }
     }
@@ -356,6 +362,11 @@ impl Stack {
 
     pub fn mac_stats(&self) -> MacStats {
         self.mac.stats()
+    }
+
+    /// The per-layer timing summary (`FERRITE_PERF`), one line per section.
+    pub fn perf_report(&self) -> Vec<String> {
+        self.perf.as_ref().map_or_else(Vec::new, Perf::report)
     }
 
     /// Write out the capture's buffered packets (before the process exits).
@@ -731,7 +742,9 @@ impl Stack {
 
     /// Deliver reassembled RLC SDUs up: SRB → PDCP → RRC, DRB → PDCP → user plane.
     fn deliver_rx(&mut self, now: SlotPoint) {
+        let t = std::time::Instant::now();
         let d = self.bearers.deliver_rx(now);
+        self.l2_time += t.elapsed();
         for lcid in d.rlc_max_retx {
             log::warn!("RLC max retransmissions on LCID {lcid}");
             self.rrc.on_mac(MacNotification::RlcMaxRetx { lcid });
@@ -873,12 +886,18 @@ impl Stack {
             log::warn!("test: injecting a radio link failure");
             self.rrc.on_mac(MacNotification::RadioLinkFailure);
         }
+        let kind = perf_kind(&msg);
+        let t_total = std::time::Instant::now();
         self.mac.handle_with(msg, phy, &mut self.bearers);
+        let t_mac = t_total.elapsed();
+        self.l2_time = std::time::Duration::ZERO;
         self.on_mac_events(phy, now);
         self.deliver_rx(now);
         self.apply_rrc_events(phy, now);
         if is_slot {
+            let t = std::time::Instant::now();
             self.bearers.tick(now);
+            self.l2_time += t.elapsed();
             self.rrc.tick(now);
             // The NAS timers run on air-interface time: one slot (1 ms / 2^µ) per SLOT.indication.
             self.nas_us += 1_000 / u64::from(self.numerology.slots_per_subframe()).max(1);
@@ -891,6 +910,78 @@ impl Stack {
             self.user_plane_slot(now);
             self.apply_rrc_events(phy, now);
         }
+        if let Some(p) = self.perf.as_mut() {
+            let total = t_total.elapsed();
+            let l2 = self.l2_time;
+            let l3 = total.saturating_sub(t_mac + l2);
+            for (name, d) in [("total", total), ("mac", t_mac), ("l2", l2), ("l3", l3)] {
+                p.add(name, d, now, kind);
+            }
+        }
+    }
+}
+
+/// Per-section time accounting of [`Stack::handle`] (`FERRITE_PERF`): count,
+/// total and the worst call (with its slot and message), to see what each
+/// layer costs the slot thread.
+#[derive(Default)]
+struct Perf {
+    sections: std::collections::BTreeMap<&'static str, PerfSection>,
+}
+
+#[derive(Default)]
+struct PerfSection {
+    count: u64,
+    total: std::time::Duration,
+    max: std::time::Duration,
+    max_at: Option<(SlotPoint, &'static str)>,
+}
+
+impl Perf {
+    fn add(
+        &mut self,
+        name: &'static str,
+        d: std::time::Duration,
+        at: SlotPoint,
+        kind: &'static str,
+    ) {
+        let s = self.sections.entry(name).or_default();
+        s.count += 1;
+        s.total += d;
+        if d > s.max {
+            s.max = d;
+            s.max_at = Some((at, kind));
+        }
+    }
+
+    fn report(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .map(|(name, s)| {
+                let mean = s.total.as_secs_f64() * 1e6 / s.count.max(1) as f64;
+                let at = s
+                    .max_at
+                    .map_or(String::new(), |(slot, kind)| format!(" at {slot} ({kind})"));
+                format!(
+                    "perf {name}: {} calls, mean {mean:.1} µs, total {:.1} ms, max {:.1} µs{at}",
+                    s.count,
+                    s.total.as_secs_f64() * 1e3,
+                    s.max.as_secs_f64() * 1e6
+                )
+            })
+            .collect()
+    }
+}
+
+fn perf_kind(m: &PhyToMac) -> &'static str {
+    match m {
+        PhyToMac::Slot(_) => "SLOT",
+        PhyToMac::Dci(_) => "DCI",
+        PhyToMac::RxData(_) => "RX_DATA",
+        PhyToMac::Csi(_) => "CSI",
+        PhyToMac::Rach(_) => "RACH",
+        PhyToMac::Sync(_) => "SYNC",
+        PhyToMac::Error(_) => "ERROR",
     }
 }
 
