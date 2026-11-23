@@ -441,7 +441,7 @@ pub fn run(
     }
     // Sensing tap: its sender thread, fed by the PDSCH worker.
     let nof_ant = dl.nof_antennas();
-    let sense_tap = params
+    let mut sense_tap = params
         .sense_tap
         .clone()
         .map(|p| SenseTap::start(p, nof_ant))
@@ -464,7 +464,7 @@ pub fn run(
                                 let grids: Vec<Vec<Vec<Iq>>> =
                                     samples.iter().filter_map(|s| w.demod(slot, s)).collect();
                                 if grids.len() == samples.len() {
-                                    if let Some(t) = &sense_tap {
+                                    if let Some(t) = sense_tap.as_mut() {
                                         t.on_slot(&w.cfg, slot, &grids, &tap);
                                     }
                                     if let Some(c) = w.measure_csi(slot, &grids) {
@@ -506,7 +506,7 @@ pub fn run(
                                     if grids.len() != job.samples.len() {
                                         failed()
                                     } else {
-                                        if let (Some(t), Some(state)) = (&sense_tap, &job.tap) {
+                                        if let (Some(t), Some(state)) = (sense_tap.as_mut(), &job.tap) {
                                             t.on_slot(&w.cfg, job.slot, &grids, state);
                                         }
                                         if let Some(c) = w.measure_csi(job.slot, &grids) {

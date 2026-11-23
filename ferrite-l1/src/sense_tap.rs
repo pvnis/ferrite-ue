@@ -90,6 +90,33 @@ pub struct TapLoopState {
 pub(crate) struct SenseTap {
     params: SenseTapParams,
     queue: crossbeam_channel::Sender<Vec<u8>>,
+    clock: SlotUnwrap,
+}
+
+/// The slot index unwrapped across the 1024-frame SFN cycle, so that the
+/// records' occasion and CPI indices grow over a whole run as the DU's do
+/// (they count hyper frames); the record's timestamp still wraps with the SFN.
+#[derive(Debug, Default)]
+struct SlotUnwrap {
+    last: Option<u64>,
+    cycles: u64,
+}
+
+impl SlotUnwrap {
+    /// Absolute slot of `slot`: a step back by more than half the SFN cycle
+    /// is a wrap. Slots arrive in order; a late one within half a cycle keeps
+    /// its own index.
+    fn unwrap(&mut self, slot: SlotPoint) -> u64 {
+        let cycle = 1024 * u64::from(slot.slots_per_frame());
+        let i = slot.index();
+        if let Some(last) = self.last {
+            if i + cycle / 2 < last {
+                self.cycles += 1;
+            }
+        }
+        self.last = Some(i);
+        self.cycles * cycle + i
+    }
 }
 
 impl SenseTap {
@@ -166,19 +193,24 @@ impl SenseTap {
                 .as_ref()
                 .map_or(String::new(), |p| format!(", recording to {}", p.display()))
         );
-        Ok(Self { params, queue })
+        Ok(Self {
+            params,
+            queue,
+            clock: SlotUnwrap::default(),
+        })
     }
 
     /// Tap the TRS symbols of `slot` from its demodulated grids
     /// (`grids_all[antenna][symbol][bin]`). A full queue drops the records.
     pub(crate) fn on_slot(
-        &self,
+        &mut self,
         cfg: &WorkerConfig,
         slot: SlotPoint,
         grids_all: &[Vec<Vec<Iq>>],
         state: &TapLoopState,
     ) {
-        for rec in trs_records(&self.params, cfg, slot, grids_all, state) {
+        let slot_abs = self.clock.unwrap(slot);
+        for rec in trs_records(&self.params, cfg, slot, slot_abs, grids_all, state) {
             if self.queue.try_send(rec).is_err() {
                 log::debug!("sensing tap: queue full, record of slot {slot} dropped");
             }
@@ -214,11 +246,12 @@ fn send(_p: &Publisher, _rec: &[u8]) -> Result<bool> {
 }
 
 /// The records of the TRS symbols of `slot`, one per configured TRS resource
-/// on it.
+/// on it; `slot_abs` is the slot unwrapped across SFN cycles.
 pub(crate) fn trs_records(
     params: &SenseTapParams,
     cfg: &WorkerConfig,
     slot: SlotPoint,
+    slot_abs: u64,
     grids_all: &[Vec<Vec<Iq>>],
     state: &TapLoopState,
 ) -> Vec<Vec<u8>> {
@@ -246,7 +279,7 @@ pub(crate) fn trs_records(
                     }
                 }
             }
-            let occasion = (slot.index() / u64::from((*period).max(1))) as u32;
+            let occasion = (slot_abs / u64::from((*period).max(1))) as u32;
             let header = Header {
                 sfn: slot.sfn,
                 slot: slot.slot,
@@ -424,6 +457,16 @@ mod tests {
             f32::from_le_bytes(b[128 + 8..128 + 12].try_into().unwrap()),
             1.0
         );
+    }
+
+    #[test]
+    fn occasions_keep_counting_across_the_sfn_wrap() {
+        let mu1 = Numerology { mu: 1 };
+        let mut c = SlotUnwrap::default();
+        assert_eq!(c.unwrap(SlotPoint::new(mu1, 1023, 2)), 20462);
+        // The next frame's slot 2 is past the wrap: one cycle of 20480 slots on.
+        assert_eq!(c.unwrap(SlotPoint::new(mu1, 0, 2)), 20480 + 2);
+        assert_eq!(c.unwrap(SlotPoint::new(mu1, 1, 2)), 20480 + 22);
     }
 
     #[test]
