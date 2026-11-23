@@ -282,6 +282,49 @@ pub fn pmi_hypotheses(cb: Codebook, rank: u8) -> Vec<Pmi> {
     out
 }
 
+/// The per-port channel of a two- or four-port NZP-CSI-RS (rows 3 and 4),
+/// `h[rb][antenna][port]` over the resource's RBs, from each antenna's
+/// demodulated grid of its symbol. Per RB and CDM group the two REs
+/// `k0 + 2g + k'` carry `r(2n + k')` (α = 2ρ, TS 38.211 §7.4.1.5.3) times the
+/// group's two ports under `w_f = [+1, ±1]`; dividing out the sequence and
+/// despreading gives each port's channel, taken as flat over the two
+/// subcarriers (a path delayed by τ leaks `(1 − e^{−j2π·Δf·τ})/2` into its
+/// partner port: 4 % at 0.4 µs and 30 kHz).
+pub fn csi_rs_port_channels(
+    grids: &[&[Complex32]],
+    sc_to_bin: impl Fn(usize) -> usize,
+    res: &CsiRsMeasurement,
+    slot: u32,
+    ports: usize,
+) -> Vec<Vec<Vec<Complex32>>> {
+    let seq = csi_rs_sequence(
+        res.n_id,
+        slot,
+        res.symbol as u32,
+        2 * (res.start_rb + res.n_rb),
+    );
+    let zero = Complex32::new(0.0, 0.0);
+    (res.start_rb..res.start_rb + res.n_rb)
+        .map(|n| {
+            grids
+                .iter()
+                .map(|grid| {
+                    let mut hp = vec![zero; ports];
+                    for g in 0..ports / 2 {
+                        let k = 12 * n + res.k0 + 2 * g;
+                        let y0 = grid[sc_to_bin(k)] * seq[2 * n].conj();
+                        let y1 = grid[sc_to_bin(k + 1)] * seq[2 * n + 1].conj();
+                        // Even port w_f = [+1, +1], odd port [+1, −1]; |seq| = 1.
+                        hp[2 * g] = (y0 + y1) / 2.0;
+                        hp[2 * g + 1] = (y0 - y1) / 2.0;
+                    }
+                    hp
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Measure a multi-port NZP-CSI-RS on every receive antenna — `grids[a]` is
 /// antenna `a`'s demodulated grid of the resource's symbol — and choose the
 /// rank and PMI of `codebook` that maximise the sum of the per-layer
@@ -319,34 +362,8 @@ pub fn measure_csi_rs_ports(
     if n_ant == 0 || res.n_rb == 0 || !row_ok {
         return none;
     }
-    let seq = csi_rs_sequence(
-        res.n_id,
-        slot,
-        res.symbol as u32,
-        2 * (res.start_rb + res.n_rb),
-    );
     // h[rb][antenna][port].
-    let zero = Complex32::new(0.0, 0.0);
-    let h: Vec<Vec<Vec<Complex32>>> = (res.start_rb..res.start_rb + res.n_rb)
-        .map(|n| {
-            grids
-                .iter()
-                .take(n_ant)
-                .map(|grid| {
-                    let mut hp = vec![zero; ports];
-                    for g in 0..ports / 2 {
-                        let k = 12 * n + res.k0 + 2 * g;
-                        let y0 = grid[sc_to_bin(k)] * seq[2 * n].conj();
-                        let y1 = grid[sc_to_bin(k + 1)] * seq[2 * n + 1].conj();
-                        // Even port w_f = [+1, +1], odd port [+1, −1]; |seq| = 1.
-                        hp[2 * g] = (y0 + y1) / 2.0;
-                        hp[2 * g + 1] = (y0 - y1) / 2.0;
-                    }
-                    hp
-                })
-                .collect()
-        })
-        .collect();
+    let h = csi_rs_port_channels(&grids[..n_ant], sc_to_bin, res, slot, ports);
     let entries = || h.iter().flat_map(|hn| hn.iter().flatten());
     let sig = entries().map(|x| x.norm_sqr()).sum::<f32>() / (h.len() * n_ant * ports) as f32;
     let (mut noise, mut n_noise) = (0.0f32, 0usize);

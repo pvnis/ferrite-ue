@@ -36,6 +36,11 @@ const VERSION: u16 = 4;
 const HEADER_LEN: usize = 128;
 /// Sequence type of the CSI-RS in the record's `sequence` word.
 const SEQUENCE_CSI_RS: u32 = 2;
+/// Sequence type of a record of channel estimates: the receiver has divided
+/// out the RS (a multi-port CSI-RS despread per port), so the sensor's RS is 1.
+const SEQUENCE_CHANNEL: u32 = 4;
+/// Comb of a despread density-1 CSI-RS port: one value per RB.
+const COMB_PER_RB: u16 = 12;
 /// Transmit beam of a record that names none (the illuminator's default).
 const DEFAULT_BEAM: u16 = 0xFFFF;
 /// TRS comb: one RE every fourth subcarrier.
@@ -210,7 +215,7 @@ impl SenseTap {
         state: &TapLoopState,
     ) {
         let slot_abs = self.clock.unwrap(slot);
-        for rec in trs_records(&self.params, cfg, slot, slot_abs, grids_all, state) {
+        for rec in tap_records(&self.params, cfg, slot, slot_abs, grids_all, state) {
             if self.queue.try_send(rec).is_err() {
                 log::debug!("sensing tap: queue full, record of slot {slot} dropped");
             }
@@ -245,9 +250,11 @@ fn send(_p: &Publisher, _rec: &[u8]) -> Result<bool> {
     Ok(false)
 }
 
-/// The records of the TRS symbols of `slot`, one per configured TRS resource
-/// on it; `slot_abs` is the slot unwrapped across SFN cycles.
-pub(crate) fn trs_records(
+/// The records of `slot`: one per TRS resource on it, and one per transmit
+/// port of each two- or four-port measurement CSI-RS on it (rows 3 and 4,
+/// despread per port: `rs_id` 1 + port, the port's channel per RB);
+/// `slot_abs` is the slot unwrapped across SFN cycles.
+pub(crate) fn tap_records(
     params: &SenseTapParams,
     cfg: &WorkerConfig,
     slot: SlotPoint,
@@ -256,7 +263,8 @@ pub(crate) fn trs_records(
     state: &TapLoopState,
 ) -> Vec<Vec<u8>> {
     let sc_to_bin = cfg.geom.dl_sc_to_bin();
-    cfg.csi_meas
+    let mut out: Vec<Vec<u8>> = cfg
+        .csi_meas
         .iter()
         .filter(|(m, period, offset, _)| {
             m.row == CsiRsRow::Row1 && ferrite_phy::csi::csi_rs_slots(*period, *offset, slot)
@@ -281,6 +289,10 @@ pub(crate) fn trs_records(
             }
             let occasion = (slot_abs / u64::from((*period).max(1))) as u32;
             let header = Header {
+                rs_id: 0,
+                comb: COMB,
+                sequence: SEQUENCE_CSI_RS,
+                nof_tx_ports: 0,
                 sfn: slot.sfn,
                 slot: slot.slot,
                 symbol: m.symbol as u8,
@@ -301,7 +313,69 @@ pub(crate) fn trs_records(
             };
             Some(encode(&header, &samples))
         })
-        .collect()
+        .collect();
+    for (m, period, offset, (codebook, _)) in &cfg.csi_meas {
+        if !matches!(m.row, CsiRsRow::Row3 | CsiRsRow::Row4)
+            || !ferrite_phy::csi::csi_rs_slots(*period, *offset, slot)
+        {
+            continue;
+        }
+        if m.start_rb != 0 {
+            log::debug!(
+                "sensing tap: CSI-RS from CRB {} skipped (the sensor counts from CRB 0)",
+                m.start_rb
+            );
+            continue;
+        }
+        let ports = usize::from(codebook.nof_ports());
+        let Some(views) = grids_all
+            .iter()
+            .map(|g| g.get(m.symbol).map(Vec::as_slice))
+            .collect::<Option<Vec<&[Iq]>>>()
+        else {
+            continue;
+        };
+        // h[rb][antenna][port].
+        let h = ferrite_phy::csi::csi_rs_port_channels(
+            &views,
+            sc_to_bin,
+            m,
+            u32::from(slot.slot),
+            ports,
+        );
+        let occasion = (slot_abs / u64::from((*period).max(1))) as u32;
+        for p in 0..ports {
+            let samples: Vec<Iq> = (0..views.len())
+                .flat_map(|a| h.iter().map(move |hn| hn[a][p]))
+                .collect();
+            let header = Header {
+                rs_id: 1 + p as u16,
+                comb: COMB_PER_RB,
+                sequence: SEQUENCE_CHANNEL,
+                nof_tx_ports: ports as u16,
+                sfn: slot.sfn,
+                slot: slot.slot,
+                symbol: m.symbol as u8,
+                illuminator: params.illuminator,
+                receiver: params.receiver,
+                nof_ant: views.len() as u8,
+                nof_re: m.n_rb as u16,
+                // The port's CDM group starts at k0 + 2g; its value stands for both REs.
+                comb_offset: (m.k0 + 2 * (p / 2)) as u16,
+                numerology: u16::from(slot.numerology.mu),
+                occasion_index: occasion,
+                cpi_index: occasion / params.cpi_occasions.max(1),
+                timestamp_ns: slot_start_ns(slot),
+                seed: u32::from(m.n_id),
+                timing_offset_s: state.applied_samples as f64 / cfg.geom.fs,
+                cfo_hz: state.cfo_removed_hz,
+                gain_db: state.gain_db,
+                position_m: params.position_m,
+            };
+            out.push(encode(&header, &samples));
+        }
+    }
+    out
 }
 
 /// Start of `slot` in the slot clock of the records, nanoseconds: it wraps
@@ -312,6 +386,10 @@ fn slot_start_ns(slot: SlotPoint) -> u64 {
 
 /// The fields of one record that vary.
 struct Header {
+    rs_id: u16,
+    comb: u16,
+    sequence: u32,
+    nof_tx_ports: u16,
     sfn: u16,
     slot: u16,
     symbol: u8,
@@ -336,22 +414,22 @@ fn encode(h: &Header, samples: &[Iq]) -> Vec<u8> {
     let mut b = Vec::with_capacity(HEADER_LEN + 8 * samples.len());
     b.extend_from_slice(&MAGIC);
     b.extend_from_slice(&VERSION.to_le_bytes());
-    b.extend_from_slice(&0u16.to_le_bytes()); // rs_id: the TRS
+    b.extend_from_slice(&h.rs_id.to_le_bytes());
     b.extend_from_slice(&h.sfn.to_le_bytes());
     b.extend_from_slice(&h.slot.to_le_bytes());
     b.extend_from_slice(&[h.symbol, h.illuminator, h.receiver, h.nof_ant]);
     b.extend_from_slice(&h.nof_re.to_le_bytes());
-    b.extend_from_slice(&COMB.to_le_bytes());
+    b.extend_from_slice(&h.comb.to_le_bytes());
     b.extend_from_slice(&h.comb_offset.to_le_bytes());
     b.extend_from_slice(&h.numerology.to_le_bytes());
     b.extend_from_slice(&h.occasion_index.to_le_bytes());
     b.extend_from_slice(&h.cpi_index.to_le_bytes());
     b.extend_from_slice(&h.timestamp_ns.to_le_bytes());
     b.extend_from_slice(&h.seed.to_le_bytes());
-    b.extend_from_slice(&SEQUENCE_CSI_RS.to_le_bytes());
+    b.extend_from_slice(&h.sequence.to_le_bytes());
     // Version 3: transmit beam, transmit ports (unknown), reserved.
     b.extend_from_slice(&DEFAULT_BEAM.to_le_bytes());
-    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&h.nof_tx_ports.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());
     // Version 4: the UE block.
     let mut flags = FLAG_TIMING | FLAG_CFO | FLAG_CORRECTED;
@@ -386,6 +464,10 @@ mod tests {
 
     fn header() -> Header {
         Header {
+            rs_id: 0,
+            comb: COMB,
+            sequence: SEQUENCE_CSI_RS,
+            nof_tx_ports: 0,
             sfn: 1023,
             slot: 3,
             symbol: 8,
@@ -467,6 +549,24 @@ mod tests {
         // The next frame's slot 2 is past the wrap: one cycle of 20480 slots on.
         assert_eq!(c.unwrap(SlotPoint::new(mu1, 0, 2)), 20480 + 2);
         assert_eq!(c.unwrap(SlotPoint::new(mu1, 1, 2)), 20480 + 22);
+    }
+
+    /// A despread CSI-RS port's record: its rs_id, the per-RB comb, the
+    /// channel-estimate sequence type and the transmit ports.
+    #[test]
+    fn csi_rs_port_record_names_its_port_and_comb() {
+        let h = Header {
+            rs_id: 3,
+            comb: COMB_PER_RB,
+            sequence: SEQUENCE_CHANNEL,
+            nof_tx_ports: 4,
+            ..header()
+        };
+        let b = encode(&h, &[Iq::new(1.0, 0.0); 6]);
+        assert_eq!(u16_at(&b, 6), 3);
+        assert_eq!(u16_at(&b, 18), 12);
+        assert_eq!(u32_at(&b, 44), 4);
+        assert_eq!((u16_at(&b, 48), u16_at(&b, 50)), (0xFFFF, 4));
     }
 
     #[test]
