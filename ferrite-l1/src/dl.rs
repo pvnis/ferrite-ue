@@ -495,6 +495,8 @@ pub struct PdschJob {
     pub queued: std::time::Instant,
     /// Sample-clock state when the slot was read (for the tracking measurement).
     pub sync: SyncTag,
+    /// The loop state for the sensing tap, on the slot's first job only.
+    pub tap: Option<crate::sense_tap::TapLoopState>,
 }
 
 /// Synchronisation measurement from one PDSCH's DM-RS, for the tracker.

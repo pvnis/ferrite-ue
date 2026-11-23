@@ -22,6 +22,7 @@ use crate::dl::{DlMonitor, PdschJob, PdschSync, PdschWorker, WorkerConfig};
 use crate::fapi::*;
 use crate::radio::{serve_uplink, DlStream, UlPacing, UlServer, UlShared};
 use crate::rt::ReadyWaveform;
+use crate::sense_tap::{SenseTap, SenseTapParams, TapLoopState};
 use crate::timing::SampleClock;
 use crate::track::{SyncTag, SyncTracker, TrackerConfig};
 use crate::ul::UlBuilder;
@@ -73,6 +74,9 @@ pub struct EngineParams {
     /// (exercises N310 / T310 / N311 and the re-establishment without
     /// touching the data path). `None` in normal operation.
     pub rlm_outage: Option<(u64, u64)>,
+    /// Sensing tap: the TRS symbols as ISAC tap records ([`crate::sense_tap`]);
+    /// `None` taps nothing.
+    pub sense_tap: Option<SenseTapParams>,
 }
 
 /// Commands from the application.
@@ -132,6 +136,8 @@ enum WorkerCmd {
     Measure {
         slot: SlotPoint,
         samples: Arc<Vec<Vec<Iq>>>,
+        /// The loop state the slot was read with, for the sensing tap.
+        tap: TapLoopState,
     },
     Reconfigure(Box<WorkerConfig>),
     Stop,
@@ -433,6 +439,8 @@ pub fn run(
             })
             .map_err(Error::Io)?;
     }
+    // Sensing tap: its sender thread, fed by the PDSCH worker.
+    let sense_tap = params.sense_tap.clone().map(SenseTap::start).transpose()?;
     // PDSCH worker thread.
     {
         std::thread::Builder::new()
@@ -446,11 +454,14 @@ pub fn run(
                             Some(w) => w.reconfigure(*c),
                             None => worker = Some(PdschWorker::new(*c)),
                         },
-                        WorkerCmd::Measure { slot, samples } => {
+                        WorkerCmd::Measure { slot, samples, tap } => {
                             if let Some(w) = worker.as_ref() {
                                 let grids: Vec<Vec<Vec<Iq>>> =
                                     samples.iter().filter_map(|s| w.demod(slot, s)).collect();
                                 if grids.len() == samples.len() {
+                                    if let Some(t) = &sense_tap {
+                                        t.on_slot(&w.cfg, slot, &grids, &tap);
+                                    }
                                     if let Some(c) = w.measure_csi(slot, &grids) {
                                         log::debug!(
                                             "CSI {}: sinr {:.1} dB cqi {} ri {} pmi {:?} ({} rx antennas)",
@@ -490,6 +501,9 @@ pub fn run(
                                     if grids.len() != job.samples.len() {
                                         failed()
                                     } else {
+                                        if let (Some(t), Some(state)) = (&sense_tap, &job.tap) {
+                                            t.on_slot(&w.cfg, job.slot, &grids, state);
+                                        }
                                         if let Some(c) = w.measure_csi(job.slot, &grids) {
                                             let _ = wk_res_tx.send(WorkerOut::Mac(PhyToMac::Csi(c)));
                                         }
@@ -1120,13 +1134,21 @@ impl<'a> Engine<'a> {
                     csi_rs_measured(r).is_some()
                         && csi::csi_rs_slots(r.period_slots as u32, r.offset_slots as u32, slot)
                 });
+            // What the sensing tap reports with the slot's records: the timing
+            // steps and the CFO removed from these samples, and the RX gain.
+            let tap = TapLoopState {
+                applied_samples: data_tag.applied,
+                cfo_removed_hz: data_tag.cfo_removed_hz,
+                gain_db: self.agc.as_ref().map(|a| a.gain_db() as f32),
+            };
             if grants.is_empty() && has_csi {
                 let _ = self.wk_cmd.try_send(WorkerCmd::Measure {
                     slot,
                     samples: arc_samples.clone(),
+                    tap,
                 });
             }
-            for g in grants {
+            for (i, g) in grants.into_iter().enumerate() {
                 self.stats.pdsch_jobs += 1;
                 let job = PdschJob {
                     slot,
@@ -1135,6 +1157,8 @@ impl<'a> Engine<'a> {
                     skip_decode: false,
                     queued: std::time::Instant::now(),
                     sync: data_tag,
+                    // The slot's first job taps it, once.
+                    tap: (i == 0).then_some(tap),
                 };
                 if self.wk_cmd.try_send(WorkerCmd::Job(job)).is_err() {
                     log::warn!("PDSCH worker queue full: slot {slot} dropped");

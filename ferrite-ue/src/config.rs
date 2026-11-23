@@ -169,6 +169,29 @@ pub struct Cli {
     /// registration update happens within a lab run.
     #[arg(long)]
     pub t3512_s: Option<u64>,
+    /// Sensing tap (nextghq/morty#25): publish every received TRS symbol as an
+    /// ISAC tap record (version 4, a receiving UE's) on a ZMQ PUB socket bound
+    /// here, for `isac-sensor --zmq`.
+    #[arg(long)]
+    pub sense_zmq: Option<String>,
+    /// Sensing tap: append the records to this recording (`isac-sensor --file`).
+    #[arg(long)]
+    pub sense_record: Option<std::path::PathBuf>,
+    /// Sensing tap: the illuminating cell's index in the sensing site (default 0).
+    #[arg(long)]
+    pub sense_illuminator: Option<u8>,
+    /// Sensing tap: this UE's receiver index in the sensing system, distinct
+    /// from every RU's (default 16).
+    #[arg(long)]
+    pub sense_receiver: Option<u8>,
+    /// Sensing tap: the UE antenna's position in the sensing site's frame,
+    /// metres, as `x,y,z`.
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true, num_args = 3)]
+    pub sense_position: Option<Vec<f64>>,
+    /// Sensing tap: TRS occasions per CPI for the records' CPI index (the
+    /// O-DU's `sensing_listener.cpi_occasions`, default 16).
+    #[arg(long)]
+    pub sense_cpi_occasions: Option<u32>,
     /// Log level (error/warn/info/debug/trace).
     #[arg(long)]
     pub log: Option<String>,
@@ -263,6 +286,8 @@ pub struct UeConfig {
     /// Wireshark capture file (MAC-NR, RRC, NAS).
     pub pcap: Option<String>,
     pub pcap_mac_udp: bool,
+    /// Sensing tap; `None` without `--sense-zmq` or `--sense-record`.
+    pub sense_tap: Option<ferrite_l1::sense_tap::SenseTapParams>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,7 +421,33 @@ impl UeConfig {
             t3512_s: cli.t3512_s.or(file.t3512_s),
             pcap: cli.pcap.clone().or(file.pcap.clone()),
             pcap_mac_udp: cli.pcap_mac_udp,
+            sense_tap: sense_tap(&cli)?,
             log: pick!(log, "info".into()),
         })
     }
+}
+
+/// The sensing tap's parameters, when an output is given.
+fn sense_tap(cli: &Cli) -> Result<Option<ferrite_l1::sense_tap::SenseTapParams>, String> {
+    if cli.sense_zmq.is_none() && cli.sense_record.is_none() {
+        return Ok(None);
+    }
+    let position_m = match cli.sense_position.as_deref() {
+        None => None,
+        Some(&[x, y, z]) => Some([x, y, z]),
+        Some(p) => {
+            return Err(format!(
+                "--sense-position takes x,y,z, got {} values",
+                p.len()
+            ))
+        }
+    };
+    Ok(Some(ferrite_l1::sense_tap::SenseTapParams {
+        zmq_bind: cli.sense_zmq.clone(),
+        record_path: cli.sense_record.clone(),
+        illuminator: cli.sense_illuminator.unwrap_or(0),
+        receiver: cli.sense_receiver.unwrap_or(16),
+        position_m,
+        cpi_occasions: cli.sense_cpi_occasions.unwrap_or(16),
+    }))
 }

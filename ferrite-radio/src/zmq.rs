@@ -175,6 +175,35 @@ impl ZmqSink {
     }
 }
 
+/// Message publisher: binds a `PUB` socket and sends each message to every
+/// connected subscriber, dropping it when a subscriber's queue is full. The
+/// sensing tap publishes its records with it (nextghq/morty#25).
+pub struct ZmqPublisher {
+    socket: ::zmq::Socket,
+    _ctx: ::zmq::Context,
+}
+
+impl ZmqPublisher {
+    /// Bind `endpoint` (e.g. `tcp://127.0.0.1:7100`).
+    pub fn bind(endpoint: &str) -> Result<Self> {
+        let ctx = ::zmq::Context::new();
+        let socket = ctx.socket(::zmq::PUB).map_err(zerr)?;
+        socket.set_linger(0).map_err(zerr)?;
+        socket.bind(endpoint).map_err(zerr)?;
+        Ok(Self { socket, _ctx: ctx })
+    }
+
+    /// Send one message without blocking. Returns `false` when it was dropped
+    /// (a full queue); a `PUB` socket never blocks its sender.
+    pub fn send(&self, msg: &[u8]) -> Result<bool> {
+        match self.socket.send(msg, ::zmq::DONTWAIT) {
+            Ok(()) => Ok(true),
+            Err(::zmq::Error::EAGAIN) => Ok(false),
+            Err(e) => Err(zerr(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +262,27 @@ mod tests {
         let msg = req.recv_msg(0).unwrap();
         assert_eq!(msg.len(), 32 * 8);
         assert!(msg.iter().all(|&b| b == 0));
+    }
+
+    /// A subscriber receives the publisher's messages whole.
+    #[test]
+    fn publisher_reaches_a_subscriber() {
+        let endpoint = "tcp://127.0.0.1:29519";
+        let publisher = ZmqPublisher::bind(endpoint).unwrap();
+        let ctx = ::zmq::Context::new();
+        let sub = ctx.socket(::zmq::SUB).unwrap();
+        sub.set_subscribe(b"").unwrap();
+        sub.set_rcvtimeo(100).unwrap();
+        sub.connect(endpoint).unwrap();
+        // A PUB socket drops messages until the subscription has arrived.
+        let msg = [7u8, 1, 2, 3];
+        for _ in 0..50 {
+            publisher.send(&msg).unwrap();
+            if let Ok(got) = sub.recv_bytes(0) {
+                assert_eq!(got, msg);
+                return;
+            }
+        }
+        panic!("no message reached the subscriber");
     }
 }

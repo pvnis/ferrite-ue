@@ -121,6 +121,7 @@ fn main() {
         sro_from_cfo: true,
         max_search_attempts: 10,
         rlm_outage: None,
+        sense_tap: None,
     };
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(4);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded(16);

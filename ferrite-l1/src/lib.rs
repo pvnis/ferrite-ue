@@ -22,6 +22,7 @@ pub mod engine;
 pub mod radio;
 pub(crate) mod resolve;
 pub(crate) mod rt;
+pub mod sense_tap;
 pub mod stream;
 pub(crate) mod timing;
 pub mod track;

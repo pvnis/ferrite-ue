@@ -85,6 +85,7 @@ fn config() -> UeConfig {
         log: "info".into(),
         pcap: None,
         pcap_mac_udp: false,
+        sense_tap: None,
     }
 }
 

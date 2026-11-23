@@ -60,6 +60,7 @@ fn main() {
         sro_from_cfo: !cfg.independent_lo && cfg.emulate_lo_ppm.is_none(),
         max_search_attempts: 0,
         rlm_outage: cfg.rlm_outage,
+        sense_tap: cfg.sense_tap.clone(),
     };
     let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<EngineCommand>(4);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<EngineEvent>(64);
