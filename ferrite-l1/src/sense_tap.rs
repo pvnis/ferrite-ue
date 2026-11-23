@@ -1,7 +1,8 @@
 //! Sensing tap of a connected UE (nextghq/morty#25): the received REs of
 //! every TRS symbol, per receive antenna, as ISAC tap records for
-//! `isac-sensor` (nextghq/morty), published on a ZMQ `PUB` socket and/or
-//! appended to a recording.
+//! `isac-sensor` (nextghq/morty): written into the tap's shared-memory ring
+//! ([`crate::shm_ring`], `isac-sensor --shm`), published on a ZMQ `PUB` socket
+//! (`--zmq`) and/or appended to a recording (`--file`).
 //!
 //! The TRS is the single-port, density-3 NZP-CSI-RS of a resource set with
 //! `trs-Info` (TS 38.214 §5.1.6.1.1; TS 38.211 §7.4.1.5.3 row 1): three REs per
@@ -21,6 +22,7 @@
 //! UE's timing on the downlink), and its position when configured.
 
 use crate::dl::WorkerConfig;
+use crate::shm_ring::{ring_path, slot_size_for, RingWriter};
 use ferrite_common::{Error, Iq, Result, SlotPoint};
 use ferrite_phy::csi::CsiRsRow;
 use std::io::Write;
@@ -46,10 +48,17 @@ const FLAG_POSITION: u32 = 1 << 4;
 const FLAG_CORRECTED: u32 = 1 << 8;
 /// Records queued between the PHY worker and the sender before new ones drop.
 const QUEUE_RECORDS: usize = 256;
+/// Slots of the shared-memory ring: 2.5 s of a 10 ms TRS burst of four symbols.
+const RING_SLOTS: usize = 1024;
+/// Largest carrier in RBs (TS 38.101-1 Table 5.3.2-1), for the ring's slot size.
+const MAX_RB: usize = 275;
 
 /// What the tap writes and where (the `--sense-*` options).
 #[derive(Clone, Debug, Default)]
 pub struct SenseTapParams {
+    /// Name of the shared-memory ring (`/dev/shm/<name>`, or a path) for
+    /// `isac-sensor --shm`.
+    pub shm_name: Option<String>,
     /// ZMQ endpoint to bind a `PUB` socket on (`isac-sensor --zmq` connects).
     pub zmq_bind: Option<String>,
     /// Recording to append the records to (`isac-sensor --file`).
@@ -84,10 +93,22 @@ pub(crate) struct SenseTap {
 }
 
 impl SenseTap {
-    /// Start the sender thread: it binds the ZMQ socket and opens the
-    /// recording, then sends every record it is handed until the tap is
-    /// dropped.
-    pub(crate) fn start(params: SenseTapParams) -> Result<Self> {
+    /// Start the sender thread: it creates the ring for records of up to
+    /// `nof_ant` antennas, binds the ZMQ socket and opens the recording, then
+    /// sends every record it is handed until the tap is dropped.
+    pub(crate) fn start(params: SenseTapParams, nof_ant: usize) -> Result<Self> {
+        let mut ring = match &params.shm_name {
+            Some(name) => {
+                let slot_size = slot_size_for(HEADER_LEN + nof_ant.max(1) * 3 * MAX_RB * 8);
+                Some(RingWriter::create(
+                    &ring_path(name),
+                    slot_size,
+                    RING_SLOTS,
+                    VERSION,
+                )?)
+            }
+            None => None,
+        };
         let mut file = match &params.record_path {
             Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
             None => None,
@@ -102,6 +123,9 @@ impl SenseTap {
             .spawn(move || {
                 let mut dropped = 0u64;
                 while let Ok(rec) = records.recv() {
+                    if let Some(r) = ring.as_mut() {
+                        r.write(&rec);
+                    }
                     if let Some(p) = &publisher {
                         match send(p, &rec) {
                             Ok(true) => {}
@@ -110,14 +134,15 @@ impl SenseTap {
                         }
                     }
                     if let Some(f) = file.as_mut() {
-                        if let Err(e) = f.write_all(&rec) {
+                        // Flushed per record, so that a stopped UE leaves whole records.
+                        if let Err(e) = f.write_all(&rec).and_then(|()| f.flush()) {
                             log::warn!("sensing tap recording: {e}");
                             file = None;
                         }
                     }
                 }
-                if let Some(mut f) = file {
-                    let _ = f.flush();
+                if let Some(r) = &ring {
+                    log::info!("sensing tap: {} records written to the ring", r.written());
                 }
                 if dropped > 0 {
                     log::info!("sensing tap: {dropped} records dropped by a full subscriber queue");
@@ -125,9 +150,13 @@ impl SenseTap {
             })
             .map_err(Error::Io)?;
         log::info!(
-            "sensing tap: illuminator {} receiver {}{}{}",
+            "sensing tap: illuminator {} receiver {}{}{}{}",
             params.illuminator,
             params.receiver,
+            params.shm_name.as_ref().map_or(String::new(), |n| format!(
+                ", ring {}",
+                ring_path(n).display()
+            )),
             params
                 .zmq_bind
                 .as_ref()

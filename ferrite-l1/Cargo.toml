@@ -12,6 +12,7 @@ ferrite-radio.workspace = true
 ferrite-fapi.workspace = true
 num-complex.workspace = true
 crossbeam-channel.workspace = true
+memmap2.workspace = true
 
 [features]
 default = ["zmq"]

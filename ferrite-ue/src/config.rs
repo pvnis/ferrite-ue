@@ -169,7 +169,12 @@ pub struct Cli {
     /// registration update happens within a lab run.
     #[arg(long)]
     pub t3512_s: Option<u64>,
-    /// Sensing tap (nextghq/morty#25): publish every received TRS symbol as an
+    /// Sensing tap (nextghq/morty#25): write every received TRS symbol as an
+    /// ISAC tap record into the shared-memory ring of this name
+    /// (`/dev/shm/<name>`, or a path) for `isac-sensor --shm`.
+    #[arg(long)]
+    pub sense_shm: Option<String>,
+    /// Sensing tap: publish every received TRS symbol as an
     /// ISAC tap record (version 4, a receiving UE's) on a ZMQ PUB socket bound
     /// here, for `isac-sensor --zmq`.
     #[arg(long)]
@@ -286,7 +291,7 @@ pub struct UeConfig {
     /// Wireshark capture file (MAC-NR, RRC, NAS).
     pub pcap: Option<String>,
     pub pcap_mac_udp: bool,
-    /// Sensing tap; `None` without `--sense-zmq` or `--sense-record`.
+    /// Sensing tap; `None` without `--sense-shm`, `--sense-zmq` or `--sense-record`.
     pub sense_tap: Option<ferrite_l1::sense_tap::SenseTapParams>,
 }
 
@@ -429,7 +434,7 @@ impl UeConfig {
 
 /// The sensing tap's parameters, when an output is given.
 fn sense_tap(cli: &Cli) -> Result<Option<ferrite_l1::sense_tap::SenseTapParams>, String> {
-    if cli.sense_zmq.is_none() && cli.sense_record.is_none() {
+    if cli.sense_shm.is_none() && cli.sense_zmq.is_none() && cli.sense_record.is_none() {
         return Ok(None);
     }
     let position_m = match cli.sense_position.as_deref() {
@@ -443,6 +448,7 @@ fn sense_tap(cli: &Cli) -> Result<Option<ferrite_l1::sense_tap::SenseTapParams>,
         }
     };
     Ok(Some(ferrite_l1::sense_tap::SenseTapParams {
+        shm_name: cli.sense_shm.clone(),
         zmq_bind: cli.sense_zmq.clone(),
         record_path: cli.sense_record.clone(),
         illuminator: cli.sense_illuminator.unwrap_or(0),

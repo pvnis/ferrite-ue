@@ -40,6 +40,8 @@ ctr = "0.9"
 sha2 = "0.10"
 hmac = "0.12"
 libc = "0.2"
+# The sensing tap's shared-memory ring (ferrite-l1 shm_ring).
+memmap2 = "0.9"
 
 ferrite-common = { path = "ferrite-common" }
 ferrite-ran = { path = "ferrite-ran" }

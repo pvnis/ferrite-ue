@@ -440,7 +440,12 @@ pub fn run(
             .map_err(Error::Io)?;
     }
     // Sensing tap: its sender thread, fed by the PDSCH worker.
-    let sense_tap = params.sense_tap.clone().map(SenseTap::start).transpose()?;
+    let nof_ant = dl.nof_antennas();
+    let sense_tap = params
+        .sense_tap
+        .clone()
+        .map(|p| SenseTap::start(p, nof_ant))
+        .transpose()?;
     // PDSCH worker thread.
     {
         std::thread::Builder::new()
