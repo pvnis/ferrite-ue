@@ -1480,6 +1480,17 @@ fn csi_codebook(cfg: &PhyConfig, nof_ports: u8) -> (Codebook, u8) {
         })
 }
 
+/// The CRBs a CSI-RS resource occupies: its `CSI-FrequencyOccupation`
+/// (`startingRB`, `nrofRBs`, both multiples of 4) within the DL BWP. TS 38.331
+/// (CSI-FrequencyOccupation): when `nrofRBs` is larger than the BWP, the UE
+/// takes the CSI-RS bandwidth to be the BWP's, as on a 51-PRB carrier with
+/// `nrofRBs` 52. Returns `(start_rb, n_rb)`.
+fn csi_rs_rbs(r: &CsiRsResource, bwp_start: u16, bwp_rb: u16) -> (usize, usize) {
+    let start = r.start_rb.max(bwp_start);
+    let end = (r.start_rb + r.n_rb).min(bwp_start + bwp_rb);
+    (start as usize, end.saturating_sub(start) as usize)
+}
+
 fn worker_config(
     geom: &CellGeometry,
     cfg: &PhyConfig,
@@ -1502,12 +1513,13 @@ fn worker_config(
         if let Some(s2) = r.second_symbol {
             symbols.push(s2 as usize);
         }
+        let (start_rb, n_rb) = csi_rs_rbs(r, cfg.dl_bwp.start_crb, cfg.dl_bwp.n_rb);
         patterns.push(csi::CsiRsPattern {
             period_slots: r.period_slots as u32,
             offset_slots: r.offset_slots as u32,
             symbols: symbols.clone(),
-            start_rb: r.start_rb as usize,
-            n_rb: r.n_rb as usize,
+            start_rb,
+            n_rb,
             re_mask: csi::csi_rs_re_mask(row, r.freq_bits),
         });
         if csi_rs_measured(r).is_some() {
@@ -1517,8 +1529,8 @@ fn worker_config(
                     n_id: r.scrambling_id,
                     k0: csi::csi_rs_k0(row, r.freq_bits),
                     symbol: r.first_symbol as usize,
-                    start_rb: r.start_rb as usize,
-                    n_rb: r.n_rb as usize,
+                    start_rb,
+                    n_rb,
                 },
                 r.period_slots as u32,
                 r.offset_slots as u32,
@@ -1557,6 +1569,34 @@ fn worker_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TS 38.331 CSI-FrequencyOccupation: a resource wider than the BWP
+    /// spans the BWP.
+    #[test]
+    fn csi_rs_resource_is_clipped_to_the_bwp() {
+        let r = CsiRsResource {
+            zero_power: false,
+            id: 0,
+            row: 1,
+            nof_ports: 1,
+            freq_bits: 1,
+            first_symbol: 4,
+            second_symbol: None,
+            density_x2: 6,
+            start_rb: 0,
+            n_rb: 52,
+            period_slots: 20,
+            offset_slots: 2,
+            scrambling_id: 0,
+            trs: true,
+        };
+        assert_eq!(csi_rs_rbs(&r, 0, 51), (0, 51));
+        assert_eq!(csi_rs_rbs(&r, 0, 106), (0, 52));
+        assert_eq!(
+            csi_rs_rbs(&CsiRsResource { start_rb: 4, ..r }, 8, 20),
+            (8, 20)
+        );
+    }
 
     /// TS 38.133 §8.1: out-of-sync below Q_out, in-sync above Q_in, nothing
     /// in between; a missing SSB is out-of-sync.
