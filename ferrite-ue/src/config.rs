@@ -186,7 +186,7 @@ pub struct Cli {
     pub sense_receiver: Option<u8>,
     /// Sensing tap: the UE antenna's position in the sensing site's frame,
     /// metres, as `x,y,z`.
-    #[arg(long, value_delimiter = ',', allow_hyphen_values = true, num_args = 3)]
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
     pub sense_position: Option<Vec<f64>>,
     /// Sensing tap: TRS occasions per CPI for the records' CPI index (the
     /// O-DU's `sensing_listener.cpi_occasions`, default 16).
@@ -450,4 +450,41 @@ fn sense_tap(cli: &Cli) -> Result<Option<ferrite_l1::sense_tap::SenseTapParams>,
         position_m,
         cpi_occasions: cli.sense_cpi_occasions.unwrap_or(16),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<ferrite_l1::sense_tap::SenseTapParams>, String> {
+        let cli = Cli::try_parse_from(args).map_err(|e| e.to_string())?;
+        sense_tap(&cli)
+    }
+
+    #[test]
+    fn sense_position_takes_one_comma_separated_value() {
+        let p = parse(&[
+            "ferrite-ue",
+            "--sense-record",
+            "t.bin",
+            "--sense-position",
+            "-30,-40,1.5",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.position_m, Some([-30.0, -40.0, 1.5]));
+        assert_eq!((p.illuminator, p.receiver, p.cpi_occasions), (0, 16, 16));
+        assert!(parse(&[
+            "ferrite-ue",
+            "--sense-record",
+            "t.bin",
+            "--sense-position",
+            "1,2"
+        ])
+        .is_err());
+        // Without an output the tap is off, whatever else is given.
+        assert!(parse(&["ferrite-ue", "--sense-position", "1,2,3"])
+            .unwrap()
+            .is_none());
+    }
 }
