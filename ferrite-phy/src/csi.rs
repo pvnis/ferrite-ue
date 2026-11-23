@@ -495,6 +495,54 @@ mod tests {
     use super::*;
     use ferrite_common::Numerology;
 
+    /// A four-port row-4 CSI-RS built from known per-port channels (each CDM
+    /// group's REs `k0 + 2g + k'` carrying `r(2n + k')` times its two ports
+    /// under `w_f = [+1, ±1]`) despreads back into those channels, per RB,
+    /// antenna and port.
+    #[test]
+    fn port_channels_of_a_four_port_csi_rs() {
+        let (n_id, slot, symbol, k0, n_rb) = (1u16, 12u32, 4usize, 4usize, 6usize);
+        let seq = csi_rs_sequence(n_id, slot, symbol as u32, 2 * n_rb);
+        // h[antenna][port][rb]: distinct values everywhere.
+        let h = |a: usize, p: usize, n: usize| {
+            Complex32::new(1.0 + a as f32 + 0.1 * n as f32, p as f32 - 0.2 * n as f32)
+        };
+        let grids: Vec<Vec<Complex32>> = (0..2)
+            .map(|a| {
+                let mut g = vec![Complex32::new(0.0, 0.0); 12 * n_rb];
+                for n in 0..n_rb {
+                    for grp in 0..2 {
+                        let (e, o) = (h(a, 2 * grp, n), h(a, 2 * grp + 1, n));
+                        g[12 * n + k0 + 2 * grp] = seq[2 * n] * (e + o);
+                        g[12 * n + k0 + 2 * grp + 1] = seq[2 * n + 1] * (e - o);
+                    }
+                }
+                g
+            })
+            .collect();
+        let views: Vec<&[Complex32]> = grids.iter().map(Vec::as_slice).collect();
+        let res = CsiRsMeasurement {
+            row: CsiRsRow::Row4,
+            n_id,
+            k0,
+            symbol,
+            start_rb: 0,
+            n_rb,
+        };
+        let got = csi_rs_port_channels(&views, |sc| sc, &res, slot, 4);
+        assert_eq!(got.len(), n_rb);
+        for (n, hn) in got.iter().enumerate() {
+            for (a, ha) in hn.iter().enumerate() {
+                for (p, v) in ha.iter().enumerate() {
+                    assert!(
+                        (v - h(a, p, n)).norm() < 1e-5,
+                        "rb {n} antenna {a} port {p}: {v}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A perfectly-received CSI-RS (grid = h·sequence at the RE locations) measures a
     /// very high SINR and maps to the maximum CQI — for both single-port rows and a
     /// resource that does not start at CRB 0.
